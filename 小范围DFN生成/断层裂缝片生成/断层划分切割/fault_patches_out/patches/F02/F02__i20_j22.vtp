@@ -1,0 +1,62 @@
+<?xml version="1.0"?>
+<VTKFile type="PolyData" version="0.1" byte_order="LittleEndian" header_type="UInt32" compressor="vtkZLibDataCompressor">
+  <PolyData>
+    <Piece NumberOfPoints="66" NumberOfVerts="0" NumberOfLines="0" NumberOfStrips="0" NumberOfPolys="64">
+      <PointData>
+        <DataArray type="Int64" IdType="1" Name="vtkOriginalPointIds" format="binary" RangeMin="3" RangeMax="117">
+          AQAAAACAAAAQAgAAhAAAAA==eJwtxU1rAQAAAFDFwUdx8NEKZbHiMLQaKcRhRaRGiqUQKaRM/H8H711eMPASdsQhRx1z3EmnnHDaGWf95pzzfnfBRZf84bI/XXXFNdf95W833HTbLXfcdc99/3jogUce+9cTTz3zwnMv/eeV19546533Pvrgk8+++Op/33z3w081fQ+n
+        </DataArray>
+      </PointData>
+      <CellData>
+        <DataArray type="Int64" IdType="1" Name="vtkOriginalCellIds" format="binary" RangeMin="0" RangeMax="63">
+          AQAAAACAAAAAAgAAcAAAAA==eJwtxbVhAgAAADCgSHF3p8XdHf7/ioFkSSDwFXTIPw474qhj/nXcCSedctoZZ51z3gUXXXLZFVddc90NN91y2x133XPfA//530OPPPbEU88898JLr7z2xlvvvPfBR5989sVX33z3w0+//PYHV0sH4Q==
+        </DataArray>
+      </CellData>
+      <Points>
+        <DataArray type="Float32" Name="Points" NumberOfComponents="3" format="binary" RangeMin="4238156.317183277" RangeMax="4238362.142397875">
+          AQAAAACAAAAYAwAA2AEAAA==eJwtkk1IlFEUhikIG00oCiLaCAqVCyUNIqHM9G3mm5ScYAzB7Kvg3BultiiCsJjSoMVQGGiLmNqMYNgPBRJUjIucCAOjrDYuCgQNokVRCQXVmTnv7uHhOYfLvTfcFQk21KfinQ8cBnZHgg7lnasdOsn16x1CbVYo5/IO25rML34XjLBZU27NvbpUfGOfR0XMfN05wbWosZyVYpPVZm3aI8Om8rzgMLm8XxALjGMZ629qv3XS4z398IQgQ94ybs2QNo8WfZFLlB8vC1GRiATVhbNdOFTkQh8eCHF0n/HXdzb7VvuFEo/jLea7zghqyRcHrHmlTTzi8ZS++4hgkDzda80nbaK/HYabzQ/dEmwn/7gvmCTX3BB43uHsF5v9qbNjcw7/6Gc+CFJk+az3s8d4fFqQJv+dstkG5ZcJh5pG8/Ol9hYFzlY7BPRLZQ4d5MurHL7x/NGk7cnrGa6WeeyA+TstglJycr/gCrkysD6nfc9mjzn6u+2CUXJrqzUT2ky1e2ziH+g7JXi41/jgCUGSfvlpQSP9ym5BD3nmmKAtbpx+YjtHdGf2jcdt+sGc4BJ5/pk117Wp/eiR4FuffC1oIK97IegiV80KfnH2z3NBFX1TXvAfkiEKZA==
+          <InformationKey name="L2_NORM_RANGE" location="vtkDataArray" length="2">
+            <Value index="0">
+              4238156.3172
+            </Value>
+            <Value index="1">
+              4238362.1424
+            </Value>
+          </InformationKey>
+        </DataArray>
+      </Points>
+      <Verts>
+        <DataArray type="Int64" Name="connectivity" format="binary" RangeMin="1e+299" RangeMax="-1e+299">
+          AAAAAACAAAAAAAAA
+        </DataArray>
+        <DataArray type="Int64" Name="offsets" format="binary" RangeMin="1e+299" RangeMax="-1e+299">
+          AAAAAACAAAAAAAAA
+        </DataArray>
+      </Verts>
+      <Lines>
+        <DataArray type="Int64" Name="connectivity" format="binary" RangeMin="1e+299" RangeMax="-1e+299">
+          AAAAAACAAAAAAAAA
+        </DataArray>
+        <DataArray type="Int64" Name="offsets" format="binary" RangeMin="1e+299" RangeMax="-1e+299">
+          AAAAAACAAAAAAAAA
+        </DataArray>
+      </Lines>
+      <Strips>
+        <DataArray type="Int64" Name="connectivity" format="binary" RangeMin="1e+299" RangeMax="-1e+299">
+          AAAAAACAAAAAAAAA
+        </DataArray>
+        <DataArray type="Int64" Name="offsets" format="binary" RangeMin="1e+299" RangeMax="-1e+299">
+          AAAAAACAAAAAAAAA
+        </DataArray>
+      </Strips>
+      <Polys>
+        <DataArray type="Int64" Name="connectivity" format="binary" RangeMin="0" RangeMax="65">
+          AQAAAACAAAAABgAAEAEAAA==eJxtk1s3QmEURY8KhXIrlUQuuYVILpHw//+UB2s+mMP3MseZZ+019hjnfEXxe5bCUvH3lMOKuFz8f/D0rYSrYVW+Fq6J68qtyNPH/Ibm8fWwIW4qV5OnbyvcDnfked4Vm8q1wr2wLd8Ju+K+ci15+nrhQdiXZ64tHirXk6eP/+AorMgPwmPxRLmyPH3Mn2oez1598Uy5gTx9w/A8vJC/1Hs8pyReKTeUp4/veh125UfhjXirXEeePubvNI8fh/fig3Ijefom4WM4ledeVsUn5Sby9LHfs/bDMzcVX5Qby9PH/X8NG/Kz8E18V64uT988/AgX8tz/pvip3FyePvb70n545hbit3Izefp+AHluF2I=
+        </DataArray>
+        <DataArray type="Int64" Name="offsets" format="binary" RangeMin="3" RangeMax="192">
+          AQAAAACAAAAAAgAAiQAAAA==eJwtxdFmAgAAAMCIGBERIyIiImJERERERERERMQYIyIiIiIiIiIiIiIiIqJP66G7lwsGPkL+ctgRRx3zt+NOOOmU084465x/nHfBRZdcdsVV11x3w0233HbHXffc96///O+Bhx557ImnnnnuhZdeee2Nt95574OPPvnsi6+++e6Hn375DcTwGGE=
+        </DataArray>
+      </Polys>
+    </Piece>
+  </PolyData>
+</VTKFile>

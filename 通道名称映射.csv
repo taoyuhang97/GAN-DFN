@@ -1,0 +1,32 @@
+﻿Channel Name,Long Name,Unit
+AVERAGE_CURRENT,"Average response of FMI, FMS4 or FMS2 over vertical span of LLS/SFL (32 inches)",
+C1,Caliper 1,in
+C2,Caliper 2,in
+DEVI,Hole Deviation,rad
+EMEX_AVERAGE,Average of EMEX over vertical span of LLS/SFL (32 inches),V
+EV,EMEX Voltage,V
+FBGA,FMI Electronic Gain,dB
+FVA,Electrical Fracture Aperture: Mean value of fracture trace aperture averaged over a given window height,0.1 in
+FVAH,Hydraulic Electrical Fracture Aperture: Cube root of the cube of the fracture trace aperture summed over a given window height,0.1 in
+FVDC,Corrected Fracture Density: Apparent Fracture Density (FVDA) corrected for the orientation bias (angle between fracture plane and borehole axis),1/ft
+FVPA,Apparent Electrical Fracture Porosity: Ratio of the apparent area of fractures seen on the borehole wall over the area of borehole for a given window height,pu
+FVTL,Areal Trace Length: Cumulated fracture trace length seen per unit area of borehole wall within a given window height,1/ft
+GR,Gamma Ray,gAPI
+HAZI,Hole Azimuth,rad
+P1AZ,Pad 1 Azimuth,rad
+P1NO,Pad 1 Rotation Relative to North Azimuth,rad
+PHIT,"Total Porosity: includes all forms of porosity, including that occupied by bound fluids, and is independent of rock and fluid materials and of environmental effects",m3/m3
+RB,Relative Bearing,rad
+SDEV,Sonde Deviation,rad
+TDEP,,0.1 in
+U-1047,SIZE,
+U-1051,SIZE,
+U-1069,SIZE,
+U-1073,SIZE,
+U-1084,SIZE,
+U-1088,SIZE,
+U-1104,SIZE,
+U-1108,SIZE,
+U-1113,SIZE,
+U-1117,SIZE,
+VISO,Volume of Isolated Fluid Relative to Total Volume,m3/m3
