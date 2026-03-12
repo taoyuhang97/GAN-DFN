@@ -26,8 +26,8 @@ SAVE_DIR = r"E:\项目\石油项目\断缝储\原始数据\wx数据\砂砾岩\�
 os.makedirs(SAVE_DIR, exist_ok=True)
 
 # ===================== 特征定义 =====================
-# imaging_well_features = ['AC', 'GR', 'CAL', 'CNL', 'PE', 'DEN', 'CON1', 'GRSL', 'K', 'KTH', 'TH', 'U']
-imaging_well_features = ['DEN', 'CON1', 'GRSL', 'AC', 'GR']
+imaging_well_features = ['AC', 'GR', 'CAL', 'CNL', 'PE', 'DEN', 'CON1', 'GRSL', 'K', 'KTH', 'TH', 'U']
+# imaging_well_features = ['DEN', 'CON1', 'GRSL', 'AC', 'GR']
 
 seis_features = [f"SEIS_{i}" for i in range(63)]
 # seis_features = [f"SEIS_{i}" for i in range(3, 63, 7)]
@@ -211,41 +211,104 @@ def analyze_seismic_complexity():
 # ===================== 井间分布距离 =====================
 
 def compute_well_distance():
-    matrix = []
+    seis_cube = X_seis.reshape(-1, 3, 3, 7)
 
-    for w1 in tqdm(well_names, desc="计算井间距离"):
+    seismic_scenarios = {
+        "seismic_3x3x7": X_seis,
+        "seismic_3x3_plane": seis_cube[:, :, :, 3].reshape(len(seis_cube), -1),
+        "seismic_single_amplitude": seis_cube[:, 1, 1, 3].reshape(-1, 1),
+        "seismic_center_trace_7": seis_cube[:, 1, 1, :],
+    }
 
-        row = []
+    scenarios = {
+        "imaging_only": X_log,
+    }
+    scenarios.update(seismic_scenarios)
+    for scenario_name, scenario_features in seismic_scenarios.items():
+        scenarios[f"{scenario_name}_plus_imaging"] = np.concatenate(
+            [scenario_features, X_log],
+            axis=1
+        )
 
-        idx1 = well == w1
+    def compute_distance_matrix(feature_matrix):
+        matrix = []
 
-        for w2 in well_names:
+        for w1 in well_names:
+            idx1 = well == w1
+            row = []
 
-            idx2 = well == w2
+            for w2 in well_names:
+                idx2 = well == w2
+                dists = []
 
-            dists = []
+                for i in range(feature_matrix.shape[1]):
+                    d = wasserstein_distance(
+                        feature_matrix[idx1, i],
+                        feature_matrix[idx2, i]
+                    )
+                    dists.append(d)
 
-            for i in range(X_log.shape[1]):
-                d = wasserstein_distance(
-                    X_log[idx1, i],
-                    X_log[idx2, i]
-                )
+                row.append(np.mean(dists))
 
-                dists.append(d)
+            matrix.append(row)
 
-            row.append(np.mean(dists))
+        return np.array(matrix)
 
-        matrix.append(row)
+    save_dir = os.path.join(SAVE_DIR, "well_distance_analysis")
+    os.makedirs(save_dir, exist_ok=True)
 
-    matrix = np.array(matrix)
+    summary_records = []
 
-    df_out = pd.DataFrame(
-        matrix,
-        index=well_names,
-        columns=well_names
+    for scenario_name, feature_matrix in tqdm(
+        scenarios.items(),
+        desc="计算井间距离"
+    ):
+        matrix = compute_distance_matrix(feature_matrix)
+
+        df_out = pd.DataFrame(
+            matrix,
+            index=well_names,
+            columns=well_names
+        )
+
+        df_out.to_csv(
+            os.path.join(save_dir, f"{scenario_name}_distance_matrix.csv"),
+            encoding="utf-8-sig"
+        )
+
+        plt.figure(figsize=(6, 5))
+        sns.heatmap(df_out, annot=True, cmap="viridis", fmt=".3f")
+        plt.title(scenario_name)
+        plt.tight_layout()
+        plt.savefig(
+            os.path.join(save_dir, f"{scenario_name}_distance_matrix.png"),
+            dpi=300
+        )
+        plt.close()
+
+        for i, w1 in enumerate(well_names):
+            for j, w2 in enumerate(well_names):
+                summary_records.append({
+                    "scenario": scenario_name,
+                    "well_1": w1,
+                    "well_2": w2,
+                    "distance": matrix[i, j]
+                })
+
+        if scenario_name == "imaging_only":
+            df_out.to_csv(
+                os.path.join(SAVE_DIR, "well_distance_matrix.csv"),
+                encoding="utf-8-sig"
+            )
+
+    summary_df = pd.DataFrame(summary_records)
+    summary_df.to_csv(
+        os.path.join(save_dir, "well_distance_summary.csv"),
+        index=False,
+        encoding="utf-8-sig"
     )
 
-    df_out.to_csv(os.path.join(SAVE_DIR, "well_distance_matrix.csv"), encoding="utf-8-sig")
+    return summary_df
 
 
 # ===================== PCA =====================
@@ -319,65 +382,107 @@ def plot_tsne():
 def analyze_fracture_separability():
     print("\n开始裂缝可分性分析...\n")
 
-    results = []
-
     X_all = np.concatenate([X_seis, X_log], axis=1)
     feature_names = seis_features + imaging_well_features
+    summary_results = []
+    detail_results = []
 
-    fracture_idx = y == 1
-    nonfracture_idx = y == 0
+    for i, name in tqdm(list(enumerate(feature_names)), total=len(feature_names), desc="分析裂缝可分性"):
+        per_well_mean_diffs = []
+        per_well_abs_mean_diffs = []
+        per_well_aucs = []
+        per_well_ks_stats = []
+        direction_signs = []
 
-    for i, name in tqdm(list(enumerate(feature_names)), total=len(feature_names), desc="绘制裂缝分布"):
+        for current_well in well_names:
+            idx = well == current_well
+            y_well = y[idx]
+            x_well = X_all[idx, i]
 
-        f = X_all[fracture_idx, i]
-        nf = X_all[nonfracture_idx, i]
+            fracture_values = x_well[y_well == 1]
+            nonfracture_values = x_well[y_well == 0]
 
-        mean_f = np.mean(f)
-        mean_nf = np.mean(nf)
+            fracture_mean = np.mean(fracture_values) if len(fracture_values) > 0 else np.nan
+            nonfracture_mean = np.mean(nonfracture_values) if len(nonfracture_values) > 0 else np.nan
+            fracture_std = np.std(fracture_values) if len(fracture_values) > 0 else np.nan
+            nonfracture_std = np.std(nonfracture_values) if len(nonfracture_values) > 0 else np.nan
 
-        std_f = np.std(f)
-        std_nf = np.std(nf)
+            mean_diff = fracture_mean - nonfracture_mean
+            abs_mean_diff = abs(mean_diff) if np.isfinite(mean_diff) else np.nan
 
-        # KS检验
-        if len(f) > 5 and len(nf) > 5:
-            ks_stat, ks_p = ks_2samp(f, nf)
-        else:
-            ks_stat, ks_p = np.nan, np.nan
+            if len(fracture_values) > 5 and len(nonfracture_values) > 5:
+                ks_stat, ks_p = ks_2samp(fracture_values, nonfracture_values)
+            else:
+                ks_stat, ks_p = np.nan, np.nan
 
-        # 单特征AUC
-        try:
-            auc = roc_auc_score(y, X_all[:, i])
-            auc = max(auc, 1 - auc)
-        except:
-            auc = np.nan
+            if len(np.unique(y_well)) > 1:
+                try:
+                    auc = roc_auc_score(y_well, x_well)
+                    auc = max(auc, 1 - auc)
+                except Exception:
+                    auc = np.nan
+            else:
+                auc = np.nan
 
-        results.append({
+            if np.isfinite(mean_diff) and mean_diff != 0:
+                direction_signs.append(np.sign(mean_diff))
+
+            if np.isfinite(mean_diff):
+                per_well_mean_diffs.append(mean_diff)
+            if np.isfinite(abs_mean_diff):
+                per_well_abs_mean_diffs.append(abs_mean_diff)
+            if np.isfinite(auc):
+                per_well_aucs.append(auc)
+            if np.isfinite(ks_stat):
+                per_well_ks_stats.append(ks_stat)
+
+            detail_results.append({
+                "feature": name,
+                "well": current_well,
+                "fracture_samples": int((y_well == 1).sum()),
+                "nonfracture_samples": int((y_well == 0).sum()),
+                "fracture_mean": fracture_mean,
+                "nonfracture_mean": nonfracture_mean,
+                "fracture_std": fracture_std,
+                "nonfracture_std": nonfracture_std,
+                "mean_diff": mean_diff,
+                "abs_mean_diff": abs_mean_diff,
+                "ks_statistic": ks_stat,
+                "ks_pvalue": ks_p,
+                "single_feature_auc": auc
+            })
+
+        direction_consistency = np.nan
+        if len(direction_signs) > 0:
+            direction_consistency = abs(np.mean(direction_signs))
+
+        summary_results.append({
             "feature": name,
-            "fracture_mean": mean_f,
-            "nonfracture_mean": mean_nf,
-            "fracture_std": std_f,
-            "nonfracture_std": std_nf,
-            "mean_diff": abs(mean_f - mean_nf),
-            "ks_statistic": ks_stat,
-            "ks_pvalue": ks_p,
-            "single_feature_auc": auc
+            "well_count": len(well_names),
+            "valid_auc_well_count": len(per_well_aucs),
+            "mean_diff_mean": np.nanmean(per_well_mean_diffs) if len(per_well_mean_diffs) > 0 else np.nan,
+            "mean_diff_abs_mean": np.nanmean(per_well_abs_mean_diffs) if len(per_well_abs_mean_diffs) > 0 else np.nan,
+            "mean_diff_std": np.nanstd(per_well_mean_diffs) if len(per_well_mean_diffs) > 0 else np.nan,
+            "ks_statistic_mean": np.nanmean(per_well_ks_stats) if len(per_well_ks_stats) > 0 else np.nan,
+            "single_feature_auc_mean": np.nanmean(per_well_aucs) if len(per_well_aucs) > 0 else np.nan,
+            "single_feature_auc_std": np.nanstd(per_well_aucs) if len(per_well_aucs) > 0 else np.nan,
+            "direction_consistency": direction_consistency
         })
 
-    df_out = pd.DataFrame(results)
-
-    df_out = df_out.sort_values(
-        "single_feature_auc",
-        ascending=False
+    df_out = pd.DataFrame(summary_results).sort_values(
+        ["single_feature_auc_mean", "direction_consistency", "mean_diff_abs_mean"],
+        ascending=[False, False, False]
     )
+    detail_df = pd.DataFrame(detail_results)
 
-    save_path = os.path.join(
-        SAVE_DIR,
-        "fracture_separability.csv"
-    )
+    save_path = os.path.join(SAVE_DIR, "fracture_separability.csv")
+    detail_path = os.path.join(SAVE_DIR, "fracture_separability_by_well.csv")
 
     df_out.to_csv(save_path, index=False, encoding="utf-8-sig")
+    detail_df.to_csv(detail_path, index=False, encoding="utf-8-sig")
 
-    print("裂缝可分性结果保存：", save_path)
+    print("裂缝可分性汇总结果保存：", save_path)
+    print("分井可分性结果保存：", detail_path)
 
     return df_out
 
@@ -390,36 +495,74 @@ def plot_fracture_distribution():
     X_all = np.concatenate([X_seis, X_log], axis=1)
     feature_names = seis_features + imaging_well_features
 
-    fracture_idx = y == 1
-    nonfracture_idx = y == 0
-
     save_dir = os.path.join(SAVE_DIR, "fracture_distribution")
     os.makedirs(save_dir, exist_ok=True)
 
     for i, name in tqdm(list(enumerate(feature_names)), total=len(feature_names), desc="绘制裂缝分布"):
-        plt.figure(figsize=(6, 4))
-
-        sns.kdeplot(
-            X_all[fracture_idx, i],
-            label="fracture",
-            fill=True
+        fig, axes = plt.subplots(
+            len(well_names),
+            1,
+            figsize=(7, 3.5 * len(well_names)),
+            squeeze=False
         )
 
-        sns.kdeplot(
-            X_all[nonfracture_idx, i],
-            label="non-fracture",
-            fill=True
-        )
+        plotted_any = False
 
-        plt.title(name)
-        plt.legend()
+        for row_idx, current_well in enumerate(well_names):
+            ax = axes[row_idx, 0]
+            idx = well == current_well
+            x_well = X_all[idx, i]
+            y_well = y[idx]
 
-        plt.savefig(
-            os.path.join(save_dir, f"{name}.png"),
-            dpi=200
-        )
+            fracture_values = x_well[y_well == 1]
+            nonfracture_values = x_well[y_well == 0]
 
-        plt.close()
+            if len(fracture_values) >= 2:
+                sns.kdeplot(
+                    fracture_values,
+                    label="fracture",
+                    fill=True,
+                    ax=ax
+                )
+                plotted_any = True
+            elif len(fracture_values) == 1:
+                ax.axvline(fracture_values[0], color="tab:orange", linestyle="-", label="fracture")
+                plotted_any = True
+
+            if len(nonfracture_values) >= 2:
+                sns.kdeplot(
+                    nonfracture_values,
+                    label="non-fracture",
+                    fill=True,
+                    ax=ax
+                )
+                plotted_any = True
+            elif len(nonfracture_values) == 1:
+                ax.axvline(nonfracture_values[0], color="tab:blue", linestyle="--", label="non-fracture")
+                plotted_any = True
+
+            ax.set_title(
+                f"{current_well} | fracture={len(fracture_values)} | non-fracture={len(nonfracture_values)}"
+            )
+            ax.set_xlabel(name)
+            ax.set_ylabel("Density")
+
+            handles, labels = ax.get_legend_handles_labels()
+            if handles:
+                unique = dict(zip(labels, handles))
+                ax.legend(unique.values(), unique.keys())
+            else:
+                ax.text(0.5, 0.5, "样本不足，无法绘制分布", ha="center", va="center", transform=ax.transAxes)
+
+        fig.suptitle(f"{name} by well", y=0.995)
+        fig.tight_layout()
+
+        if plotted_any:
+            fig.savefig(
+                os.path.join(save_dir, f"{name}.png"),
+                dpi=200
+            )
+        plt.close(fig)
 
     print("分布图已保存")
 
@@ -467,18 +610,45 @@ def analyze_seismic_window_importance():
     X = X_seis
     label = y
 
-    model = xgb.XGBClassifier(
-        n_estimators=300,
-        max_depth=4,
-        learning_rate=0.05,
-        subsample=0.8,
-        colsample_bytree=0.8,
-        random_state=42
-    )
+    importance_list = []
+    fold_results = []
 
-    model.fit(X, label)
+    for test_well in well_names:
+        train_idx = well != test_well
+        test_idx = well == test_well
 
-    importance = model.feature_importances_
+        X_train = X[train_idx]
+        y_train = label[train_idx]
+        X_test = X[test_idx]
+        y_test = label[test_idx]
+
+        model = xgb.XGBClassifier(
+            n_estimators=300,
+            max_depth=4,
+            learning_rate=0.05,
+            subsample=0.8,
+            colsample_bytree=0.8,
+            random_state=42
+        )
+
+        model.fit(X_train, y_train)
+        pred = model.predict_proba(X_test)[:, 1]
+
+        if len(np.unique(y_test)) > 1:
+            auc = roc_auc_score(y_test, pred)
+        else:
+            auc = np.nan
+
+        fold_results.append({
+            "test_well": test_well,
+            "samples": len(y_test),
+            "fracture_ratio": y_test.mean(),
+            "AUC": auc
+        })
+
+        importance_list.append(model.feature_importances_)
+
+    importance = np.mean(np.vstack(importance_list), axis=0)
 
     # 保存重要性表
     df_imp = pd.DataFrame({
@@ -491,7 +661,14 @@ def analyze_seismic_window_importance():
 
     df_imp.to_csv(
         os.path.join(save_dir, "feature_importance.csv"),
-        index=False
+        index=False,
+        encoding="utf-8-sig"
+    )
+
+    pd.DataFrame(fold_results).to_csv(
+        os.path.join(save_dir, "window_importance_by_well.csv"),
+        index=False,
+        encoding="utf-8-sig"
     )
 
     # reshape
@@ -581,30 +758,23 @@ def analyze_seismic_feature_scenarios():
 
     seis_cube = X_seis.reshape(-1, 3, 3, 7)
 
-    scenarios = {}
+    seismic_scenarios = {
+        "seismic_3x3x7": X_seis,
+        "seismic_3x3_plane": seis_cube[:, :, :, 3].reshape(len(seis_cube), -1),
+        "seismic_single_amplitude": seis_cube[:, 1, 1, 3].reshape(-1, 1),
+        "seismic_center_trace_7": seis_cube[:, 1, 1, :],
+    }
 
-    # =====================
-    # 场景1：3×3×7（已有）
-    # =====================
+    scenarios = {
+        "imaging_only": X_log,
+    }
 
-    scenarios["3x3x7"] = X_seis
-
-    # =====================
-    # 场景2：3×3 平面
-    # 使用中心时间 t=0
-    # =====================
-
-    plane = seis_cube[:, :, :, 3]  # t=0
-    scenarios["3x3_plane"] = plane.reshape(len(plane), -1)
-
-    # =====================
-    # 场景3：中心点
-    # =====================
-
-    center = seis_cube[:, 1, 1, 3]
-    scenarios["center_point"] = center.reshape(-1, 1)
+    for name, X_s in seismic_scenarios.items():
+        scenarios[name] = X_s
+        scenarios[f"{name}_plus_imaging"] = np.concatenate([X_s, X_log], axis=1)
 
     results = []
+    fold_results = []
 
     save_dir = os.path.join(SAVE_DIR, "seismic_scenario_analysis")
     os.makedirs(save_dir, exist_ok=True)
@@ -612,29 +782,61 @@ def analyze_seismic_feature_scenarios():
     for name, X_s in scenarios.items():
         print("训练模型:", name)
 
-        model = xgb.XGBClassifier(
-            n_estimators=300,
-            max_depth=4,
-            learning_rate=0.05,
-            subsample=0.8,
-            colsample_bytree=0.8,
-            random_state=42
-        )
+        well_aucs = []
+        importance_list = []
 
-        model.fit(X_s, y)
+        for test_well in well_names:
+            train_idx = well != test_well
+            test_idx = well == test_well
 
-        pred = model.predict_proba(X_s)[:, 1]
+            X_train = X_s[train_idx]
+            y_train = y[train_idx]
+            X_test = X_s[test_idx]
+            y_test = y[test_idx]
 
-        auc = roc_auc_score(y, pred)
+            model = xgb.XGBClassifier(
+                n_estimators=300,
+                max_depth=4,
+                learning_rate=0.05,
+                subsample=0.8,
+                colsample_bytree=0.8,
+                random_state=42
+            )
+
+            model.fit(X_train, y_train)
+            pred = model.predict_proba(X_test)[:, 1]
+
+            if len(np.unique(y_test)) > 1:
+                auc = roc_auc_score(y_test, pred)
+            else:
+                auc = np.nan
+
+            well_aucs.append(auc)
+            importance_list.append(model.feature_importances_)
+
+            fold_results.append({
+                "scenario": name,
+                "test_well": test_well,
+                "samples": len(y_test),
+                "fracture_ratio": y_test.mean(),
+                "AUC": auc
+            })
+
+        auc_array = np.array(well_aucs, dtype=float)
+        mean_auc = np.nanmean(auc_array)
+        std_auc = np.nanstd(auc_array)
 
         results.append({
             "scenario": name,
             "feature_dim": X_s.shape[1],
-            "AUC": auc
+            "AUC_mean": mean_auc,
+            "AUC_std": std_auc,
+            "uses_imaging": int("plus_imaging" in name or name == "imaging_only"),
+            "uses_seismic": int(name != "imaging_only")
         })
 
-        # 保存特征重要性
-        imp = model.feature_importances_
+        # 保存跨井平均特征重要性
+        imp = np.mean(np.vstack(importance_list), axis=0)
 
         np.save(
             os.path.join(save_dir, f"{name}_importance.npy"),
@@ -642,6 +844,7 @@ def analyze_seismic_feature_scenarios():
         )
 
     df = pd.DataFrame(results)
+    fold_df = pd.DataFrame(fold_results)
 
     df.to_csv(
         os.path.join(save_dir, "scenario_performance.csv"),
@@ -649,9 +852,15 @@ def analyze_seismic_feature_scenarios():
         encoding="utf-8-sig"
     )
 
+    fold_df.to_csv(
+        os.path.join(save_dir, "scenario_performance_by_well.csv"),
+        index=False,
+        encoding="utf-8-sig"
+    )
+
     print("\nScenario comparison result:")
 
-    print(df)
+    print(df.sort_values("AUC_mean", ascending=False))
 
     return df
 
