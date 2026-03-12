@@ -14,10 +14,11 @@ from tqdm import tqdm
 # ===================== 基本设置 =====================
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
-SEQ_LEN = 21
+# SEQ_LEN = 21
+SEQ_LEN = 11
 HALF = SEQ_LEN // 2
 BATCH_SIZE = 32
-EPOCHS = 5
+EPOCHS = 20
 LR = 1e-3
 N_FOLDS = 5
 
@@ -26,9 +27,10 @@ SAVE_DIR = r"E:\项目\石油项目\断缝储\原始数据\wx数据\砂砾岩\�
 os.makedirs(SAVE_DIR, exist_ok=True)
 
 # ===================== 特征定义 =====================
-features = (["SEIS_TRUE"] + [f"SEIS_{i}" for i in range(63)] + ["AC", "GR"])
+# features = (["SEIS_TRUE"] + [f"SEIS_{i}" for i in range(63)] + ["AC", "GR"])
 # features = ['SEIS_TRUE'] + [f'SEIS_{i}' for i in range(3, 63, 7)] + ['AC', 'GR']
-#
+features = [f'SEIS_{i}' for i in range(3, 63, 7)] + ['AC', 'GR']
+
 # ===================== 1. 数据读取 =====================
 csv_files = glob.glob(os.path.join(DATA_DIR, "*.csv"))
 
