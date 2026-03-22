@@ -1,1 +1,7 @@
 /小范围DFN生成/断层裂缝片生成/断层划分分割/fault_patches_out
+__pycache__/
+*.py[cod]
+_local_experiment_runs/
+_tmp*.py
+tmp_syntax_check.py
+error_log.txt

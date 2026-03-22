@@ -1,5 +1,6 @@
 import os
 import glob
+import json
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
@@ -17,6 +18,44 @@ from tqdm import tqdm
 plt.rcParams['font.sans-serif'] = ['SimHei']
 plt.rcParams['axes.unicode_minus'] = False
 
+
+def plot_heatmap(df_out, save_path, title):
+    try:
+        import seaborn as sns
+
+        plt.figure(figsize=(6, 5))
+        sns.heatmap(df_out, annot=True, cmap="viridis", fmt=".3f")
+    except ModuleNotFoundError:
+        fig, ax = plt.subplots(figsize=(6, 5))
+        im = ax.imshow(df_out.values, cmap="viridis")
+        ax.set_xticks(np.arange(len(df_out.columns)))
+        ax.set_yticks(np.arange(len(df_out.index)))
+        ax.set_xticklabels(df_out.columns)
+        ax.set_yticklabels(df_out.index)
+        plt.setp(ax.get_xticklabels(), rotation=45, ha="right", rotation_mode="anchor")
+        for i in range(df_out.shape[0]):
+            for j in range(df_out.shape[1]):
+                ax.text(j, i, f"{df_out.iloc[i, j]:.3f}", ha="center", va="center", color="w", fontsize=8)
+        fig.colorbar(im, ax=ax)
+    plt.title(title)
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=300)
+    plt.close()
+
+
+def get_xgb_classifier():
+    import xgboost as xgb
+
+    return xgb.XGBClassifier(
+        n_estimators=200,
+        max_depth=4,
+        learning_rate=0.05,
+        subsample=0.8,
+        colsample_bytree=0.8,
+        eval_metric="logloss",
+        random_state=42
+    )
+
 # ===================== 路径 =====================
 
 DATA_DIR = r"E:\项目\石油项目\断缝储\原始数据\wx数据\砂砾岩\优化阶段一\研究内容一\成像测井\裂缝样本"
@@ -28,6 +67,9 @@ os.makedirs(SAVE_DIR, exist_ok=True)
 # ===================== 特征定义 =====================
 imaging_well_features = ['AC', 'GR', 'CAL', 'CNL', 'PE', 'DEN', 'CON1', 'GRSL', 'K', 'KTH', 'TH', 'U']
 # imaging_well_features = ['DEN', 'CON1', 'GRSL', 'AC', 'GR']
+env_imaging_features = os.getenv("EXP_IMAGING_FEATURES")
+if env_imaging_features:
+    imaging_well_features = json.loads(env_imaging_features)
 
 seis_features = [f"SEIS_{i}" for i in range(63)]
 # seis_features = [f"SEIS_{i}" for i in range(3, 63, 7)]
@@ -276,15 +318,11 @@ def compute_well_distance():
             encoding="utf-8-sig"
         )
 
-        plt.figure(figsize=(6, 5))
-        sns.heatmap(df_out, annot=True, cmap="viridis", fmt=".3f")
-        plt.title(scenario_name)
-        plt.tight_layout()
-        plt.savefig(
+        plot_heatmap(
+            df_out,
             os.path.join(save_dir, f"{scenario_name}_distance_matrix.png"),
-            dpi=300
+            scenario_name
         )
-        plt.close()
 
         for i, w1 in enumerate(well_names):
             for j, w2 in enumerate(well_names):
@@ -1002,6 +1040,12 @@ steps = [
     ("地震场景重要性", analyze_seismic_feature_scenarios),
     ("井交叉验证", well_cross_validation)
 ]
+
+step_filter = os.getenv("EXP_ANALYSIS_STEP")
+if step_filter:
+    steps = [(name, func) for name, func in steps if name == step_filter]
+    if not steps:
+        raise ValueError(f"未找到指定分析步骤: {step_filter}")
 
 for name, func in tqdm(steps, desc="总体分析进度"):
     print(f"\n===== {name} =====")

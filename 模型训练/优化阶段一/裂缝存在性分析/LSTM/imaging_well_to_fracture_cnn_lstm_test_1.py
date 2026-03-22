@@ -1,4 +1,4 @@
-import os
+﻿import os
 import glob
 import joblib
 import numpy as np
@@ -8,7 +8,14 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, TensorDataset
 from sklearn.preprocessing import StandardScaler
-from sklearn.metrics import classification_report, roc_auc_score, accuracy_score
+from sklearn.metrics import (
+    classification_report,
+    roc_auc_score,
+    accuracy_score,
+    f1_score,
+    precision_score,
+    recall_score,
+)
 from sklearn.cluster import AgglomerativeClustering
 from tqdm import tqdm
 import json
@@ -17,17 +24,86 @@ import matplotlib.pyplot as plt
 plt.rcParams['font.sans-serif'] = ['SimHei']  # 设置中文字体
 plt.rcParams['axes.unicode_minus'] = False  # 正常显示负号
 
+
+def get_env_bool(name, default):
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def get_env_int(name, default):
+    value = os.getenv(name)
+    return int(value) if value is not None else default
+
+
+def get_env_float(name, default):
+    value = os.getenv(name)
+    return float(value) if value is not None else default
+
+
+def get_env_json_list(name, default):
+    value = os.getenv(name)
+    if value is None:
+        return default
+    parsed = json.loads(value)
+    if not isinstance(parsed, list):
+        raise ValueError(f"{name} must be a JSON list")
+    return parsed
+
+
+def get_env_json_dict(name, default):
+    value = os.getenv(name)
+    if value is None:
+        return default
+    parsed = json.loads(value)
+    if not isinstance(parsed, dict):
+        raise ValueError(f"{name} must be a JSON object")
+    return parsed
+
+
+LOG_MISSING_PLACEHOLDERS = {-999.25, -9999.0}
+ZERO_AS_MISSING_LOG_FEATURES = {"GR"}
+
+
+def clean_invalid_log_values(df, log_features):
+    df = df.copy()
+    summary_rows = []
+
+    for col in log_features:
+        if col not in df.columns:
+            continue
+
+        series = pd.to_numeric(df[col], errors="coerce")
+        invalid_mask = series.isna() | series.isin(LOG_MISSING_PLACEHOLDERS) | (series <= -999)
+        if col in ZERO_AS_MISSING_LOG_FEATURES:
+            invalid_mask |= (series == 0)
+
+        df[col] = series.mask(invalid_mask)
+
+        if invalid_mask.any() and "WellName" in df.columns:
+            invalid_counts = df.loc[invalid_mask].groupby("WellName").size()
+            for well_name, invalid_count in invalid_counts.items():
+                summary_rows.append({
+                    "WellName": well_name,
+                    "Feature": col,
+                    "InvalidCount": int(invalid_count),
+                })
+
+    summary_df = pd.DataFrame(summary_rows)
+    return df, summary_df
+
+
 # ===================== 基本设置 =====================
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
-SEQ_LEN = 11
+SEQ_LEN = 3
 HALF = SEQ_LEN // 2
 BATCH_SIZE = 32
 LR = 1e-4
 Dropout = 0.3
 # 测井聚类阈值
-distance_threshold = 0.55
-DIST_THRESHOLD = 0.55
+DIST_THRESHOLD = 0.4
 MIN_TRAIN_WELLS = 2
 # ---------- Early Stopping ----------
 EPOCHS = 50
@@ -38,6 +114,18 @@ min_delta = 1e-4
 use_dynamic_threshold = True
 # use_dynamic_threshold = False
 best_thr = 0.5
+selection_metric = "iou"
+THRESH_SEARCH_MIN = 0.3
+THRESH_SEARCH_MAX = 0.9
+THRESH_SEARCH_STEP = 0.02
+use_selection_accuracy_floor = True
+MIN_SELECTION_ACCURACY = 0.80
+use_threshold_constraints = True
+MIN_SELECTION_RECALL = 0.20
+MIN_SELECTION_POS_RATIO = 0.03
+MIN_SELECTION_POS_RATIO_SCALE = 0.35
+# selection_metric = "f1"
+# selection_metric = "iou"
 # 概率平滑
 # use_smooth = True
 use_smooth = False
@@ -47,31 +135,110 @@ use_short_segment_processing = False
 # 过采样操作
 # use_over_smaple = True
 use_over_smaple = False
+MAX_N_POS = 1
 manual_pos_weight = 2.0
+MAX_POS_WEIGHT = 3.0
 target_ratio = 0.35
 edge_exclude = 1
+use_dice_loss = True
+DICE_LOSS_WEIGHT = 0.5
 # 特征重要性检查
-show_features_importance = True
+show_features_importance = False
 show_one_well_features_importance = False
 all_importances = []
+# 密度考量
+use_density_regression = False
+# 域偏差考量
+use_domain_adversarial = False
+use_all_other_wells = False
+only_val_wells = []
+custom_train_wells_map = {}
 
-DIST_MATRIX_PATH = r"E:\项目\石油项目\断缝储\原始数据\wx数据\砂砾岩\优化阶段一\研究内容一\裂缝存在性预测\成像测井数据分布分析\well_distance_matrix.csv"
+# SEIS_MODE = "3x3x7"
+SEIS_MODE = "3x3"
+# SEIS_MODE = "1"
+
+DISTANCE_ANALYSIS_DIR = r"E:\项目\石油项目\断缝储\原始数据\wx数据\砂砾岩\优化阶段一\研究内容一\裂缝存在性预测\成像测井数据分布分析\well_distance_analysis"
 DATA_DIR = r"E:\项目\石油项目\断缝储\原始数据\wx数据\砂砾岩\优化阶段一\研究内容一\成像测井\裂缝样本"
 SAVE_DIR = r"E:\项目\石油项目\断缝储\原始数据\wx数据\砂砾岩\优化阶段一\研究内容一\裂缝存在性预测\LSTM\单井验证\成像测井裂缝预测\cnn+lstm"
-os.makedirs(SAVE_DIR, exist_ok=True)
 
 # ===================== 特征定义 =====================
 # imaging_well_features = ['AC', 'GR', 'CAL', 'CNL', 'PE', 'DEN', 'CON1', 'GRSL', 'K', 'KTH', 'TH', 'U']
-imaging_well_features = ['DEN', 'CON1', 'GRSL', 'AC', 'GR']
+# imaging_well_features = ['DEN', 'CON1', 'GRSL', 'AC', 'GR']
+imaging_well_features = ['DEN', 'GRSL', 'AC', 'GR']
+# imaging_well_features = ['CON1', 'GRSL', 'AC', 'GR']
+# imaging_well_features = ['GRSL', 'AC', 'GR']
+# imaging_well_features = ['CON1', 'AC', 'GR']
+# imaging_well_features = ['CON1', 'GR']
+# imaging_well_features = ['AC', 'GR']
 
-SEIS_MODE = "3x3x7"
-# SEIS_MODE = "3x3"
-# SEIS_MODE = "1"
+SEQ_LEN = get_env_int("EXP_SEQ_LEN", SEQ_LEN)
+HALF = SEQ_LEN // 2
+SEIS_MODE = os.getenv("EXP_SEIS_MODE", SEIS_MODE)
+imaging_well_features = get_env_json_list("EXP_IMAGING_FEATURES", imaging_well_features)
+selection_metric = os.getenv("EXP_SELECTION_METRIC", selection_metric)
+THRESH_SEARCH_MIN = get_env_float("EXP_THRESH_SEARCH_MIN", THRESH_SEARCH_MIN)
+THRESH_SEARCH_MAX = get_env_float("EXP_THRESH_SEARCH_MAX", THRESH_SEARCH_MAX)
+THRESH_SEARCH_STEP = get_env_float("EXP_THRESH_SEARCH_STEP", THRESH_SEARCH_STEP)
+use_selection_accuracy_floor = get_env_bool(
+    "EXP_USE_SELECTION_ACCURACY_FLOOR",
+    use_selection_accuracy_floor,
+)
+MIN_SELECTION_ACCURACY = get_env_float(
+    "EXP_MIN_SELECTION_ACCURACY",
+    MIN_SELECTION_ACCURACY,
+)
+use_threshold_constraints = get_env_bool("EXP_USE_THRESHOLD_CONSTRAINTS", use_threshold_constraints)
+MIN_SELECTION_RECALL = get_env_float("EXP_MIN_SELECTION_RECALL", MIN_SELECTION_RECALL)
+MIN_SELECTION_POS_RATIO = get_env_float("EXP_MIN_SELECTION_POS_RATIO", MIN_SELECTION_POS_RATIO)
+MIN_SELECTION_POS_RATIO_SCALE = get_env_float("EXP_MIN_SELECTION_POS_RATIO_SCALE", MIN_SELECTION_POS_RATIO_SCALE)
+use_dynamic_threshold = get_env_bool("EXP_USE_DYNAMIC_THRESHOLD", use_dynamic_threshold)
+use_over_smaple = get_env_bool("EXP_USE_OVERSAMPLE", use_over_smaple)
+manual_pos_weight = get_env_float("EXP_MANUAL_POS_WEIGHT", manual_pos_weight)
+target_ratio = get_env_float("EXP_TARGET_RATIO", target_ratio)
+edge_exclude = get_env_int("EXP_EDGE_EXCLUDE", edge_exclude)
+use_dice_loss = get_env_bool("EXP_USE_DICE_LOSS", use_dice_loss)
+DICE_LOSS_WEIGHT = get_env_float("EXP_DICE_LOSS_WEIGHT", DICE_LOSS_WEIGHT)
+use_density_regression = get_env_bool("EXP_USE_DENSITY_REGRESSION", use_density_regression)
+use_domain_adversarial = get_env_bool("EXP_USE_DOMAIN_ADVERSARIAL", use_domain_adversarial)
+use_all_other_wells = get_env_bool("EXP_USE_ALL_OTHER_WELLS", use_all_other_wells)
+only_val_wells = get_env_json_list("EXP_ONLY_VAL_WELLS", only_val_wells)
+custom_train_wells_map = get_env_json_dict("EXP_CUSTOM_TRAIN_WELLS_MAP", custom_train_wells_map)
+DIST_THRESHOLD = get_env_float("EXP_DIST_THRESHOLD", DIST_THRESHOLD)
+MIN_TRAIN_WELLS = get_env_int("EXP_MIN_TRAIN_WELLS", MIN_TRAIN_WELLS)
+MAX_POS_WEIGHT = get_env_float("EXP_MAX_POS_WEIGHT", MAX_POS_WEIGHT)
+save_dir_override = os.getenv("EXP_SAVE_DIR")
+if save_dir_override:
+    SAVE_DIR = save_dir_override
+
+os.makedirs(SAVE_DIR, exist_ok=True)
+
 seis_features = [f"SEIS_{i}" for i in range(63)]
 features = seis_features + imaging_well_features
 N_LOG = len(imaging_well_features)
 
 density_cols = ["P10", "P21", "P33"]
+
+DIST_MATRIX_FILES = {
+    "3x3x7": "seismic_3x3x7_plus_imaging_distance_matrix.csv",
+    "3x3": "seismic_3x3_plane_plus_imaging_distance_matrix.csv",
+    "1": "seismic_single_amplitude_plus_imaging_distance_matrix.csv",
+}
+
+
+def get_distance_matrix_path(seis_mode):
+    matrix_name = DIST_MATRIX_FILES.get(seis_mode)
+    if matrix_name is None:
+        raise ValueError(f"Unsupported SEIS_MODE for distance matrix: {seis_mode}")
+
+    matrix_path = os.path.join(DISTANCE_ANALYSIS_DIR, matrix_name)
+    if not os.path.exists(matrix_path):
+        raise FileNotFoundError(f"Distance matrix not found: {matrix_path}")
+
+    return matrix_path
+
+
+DIST_MATRIX_PATH = get_distance_matrix_path(SEIS_MODE)
 
 # ===================== 1. 数据读取 =====================
 # csv_files = glob.glob(os.path.join(DATA_DIR, "*.csv"))
@@ -87,20 +254,44 @@ df_raw_list = []
 for f in csv_files:
     df = pd.read_csv(f)
     df["WellName"] = os.path.basename(f).split("_")[0]
+    df["ROW_IN_WELL"] = np.arange(len(df))
     df_list.append(df)
     df_raw_list.append(df.copy())
 
 df_raw = pd.concat(df_raw_list, ignore_index=True)
-df = pd.concat(df_list, ignore_index=True).copy()
+df_raw["RAW_ROW_IDX"] = np.arange(len(df_raw))
+df = df_raw.copy()
+
+df, invalid_log_summary = clean_invalid_log_values(df, imaging_well_features)
+if not invalid_log_summary.empty:
+    print("检测到测井缺失占位值，已按缺失处理并准备删除对应样本：")
+    print(
+        invalid_log_summary.sort_values(["WellName", "Feature"]).to_string(index=False)
+    )
 
 df["FRACTURE_FLAG"] = df["Frac_Azimuth"].notna().astype(int)
-df = df[features + ["FRACTURE_FLAG", "WellName"]].dropna()
 
 # 只在有裂缝位置保留密度
 for col in density_cols:
     if col not in df.columns:
         df[col] = 0.0
-df = df[features + density_cols + ["FRACTURE_FLAG", "WellName"]].dropna()
+
+required_columns = features + density_cols + ["FRACTURE_FLAG", "WellName", "ROW_IN_WELL", "RAW_ROW_IDX"]
+before_drop_counts = df.groupby("WellName").size().to_dict()
+df = df[required_columns].dropna().copy()
+after_drop_counts = df.groupby("WellName").size().to_dict()
+removed_counts = {
+    well_name: before_drop_counts.get(well_name, 0) - after_drop_counts.get(well_name, 0)
+    for well_name in before_drop_counts
+}
+if any(count > 0 for count in removed_counts.values()):
+    print("按当前建模特征删除缺失样本后，各井剩余样本：")
+    for well_name in before_drop_counts:
+        print(
+            f"{well_name}: {after_drop_counts.get(well_name, 0)}/"
+            f"{before_drop_counts.get(well_name, 0)} "
+            f"(removed={removed_counts[well_name]})"
+        )
 # log 变换密度（推荐）
 df[density_cols] = np.log1p(df[density_cols])
 
@@ -167,6 +358,21 @@ def select_train_wells(val_well, distance_df, threshold=0.55, min_wells=2):
     print(f"\n验证井: {val_well}")
     print("训练井选择模式:", mode)
     print("训练井:", train_wells)
+    print("对应距离:", {w: round(float(dists[w]), 4) for w in train_wells})
+
+    return train_wells
+
+
+def validate_custom_train_wells(val_well, train_wells, all_wells):
+    invalid = [w for w in train_wells if w not in all_wells]
+    if invalid:
+        raise ValueError(f"Custom train wells for {val_well} contain unknown wells: {invalid}")
+
+    if val_well in train_wells:
+        raise ValueError(f"Custom train wells for {val_well} cannot include itself")
+
+    if len(train_wells) == 0:
+        raise ValueError(f"Custom train wells for {val_well} cannot be empty")
 
     return train_wells
 
@@ -184,13 +390,20 @@ class GRL(torch.autograd.Function):
 
 # ===================== 2. LSTM 定义 =====================
 class FractureCNNLSTM(nn.Module):
-    def __init__(self, seis_mode, log_dim, n_domains, hidden_dim=64):
+    def __init__(self, seis_mode, log_dim, n_domains, hidden_dim=64,
+                 use_density_regression=True, use_domain_adversarial=True):
         super().__init__()
-        self.domain_classifier = nn.Sequential(
-            nn.Linear(hidden_dim, 32),
-            nn.ReLU(),
-            nn.Linear(32, n_domains)
-        )
+        self.hidden_dim = hidden_dim
+        self.use_density_regression = use_density_regression
+        self.use_domain_adversarial = use_domain_adversarial
+        if self.use_domain_adversarial:
+            self.domain_classifier = nn.Sequential(
+                nn.Linear(hidden_dim, 32),
+                nn.ReLU(),
+                nn.Linear(32, n_domains)
+            )
+        else:
+            self.domain_classifier = None
 
         if seis_mode == "3x3x7":
             in_channels = 7
@@ -214,6 +427,7 @@ class FractureCNNLSTM(nn.Module):
                 nn.ReLU(),
                 nn.AdaptiveAvgPool2d((1, 1))
             )
+            self.cnn_dropout = nn.Dropout(Dropout)
             cnn_out = 8
 
         else:  # 1×1
@@ -228,7 +442,7 @@ class FractureCNNLSTM(nn.Module):
         self.dropout = nn.Dropout(Dropout)
 
         self.fc_cls = nn.Linear(hidden_dim, 1)
-        self.fc_den = nn.Linear(hidden_dim, 3)
+        self.fc_den = nn.Linear(hidden_dim, 3) if self.use_density_regression else None
 
     def forward(self, seis, log, alpha=1.0):
 
@@ -250,10 +464,13 @@ class FractureCNNLSTM(nn.Module):
         out = self.dropout(out)
 
         cls_out = self.fc_cls(out).squeeze(1)
-        den_out = self.fc_den(out)
+        den_out = self.fc_den(out) if self.fc_den is not None else None
 
-        rev_feat = GRL.apply(out, alpha)
-        domain_out = self.domain_classifier(rev_feat)
+        if self.domain_classifier is not None:
+            rev_feat = GRL.apply(out, alpha)
+            domain_out = self.domain_classifier(rev_feat)
+        else:
+            domain_out = None
 
         return cls_out, den_out, domain_out, out
 
@@ -288,13 +505,18 @@ def build_sequences_by_well(df, X_seis, X_log, y_cls, y_den, seq_len):
     X_seis_seq, X_log_seq = [], []
     y_cls_seq, y_den_seq = [], []
     domain_seq = []
+    center_row_idx_seq = []
+    half = seq_len // 2
 
     start = 0
+    skipped_windows = 0
 
     for well in df["WellName"].unique():
 
         well_df = df[df["WellName"] == well]
         n = len(well_df)
+        row_in_well = well_df["ROW_IN_WELL"].values
+        raw_row_idx = well_df["RAW_ROW_IDX"].values
 
         seis_well = X_seis[start:start + n]
         log_well = X_log[start:start + n]
@@ -304,23 +526,33 @@ def build_sequences_by_well(df, X_seis, X_log, y_cls, y_den, seq_len):
 
         domain_id = domain_map[well]
 
-        for i in range(HALF, n - HALF):
-            X_seis_seq.append(seis_well[i - HALF:i + HALF + 1])
-            X_log_seq.append(log_well[i - HALF:i + HALF + 1])
+        for i in range(half, n - half):
+            window_row_idx = row_in_well[i - half:i + half + 1]
+            if not np.all(np.diff(window_row_idx) == 1):
+                skipped_windows += 1
+                continue
+
+            X_seis_seq.append(seis_well[i - half:i + half + 1])
+            X_log_seq.append(log_well[i - half:i + half + 1])
 
             y_cls_seq.append(y_cls_well[i])
             y_den_seq.append(y_den_well[i])
 
             domain_seq.append(domain_id)
+            center_row_idx_seq.append(raw_row_idx[i])
 
         start += n
+
+    if skipped_windows > 0:
+        print(f"因删除缺失值导致窗口不连续，跳过序列数: {skipped_windows}")
 
     return (
         np.array(X_seis_seq),
         np.array(X_log_seq),
         np.array(y_cls_seq),
         np.array(y_den_seq),
-        np.array(domain_seq)
+        np.array(domain_seq),
+        np.array(center_row_idx_seq)
     )
 
 
@@ -388,9 +620,7 @@ def oversample_center_segments(seis, log, y_cls, y_den, train_domain,
         return seis, log, y_cls, y_den, train_domain
 
     # ---------- 只从中心点采样 ----------
-    add_idx = rng.choice(center_indices,
-                         size=n_to_add,
-                         replace=True)
+    add_idx = rng.choice(center_indices, size=n_to_add, replace=True)
 
     seis_new = np.concatenate([seis, seis[add_idx]], axis=0)
     log_new = np.concatenate([log, log[add_idx]], axis=0)
@@ -479,6 +709,28 @@ def compute_iou(gt, pred):
     return np.mean(iou_list)
 
 
+def soft_dice_loss_from_logits(logits, targets, smooth=1.0):
+    prob = torch.sigmoid(logits)
+    targets = targets.float()
+
+    intersection = (prob * targets).sum()
+    denom = prob.sum() + targets.sum()
+
+    dice_score = (2.0 * intersection + smooth) / (denom + smooth)
+    return 1.0 - dice_score
+
+
+def compute_classification_loss(logits, targets, bce_loss_fn):
+    loss_bce = bce_loss_fn(logits, targets)
+
+    if not use_dice_loss:
+        return loss_bce, loss_bce, torch.tensor(0.0, device=logits.device)
+
+    loss_dice = soft_dice_loss_from_logits(logits, targets)
+    loss_total = loss_bce + DICE_LOSS_WEIGHT * loss_dice
+    return loss_total, loss_bce, loss_dice
+
+
 # ================= 概率平滑 =================
 def smooth_prob(prob, window=3):
     smoothed = np.convolve(prob,
@@ -527,6 +779,105 @@ def fill_small_gaps(labels, max_gap=2):
     return labels
 
 
+def postprocess_predictions(pred, metric):
+    pred = pred.copy()
+
+    if metric == "iou" or use_short_segment_processing:
+        pred = remove_short_segments(pred, min_len=3)
+        pred = fill_small_gaps(pred, max_gap=2)
+
+    return pred
+
+
+def evaluate_selection_metric_from_pred(y_true, pred, metric, val_df=None):
+    if metric == "accuracy":
+        return accuracy_score(y_true, pred)
+
+    if metric == "f1":
+        return f1_score(y_true, pred, zero_division=0)
+
+    if metric == "iou":
+        if val_df is None:
+            raise ValueError("val_df is required when metric='iou'")
+
+        iou_list = []
+        start = 0
+        for well in val_df["WellName"].unique():
+            well_df = val_df[val_df["WellName"] == well]
+            n = len(well_df)
+            n_seq = max(0, n - 2 * HALF)
+
+            if n_seq <= 0:
+                continue
+
+            gt_well = y_true[start:start + n_seq]
+            pred_well = pred[start:start + n_seq]
+
+            iou_list.append(compute_iou(gt_well, pred_well))
+            start += n_seq
+
+        return np.mean(iou_list) if iou_list else 0.0
+
+    raise ValueError(f"Unsupported selection metric: {metric}")
+
+
+def build_eval_pred(prob, threshold, metric):
+    pred = (prob >= threshold).astype(int)
+    return postprocess_predictions(pred, metric)
+
+
+def threshold_candidate_is_valid(y_true, pred):
+    stats = get_threshold_candidate_stats(y_true, pred)
+
+    return threshold_candidate_meets_accuracy_floor(stats) and threshold_candidate_meets_soft_constraints(stats)
+
+
+def get_threshold_candidate_stats(y_true, pred):
+    true_pos_ratio = float(np.mean(y_true))
+    pred_pos_ratio = float(np.mean(pred))
+    recall = recall_score(y_true, pred, zero_division=0)
+    accuracy = accuracy_score(y_true, pred)
+
+    min_pos_ratio_required = max(
+        MIN_SELECTION_POS_RATIO,
+        true_pos_ratio * MIN_SELECTION_POS_RATIO_SCALE,
+    )
+
+    return {
+        "accuracy": accuracy,
+        "recall": recall,
+        "pred_pos_ratio": pred_pos_ratio,
+        "true_pos_ratio": true_pos_ratio,
+        "min_pos_ratio_required": min_pos_ratio_required,
+    }
+
+
+def threshold_candidate_meets_accuracy_floor(stats):
+    return (not use_selection_accuracy_floor) or (stats["accuracy"] >= MIN_SELECTION_ACCURACY)
+
+
+def threshold_candidate_meets_pos_ratio(stats):
+    return stats["pred_pos_ratio"] >= stats["min_pos_ratio_required"]
+
+
+def threshold_candidate_meets_soft_constraints(stats):
+    return (
+        stats["recall"] >= MIN_SELECTION_RECALL and
+        threshold_candidate_meets_pos_ratio(stats)
+    )
+
+
+def summarize_binary_prediction(y_true, pred):
+    return {
+        "accuracy": accuracy_score(y_true, pred),
+        "precision": precision_score(y_true, pred, zero_division=0),
+        "recall": recall_score(y_true, pred, zero_division=0),
+        "f1": f1_score(y_true, pred, zero_division=0),
+        "pred_pos_ratio": float(np.mean(pred)),
+        "true_pos_ratio": float(np.mean(y_true)),
+    }
+
+
 # ================= 动态阈值搜索 =================
 def search_best_threshold(prob, y_true, val_df):
     best_thr = 0.5
@@ -562,6 +913,90 @@ def search_best_threshold(prob, y_true, val_df):
             best_thr = thr
 
     return best_thr, best_iou
+
+
+def evaluate_selection_metric(prob, y_true, metric, val_df=None, threshold=0.5):
+    pred = build_eval_pred(prob, threshold, metric)
+    return evaluate_selection_metric_from_pred(y_true, pred, metric, val_df=val_df)
+
+
+def search_best_threshold_by_metric(prob, y_true, metric, val_df=None):
+    best_thr = None
+    best_rank = None
+    fallback_acc_pos_thr = None
+    fallback_acc_pos_rank = None
+    fallback_acc_thr = None
+    fallback_acc_rank = None
+    fallback_soft_thr = None
+    fallback_soft_rank = None
+    fallback_pos_thr = None
+    fallback_pos_rank = None
+    fallback_any_thr = 0.5
+    fallback_any_rank = None
+
+    for thr in np.arange(
+        THRESH_SEARCH_MIN,
+        THRESH_SEARCH_MAX + THRESH_SEARCH_STEP * 0.5,
+        THRESH_SEARCH_STEP,
+    ):
+        pred = build_eval_pred(prob, thr, metric)
+        score = evaluate_selection_metric_from_pred(y_true, pred, metric, val_df=val_df)
+        stats = get_threshold_candidate_stats(y_true, pred)
+
+        meets_acc = threshold_candidate_meets_accuracy_floor(stats)
+        meets_pos = threshold_candidate_meets_pos_ratio(stats)
+        meets_soft = threshold_candidate_meets_soft_constraints(stats)
+
+        primary_rank = (score, stats["accuracy"], stats["recall"])
+        acc_pos_rank = (score, stats["recall"], stats["accuracy"])
+        acc_rank = (score, stats["recall"], stats["pred_pos_ratio"])
+        soft_rank = (score, stats["accuracy"], stats["pred_pos_ratio"])
+        pos_rank = (score, stats["accuracy"], stats["recall"])
+        any_rank = (stats["recall"], score, stats["accuracy"])
+
+        if fallback_any_rank is None or any_rank > fallback_any_rank:
+            fallback_any_rank = any_rank
+            fallback_any_thr = thr
+
+        if meets_pos and (fallback_pos_rank is None or pos_rank > fallback_pos_rank):
+            fallback_pos_rank = pos_rank
+            fallback_pos_thr = thr
+
+        if meets_soft and (fallback_soft_rank is None or soft_rank > fallback_soft_rank):
+            fallback_soft_rank = soft_rank
+            fallback_soft_thr = thr
+
+        if meets_acc and (fallback_acc_rank is None or acc_rank > fallback_acc_rank):
+            fallback_acc_rank = acc_rank
+            fallback_acc_thr = thr
+
+        if meets_acc and meets_pos and (fallback_acc_pos_rank is None or acc_pos_rank > fallback_acc_pos_rank):
+            fallback_acc_pos_rank = acc_pos_rank
+            fallback_acc_pos_thr = thr
+
+        if use_threshold_constraints and not (meets_acc and meets_soft):
+            continue
+
+        if best_rank is None or primary_rank > best_rank:
+            best_rank = primary_rank
+            best_thr = thr
+
+    if best_thr is not None:
+        return best_thr, best_rank[0]
+
+    if fallback_acc_pos_thr is not None:
+        return fallback_acc_pos_thr, fallback_acc_pos_rank[0]
+
+    if fallback_acc_thr is not None:
+        return fallback_acc_thr, fallback_acc_rank[0]
+
+    if fallback_soft_thr is not None:
+        return fallback_soft_thr, fallback_soft_rank[0]
+
+    if fallback_pos_thr is not None:
+        return fallback_pos_thr, fallback_pos_rank[0]
+
+    return fallback_any_thr, fallback_any_rank[1]
 
 
 # ===================== 自动跨井CV策略 =====================
@@ -605,218 +1040,285 @@ def cross_well_loss(features, well_ids, well_sim_matrix, well_names):
 dist_df = pd.read_csv(DIST_MATRIX_PATH, index_col=0)
 well_sim = 1 / (dist_df + 1e-6)
 well_sim = well_sim / well_sim.max().max()
-cluster_map = cluster_wells(
-    dist_df.values,
-    dist_df.index.tolist(),
-    n_clusters=2
-)
-domain_map = cluster_map
-cv_splits = generate_cv_splits(cluster_map)
+well_names = dist_df.index.tolist()
+domain_map = {well: idx for idx, well in enumerate(well_names)}
 
 all_results = []
-for train_wells, val_wells in cv_splits:
-    for val_well in val_wells:
-        print(f"\n================ 验证井：{val_well} ================")
-        well_save_dir = os.path.join(SAVE_DIR, f"verify_{val_well}")
-        os.makedirs(well_save_dir, exist_ok=True)
-        train_wells = [w for w, c in cluster_map.items() if c != cluster_map[val_well]]
-        train_df = df[df["WellName"].isin(train_wells)]
-        val_df = df[df["WellName"] == val_well]
+loop_wells = [w for w in well_names if (not only_val_wells) or (w in only_val_wells)]
+if not loop_wells:
+    raise ValueError(f"No validation wells selected. only_val_wells={only_val_wells}")
 
-        # ---------- 标准化 ----------
-        train_df_scaled, train_scalers = wellwise_standardize(train_df, features)
-        val_df_scaled = []
-        for well in val_df["WellName"].unique():
-            scaler = train_scalers.get(well, None)
-            well_df = val_df[val_df["WellName"] == well].copy()
-            if scaler is None:
-                scaler = StandardScaler()
-                well_df[features] = scaler.fit_transform(well_df[features])
-            else:
-                well_df[features] = scaler.transform(well_df[features])
-            val_df_scaled.append(well_df)
-        val_df_scaled = pd.concat(val_df_scaled)
-        X_train_all = train_df_scaled[features].values
-        X_val_all = val_df_scaled[features].values
-        X_train_seis = reshape_seis(X_train_all[:, :63], SEIS_MODE)
-        X_val_seis = reshape_seis(X_val_all[:, :63], SEIS_MODE)
-        X_train_log = X_train_all[:, 63:]
-        X_val_log = X_val_all[:, 63:]
-
-        y_train = train_df["FRACTURE_FLAG"].values
-        y_val = val_df["FRACTURE_FLAG"].values
-
-        y_train_den = train_df[density_cols].values
-        y_val_den = val_df[density_cols].values
-
-        # ---------- 构造序列 ----------
-        X_train_seis_seq, X_train_log_seq, y_train_seq, y_train_den_seq, train_domain_seq = build_sequences_by_well(
-            train_df,
-            X_train_seis,
-            X_train_log,
-            y_train,
-            y_train_den,
-            SEQ_LEN
+for val_well in loop_wells:
+    print(f"\n================ 验证井：{val_well} ================")
+    well_save_dir = os.path.join(SAVE_DIR, f"verify_{val_well}")
+    os.makedirs(well_save_dir, exist_ok=True)
+    if val_well in custom_train_wells_map:
+        train_wells = validate_custom_train_wells(
+            val_well,
+            custom_train_wells_map[val_well],
+            well_names,
         )
-        # 数据增强
-        aug_seis = augment_seismic(X_train_seis_seq)
-        X_train_seis_seq = np.concatenate([X_train_seis_seq, aug_seis])
-        noise = np.random.normal(0, 0.01, X_train_log_seq.shape)
-        X_train_log_seq = np.concatenate([X_train_log_seq, X_train_log_seq + noise])
-        y_train_seq = np.concatenate([y_train_seq, y_train_seq])
-        y_train_den_seq = np.concatenate([y_train_den_seq, y_train_den_seq])
-        train_domain_seq = np.concatenate([train_domain_seq, train_domain_seq])
-
-        if use_over_smaple:
-            print("Before oversample:",
-                  (y_train_seq == 1).sum() / len(y_train_seq))
-            X_train_seis_seq, X_train_log_seq, y_train_seq, y_train_den_seq = oversample_center_segments(
-                X_train_seis_seq,
-                X_train_log_seq,
-                y_train_seq,
-                y_train_den_seq,
-                train_domain_seq,
-                target_ratio=target_ratio,  # 建议 0.30~0.40
-                edge_exclude=edge_exclude  # 去掉每段两端1个
-            )
-            print("After oversample:",
-                  (y_train_seq == 1).sum() / len(y_train_seq))
-
-        X_val_seis_seq, X_val_log_seq, y_val_seq, y_val_den_seq, val_domain_seq = build_sequences_by_well(
-            val_df,
-            X_val_seis,
-            X_val_log,
-            y_val,
-            y_val_den,
-            SEQ_LEN
+        print(f"\n验证井: {val_well}")
+        print("训练井选择模式: custom_train_wells")
+        print("训练井:", train_wells)
+        print("对应距离:", {w: round(float(dist_df.loc[val_well, w]), 4) for w in train_wells})
+    elif use_all_other_wells:
+        train_wells = [w for w in well_names if w != val_well]
+        print(f"\n验证井: {val_well}")
+        print("训练井选择模式: all_other_wells")
+        print("训练井:", train_wells)
+        print("对应距离:", {w: round(float(dist_df.loc[val_well, w]), 4) for w in train_wells})
+    else:
+        train_wells = select_train_wells(
+            val_well,
+            dist_df,
+            threshold=DIST_THRESHOLD,
+            min_wells=MIN_TRAIN_WELLS
         )
+    print("测试井:", [val_well])
+    print("训练井:", train_wells)
 
-        # ---------- Tensor ----------
-        X_train_seis_t = torch.tensor(X_train_seis_seq, dtype=torch.float32).to(DEVICE)
-        X_train_log_t = torch.tensor(X_train_log_seq, dtype=torch.float32).to(DEVICE)
-        X_val_seis_t = torch.tensor(X_val_seis_seq, dtype=torch.float32).to(DEVICE)
-        X_val_log_t = torch.tensor(X_val_log_seq, dtype=torch.float32).to(DEVICE)
-        y_train_t = torch.tensor(y_train_seq, dtype=torch.float32).to(DEVICE)
-        y_val_t = torch.tensor(y_val_seq, dtype=torch.float32).to(DEVICE)
-        y_train_den_t = torch.tensor(y_train_den_seq, dtype=torch.float32).to(DEVICE)
-        y_val_den_t = torch.tensor(y_val_den_seq, dtype=torch.float32).to(DEVICE)
-        train_domain_t = torch.tensor(train_domain_seq).long().to(DEVICE)
+    train_df = df[df["WellName"].isin(train_wells)]
+    val_df = df[df["WellName"] == val_well]
 
-        print("Shapes:")
-        print("seis:", X_train_seis_seq.shape)
-        print("log:", X_train_log_seq.shape)
-        print("y_cls:", y_train_seq.shape)
-        print("y_den:", y_train_den_seq.shape)
-        print("domain:", train_domain_seq.shape)
+    # ---------- 标准化 ----------
+    global_scaler = StandardScaler()
+    train_df_scaled = train_df.copy()
+    val_df_scaled = val_df.copy()
+    train_df_scaled[features] = global_scaler.fit_transform(train_df[features])
+    val_df_scaled[features] = global_scaler.transform(val_df[features])
+    X_train_all = train_df_scaled[features].values
+    X_val_all = val_df_scaled[features].values
+    X_train_seis = reshape_seis(X_train_all[:, :63], SEIS_MODE)
+    X_val_seis = reshape_seis(X_val_all[:, :63], SEIS_MODE)
+    X_train_log = X_train_all[:, 63:]
+    X_val_log = X_val_all[:, 63:]
 
-        train_loader = DataLoader(
-            TensorDataset(
-                X_train_seis_t,
-                X_train_log_t,
-                y_train_t,
-                y_train_den_t,
-                train_domain_t
-            ),
-            batch_size=BATCH_SIZE,
-            shuffle=True
+    y_train = train_df["FRACTURE_FLAG"].values
+    y_val = val_df["FRACTURE_FLAG"].values
+
+    y_train_den = train_df[density_cols].values
+    y_val_den = val_df[density_cols].values
+
+    # ---------- 构造序列 ----------
+    X_train_seis_seq, X_train_log_seq, y_train_seq, y_train_den_seq, train_domain_seq, _ = build_sequences_by_well(
+        train_df,
+        X_train_seis,
+        X_train_log,
+        y_train,
+        y_train_den,
+        SEQ_LEN
+    )
+    # 数据增强
+    aug_seis = augment_seismic(X_train_seis_seq)
+    X_train_seis_seq = np.concatenate([X_train_seis_seq, aug_seis])
+    noise = np.random.normal(0, 0.01, X_train_log_seq.shape)
+    X_train_log_seq = np.concatenate([X_train_log_seq, X_train_log_seq + noise])
+    y_train_seq = np.concatenate([y_train_seq, y_train_seq])
+    y_train_den_seq = np.concatenate([y_train_den_seq, y_train_den_seq])
+    train_domain_seq = np.concatenate([train_domain_seq, train_domain_seq])
+
+    if use_over_smaple:
+        print("Before oversample:",
+              (y_train_seq == 1).sum() / len(y_train_seq))
+        X_train_seis_seq, X_train_log_seq, y_train_seq, y_train_den_seq, train_domain_seq = oversample_center_segments(
+            X_train_seis_seq,
+            X_train_log_seq,
+            y_train_seq,
+            y_train_den_seq,
+            train_domain_seq,
+            target_ratio=target_ratio,  # 建议 0.30~0.40
+            edge_exclude=edge_exclude  # 去掉每段两端1个
         )
+        print("After oversample:",
+              (y_train_seq == 1).sum() / len(y_train_seq))
 
-        # ---------- 模型 ----------
-        model = FractureCNNLSTM(
-            seis_mode=SEIS_MODE,
-            log_dim=len(imaging_well_features),
-            n_domains=len(set(cluster_map.values()))
-        ).to(DEVICE)
+    X_val_seis_seq, X_val_log_seq, y_val_seq, y_val_den_seq, val_domain_seq, val_center_row_idx = build_sequences_by_well(
+        val_df,
+        X_val_seis,
+        X_val_log,
+        y_val,
+        y_val_den,
+        SEQ_LEN
+    )
 
-        if use_over_smaple:
-            pos_weight = manual_pos_weight
-        else:
-            n_pos = (y_train_seq == 1).sum()
-            n_neg = (y_train_seq == 0).sum()
-            pos_weight = n_neg / max(n_pos, 1)
-        print(f"pos_weight = {pos_weight:.3f}")
-        print(f"train pos ratio = {(y_train_seq == 1).mean():.3f}")
+    # ---------- Tensor ----------
+    X_train_seis_t = torch.tensor(X_train_seis_seq, dtype=torch.float32).to(DEVICE)
+    X_train_log_t = torch.tensor(X_train_log_seq, dtype=torch.float32).to(DEVICE)
+    X_val_seis_t = torch.tensor(X_val_seis_seq, dtype=torch.float32).to(DEVICE)
+    X_val_log_t = torch.tensor(X_val_log_seq, dtype=torch.float32).to(DEVICE)
+    y_train_t = torch.tensor(y_train_seq, dtype=torch.float32).to(DEVICE)
+    y_val_t = torch.tensor(y_val_seq, dtype=torch.float32).to(DEVICE)
+    y_train_den_t = torch.tensor(y_train_den_seq, dtype=torch.float32).to(DEVICE)
+    y_val_den_t = torch.tensor(y_val_den_seq, dtype=torch.float32).to(DEVICE)
+    train_domain_t = torch.tensor(train_domain_seq).long().to(DEVICE)
 
-        criterion_cls = nn.BCEWithLogitsLoss(
-            pos_weight=torch.tensor(pos_weight).to(DEVICE)
-        )
-        criterion_domain = nn.CrossEntropyLoss()
-        optimizer = torch.optim.Adam(model.parameters(), lr=LR)
+    print("Shapes:")
+    print("seis:", X_train_seis_seq.shape)
+    print("log:", X_train_log_seq.shape)
+    print("y_cls:", y_train_seq.shape)
+    print("y_den:", y_train_den_seq.shape)
+    print("domain:", train_domain_seq.shape)
 
-        # Early Stopping
-        best_val_loss = float("inf")
-        early_stop_counter = 0
-        best_model_state = None
-        best_epoch = -1
+    train_loader = DataLoader(
+        TensorDataset(
+            X_train_seis_t,
+            X_train_log_t,
+            y_train_t,
+            y_train_den_t,
+            train_domain_t
+        ),
+        batch_size=BATCH_SIZE,
+        shuffle=True
+    )
 
-        # ---------- 训练 ----------
-        for epoch in range(EPOCHS):
-            model.train()
-            p = epoch / EPOCHS
-            alpha = 2. / (1. + np.exp(-10 * p)) - 1
-            epoch_loss = 0.0
-            pbar = tqdm(train_loader, desc=f"[{val_well}] Epoch {epoch + 1}/{EPOCHS}", leave=False)
+    # ---------- 模型 ----------
+    model = FractureCNNLSTM(
+        seis_mode=SEIS_MODE,
+        log_dim=len(imaging_well_features),
+        n_domains=len(domain_map),
+        hidden_dim=32,
+        use_density_regression=use_density_regression,
+        use_domain_adversarial=use_domain_adversarial
+    ).to(DEVICE)
 
-            for xb_seis, xb_log, yb_cls, yb_den, yb_domain in pbar:
-                optimizer.zero_grad()
-                cls_out, den_out, domain_out, emb = model(xb_seis, xb_log, alpha)
-                loss_cls = criterion_cls(cls_out, yb_cls)
+    if use_over_smaple:
+        pos_weight = manual_pos_weight
+    else:
+        n_pos = (y_train_seq == 1).sum()
+        n_neg = (y_train_seq == 0).sum()
+        pos_weight = n_neg / max(n_pos, MAX_N_POS)
+        pos_weight = min(pos_weight, MAX_POS_WEIGHT)
+    print(f"pos_weight = {pos_weight:.3f}")
+    print(f"train pos ratio = {(y_train_seq == 1).mean():.3f}")
+
+    criterion_bce = nn.BCEWithLogitsLoss(
+        pos_weight=torch.tensor(pos_weight).to(DEVICE)
+    )
+    criterion_domain = nn.CrossEntropyLoss() if use_domain_adversarial else None
+    optimizer = torch.optim.Adam(model.parameters(), lr=LR)
+
+    # Early Stopping
+    best_val_loss = float("inf")
+    best_val_score = -1.0
+    early_stop_counter = 0
+    best_model_state = None
+    best_epoch = -1
+    best_epoch_thr = best_thr
+
+    # ---------- 训练 ----------
+    for epoch in range(EPOCHS):
+        model.train()
+        p = epoch / EPOCHS
+        alpha = 2. / (1. + np.exp(-10 * p)) - 1
+        epoch_loss = 0.0
+        pbar = tqdm(train_loader, desc=f"[{val_well}] Epoch {epoch + 1}/{EPOCHS}", leave=False)
+
+        for xb_seis, xb_log, yb_cls, yb_den, yb_domain in pbar:
+            optimizer.zero_grad()
+            cls_out, den_out, domain_out, emb = model(xb_seis, xb_log, alpha)
+            loss_cls, loss_bce, loss_dice = compute_classification_loss(cls_out, yb_cls, criterion_bce)
+            if use_density_regression:
                 mask = (yb_cls == 1).float().unsqueeze(1)
                 if mask.sum().item() > 0:
                     loss_den = ((den_out - yb_den) ** 2 * mask).sum() / mask.sum()
                 else:
                     loss_den = torch.tensor(0.0).to(DEVICE)
+            else:
+                loss_den = torch.tensor(0.0).to(DEVICE)
+            if use_domain_adversarial:
                 loss_domain = criterion_domain(domain_out, yb_domain)
-                loss_cross = cross_well_loss(emb, yb_domain.cpu().numpy(), well_sim, well_names)
-                loss = loss_cls + 0.5 * loss_den + 0.3 * loss_domain + 0.2 * loss_cross
+            else:
+                loss_domain = torch.tensor(0.0).to(DEVICE)
+            # loss_cross = cross_well_loss(emb, yb_domain.cpu().numpy(), well_sim, well_names)
+            # loss = loss_cls + 0.5 * loss_den + 0.3 * loss_domain + 0.2 * loss_cross
+            loss = loss_cls + 0.5 * loss_den + 0.3 * loss_domain
 
-                loss.backward()
-                optimizer.step()
-                epoch_loss += loss.item()
-                pbar.set_postfix(loss=float(loss))
+            loss.backward()
+            optimizer.step()
+            epoch_loss += loss.item()
+            pbar.set_postfix(
+                loss=loss.detach().item(),
+                cls=loss_cls.detach().item(),
+                dice=loss_dice.detach().item(),
+            )
 
-            avg_train_loss = epoch_loss / len(train_loader)
+        avg_train_loss = epoch_loss / len(train_loader)
 
-            # ===== validation loss =====
-            model.eval()
-            with torch.no_grad():
-                cls_out_val, den_out_val, domain_out_val, emb_val = model(X_val_seis_t, X_val_log_t)
-                val_loss_cls = criterion_cls(cls_out_val, y_val_t)
+        # ===== validation loss =====
+        model.eval()
+        with torch.no_grad():
+            cls_out_val, den_out_val, domain_out_val, emb_val = model(X_val_seis_t, X_val_log_t)
+            val_loss_cls, val_loss_bce, val_loss_dice = compute_classification_loss(cls_out_val, y_val_t, criterion_bce)
+            val_prob = torch.sigmoid(cls_out_val).cpu().numpy()
+            if use_dynamic_threshold:
+                epoch_thr, val_score = search_best_threshold_by_metric(
+                    val_prob,
+                    y_val_seq,
+                    selection_metric,
+                    val_df=val_df
+                )
+            else:
+                epoch_thr = best_thr
+                val_score = evaluate_selection_metric(
+                    val_prob,
+                    y_val_seq,
+                    selection_metric,
+                    val_df=val_df,
+                    threshold=epoch_thr
+                )
+            if use_density_regression:
                 mask = (y_val_t == 1).float().unsqueeze(1)
-
                 if mask.sum().item() > 0:
                     val_loss_den = ((den_out_val - y_val_den_t) ** 2 * mask).sum() / mask.sum()
                 else:
                     val_loss_den = torch.tensor(0.0).to(DEVICE)
-
-                # val_loss = val_loss_cls + 0.5 * val_loss_den
-                val_loss = val_loss_cls
-                val_loss = val_loss.item()
-
-            print(f"Epoch {epoch + 1} | TrainLoss={avg_train_loss:.4f} | ValLoss={val_loss:.4f}")
-
-            # ===== Early Stopping =====
-            if val_loss < best_val_loss - min_delta:
-                best_val_loss = val_loss
-                early_stop_counter = 0
-                best_model_state = copy.deepcopy(model.state_dict())
-                best_epoch = epoch
             else:
-                early_stop_counter += 1
-                print(f"EarlyStopping counter: {early_stop_counter}/{patience}, best_val_loss: {best_val_loss}")
+                val_loss_den = torch.tensor(0.0).to(DEVICE)
 
-                if early_stop_counter >= patience:
-                    print(f"Early stopping triggered, best_val_loss: {best_val_loss}, best_epoch: {best_epoch + 1}")
-                    break
+            # val_loss = val_loss_cls + 0.5 * val_loss_den
+            val_loss = val_loss_cls
+            val_loss = val_loss.item()
+
+        print(
+            f"Epoch {epoch + 1} | TrainLoss={avg_train_loss:.4f} | "
+            f"ValLoss={val_loss:.4f} | Val{selection_metric.upper()}={val_score:.4f} | "
+            f"ValBCE={val_loss_bce.detach().item():.4f} | ValDice={val_loss_dice.detach().item():.4f} | Thr={epoch_thr:.2f}"
+        )
+
+        # ===== Early Stopping =====
+        if (val_score > best_val_score + min_delta) or (
+                abs(val_score - best_val_score) <= min_delta and val_loss < best_val_loss - min_delta
+        ):
+            best_val_score = val_score
+            best_val_loss = val_loss
+            best_epoch_thr = epoch_thr
+            early_stop_counter = 0
+            best_model_state = copy.deepcopy(model.state_dict())
+            best_epoch = epoch
+        else:
+            early_stop_counter += 1
+            print(
+                f"EarlyStopping counter: {early_stop_counter}/{patience}, "
+                f"best_val_{selection_metric}: {best_val_score:.4f}, best_val_loss: {best_val_loss:.4f}"
+            )
+
+            if early_stop_counter >= patience:
+                print(
+                    f"Early stopping triggered, best_val_{selection_metric}: {best_val_score:.4f}, "
+                    f"best_val_loss: {best_val_loss:.4f}, best_epoch: {best_epoch + 1}"
+                )
+                break
 
     if best_model_state is not None:
         model.load_state_dict(best_model_state)
+        best_thr = best_epoch_thr
 
     # ===============================
     # LSTM 特征重要性分析
     # ===============================
     if show_features_importance:
-        importances = cnn_lstm_permutation_importance(model, X_val_seis_t, X_val_log_t, y_val_t, loss_fn=criterion_cls,
+        importances = cnn_lstm_permutation_importance(model, X_val_seis_t, X_val_log_t, y_val_t, loss_fn=criterion_bce,
                                                       device=DEVICE)
         all_importances.append(importances)
 
@@ -846,20 +1348,22 @@ for train_wells, val_wells in cv_splits:
             prob = smooth_prob(prob, window=3)
         # 动态阈值
         if use_dynamic_threshold:
-            best_thr, best_iou = search_best_threshold(prob, y_val_seq, val_df)
-        pred = (prob >= best_thr).astype(int)
-        # 小段处理
-        if use_short_segment_processing:
-            pred = remove_short_segments(pred, min_len=3)
-            pred = fill_small_gaps(pred, max_gap=2)
-        den_pred = den_out.cpu().numpy()
+            best_thr, best_metric_score = search_best_threshold_by_metric(
+                prob,
+                y_val_seq,
+                selection_metric,
+                val_df=val_df
+            )
+        pred = build_eval_pred(prob, best_thr, selection_metric)
+        den_pred = den_out.cpu().numpy() if den_out is not None else None
 
+    pred_summary = summarize_binary_prediction(y_val_seq, pred)
     acc = accuracy_score(y_val_seq, pred)
     auc = roc_auc_score(y_val_seq, prob) if len(np.unique(y_val_seq)) > 1 else np.nan
-    report = classification_report(y_val_seq, pred, output_dict=True)
+    report = classification_report(y_val_seq, pred, output_dict=True, zero_division=0)
 
-    if use_dynamic_threshold:
-        iou = best_iou
+    if use_dynamic_threshold and selection_metric == "iou":
+        iou = best_metric_score
     else:
         iou_list = []
         start = 0
@@ -881,7 +1385,7 @@ for train_wells, val_wells in cv_splits:
 
     # 密度误差计算
     mask = (y_val_seq == 1) & (pred == 1)
-    if mask.sum() > 0:
+    if use_density_regression and mask.sum() > 0:
         gt_den = np.expm1(y_val_den_seq[mask])
         pred_den = np.expm1(den_pred[mask])
 
@@ -899,6 +1403,8 @@ for train_wells, val_wells in cv_splits:
     Precision={report['1']['precision']:.3f}
     Recall={report['1']['recall']:.3f}
     F1={report['1']['f1-score']:.3f}
+    PredPositiveRatio={pred_summary['pred_pos_ratio']:.3f}
+    TruePositiveRatio={pred_summary['true_pos_ratio']:.3f}
     Threshold={best_thr:.3f}
     IoU={iou:.3f}
 
@@ -915,28 +1421,54 @@ for train_wells, val_wells in cv_splits:
         "Precision": report["1"]["precision"],
         "Recall": report["1"]["recall"],
         "F1": report["1"]["f1-score"],
+        "PredPositiveRatio": pred_summary["pred_pos_ratio"],
+        "TruePositiveRatio": pred_summary["true_pos_ratio"],
         "Threshold": best_thr,
         "IoU": iou,
         "P10": mean_percent_error[0],
         "P21": mean_percent_error[1],
         "P33": mean_percent_error[2],
-        "best_loss": best_val_loss
+        "best_loss": best_val_loss,
+        f"best_val_{selection_metric}": best_val_score
     })
 
     # ---------- 保存 ----------
     torch.save(model.state_dict(), os.path.join(well_save_dir, "model.pth"))
-    joblib.dump(train_scalers,
-                os.path.join(well_save_dir, "scalers.pkl"))
+    joblib.dump(global_scaler,
+                os.path.join(well_save_dir, "scaler.pkl"))
 
     config = {
         "SEQ_LEN": SEQ_LEN,
         "features": features,
         "model": "FractureLSTM",
-        "hidden_dim": 64,
-        "BEST_THRESHOLD": float(best_thr),
+        "hidden_dim": model.hidden_dim,
+        "best_thrESHOLD": float(best_thr),
+        "selection_metric": selection_metric,
         "BATCH_SIZE": BATCH_SIZE,
         "EPOCHS": EPOCHS,
         "LR": LR,
+        "SEIS_MODE": SEIS_MODE,
+        "DIST_MATRIX_PATH": DIST_MATRIX_PATH,
+        "DIST_THRESHOLD": DIST_THRESHOLD,
+        "MIN_TRAIN_WELLS": MIN_TRAIN_WELLS,
+        "MAX_POS_WEIGHT": MAX_POS_WEIGHT,
+        "use_dice_loss": use_dice_loss,
+        "DICE_LOSS_WEIGHT": DICE_LOSS_WEIGHT,
+        "use_selection_accuracy_floor": use_selection_accuracy_floor,
+        "MIN_SELECTION_ACCURACY": MIN_SELECTION_ACCURACY,
+        "use_threshold_constraints": use_threshold_constraints,
+        "MIN_SELECTION_RECALL": MIN_SELECTION_RECALL,
+        "MIN_SELECTION_POS_RATIO": MIN_SELECTION_POS_RATIO,
+        "MIN_SELECTION_POS_RATIO_SCALE": MIN_SELECTION_POS_RATIO_SCALE,
+        "only_val_wells": only_val_wells,
+        "custom_train_wells_map": custom_train_wells_map,
+        "use_over_smaple": use_over_smaple,
+        "manual_pos_weight": manual_pos_weight,
+        "target_ratio": target_ratio,
+        "edge_exclude": edge_exclude,
+        "use_density_regression": use_density_regression,
+        "use_domain_adversarial": use_domain_adversarial,
+        "use_all_other_wells": use_all_other_wells,
         "train_wells": train_df["WellName"].unique().tolist(),
         "val_well": val_well,
     }
@@ -950,14 +1482,20 @@ for train_wells, val_wells in cv_splits:
     # 初始化预测列
     val_raw_df["PRED_PROB"] = np.nan
     val_raw_df["PRED_LABEL"] = np.nan
-    val_raw_df["P10_PRED"] = np.nan
-    val_raw_df["P21_PRED"] = np.nan
-    val_raw_df["P33_PRED"] = np.nan
+    if use_density_regression:
+        val_raw_df["P10_PRED"] = np.nan
+        val_raw_df["P21_PRED"] = np.nan
+        val_raw_df["P33_PRED"] = np.nan
     # 真实标签
     val_raw_df["GT_LABEL"] = np.nan
 
     # LSTM可预测中心点
-    pred_index = val_raw_df.index[HALF: len(val_raw_df) - HALF]
+    pred_index = val_center_row_idx
+    if len(pred_index) != len(prob):
+        raise ValueError(
+            f"Prediction index length mismatch for {val_well}: "
+            f"indices={len(pred_index)}, prob={len(prob)}"
+        )
 
     # ---------- 分类预测 ----------
     val_raw_df.loc[pred_index, "PRED_PROB"] = prob
@@ -967,10 +1505,11 @@ for train_wells, val_wells in cv_splits:
     val_raw_df.loc[pred_index, "GT_LABEL"] = y_val_seq
 
     # ---------- 密度预测 ----------
-    den_pred_real = np.expm1(den_pred)
-    val_raw_df.loc[pred_index, "P10_PRED"] = den_pred_real[:, 0]
-    val_raw_df.loc[pred_index, "P21_PRED"] = den_pred_real[:, 1]
-    val_raw_df.loc[pred_index, "P33_PRED"] = den_pred_real[:, 2]
+    if use_density_regression and den_pred is not None:
+        den_pred_real = np.expm1(den_pred)
+        val_raw_df.loc[pred_index, "P10_PRED"] = den_pred_real[:, 0]
+        val_raw_df.loc[pred_index, "P21_PRED"] = den_pred_real[:, 1]
+        val_raw_df.loc[pred_index, "P33_PRED"] = den_pred_real[:, 2]
 
     # 删除全空列
     val_raw_df = val_raw_df.dropna(axis=1, how="all")
