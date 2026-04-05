@@ -11,6 +11,7 @@ import numpy as np
 import pandas as pd
 import torch
 import torch.nn as nn
+from sklearn.preprocessing import StandardScaler
 
 
 ROOT = Path(__file__).resolve().parent
@@ -24,6 +25,10 @@ OUTPUT_BASE_DIR = Path(
     r"E:\项目\石油项目\断缝储\原始数据\wx数据\砂砾岩\优化阶段一\研究内容一\裂缝位置预测\基于密度的裂缝点位分析\常规测井最近成像井预测"
 )
 DEFAULT_CANDIDATE_WELLS = ["车660-1", "车660-2", "车662", "车663"]
+FLOW_RESULT_ROOT = Path(
+    r"E:\项目\石油项目\断缝储\原始数据\wx数据\砂砾岩\优化阶段一\研究内容一\两阶段裂缝预测流程结果"
+)
+OUTPUT_BASE_DIR = FLOW_RESULT_ROOT / "manual_runs" / "nearest_predict_then_refine"
 RAW_POINT_GUIDED_SCRIPT = ROOT / "raw_point_guided_segment_refine.py"
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 LOG_MISSING_PLACEHOLDERS = {-999.25, -9999.0}
@@ -386,6 +391,105 @@ def build_inference_sequences(
     )
 
 
+def apply_saved_feature_scaler(
+    df_model: pd.DataFrame,
+    features: list[str],
+    log_features: list[str],
+    scaler_artifact,
+) -> np.ndarray:
+    if hasattr(scaler_artifact, "transform"):
+        return scaler_artifact.transform(df_model[features].astype(np.float64))
+
+    if not isinstance(scaler_artifact, dict):
+        raise ValueError(f"Unsupported scaler artifact type: {type(scaler_artifact)}")
+
+    scaling_mode = str(scaler_artifact.get("scaling_mode", "")).strip().lower()
+    if scaling_mode == "global_all_features":
+        feature_scaler = scaler_artifact.get("feature_scaler")
+        if feature_scaler is None or not hasattr(feature_scaler, "transform"):
+            raise ValueError("Missing feature_scaler in scaler artifact")
+        return feature_scaler.transform(df_model[features].astype(np.float64))
+
+    if scaling_mode == "global_seis_wellwise_log":
+        seis_features = [feature for feature in features if feature not in log_features]
+        out_df = df_model[features].copy()
+        seis_scaler = scaler_artifact.get("seis_scaler")
+        if seis_features:
+            if seis_scaler is None or not hasattr(seis_scaler, "transform"):
+                raise ValueError("Missing seis_scaler in scaler artifact")
+            out_df[seis_features] = seis_scaler.transform(df_model[seis_features].astype(np.float64))
+        if log_features:
+            log_scaler = StandardScaler()
+            out_df[log_features] = log_scaler.fit_transform(df_model[log_features].astype(np.float64))
+        return out_df.to_numpy(dtype=np.float64)
+
+    raise ValueError(f"Unsupported scaler artifact scaling_mode: {scaling_mode}")
+
+
+def resolve_missing_log_fill_values(
+    features: list[str],
+    log_features: list[str],
+    scaler_artifact,
+) -> dict[str, float]:
+    default_fill_values = {
+        feature: (1.0 if feature in ZERO_AS_MISSING_LOG_FEATURES else 0.0)
+        for feature in log_features
+    }
+    feature_mean_lookup: dict[str, float] = {}
+
+    def update_from_scaler(feature_scaler) -> None:
+        if feature_scaler is None or not hasattr(feature_scaler, "mean_"):
+            return
+        means = np.asarray(getattr(feature_scaler, "mean_"), dtype=np.float64).reshape(-1)
+        for idx, feature_name in enumerate(features):
+            if idx >= len(means) or feature_name not in log_features:
+                continue
+            if np.isfinite(means[idx]):
+                feature_mean_lookup[feature_name] = float(means[idx])
+
+    if hasattr(scaler_artifact, "mean_"):
+        update_from_scaler(scaler_artifact)
+    elif isinstance(scaler_artifact, dict):
+        scaling_mode = str(scaler_artifact.get("scaling_mode", "")).strip().lower()
+        if scaling_mode == "global_all_features":
+            update_from_scaler(scaler_artifact.get("feature_scaler"))
+
+    fill_values: dict[str, float] = {}
+    for feature_name in log_features:
+        fill_value = feature_mean_lookup.get(feature_name, default_fill_values.get(feature_name, 0.0))
+        if feature_name in ZERO_AS_MISSING_LOG_FEATURES and (not np.isfinite(fill_value) or float(fill_value) == 0.0):
+            fill_value = 1.0
+        fill_values[feature_name] = float(fill_value)
+    return fill_values
+
+
+def fill_invalid_log_values_with_neutral_values(
+    df_model: pd.DataFrame,
+    log_features: list[str],
+    fill_values: dict[str, float],
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    out_df = df_model.copy()
+    summary_rows: list[dict] = []
+    for feature_name in log_features:
+        if feature_name not in out_df.columns:
+            continue
+        series = pd.to_numeric(out_df[feature_name], errors="coerce")
+        invalid_mask = ~np.isfinite(series)
+        if invalid_mask.sum() <= 0:
+            continue
+        fill_value = float(fill_values.get(feature_name, 1.0 if feature_name in ZERO_AS_MISSING_LOG_FEATURES else 0.0))
+        out_df.loc[invalid_mask, feature_name] = fill_value
+        summary_rows.append(
+            {
+                "Feature": feature_name,
+                "FilledInvalidCount": int(invalid_mask.sum()),
+                "FillValue": fill_value,
+                "FillReason": "all_rows_removed_after_cleaning_fallback",
+            }
+        )
+    return out_df, pd.DataFrame(summary_rows)
+
+
 def run_first_stage_prediction(
     input_csv: Path,
     well_name: str,
@@ -438,8 +542,29 @@ def run_first_stage_prediction(
         raise ValueError(f"Input CSV is empty: {input_csv}")
 
     missing_features = [feature for feature in features if feature not in df_raw.columns]
-    if missing_features:
-        raise ValueError(f"Input CSV missing required first-stage features: {missing_features}")
+    missing_log_features = [feature for feature in missing_features if feature in log_features]
+    missing_non_log_features = [feature for feature in missing_features if feature not in log_features]
+    if missing_non_log_features:
+        raise ValueError(f"Input CSV missing required first-stage features: {missing_non_log_features}")
+    missing_log_fill_df = pd.DataFrame()
+    if missing_log_features:
+        fill_values = resolve_missing_log_fill_values(
+            features=features,
+            log_features=log_features,
+            scaler_artifact=scaler,
+        )
+        for feature in missing_log_features:
+            df_raw[feature] = float(fill_values.get(feature, 1.0 if feature in ZERO_AS_MISSING_LOG_FEATURES else 0.0))
+        missing_log_fill_df = pd.DataFrame(
+            [
+                {
+                    "Feature": feature,
+                    "FillValue": float(fill_values.get(feature, np.nan)),
+                    "FillReason": "feature_missing_in_input_csv",
+                }
+                for feature in missing_log_features
+            ]
+        )
 
     df_out = df_raw.copy()
     df_model = df_raw[features].copy()
@@ -448,14 +573,39 @@ def run_first_stage_prediction(
     df_model["RAW_ROW_IDX"] = np.arange(len(df_model), dtype=np.int64)
 
     df_model, invalid_summary = clean_invalid_log_values(df_model, log_features)
+    neutral_fill_values = resolve_missing_log_fill_values(
+        features=features,
+        log_features=log_features,
+        scaler_artifact=scaler,
+    )
     before_count = int(len(df_model))
     df_model = df_model[features + ["WellName", "ROW_IN_WELL", "RAW_ROW_IDX"]].dropna().copy()
     after_count = int(len(df_model))
     removed_count = before_count - after_count
+    invalid_fallback_df = pd.DataFrame()
     if df_model.empty:
-        raise ValueError("All rows were removed after first-stage feature cleaning")
+        df_model_raw = df_raw[features].copy()
+        df_model_raw["WellName"] = well_name
+        df_model_raw["ROW_IN_WELL"] = np.arange(len(df_model_raw), dtype=np.int64)
+        df_model_raw["RAW_ROW_IDX"] = np.arange(len(df_model_raw), dtype=np.int64)
+        df_model_raw, invalid_summary = clean_invalid_log_values(df_model_raw, log_features)
+        df_model_raw, invalid_fallback_df = fill_invalid_log_values_with_neutral_values(
+            df_model=df_model_raw,
+            log_features=log_features,
+            fill_values=neutral_fill_values,
+        )
+        df_model = df_model_raw[features + ["WellName", "ROW_IN_WELL", "RAW_ROW_IDX"]].dropna().copy()
+        after_count = int(len(df_model))
+        removed_count = before_count - after_count
+        if df_model.empty:
+            raise ValueError("All rows were removed after first-stage feature cleaning")
 
-    scaled_features = scaler.transform(df_model[features].astype(np.float64))
+    scaled_features = apply_saved_feature_scaler(
+        df_model=df_model,
+        features=features,
+        log_features=log_features,
+        scaler_artifact=scaler,
+    )
     x_seis = reshape_seis(scaled_features[:, :63], seis_mode)
     x_log = scaled_features[:, 63:]
     x_seis_seq, x_log_seq, center_row_idx = build_inference_sequences(df_model, x_seis, x_log, seq_len)
@@ -493,6 +643,14 @@ def run_first_stage_prediction(
     if not invalid_summary.empty:
         invalid_summary.to_csv(invalid_summary_csv, index=False, encoding="utf-8-sig")
 
+    missing_log_fill_csv = output_dir / "stage1_missing_log_fill_summary.csv"
+    if not missing_log_fill_df.empty:
+        missing_log_fill_df.to_csv(missing_log_fill_csv, index=False, encoding="utf-8-sig")
+
+    invalid_fallback_csv = output_dir / "stage1_invalid_log_fallback_summary.csv"
+    if not invalid_fallback_df.empty:
+        invalid_fallback_df.to_csv(invalid_fallback_csv, index=False, encoding="utf-8-sig")
+
     return {
         "model_well": model_well,
         "model_dir": model_dir,
@@ -505,6 +663,9 @@ def run_first_stage_prediction(
         "num_sequences": int(len(center_row_idx)),
         "num_predicted_positive_centers": int(np.sum(pred)),
         "config_path": config_path,
+        "filled_missing_log_features": missing_log_features,
+        "missing_log_fill_csv": missing_log_fill_csv if not missing_log_fill_df.empty else None,
+        "invalid_log_fallback_csv": invalid_fallback_csv if not invalid_fallback_df.empty else None,
     }
 
 

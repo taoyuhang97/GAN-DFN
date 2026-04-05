@@ -174,6 +174,7 @@ def pick_points_by_equal_intensity(
         return np.array([], dtype=np.float64), np.array([], dtype=np.int64)
     if len(depth) == 1:
         return np.array([float(depth[0])]), np.array([0], dtype=np.int64)
+    n_points = int(min(n_points, len(depth)))
 
     cum = integrate_trapezoid(depth, intensity)
     total = float(cum[-1])

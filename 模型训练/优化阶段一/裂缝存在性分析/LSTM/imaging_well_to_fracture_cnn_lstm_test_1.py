@@ -6,7 +6,7 @@ import pandas as pd
 import copy
 import torch
 import torch.nn as nn
-from torch.utils.data import DataLoader, TensorDataset
+from torch.utils.data import DataLoader, TensorDataset, WeightedRandomSampler
 from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import (
     classification_report,
@@ -114,6 +114,7 @@ min_delta = 1e-4
 use_dynamic_threshold = True
 # use_dynamic_threshold = False
 best_thr = 0.5
+configured_fixed_threshold = best_thr
 selection_metric = "iou"
 THRESH_SEARCH_MIN = 0.3
 THRESH_SEARCH_MAX = 0.9
@@ -151,8 +152,16 @@ use_density_regression = False
 # 域偏差考量
 use_domain_adversarial = False
 use_all_other_wells = False
+use_wellwise_log_scaling = False
+use_well_balanced_sampling = False
 only_val_wells = []
 custom_train_wells_map = {}
+min_selection_accuracy_by_well = {}
+min_selection_recall_by_well = {}
+min_selection_pos_ratio_by_well = {}
+min_selection_pos_ratio_scale_by_well = {}
+use_selection_accuracy_floor_by_well = {}
+use_threshold_constraints_by_well = {}
 
 # SEIS_MODE = "3x3x7"
 SEIS_MODE = "3x3"
@@ -193,6 +202,8 @@ MIN_SELECTION_RECALL = get_env_float("EXP_MIN_SELECTION_RECALL", MIN_SELECTION_R
 MIN_SELECTION_POS_RATIO = get_env_float("EXP_MIN_SELECTION_POS_RATIO", MIN_SELECTION_POS_RATIO)
 MIN_SELECTION_POS_RATIO_SCALE = get_env_float("EXP_MIN_SELECTION_POS_RATIO_SCALE", MIN_SELECTION_POS_RATIO_SCALE)
 use_dynamic_threshold = get_env_bool("EXP_USE_DYNAMIC_THRESHOLD", use_dynamic_threshold)
+configured_fixed_threshold = get_env_float("EXP_FIXED_THRESHOLD", configured_fixed_threshold)
+best_thr = configured_fixed_threshold
 use_over_smaple = get_env_bool("EXP_USE_OVERSAMPLE", use_over_smaple)
 manual_pos_weight = get_env_float("EXP_MANUAL_POS_WEIGHT", manual_pos_weight)
 target_ratio = get_env_float("EXP_TARGET_RATIO", target_ratio)
@@ -202,14 +213,26 @@ DICE_LOSS_WEIGHT = get_env_float("EXP_DICE_LOSS_WEIGHT", DICE_LOSS_WEIGHT)
 use_density_regression = get_env_bool("EXP_USE_DENSITY_REGRESSION", use_density_regression)
 use_domain_adversarial = get_env_bool("EXP_USE_DOMAIN_ADVERSARIAL", use_domain_adversarial)
 use_all_other_wells = get_env_bool("EXP_USE_ALL_OTHER_WELLS", use_all_other_wells)
+use_wellwise_log_scaling = get_env_bool("EXP_USE_WELLWISE_LOG_SCALING", use_wellwise_log_scaling)
+use_well_balanced_sampling = get_env_bool("EXP_USE_WELL_BALANCED_SAMPLING", use_well_balanced_sampling)
 only_val_wells = get_env_json_list("EXP_ONLY_VAL_WELLS", only_val_wells)
 custom_train_wells_map = get_env_json_dict("EXP_CUSTOM_TRAIN_WELLS_MAP", custom_train_wells_map)
+min_selection_accuracy_by_well = get_env_json_dict("EXP_MIN_SELECTION_ACCURACY_BY_WELL", min_selection_accuracy_by_well)
+min_selection_recall_by_well = get_env_json_dict("EXP_MIN_SELECTION_RECALL_BY_WELL", min_selection_recall_by_well)
+min_selection_pos_ratio_by_well = get_env_json_dict("EXP_MIN_SELECTION_POS_RATIO_BY_WELL", min_selection_pos_ratio_by_well)
+min_selection_pos_ratio_scale_by_well = get_env_json_dict("EXP_MIN_SELECTION_POS_RATIO_SCALE_BY_WELL", min_selection_pos_ratio_scale_by_well)
+use_selection_accuracy_floor_by_well = get_env_json_dict("EXP_USE_SELECTION_ACCURACY_FLOOR_BY_WELL", use_selection_accuracy_floor_by_well)
+use_threshold_constraints_by_well = get_env_json_dict("EXP_USE_THRESHOLD_CONSTRAINTS_BY_WELL", use_threshold_constraints_by_well)
 DIST_THRESHOLD = get_env_float("EXP_DIST_THRESHOLD", DIST_THRESHOLD)
 MIN_TRAIN_WELLS = get_env_int("EXP_MIN_TRAIN_WELLS", MIN_TRAIN_WELLS)
 MAX_POS_WEIGHT = get_env_float("EXP_MAX_POS_WEIGHT", MAX_POS_WEIGHT)
 save_dir_override = os.getenv("EXP_SAVE_DIR")
+data_dir_override = os.getenv("EXP_DATA_DIR")
+well_files_override = get_env_json_list("EXP_WELL_FILES", [])
 if save_dir_override:
     SAVE_DIR = save_dir_override
+if data_dir_override:
+    DATA_DIR = data_dir_override
 
 os.makedirs(SAVE_DIR, exist_ok=True)
 
@@ -240,21 +263,62 @@ def get_distance_matrix_path(seis_mode):
 
 DIST_MATRIX_PATH = get_distance_matrix_path(SEIS_MODE)
 
-# ===================== 1. 数据读取 =====================
-# csv_files = glob.glob(os.path.join(DATA_DIR, "*.csv"))
-csv_files = [
-    os.path.join(DATA_DIR, "车660-1_sample.csv"),
-    os.path.join(DATA_DIR, "车660-2_sample.csv"),
-    os.path.join(DATA_DIR, "车662_sample.csv"),
-    os.path.join(DATA_DIR, "车663_sample.csv"),
+
+DEFAULT_CSV_FILE_BASENAMES = [
+    "车660-1_sample.csv",
+    "车660-2_sample.csv",
+    "车662_sample.csv",
+    "车663_sample.csv",
 ]
+
+
+def resolve_input_csv_files(data_dir, data_dir_override=None, well_files_override=None):
+    if well_files_override:
+        csv_files = []
+        for item in well_files_override:
+            if os.path.isabs(item):
+                csv_files.append(item)
+            else:
+                csv_files.append(os.path.join(data_dir, item))
+        return csv_files
+
+    if data_dir_override:
+        discovered = sorted(glob.glob(os.path.join(data_dir, "*_sample.csv")))
+        if discovered:
+            return discovered
+
+    return [os.path.join(data_dir, name) for name in DEFAULT_CSV_FILE_BASENAMES]
+
+
+def format_distance_map(distance_df, val_well, train_wells):
+    if distance_df is None or distance_df.empty or val_well not in distance_df.index:
+        return {w: "NA" for w in train_wells}
+
+    distance_map = {}
+    for well_name in train_wells:
+        if well_name not in distance_df.columns:
+            distance_map[well_name] = "NA"
+            continue
+        value = pd.to_numeric(pd.Series([distance_df.loc[val_well, well_name]]), errors="coerce").iloc[0]
+        distance_map[well_name] = "NA" if pd.isna(value) else round(float(value), 4)
+    return distance_map
+
+# ===================== 1. 数据读取 =====================
+csv_files = resolve_input_csv_files(
+    DATA_DIR,
+    data_dir_override=data_dir_override,
+    well_files_override=well_files_override,
+)
 
 df_list = []
 df_raw_list = []
 for f in csv_files:
+    if not os.path.exists(f):
+        raise FileNotFoundError(f"Sample csv not found: {f}")
     df = pd.read_csv(f)
     df["WellName"] = os.path.basename(f).split("_")[0]
-    df["ROW_IN_WELL"] = np.arange(len(df))
+    if "ROW_IN_WELL" not in df.columns:
+        df["ROW_IN_WELL"] = np.arange(len(df))
     df_list.append(df)
     df_raw_list.append(df.copy())
 
@@ -293,6 +357,7 @@ if any(count > 0 for count in removed_counts.values()):
             f"(removed={removed_counts[well_name]})"
         )
 # log 变换密度（推荐）
+df[density_cols] = df[density_cols].apply(pd.to_numeric, errors="coerce").fillna(0.0)
 df[density_cols] = np.log1p(df[density_cols])
 
 # 深度归一化
@@ -322,6 +387,80 @@ def wellwise_standardize(df, features):
     return df_scaled, scalers
 
 
+def apply_mixed_feature_scaling(
+    train_df,
+    val_df,
+    seis_features,
+    log_features,
+    use_wellwise_log_scaling=False,
+):
+    train_df_scaled = train_df.copy()
+    val_df_scaled = val_df.copy()
+
+    if not use_wellwise_log_scaling:
+        global_scaler = StandardScaler()
+        full_features = list(seis_features) + list(log_features)
+        train_df_scaled[full_features] = global_scaler.fit_transform(train_df[full_features])
+        val_df_scaled[full_features] = global_scaler.transform(val_df[full_features])
+        scaler_artifact = {
+            "scaling_mode": "global_all_features",
+            "feature_scaler": global_scaler,
+            "seis_features": list(seis_features),
+            "log_features": list(log_features),
+        }
+        return train_df_scaled, val_df_scaled, scaler_artifact
+
+    seis_scaler = StandardScaler()
+    train_df_scaled[seis_features] = seis_scaler.fit_transform(train_df[seis_features])
+    val_df_scaled[seis_features] = seis_scaler.transform(val_df[seis_features])
+
+    train_log_scaler_summary = {}
+    for well_name in train_df["WellName"].unique():
+        mask = train_df["WellName"] == well_name
+        well_scaler = StandardScaler()
+        train_df_scaled.loc[mask, log_features] = well_scaler.fit_transform(train_df.loc[mask, log_features])
+        train_log_scaler_summary[str(well_name)] = {
+            "mean": well_scaler.mean_.tolist(),
+            "scale": well_scaler.scale_.tolist(),
+        }
+
+    val_log_scaler = StandardScaler()
+    val_df_scaled[log_features] = val_log_scaler.fit_transform(val_df[log_features])
+
+    scaler_artifact = {
+        "scaling_mode": "global_seis_wellwise_log",
+        "seis_scaler": seis_scaler,
+        "seis_features": list(seis_features),
+        "log_features": list(log_features),
+        "train_log_scaler_summary": train_log_scaler_summary,
+        "val_log_scaler_summary": {
+            "well_name": str(val_df["WellName"].iloc[0]) if len(val_df) else "",
+            "mean": val_log_scaler.mean_.tolist(),
+            "scale": val_log_scaler.scale_.tolist(),
+        },
+    }
+    return train_df_scaled, val_df_scaled, scaler_artifact
+
+
+def build_well_balanced_sampler(domain_seq):
+    domain_seq = np.asarray(domain_seq)
+    if len(domain_seq) == 0:
+        return None, {}
+
+    unique_domains, counts = np.unique(domain_seq, return_counts=True)
+    domain_count_map = {int(domain): int(count) for domain, count in zip(unique_domains, counts)}
+    sample_weights = np.array(
+        [1.0 / max(domain_count_map[int(domain_id)], 1) for domain_id in domain_seq],
+        dtype=np.float64,
+    )
+    sampler = WeightedRandomSampler(
+        weights=torch.as_tensor(sample_weights, dtype=torch.double),
+        num_samples=len(sample_weights),
+        replacement=True,
+    )
+    return sampler, domain_count_map
+
+
 # ===================== 自动井聚类 =====================
 def cluster_wells(distance_matrix, well_names, n_clusters=2):
     model = AgglomerativeClustering(
@@ -342,8 +481,36 @@ def cluster_wells(distance_matrix, well_names, n_clusters=2):
 
 
 # ===================== 基于距离矩阵自动选择训练井 =====================
-def select_train_wells(val_well, distance_df, threshold=0.55, min_wells=2):
-    dists = distance_df.loc[val_well].drop(val_well)
+def select_train_wells(val_well, distance_df, threshold=0.55, min_wells=2, candidate_wells=None):
+    candidate_wells = list(candidate_wells or [])
+    candidate_wells = [w for w in candidate_wells if w != val_well]
+    if not candidate_wells:
+        print(f"\n验证井: {val_well}")
+        print("训练井选择模式: no_candidate_wells")
+        print("训练井: []")
+        return []
+
+    if distance_df is None or distance_df.empty or val_well not in distance_df.index:
+        train_wells = candidate_wells[:min(min_wells, len(candidate_wells))]
+        print(f"\n验证井: {val_well}")
+        print("训练井选择模式: fallback_no_distance_row")
+        print("训练井:", train_wells)
+        print("对应距离:", {w: "NA" for w in train_wells})
+        return train_wells
+
+    available_wells = [
+        w for w in candidate_wells
+        if w in distance_df.columns and pd.notna(pd.to_numeric(distance_df.loc[val_well, w], errors="coerce"))
+    ]
+    if not available_wells:
+        train_wells = candidate_wells[:min(min_wells, len(candidate_wells))]
+        print(f"\n验证井: {val_well}")
+        print("训练井选择模式: fallback_no_candidate_distance")
+        print("训练井:", train_wells)
+        print("对应距离:", {w: "NA" for w in train_wells})
+        return train_wells
+
+    dists = pd.to_numeric(distance_df.loc[val_well, available_wells], errors="coerce").dropna()
 
     close_wells = dists[dists < threshold].index.tolist()
 
@@ -832,15 +999,75 @@ def threshold_candidate_is_valid(y_true, pred):
     return threshold_candidate_meets_accuracy_floor(stats) and threshold_candidate_meets_soft_constraints(stats)
 
 
-def get_threshold_candidate_stats(y_true, pred):
+def parse_well_override_float(override_map, well_name, default_value):
+    if not isinstance(override_map, dict):
+        return float(default_value)
+    raw = override_map.get(well_name)
+    if raw is None:
+        return float(default_value)
+    try:
+        return float(raw)
+    except Exception:
+        return float(default_value)
+
+
+def parse_well_override_bool(override_map, well_name, default_value):
+    if not isinstance(override_map, dict):
+        return bool(default_value)
+    raw = override_map.get(well_name)
+    if raw is None:
+        return bool(default_value)
+    if isinstance(raw, bool):
+        return raw
+    return str(raw).strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def build_effective_threshold_policy(val_well=None):
+    return {
+        "use_selection_accuracy_floor": parse_well_override_bool(
+            use_selection_accuracy_floor_by_well,
+            val_well,
+            use_selection_accuracy_floor,
+        ),
+        "min_selection_accuracy": parse_well_override_float(
+            min_selection_accuracy_by_well,
+            val_well,
+            MIN_SELECTION_ACCURACY,
+        ),
+        "use_threshold_constraints": parse_well_override_bool(
+            use_threshold_constraints_by_well,
+            val_well,
+            use_threshold_constraints,
+        ),
+        "min_selection_recall": parse_well_override_float(
+            min_selection_recall_by_well,
+            val_well,
+            MIN_SELECTION_RECALL,
+        ),
+        "min_selection_pos_ratio": parse_well_override_float(
+            min_selection_pos_ratio_by_well,
+            val_well,
+            MIN_SELECTION_POS_RATIO,
+        ),
+        "min_selection_pos_ratio_scale": parse_well_override_float(
+            min_selection_pos_ratio_scale_by_well,
+            val_well,
+            MIN_SELECTION_POS_RATIO_SCALE,
+        ),
+    }
+
+
+def get_threshold_candidate_stats(y_true, pred, threshold_policy=None):
+    if threshold_policy is None:
+        threshold_policy = build_effective_threshold_policy()
     true_pos_ratio = float(np.mean(y_true))
     pred_pos_ratio = float(np.mean(pred))
     recall = recall_score(y_true, pred, zero_division=0)
     accuracy = accuracy_score(y_true, pred)
 
     min_pos_ratio_required = max(
-        MIN_SELECTION_POS_RATIO,
-        true_pos_ratio * MIN_SELECTION_POS_RATIO_SCALE,
+        threshold_policy["min_selection_pos_ratio"],
+        true_pos_ratio * threshold_policy["min_selection_pos_ratio_scale"],
     )
 
     return {
@@ -849,11 +1076,15 @@ def get_threshold_candidate_stats(y_true, pred):
         "pred_pos_ratio": pred_pos_ratio,
         "true_pos_ratio": true_pos_ratio,
         "min_pos_ratio_required": min_pos_ratio_required,
+        "threshold_policy": threshold_policy,
     }
 
 
 def threshold_candidate_meets_accuracy_floor(stats):
-    return (not use_selection_accuracy_floor) or (stats["accuracy"] >= MIN_SELECTION_ACCURACY)
+    threshold_policy = stats.get("threshold_policy", build_effective_threshold_policy())
+    return (not threshold_policy["use_selection_accuracy_floor"]) or (
+        stats["accuracy"] >= threshold_policy["min_selection_accuracy"]
+    )
 
 
 def threshold_candidate_meets_pos_ratio(stats):
@@ -861,8 +1092,9 @@ def threshold_candidate_meets_pos_ratio(stats):
 
 
 def threshold_candidate_meets_soft_constraints(stats):
+    threshold_policy = stats.get("threshold_policy", build_effective_threshold_policy())
     return (
-        stats["recall"] >= MIN_SELECTION_RECALL and
+        stats["recall"] >= threshold_policy["min_selection_recall"] and
         threshold_candidate_meets_pos_ratio(stats)
     )
 
@@ -920,7 +1152,7 @@ def evaluate_selection_metric(prob, y_true, metric, val_df=None, threshold=0.5):
     return evaluate_selection_metric_from_pred(y_true, pred, metric, val_df=val_df)
 
 
-def search_best_threshold_by_metric(prob, y_true, metric, val_df=None):
+def search_best_threshold_by_metric(prob, y_true, metric, val_df=None, val_well=None):
     best_thr = None
     best_rank = None
     fallback_acc_pos_thr = None
@@ -933,6 +1165,7 @@ def search_best_threshold_by_metric(prob, y_true, metric, val_df=None):
     fallback_pos_rank = None
     fallback_any_thr = 0.5
     fallback_any_rank = None
+    threshold_policy = build_effective_threshold_policy(val_well)
 
     for thr in np.arange(
         THRESH_SEARCH_MIN,
@@ -941,7 +1174,7 @@ def search_best_threshold_by_metric(prob, y_true, metric, val_df=None):
     ):
         pred = build_eval_pred(prob, thr, metric)
         score = evaluate_selection_metric_from_pred(y_true, pred, metric, val_df=val_df)
-        stats = get_threshold_candidate_stats(y_true, pred)
+        stats = get_threshold_candidate_stats(y_true, pred, threshold_policy=threshold_policy)
 
         meets_acc = threshold_candidate_meets_accuracy_floor(stats)
         meets_pos = threshold_candidate_meets_pos_ratio(stats)
@@ -974,7 +1207,7 @@ def search_best_threshold_by_metric(prob, y_true, metric, val_df=None):
             fallback_acc_pos_rank = acc_pos_rank
             fallback_acc_pos_thr = thr
 
-        if use_threshold_constraints and not (meets_acc and meets_soft):
+        if threshold_policy["use_threshold_constraints"] and not (meets_acc and meets_soft):
             continue
 
         if best_rank is None or primary_rank > best_rank:
@@ -1038,9 +1271,24 @@ def cross_well_loss(features, well_ids, well_sim_matrix, well_names):
 
 # ===================== 4. Leave-One-Well-Out 循环 =====================
 dist_df = pd.read_csv(DIST_MATRIX_PATH, index_col=0)
-well_sim = 1 / (dist_df + 1e-6)
-well_sim = well_sim / well_sim.max().max()
-well_names = dist_df.index.tolist()
+dist_df.index = [str(idx).strip() for idx in dist_df.index]
+dist_df.columns = [str(col).strip() for col in dist_df.columns]
+dist_df = dist_df.apply(pd.to_numeric, errors="coerce")
+
+well_names = df["WellName"].drop_duplicates().tolist()
+available_distance_wells = [w for w in well_names if w in dist_df.index and w in dist_df.columns]
+well_sim = pd.DataFrame(
+    np.eye(len(well_names), dtype=np.float32),
+    index=well_names,
+    columns=well_names,
+)
+if available_distance_wells:
+    dist_subset = dist_df.loc[available_distance_wells, available_distance_wells]
+    sim_subset = (1.0 / (dist_subset + 1e-6)).replace([np.inf, -np.inf], np.nan).fillna(0.0)
+    max_sim = float(sim_subset.max().max()) if not sim_subset.empty else 0.0
+    if max_sim > 0:
+        sim_subset = sim_subset / max_sim
+    well_sim.loc[available_distance_wells, available_distance_wells] = sim_subset.to_numpy(dtype=np.float32)
 domain_map = {well: idx for idx, well in enumerate(well_names)}
 
 all_results = []
@@ -1061,32 +1309,39 @@ for val_well in loop_wells:
         print(f"\n验证井: {val_well}")
         print("训练井选择模式: custom_train_wells")
         print("训练井:", train_wells)
-        print("对应距离:", {w: round(float(dist_df.loc[val_well, w]), 4) for w in train_wells})
+        print("对应距离:", format_distance_map(dist_df, val_well, train_wells))
     elif use_all_other_wells:
         train_wells = [w for w in well_names if w != val_well]
         print(f"\n验证井: {val_well}")
         print("训练井选择模式: all_other_wells")
         print("训练井:", train_wells)
-        print("对应距离:", {w: round(float(dist_df.loc[val_well, w]), 4) for w in train_wells})
+        print("对应距离:", format_distance_map(dist_df, val_well, train_wells))
     else:
         train_wells = select_train_wells(
             val_well,
             dist_df,
+            candidate_wells=[w for w in well_names if w != val_well],
             threshold=DIST_THRESHOLD,
             min_wells=MIN_TRAIN_WELLS
         )
     print("测试井:", [val_well])
     print("训练井:", train_wells)
 
+    if not train_wells:
+        print(f"验证井 {val_well} 无可用训练井，跳过。")
+        continue
+
     train_df = df[df["WellName"].isin(train_wells)]
     val_df = df[df["WellName"] == val_well]
 
     # ---------- 标准化 ----------
-    global_scaler = StandardScaler()
-    train_df_scaled = train_df.copy()
-    val_df_scaled = val_df.copy()
-    train_df_scaled[features] = global_scaler.fit_transform(train_df[features])
-    val_df_scaled[features] = global_scaler.transform(val_df[features])
+    train_df_scaled, val_df_scaled, scaler_artifact = apply_mixed_feature_scaling(
+        train_df=train_df,
+        val_df=val_df,
+        seis_features=seis_features,
+        log_features=imaging_well_features,
+        use_wellwise_log_scaling=use_wellwise_log_scaling,
+    )
     X_train_all = train_df_scaled[features].values
     X_val_all = val_df_scaled[features].values
     X_train_seis = reshape_seis(X_train_all[:, :63], SEIS_MODE)
@@ -1160,6 +1415,17 @@ for val_well in loop_wells:
     print("y_den:", y_train_den_seq.shape)
     print("domain:", train_domain_seq.shape)
 
+    train_sampler = None
+    domain_count_map = {}
+    if use_well_balanced_sampling:
+        train_sampler, domain_count_map = build_well_balanced_sampler(train_domain_seq)
+        readable_domain_count_map = {
+            well_names[domain_id]: count
+            for domain_id, count in sorted(domain_count_map.items(), key=lambda item: item[0])
+            if domain_id < len(well_names)
+        }
+        print("启用井均衡采样，序列数分布:", readable_domain_count_map)
+
     train_loader = DataLoader(
         TensorDataset(
             X_train_seis_t,
@@ -1169,7 +1435,8 @@ for val_well in loop_wells:
             train_domain_t
         ),
         batch_size=BATCH_SIZE,
-        shuffle=True
+        shuffle=(train_sampler is None),
+        sampler=train_sampler
     )
 
     # ---------- 模型 ----------
@@ -1256,7 +1523,8 @@ for val_well in loop_wells:
                     val_prob,
                     y_val_seq,
                     selection_metric,
-                    val_df=val_df
+                    val_df=val_df,
+                    val_well=val_well,
                 )
             else:
                 epoch_thr = best_thr
@@ -1352,7 +1620,8 @@ for val_well in loop_wells:
                 prob,
                 y_val_seq,
                 selection_metric,
-                val_df=val_df
+                val_df=val_df,
+                val_well=val_well,
             )
         pred = build_eval_pred(prob, best_thr, selection_metric)
         den_pred = den_out.cpu().numpy() if den_out is not None else None
@@ -1434,7 +1703,7 @@ for val_well in loop_wells:
 
     # ---------- 保存 ----------
     torch.save(model.state_dict(), os.path.join(well_save_dir, "model.pth"))
-    joblib.dump(global_scaler,
+    joblib.dump(scaler_artifact,
                 os.path.join(well_save_dir, "scaler.pkl"))
 
     config = {
@@ -1444,6 +1713,10 @@ for val_well in loop_wells:
         "hidden_dim": model.hidden_dim,
         "best_thrESHOLD": float(best_thr),
         "selection_metric": selection_metric,
+        "configured_fixed_threshold": configured_fixed_threshold,
+        "THRESH_SEARCH_MIN": THRESH_SEARCH_MIN,
+        "THRESH_SEARCH_MAX": THRESH_SEARCH_MAX,
+        "THRESH_SEARCH_STEP": THRESH_SEARCH_STEP,
         "BATCH_SIZE": BATCH_SIZE,
         "EPOCHS": EPOCHS,
         "LR": LR,
@@ -1460,6 +1733,12 @@ for val_well in loop_wells:
         "MIN_SELECTION_RECALL": MIN_SELECTION_RECALL,
         "MIN_SELECTION_POS_RATIO": MIN_SELECTION_POS_RATIO,
         "MIN_SELECTION_POS_RATIO_SCALE": MIN_SELECTION_POS_RATIO_SCALE,
+        "use_selection_accuracy_floor_by_well": use_selection_accuracy_floor_by_well,
+        "min_selection_accuracy_by_well": min_selection_accuracy_by_well,
+        "use_threshold_constraints_by_well": use_threshold_constraints_by_well,
+        "min_selection_recall_by_well": min_selection_recall_by_well,
+        "min_selection_pos_ratio_by_well": min_selection_pos_ratio_by_well,
+        "min_selection_pos_ratio_scale_by_well": min_selection_pos_ratio_scale_by_well,
         "only_val_wells": only_val_wells,
         "custom_train_wells_map": custom_train_wells_map,
         "use_over_smaple": use_over_smaple,
@@ -1469,6 +1748,8 @@ for val_well in loop_wells:
         "use_density_regression": use_density_regression,
         "use_domain_adversarial": use_domain_adversarial,
         "use_all_other_wells": use_all_other_wells,
+        "use_wellwise_log_scaling": use_wellwise_log_scaling,
+        "use_well_balanced_sampling": use_well_balanced_sampling,
         "train_wells": train_df["WellName"].unique().tolist(),
         "val_well": val_well,
     }
