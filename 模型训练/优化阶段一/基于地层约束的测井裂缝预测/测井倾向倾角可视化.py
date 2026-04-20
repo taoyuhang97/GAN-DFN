@@ -6,12 +6,25 @@ plt.rcParams['font.sans-serif'] = ['SimHei']  # 设置中文字体
 plt.rcParams['axes.unicode_minus'] = False    # 正常显示负号
 
 # 读取CSV文件
-file_path = r'E:\项目\石油项目\断缝储\原始数据\wx数据\砂砾岩\研究内容一\裂缝角度预测\测井\车15_predicted_angles.csv'  # 请替换为实际文件路径
+well_name = "车页1导眼"
+# 优化前预测
+# version = "预测结果"
+# file_path = fr'E:\项目\石油项目\断缝储\原始数据\wx数据\砂砾岩\研究内容一\裂缝角度预测\井斜\{well_name}_predicted_angles.csv'
+# data = pd.read_csv(file_path)
+# azimuth_true = data['Dip_Azimuth']
+# radius_true = data['Dip_Angle']
+# 原始裂缝
+version = "原始裂缝"
+file_path = fr'E:\项目\石油项目\断缝储\原始数据\wx数据\砂砾岩\优化阶段一\研究内容一\成像测井\裂缝提取\{well_name}_fractures.csv'
 data = pd.read_csv(file_path)
-
-# 提取倾向和倾角列（假设列名为'倾向'和'倾角'）
-azimuth_true = data['Dip_Azimuth']
-radius_true = data['Dip_Angle']
+azimuth_true = data['Azimuth(0~360)']
+radius_true = data['Angle(0~90)']
+# 第一轮优化
+# version = "第一轮优化"
+# file_path = fr'E:\项目\石油项目\断缝储\原始数据\wx数据\砂砾岩\优化阶段一\研究内容一\两阶段裂缝预测流程结果\现有常规测井裂缝预测\{well_name}\final_fracture_points.csv'
+# data = pd.read_csv(file_path)
+# azimuth_true = data['PointAzimuth']
+# radius_true = data['PointDip']
 
 # 如果存在预测值列，则提取预测值
 # azimuth_pred = data['预测倾向']
@@ -41,5 +54,5 @@ ax.set_rlabel_position(135)  # 半径标签位置
 plt.legend(loc='upper right', bbox_to_anchor=(1.1, 1.1))
 # plt.title('裂缝倾向-倾角分布图', fontsize=14)
 plt.tight_layout()
-plt.savefig('裂缝倾向-倾角分布图.png', dpi=300)
+plt.savefig(f'{version}-{well_name}裂缝倾向-倾角分布图.png', dpi=300)
 plt.show()

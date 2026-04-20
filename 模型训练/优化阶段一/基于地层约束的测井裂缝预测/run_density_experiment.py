@@ -11,16 +11,10 @@ from pathlib import Path
 from docx import Document
 from docx.opc.exceptions import PackageNotFoundError
 
+from workflow_paths import FRACTURE_DENSITY_SCRIPT_PATH, WORKFLOW_ROOT
 
-ROOT = Path(__file__).resolve().parent
-SCRIPT_PATH = (
-    ROOT
-    / "模型训练"
-    / "优化阶段一"
-    / "裂缝位置分析"
-    / "基于密度的裂缝点位分析"
-    / "fracture_density_predict.py"
-)
+ROOT = WORKFLOW_ROOT
+SCRIPT_PATH = FRACTURE_DENSITY_SCRIPT_PATH
 BASE_SAVE_DIR = Path(
     r"E:\项目\石油项目\断缝储\原始数据\wx数据\砂砾岩\优化阶段一\研究内容一\裂缝位置预测\基于密度的裂缝点位分析\裂缝点位精细化\density_experiments"
 )

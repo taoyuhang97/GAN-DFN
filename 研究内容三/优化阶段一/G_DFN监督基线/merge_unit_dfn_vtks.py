@@ -168,6 +168,22 @@ def write_vtk_scalar_block(lines: list[str], name: str, values: np.ndarray, scal
     lines.extend(formatter(value) for value in values.tolist())
 
 
+def compute_polygon_areas(points: np.ndarray, polygons: list[list[int]]) -> np.ndarray:
+    areas = np.zeros(len(polygons), dtype=float)
+    for polygon_idx, polygon in enumerate(polygons):
+        if len(polygon) < 3:
+            continue
+        polygon_points = np.asarray([points[int(point_idx)] for point_idx in polygon], dtype=float)
+        origin = polygon_points[0]
+        area = 0.0
+        for vertex_idx in range(1, len(polygon_points) - 1):
+            vec1 = polygon_points[vertex_idx] - origin
+            vec2 = polygon_points[vertex_idx + 1] - origin
+            area += 0.5 * float(np.linalg.norm(np.cross(vec1, vec2)))
+        areas[polygon_idx] = area
+    return areas
+
+
 def write_legacy_vtk_polygons(
     path: Path,
     title: str,
@@ -177,6 +193,12 @@ def write_legacy_vtk_polygons(
     scalar_types: dict[str, str],
 ) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
+    local_cell_data = {name: np.asarray(values) for name, values in cell_data.items()}
+    local_scalar_types = dict(scalar_types)
+    if polygons:
+        local_cell_data["PatchArea"] = compute_polygon_areas(np.asarray(points, dtype=float), polygons)
+        local_scalar_types["PatchArea"] = "float"
+
     total_polygon_size = sum(len(polygon) + 1 for polygon in polygons)
     lines = [
         "# vtk DataFile Version 3.0",
@@ -188,10 +210,10 @@ def write_legacy_vtk_polygons(
     lines.extend(f"{float(point[0]):.6f} {float(point[1]):.6f} {float(point[2]):.6f}" for point in points)
     lines.append(f"POLYGONS {len(polygons)} {total_polygon_size}")
     lines.extend(f"{len(polygon)} {' '.join(str(int(idx)) for idx in polygon)}" for polygon in polygons)
-    if cell_data:
+    if local_cell_data:
         lines.append(f"CELL_DATA {len(polygons)}")
-        for name, values in cell_data.items():
-            write_vtk_scalar_block(lines, name, values, scalar_types.get(name, "float"))
+        for name, values in local_cell_data.items():
+            write_vtk_scalar_block(lines, name, values, local_scalar_types.get(name, "float"))
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
