@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+from dataclasses import asdict
 import json
 from datetime import datetime
 from pathlib import Path
@@ -27,7 +28,56 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--unit-id", type=str, default="")
     parser.add_argument("--limit", type=int, default=0)
     parser.add_argument("--overwrite", action="store_true")
+    parser.add_argument("--point-base-length", type=float, default=18.0)
+    parser.add_argument("--point-base-height", type=float, default=5.0)
+    parser.add_argument("--segment-base-length", type=float, default=26.0)
+    parser.add_argument("--segment-base-height", type=float, default=7.0)
+    parser.add_argument("--density-gain", type=float, default=0.35)
+    parser.add_argument("--segment-length-gain", type=float, default=1.1)
+    parser.add_argument("--virtual-point-size-scale", type=float, default=0.78)
+    parser.add_argument("--virtual-segment-size-scale", type=float, default=0.88)
+    parser.add_argument("--gradient-fill-size-scale", type=float, default=0.72)
+    parser.add_argument("--gradient-fill-threshold", type=float, default=0.65)
+    parser.add_argument("--gradient-threshold-mode", type=str, default="hybrid", choices=["global", "layer_quantile", "hybrid"])
+    parser.add_argument("--gradient-layer-quantile", type=float, default=0.985)
+    parser.add_argument("--gradient-layer-threshold-floor", type=float, default=0.60)
+    parser.add_argument("--disable-multiscale-gradient", action="store_true")
+    parser.add_argument("--gradient-multiscale-sigmas", type=str, default="0,1,2")
+    parser.add_argument("--gradient-multiscale-time-scale", type=float, default=1.5)
+    parser.add_argument("--gradient-multiscale-combine", type=str, default="max", choices=["max", "mean"])
+    parser.add_argument("--gradient-fill-radius-m", type=float, default=180.0)
+    parser.add_argument("--gradient-fill-vertical-ms", type=float, default=120.0)
+    parser.add_argument("--gradient-fill-time-padding-ms", type=float, default=20.0)
+    parser.add_argument("--gradient-fill-dbscan-eps-xy", type=float, default=35.0)
+    parser.add_argument("--gradient-fill-dbscan-eps-time", type=float, default=14.0)
+    parser.add_argument("--gradient-fill-min-samples", type=int, default=2)
+    parser.add_argument("--gradient-fill-max-clusters-per-seed", type=int, default=3)
+    parser.add_argument("--gradient-fill-max-candidate-voxels-per-seed", type=int, default=450)
+    parser.add_argument("--gradient-fill-density-scale", type=float, default=0.82)
+    parser.add_argument("--gradient-fill-length-scale", type=float, default=0.90)
+    parser.add_argument("--virtual-only-gradient-threshold-bonus", type=float, default=0.0)
+    parser.add_argument("--virtual-only-gradient-radius-scale", type=float, default=1.0)
+    parser.add_argument("--virtual-only-gradient-vertical-scale", type=float, default=1.0)
+    parser.add_argument("--virtual-only-gradient-max-clusters-per-seed", type=int, default=2)
+    parser.add_argument("--disable-seedless-layer-fill", action="store_true")
+    parser.add_argument("--seedless-layer-max-clusters-per-layer", type=int, default=4)
+    parser.add_argument("--seedless-layer-min-samples", type=int, default=2)
+    parser.add_argument("--seedless-layer-min-voxels", type=int, default=12)
+    parser.add_argument("--seedless-layer-max-candidate-voxels", type=int, default=900)
+    parser.add_argument("--seed-proximity-exclusion-xy-m", type=float, default=10.0)
+    parser.add_argument("--seed-proximity-exclusion-time-ms", type=float, default=4.0)
+    parser.add_argument("--dedup-xy-m", type=float, default=12.5)
+    parser.add_argument("--dedup-time-ms", type=float, default=4.0)
+    parser.add_argument("--dedup-azimuth-deg", type=float, default=10.0)
+    parser.add_argument("--dedup-dip-deg", type=float, default=5.0)
+    parser.add_argument("--disable-target-fill-ratio", action="store_true")
+    parser.add_argument("--target-fill-to-input-ratio", type=float, default=1.5)
+    parser.add_argument("--disable-target-fill-layer-weighted", action="store_true")
+    parser.add_argument("--target-fill-max-candidate-voxels-per-layer", type=int, default=4000)
+    parser.add_argument("--disable-gradient-fill", action="store_true")
     parser.add_argument("--disable-vtk-export", action="store_true")
+    parser.add_argument("--vtk-display-z-scale", type=float, default=5.0)
+    parser.add_argument("--vtk-no-invert-time", action="store_true")
     return parser.parse_args()
 
 
@@ -42,6 +92,81 @@ def select_units(catalog_df: pd.DataFrame, args: argparse.Namespace) -> pd.DataF
     if args.limit > 0:
         work = work.head(int(args.limit)).copy()
     return work.reset_index(drop=True)
+
+
+def build_patch_config(args: argparse.Namespace) -> preview.PatchConfig:
+    return preview.PatchConfig(
+        point_base_length=args.point_base_length,
+        point_base_height=args.point_base_height,
+        segment_base_length=args.segment_base_length,
+        segment_base_height=args.segment_base_height,
+        density_gain=args.density_gain,
+        segment_length_gain=args.segment_length_gain,
+        virtual_point_scale=args.virtual_point_size_scale,
+        virtual_segment_scale=args.virtual_segment_size_scale,
+        gradient_fill_scale=args.gradient_fill_size_scale,
+    )
+
+
+def build_gradient_config(args: argparse.Namespace) -> preview.GradientFillConfig:
+    return preview.GradientFillConfig(
+        trace_header_csv=args.trace_header_csv.resolve(),
+        segy_file=args.segy_file.resolve(),
+        time_padding_ms=args.gradient_fill_time_padding_ms,
+        gradient_threshold=args.gradient_fill_threshold,
+        layer_threshold_mode=args.gradient_threshold_mode,
+        layer_gradient_quantile=args.gradient_layer_quantile,
+        layer_threshold_floor=args.gradient_layer_threshold_floor,
+        enable_multiscale_gradient=not args.disable_multiscale_gradient,
+        multiscale_sigma_levels=preview.parse_float_tuple(args.gradient_multiscale_sigmas, (0.0, 1.0, 2.0)),
+        multiscale_time_sigma_scale=args.gradient_multiscale_time_scale,
+        multiscale_combine_mode=args.gradient_multiscale_combine,
+        expansion_radius_m=args.gradient_fill_radius_m,
+        vertical_radius_ms=args.gradient_fill_vertical_ms,
+        dbscan_eps_xy_m=args.gradient_fill_dbscan_eps_xy,
+        dbscan_eps_time_ms=args.gradient_fill_dbscan_eps_time,
+        min_cluster_samples=args.gradient_fill_min_samples,
+        max_clusters_per_seed=args.gradient_fill_max_clusters_per_seed,
+        max_candidate_voxels_per_seed=args.gradient_fill_max_candidate_voxels_per_seed,
+        fill_density_scale=args.gradient_fill_density_scale,
+        fill_length_scale=args.gradient_fill_length_scale,
+        virtual_only_threshold_bonus=args.virtual_only_gradient_threshold_bonus,
+        virtual_only_radius_scale=args.virtual_only_gradient_radius_scale,
+        virtual_only_vertical_scale=args.virtual_only_gradient_vertical_scale,
+        virtual_only_max_clusters_per_seed=args.virtual_only_gradient_max_clusters_per_seed,
+        enable_seedless_layer_fill=not args.disable_seedless_layer_fill,
+        seedless_layer_max_clusters_per_layer=args.seedless_layer_max_clusters_per_layer,
+        seedless_layer_min_cluster_samples=args.seedless_layer_min_samples,
+        seedless_layer_min_voxels=args.seedless_layer_min_voxels,
+        seedless_layer_max_candidate_voxels=args.seedless_layer_max_candidate_voxels,
+        seed_proximity_exclusion_xy_m=args.seed_proximity_exclusion_xy_m,
+        seed_proximity_exclusion_time_ms=args.seed_proximity_exclusion_time_ms,
+        dedup_xy_m=args.dedup_xy_m,
+        dedup_time_ms=args.dedup_time_ms,
+        dedup_azimuth_deg=args.dedup_azimuth_deg,
+        dedup_dip_deg=args.dedup_dip_deg,
+        enable_target_fill_ratio=not args.disable_target_fill_ratio,
+        target_fill_to_input_ratio=args.target_fill_to_input_ratio,
+        target_fill_layer_weighted=not args.disable_target_fill_layer_weighted,
+        target_fill_max_candidate_voxels_per_layer=args.target_fill_max_candidate_voxels_per_layer,
+    )
+
+
+def build_vtk_config(args: argparse.Namespace) -> preview.VtkExportConfig:
+    return preview.VtkExportConfig(
+        display_z_scale=args.vtk_display_z_scale,
+        invert_time=not args.vtk_no_invert_time,
+    )
+
+
+def to_json_ready(value: object) -> object:
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, dict):
+        return {str(key): to_json_ready(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [to_json_ready(item) for item in value]
+    return value
 
 
 def build_gradient_fill(
@@ -102,6 +227,7 @@ def build_gradient_fill(
     gradient_summary["GradientFillLayerCounts"] = (
         gradient_fill_df.groupby("GeoIntervalKey")["SeedID"].count().to_dict() if not gradient_fill_df.empty else {}
     )
+    gradient_summary["LayerFillPlan"] = preview.build_layer_fill_plan(layers_df, seeds_df, gradient_fill_df, gradient_config).to_dict(orient="records")
     return gradient_fill_df, merged_seeds_df, gradient_summary
 
 
@@ -111,7 +237,7 @@ def process_unit(
     output_root: Path,
     trace_header_df: pd.DataFrame,
     patch_config: preview.PatchConfig,
-    gradient_config: preview.GradientFillConfig,
+    gradient_config: preview.GradientFillConfig | None,
     vtk_config: preview.VtkExportConfig,
     block_size_traces: int,
     block_stride_traces: int,
@@ -119,6 +245,7 @@ def process_unit(
 ) -> dict[str, object]:
     unit_id = str(unit_row["UnitID"])
     layers_df, seeds_df, meta = preview.load_unit_package(package_run_dir, unit_id)
+    seeds_df = preview.assign_seed_layers_by_time(seeds_df, layers_df)
     unit_row = preview.derive_unit_bounds_from_block(
         unit_row,
         trace_header_df,
@@ -126,13 +253,17 @@ def process_unit(
         block_stride_traces=block_stride_traces,
     )
 
-    gradient_fill_df, merged_seeds_df, gradient_summary = build_gradient_fill(
-        unit_row=unit_row,
-        layers_df=layers_df,
-        seeds_df=seeds_df,
-        trace_header_df=trace_header_df,
-        gradient_config=gradient_config,
-    )
+    gradient_summary: dict[str, object] = {"Enabled": gradient_config is not None}
+    gradient_fill_df = pd.DataFrame(columns=list(seeds_df.columns) + ["GradientValue", "ClusterPointCount", "ParentSeedID", "ParentSourceKind"])
+    merged_seeds_df = seeds_df.copy()
+    if gradient_config is not None:
+        gradient_fill_df, merged_seeds_df, gradient_summary = build_gradient_fill(
+            unit_row=unit_row,
+            layers_df=layers_df,
+            seeds_df=seeds_df,
+            trace_header_df=trace_header_df,
+            gradient_config=gradient_config,
+        )
 
     patch_df = preview.build_unit_dfn_patches(unit_row, layers_df, merged_seeds_df, patch_config)
     patch_df = preview.with_sequential_index(patch_df, "PatchIndex")
@@ -176,11 +307,18 @@ def process_unit(
 
     return {
         "UnitID": unit_id,
+        "DataMode": str(unit_row.get("DataMode", "")),
+        "LayerCount": int(len(layers_df)),
+        "RealSeedCount": preview.safe_int(unit_row.get("RealSeedCount")),
+        "VirtualSeedCount": preview.safe_int(unit_row.get("VirtualSeedCount")),
         "InputSeedCount": int(len(seeds_df)),
         "GradientFillSeedCount": int(len(gradient_fill_df)),
         "GradientFillToInputRatio": float(gradient_summary.get("GradientFillToInputRatio", 0.0)),
         "MergedSeedCount": int(len(merged_seeds_df)),
         "PatchCount": int(len(patch_df)),
+        "GradientFillTargetBoostCount": preview.safe_int(gradient_summary.get("GradientFillTargetBoostCount")),
+        "GradientFillDirectCount": preview.safe_int(gradient_summary.get("GradientFillDirectCount")),
+        "LayerFillPlan": gradient_summary.get("LayerFillPlan", []),
         "Meta": meta,
     }
 
@@ -196,16 +334,17 @@ def main() -> int:
     if target_units_df.empty:
         raise ValueError("No units matched the current batch filters.")
 
-    patch_config = preview.PatchConfig()
-    gradient_config = preview.GradientFillConfig(
-        trace_header_csv=args.trace_header_csv.resolve(),
-        segy_file=args.segy_file.resolve(),
-    )
-    vtk_config = preview.VtkExportConfig()
-    trace_header_df = preview.load_trace_header(gradient_config.trace_header_csv)
+    patch_config = build_patch_config(args)
+    gradient_config = None if args.disable_gradient_fill else build_gradient_config(args)
+    vtk_config = build_vtk_config(args)
+    trace_header_path = args.trace_header_csv.resolve()
+    trace_header_df = preview.load_trace_header(trace_header_path)
+    preview.write_csv_utf8(target_units_df, output_root / "selected_unit_catalog.csv")
 
     completed_rows: list[dict[str, object]] = []
     failed_rows: list[dict[str, object]] = []
+    skipped_rows: list[dict[str, object]] = []
+    layer_plan_rows: list[dict[str, object]] = []
     total = len(target_units_df)
     start_timestamp = datetime.now()
     print(f"[batch] start units={total} output_root={output_root}")
@@ -216,6 +355,7 @@ def main() -> int:
         summary_path = unit_output_dir / "unit_dfn_summary.json"
         if summary_path.exists() and not args.overwrite:
             print(f"[{index}/{total}] skip {unit_id} existing")
+            skipped_rows.append({"UnitID": unit_id, "Reason": "existing_summary", "SummaryPath": str(summary_path)})
             continue
         try:
             result = process_unit(
@@ -231,6 +371,21 @@ def main() -> int:
                 export_vtk=not args.disable_vtk_export,
             )
             completed_rows.append(result)
+            for layer_row in result.get("LayerFillPlan", []) or []:
+                layer_plan_rows.append(
+                    {
+                        "UnitID": unit_id,
+                        "DataMode": result.get("DataMode", ""),
+                        "GeoIntervalKey": layer_row.get("GeoIntervalKey", ""),
+                        "StrataName": layer_row.get("StrataName", ""),
+                        "TopSurfaceCode": layer_row.get("TopSurfaceCode", ""),
+                        "BaseSurfaceCode": layer_row.get("BaseSurfaceCode", ""),
+                        "InputSeedCount": layer_row.get("InputSeedCount", 0),
+                        "CurrentFillCount": layer_row.get("CurrentFillCount", 0),
+                        "TargetFillCount": layer_row.get("TargetFillCount", 0),
+                        "RemainingFillDeficit": layer_row.get("RemainingFillDeficit", 0),
+                    }
+                )
             print(
                 f"[{index}/{total}] done {unit_id} "
                 f"input={result['InputSeedCount']} fill={result['GradientFillSeedCount']} "
@@ -243,25 +398,51 @@ def main() -> int:
     elapsed = datetime.now() - start_timestamp
     completed_count = len(completed_rows)
     failed_count = len(failed_rows)
-    skipped_count = total - completed_count - failed_count
+    skipped_count = len(skipped_rows)
     avg_ratio = float(pd.DataFrame(completed_rows)["GradientFillToInputRatio"].mean()) if completed_rows else 0.0
-    print(
-        json.dumps(
-            {
-                "timestamp": datetime.now().isoformat(timespec="seconds"),
-                "output_root": str(output_root),
-                "unit_total": total,
-                "completed": completed_count,
-                "failed": failed_count,
-                "skipped": skipped_count,
-                "avg_gradient_fill_to_input_ratio": avg_ratio,
-                "elapsed_seconds": int(elapsed.total_seconds()),
-                "failed_units": failed_rows[:20],
-            },
-            ensure_ascii=False,
-            indent=2,
-        )
+    completed_df = pd.DataFrame(completed_rows)
+    failed_df = pd.DataFrame(failed_rows)
+    skipped_df = pd.DataFrame(skipped_rows)
+    layer_plan_df = pd.DataFrame(layer_plan_rows)
+    if not completed_df.empty:
+        completed_df = completed_df.drop(columns=["LayerFillPlan", "Meta"], errors="ignore")
+        preview.write_csv_utf8(completed_df, output_root / "batch_completed_summary.csv")
+    if not failed_df.empty:
+        preview.write_csv_utf8(failed_df, output_root / "batch_failed_units.csv")
+    if not skipped_df.empty:
+        preview.write_csv_utf8(skipped_df, output_root / "batch_skipped_units.csv")
+    if not layer_plan_df.empty:
+        preview.write_csv_utf8(layer_plan_df, output_root / "batch_layer_fill_plan.csv")
+
+    run_summary = {
+        "timestamp": datetime.now().isoformat(timespec="seconds"),
+        "package_run_dir": str(package_run_dir),
+        "output_root": str(output_root),
+        "trace_header_csv": str(trace_header_path),
+        "segy_file": str(args.segy_file.resolve()),
+        "data_mode_filter": str(args.data_mode),
+        "unit_id_filter": str(args.unit_id),
+        "limit": int(args.limit),
+        "overwrite": bool(args.overwrite),
+        "gradient_fill_enabled": not args.disable_gradient_fill,
+        "vtk_export_enabled": not args.disable_vtk_export,
+        "unit_total": total,
+        "completed": completed_count,
+        "failed": failed_count,
+        "skipped": skipped_count,
+        "avg_gradient_fill_to_input_ratio": avg_ratio,
+        "elapsed_seconds": int(elapsed.total_seconds()),
+        "patch_config": to_json_ready(asdict(patch_config)),
+        "gradient_config": to_json_ready(asdict(gradient_config)) if gradient_config is not None else None,
+        "vtk_config": to_json_ready(asdict(vtk_config)),
+        "failed_units": failed_rows[:20],
+        "skipped_units": skipped_rows[:20],
+    }
+    (output_root / "batch_run_summary.json").write_text(
+        json.dumps(run_summary, ensure_ascii=False, indent=2),
+        encoding="utf-8",
     )
+    print(json.dumps(run_summary, ensure_ascii=False, indent=2))
     return 0
 
 

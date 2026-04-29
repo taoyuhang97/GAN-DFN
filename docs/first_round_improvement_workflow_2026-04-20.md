@@ -156,6 +156,224 @@
 - 与下一步的衔接：
   阶段二的单井生产预测和批量预测，就是直接使用这里整理出的 `inner_stage1_library` 和 `inner_stage2_library`。
 
+### 2.6 第一部分专家模型主链细化
+
+这一小节只补“脚本级可交接信息”，不重复前面的流程总览。下面提到的表头和目录结构，以仓库内
+`<项目根目录>/模型训练/优化阶段一/基于地层约束的测井裂缝预测/_tmp_deploy_check/outer_holdout_cheye1_v1/`
+这一套留一样例做参照；正式生产结果仍以 `<数据根目录>` 下对应目录为准。
+
+#### 2.6.1 样本表链如何逐步加字段
+
+- `new_data_around_well.py`
+  产出的 `*_around_data.csv` 是后续所有训练、验证、部署的底表。
+  关键字段分 4 组：
+  `TVD/TIME/X/Y`
+  `SEIS_TRUE` 与 `SEIS_0 ... SEIS_62`
+  常规测井曲线，如 `DEPT/AC/GR`
+  其余原始曲线列，如 `CAL/CNL/DEN/POR/...`
+- `new_fracture_exist_sample.py`
+  在 `*_around_data.csv` 基础上补 5 类裂缝字段：
+  `P10/P21/P33`
+  `Frac_Azimuth`
+  `Frac_Dip`
+  然后按 `key_col` 过滤，当前正式口径是只保留 `P10` 非空样本，输出 `*_sample.csv`。
+- `manual_strata_workflow/dataset.py`
+  在 `*_sample.csv` 基础上继续补：
+  `ROW_IN_WELL`
+  `WellName`
+  `DepthForStrata`
+  `StrataName`
+  `StrataTop`
+  `StrataBase`
+  输出到各实验目录下的 `labeled_datasets/{井名}_sample_labeled.csv`。
+- 因此三层样本表可以这样理解：
+  `around_data` 解决“井旁地震窗口和测井曲线对齐”
+  `sample` 解决“裂缝密度和产状挂接”
+  `sample_labeled` 解决“样本已知属于哪一个人工层位”
+
+#### 2.6.2 第一阶段专家库的目录结构与关键结果
+
+- 主控脚本：
+  `run_manual_strata_lstm_experiment.py`
+- 它对 `manual_strata_workflow/common.py` 中 6 口成像井的人工层位配置做切分，再调用旧内核
+  `裂缝存在性分析/LSTM/imaging_well_to_fracture_cnn_lstm_test_1.py`。
+- `result_root` 下固定会有这几层：
+  `labeled_datasets/`
+  `filtered_datasets/{层位名}/`
+  `{层位名}_lstm/`
+  `manual_strata_label_summary.csv`
+  `formation_run_plan.csv`
+  `manual_strata_lstm_summary.csv`
+  `summary.json`
+- `manual_strata_label_summary.csv` 是分层前总表，关键字段：
+  `WellName/StrataName/SampleCount/DepthMin/DepthMax/FractureRatio`
+  其中 `FractureRatio` 是 `Frac_Azimuth` 非空占比，可直接当作“该层样本内裂缝发育占比”的快速检查量。
+- `filtered_datasets/{层位名}/{井名}_sample.csv` 是层内训练样本。
+  对应的 `formation_well_sequence_counts.csv` 关键字段：
+  `WellName/StrataName/SampleCount/ValidSequenceCount/DepthColumn/DepthMin/DepthMax`
+  这里的 `ValidSequenceCount` 才是 LSTM 真正能切出窗口序列的数量。
+- `{层位名}_lstm/verify_{井名}/` 是单个专家模型目录，关键产物：
+  `model.pth`
+  `scaler.pkl`
+  `config.json`
+  `val_pred_full_log.csv`
+- `val_pred_full_log.csv` 会保留原始样本列，并追加第一阶段验证结果列。当前需要重点关注的是：
+  `RAW_ROW_IDX`
+  `PRED_PROB`
+  `PRED_LABEL`
+  `GT_LABEL`
+  这份表就是后续第二阶段细化、外层留一验证和问题追踪时最直接的“逐深度预测日志”。
+- `manual_strata_lstm_summary.csv` 是第一阶段层内 LOO 汇总表，当前最关键字段：
+  `val_well`
+  `Accuracy`
+  `AUC`
+  `Precision`
+  `Recall`
+  `F1`
+  `Threshold`
+  `IoU`
+  `StrataName`
+  `ResultDir`
+  对汇报口径而言，正文优先讲 `Recall/Precision/F1/IoU`，`Accuracy/AUC` 更适合放附录。
+
+#### 2.6.3 第二阶段专家库的目录结构与关键结果
+
+- 主控脚本：
+  `run_manual_strata_raw_point_refine.py`
+- 它复用同一套 `sample_labeled`，并把第一阶段输出目录通过 `exist_exp_map_json` 传给旧内核
+  `裂缝位置分析/基于密度的裂缝点位分析/raw_point_guided_segment_refine.py`。
+- `result_root` 下固定会有这几层：
+  `labeled_datasets/`
+  `filtered_datasets/{层位名}/`
+  `{层位名}_refine/`
+  `manual_strata_label_summary.csv`
+  `formation_run_plan.csv`
+  `manual_strata_refine_summary.csv`
+  `summary.json`
+- `filtered_datasets/{层位名}/` 下除 `{井名}_sample.csv` 外，还会额外生成：
+  `strata_range.csv`
+  `formation_well_depth_summary.csv`
+  其中 `formation_well_depth_summary.csv` 的关键字段是
+  `WellName/StrataName/SampleCount/DepthColumn/DepthMin/DepthMax/StrataTop/StrataBase`，
+  它是第二阶段做层内段约束和后续部署切段时的直接参考。
+- `{层位名}_refine/segment_dataset/` 是第二阶段训练前展开出来的段级数据集。
+  关键产物包括：
+  `all_segment_dataset.csv`
+  `segment_dataset/{井名}/segment_dataset.csv`
+  `segment_dataset/{井名}/raw_gt_points.csv`
+  `segment_dataset/{井名}/gt_dev_segments.csv`
+- `{层位名}_refine/verify_{井名}/` 是单个第二阶段专家模型目录，关键产物：
+  `segment_refine_model.joblib`
+  `segment_refine_model_meta.json`
+- `{层位名}_refine/{井名}/` 是第二阶段对该井的验证结果，关键产物：
+  `pred_segment_summary.csv`
+  `pred_fracture_points.csv`
+  `raw_gt_points.csv`
+  `gt_dev_segments.csv`
+  `train_segment_dataset.csv`
+  `metrics.json`
+- `pred_segment_summary.csv` 字段很多，真正值得地质解释优先看的不是全部中间特征，而是：
+  `SegStartDepth/SegEndDepth/SegLength`
+  `ProbMean/ProbMax`
+  `PredPointCount`
+  `PredP10Mean/PredP10MassPerLength`
+  `PredAzimuth/PredDip`
+  `PredDensityStrengthLevel`
+  `GTDevOverlapRatio`
+  `SegmentCountAbsError`
+  其中前 3 类分别对应“发育段位置”“裂缝数量级”“产状与强度”。
+- `pred_fracture_points.csv` 是最终点位级输出，建议重点读：
+  `TVD`
+  `SegStartDepth/SegEndDepth`
+  `PredPointCount`
+  `PredAzimuth/PredDip`
+  `PredP10Mean/PredP10MassPerLength`
+  它比段级表更接近后续 DFN 种子点输入。
+- `manual_strata_refine_summary.csv` 既保存了配置，也保存了评估结果。
+  真正要抓的评估字段优先是：
+  `well/strata_name`
+  `N_gt_points/N_pred_points`
+  `count_diff/count_error_pct`
+  `pred_to_gt_mean_dist/pred_to_gt_p90_dist`
+  `gt_to_pred_mean_dist/gt_to_pred_p90_dist`
+  `segment_count_mae`
+  `orientation_azimuth_mae_deg`
+  `orientation_dip_mae_deg`
+  `saved_model_dir`
+  正文解释时可以把它们翻译成：
+  “裂缝数量级偏差”
+  “预测点到真实点的距离偏差”
+  “真实点被预测覆盖的反向偏差”
+  “方位角/倾角偏差”
+
+#### 2.6.4 外层留一、专家注册与正式部署如何衔接
+
+- `run_outer_holdout_expert_validation.py` 会把“内层训练好的两个专家库”继续整理成可部署库。
+  `result_root` 下除 `inner_stage1_library/` 和 `inner_stage2_library/` 外，还会生成：
+  `holdout_segments/`
+  `expert_model_registry.csv`
+  `expert_selection_scores.csv`
+  `selected_expert_by_strata.csv`
+  `stage1_strata_summary.csv`
+  `stage1_whole_well_summary.csv`
+  `stage2_strata_summary.csv`
+  `whole_well_final_summary.csv`
+  `whole_well_stage1_pred_full_log.csv`
+  `whole_well_pred_segment_summary.csv`
+  `whole_well_pred_fracture_points.csv`
+- `expert_model_registry.csv` 是“有哪些候选专家可以被部署”的注册表，核心字段：
+  `strata_name`
+  `expert_well`
+  `stage1_model_dir/stage1_config_path/stage1_model_path/stage1_scaler_path`
+  `stage2_model_dir/stage2_artifact_path`
+  `reference_sample_csv`
+  `inner_stage1_f1/inner_stage1_iou/inner_stage1_threshold`
+  `inner_stage2_count_error_pct/inner_stage2_pred_to_gt_mean_dist/inner_stage2_gt_to_pred_mean_dist/inner_stage2_segmae`
+- `expert_selection_scores.csv` 是“目标层段与候选专家到底像不像”的相似度表，核心字段：
+  `strata_name`
+  `expert_well`
+  `similarity_score`
+  `similarity_score_seismic`
+  `similarity_score_AC`
+  `similarity_score_GR`
+  `inner_stage1_f1`
+  `inner_stage2_count_error_pct`
+- `selected_expert_by_strata.csv` 是最终选中的层位专家，核心字段：
+  `strata_name`
+  `selected_expert_well`
+  `stage1_model_dir/stage2_model_dir`
+  `quality_qualified`
+  `selection_joint_score`
+  `selection_similarity_rank_loss`
+  `selection_stage1_rank_loss`
+  `selection_stage2_rank_loss`
+  它对应的含义是：不是“离目标井最近的井”直接上，而是综合相似性、第一阶段质量、第二阶段质量后再选。
+- 正式部署入口 `run_deploy_strata_expert_prediction.py` 实际调用的是
+  `strata_expert_deploy/pipeline.py`。
+  它的结果目录中，最关键的是：
+  `target_range_resolution/`
+  `target_segments/`
+  `expert_model_registry.csv`
+  `expert_selection_scores.csv`
+  `selected_expert_by_strata.csv`
+  `prediction_by_strata/{层位名}/`
+  `deploy_strata_status.csv`
+  `stage1_deploy_summary.csv`
+  `stage2_deploy_summary.csv`
+  `whole_well_stage1_pred_full_log.csv`
+  `whole_well_pred_segment_summary.csv`
+  `whole_well_pred_fracture_points.csv`
+  `deployment_summary.json`
+- 也就是说，第一部分正式主链在代码上的闭环是：
+  `*_sample.csv`
+  `*_sample_labeled.csv`
+  `inner_stage1_library`
+  `inner_stage2_library`
+  `expert_model_registry.csv`
+  `selected_expert_by_strata.csv`
+  `final stage1/stage2 deploy outputs`
+  后续虚拟井扩充、层位裂缝发育统计和区域 DFN 约束，直接接的就是这套最终井级结果。
+
 ## 3. 阶段二：井级生产预测
 
 这一阶段是第一轮改进后的核心生产主线。它直接回答的是：对于一口目标井，如何利用分层专家库输出最终裂缝段和裂缝点结果。
@@ -586,4 +804,3 @@
 - 步骤 19
 - 步骤 20
 - 步骤 21
-

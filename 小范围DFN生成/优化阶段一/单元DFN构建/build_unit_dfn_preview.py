@@ -45,13 +45,17 @@ DEFAULT_OUTPUT_ROOT = Path(
 )
 DEFAULT_BLOCK_SIZE_TRACES = 25
 DEFAULT_BLOCK_STRIDE_TRACES = 24
+DEFAULT_TOP_BOUNDARY_TIME_MS = 1100.0
+DEFAULT_BOTTOM_BOUNDARY_TIME_MS = 3800.0
+DEFAULT_TOP_BOUNDARY_CODE = "TOP_1100MS"
+DEFAULT_BOTTOM_BOUNDARY_CODE = "BOTTOM_3800MS"
 
 # Override legacy defaults with the merged unit-fracture package used in phase 2.
 DEFAULT_PACKAGE_RUN_DIR = Path(
     r"E:\项目\石油项目\断缝储\原始数据\wx数据\砂砾岩\优化阶段一\研究内容二\单元DFN构建\单元测井裂缝"
 )
 DEFAULT_OUTPUT_ROOT = Path(
-    r"E:\项目\石油项目\断缝储\原始数据\wx数据\砂砾岩\优化阶段一\研究内容二\单元DFN构建\单元DFN预览"
+    r"E:\项目\石油项目\断缝储\原始数据\wx数据\砂砾岩\优化阶段一\研究内容二\单元DFN构建\单元测井裂缝"
 )
 DEFAULT_TRACE_HEADER_CSV = Path(
     r"E:\项目\石油项目\断缝储\原始数据\wx数据\砂砾岩\研究内容一\trace_header_xy.csv"
@@ -118,6 +122,7 @@ class GradientFillConfig:
     target_fill_to_input_ratio: float = 1.5
     target_fill_layer_weighted: bool = True
     target_fill_max_candidate_voxels_per_layer: int = 4000
+    enable_layer_min_constraint: bool = True  # 启用按地层最少数量约束
 
 
 @dataclass(frozen=True)
@@ -179,6 +184,34 @@ def parse_float_tuple(text: str, default: tuple[float, ...]) -> tuple[float, ...
     if not parsed:
         return tuple(float(item) for item in default)
     return parsed
+
+
+def normalize_surface_code(value: object) -> str:
+    text = safe_str(value, "").strip()
+    if not text or text.lower() == "nan":
+        return ""
+    return text
+
+
+def normalize_open_boundary_layers(layers_df: pd.DataFrame) -> pd.DataFrame:
+    if layers_df.empty:
+        return layers_df.copy()
+    work = layers_df.copy().reset_index(drop=True)
+    for col in ["TopSurfaceCode", "BaseSurfaceCode", "GeoIntervalKey", "StrataName"]:
+        if col not in work.columns:
+            work[col] = ""
+        else:
+            work[col] = work[col].map(normalize_surface_code if col in {"TopSurfaceCode", "BaseSurfaceCode"} else lambda v: safe_str(v, ""))
+
+    top_idx = int(work["TopTime"].astype(float).idxmin())
+    base_idx = int(work["BaseTime"].astype(float).idxmax())
+    work.at[top_idx, "TopTime"] = float(DEFAULT_TOP_BOUNDARY_TIME_MS)
+    if normalize_surface_code(work.at[top_idx, "TopSurfaceCode"]) == "":
+        work.at[top_idx, "TopSurfaceCode"] = DEFAULT_TOP_BOUNDARY_CODE
+    work.at[base_idx, "BaseTime"] = float(DEFAULT_BOTTOM_BOUNDARY_TIME_MS)
+    if normalize_surface_code(work.at[base_idx, "BaseSurfaceCode"]) == "":
+        work.at[base_idx, "BaseSurfaceCode"] = DEFAULT_BOTTOM_BOUNDARY_CODE
+    return work
 
 
 def make_fill_dedup_key(
@@ -647,6 +680,7 @@ def load_unit_package(package_run_dir: Path, unit_id: str) -> tuple[pd.DataFrame
             "VirtualSeedCount",
         ],
     )
+    layers = normalize_open_boundary_layers(layers)
     seeds = ensure_numeric(
         read_csv_utf8(unit_dir / "fracture_seeds.csv"),
         [
@@ -962,6 +996,105 @@ def layer_time_center(layer_row: pd.Series) -> float:
     return float((float(top_time) + float(base_time)) / 2.0)
 
 
+def resolve_seed_center_time(seed_row: pd.Series) -> float:
+    center_time = pd.to_numeric(seed_row.get("CenterTime"), errors="coerce")
+    if pd.notna(center_time):
+        return float(center_time)
+    start_time = pd.to_numeric(seed_row.get("TimeStart"), errors="coerce")
+    end_time = pd.to_numeric(seed_row.get("TimeEnd"), errors="coerce")
+    if pd.notna(start_time) and pd.notna(end_time):
+        return float((float(start_time) + float(end_time)) / 2.0)
+    if pd.notna(start_time):
+        return float(start_time)
+    if pd.notna(end_time):
+        return float(end_time)
+    return float("nan")
+
+
+def match_layer_by_time(time_value: float, layers_df: pd.DataFrame) -> pd.Series | None:
+    if not np.isfinite(time_value) or layers_df.empty:
+        return None
+    best_layer: pd.Series | None = None
+    best_key: tuple[float, float] | None = None
+    for _, layer in layers_df.iterrows():
+        top_time = pd.to_numeric(layer.get("TopTime"), errors="coerce")
+        base_time = pd.to_numeric(layer.get("BaseTime"), errors="coerce")
+        if pd.isna(top_time) or pd.isna(base_time):
+            continue
+        lower = float(min(top_time, base_time))
+        upper = float(max(top_time, base_time))
+        if lower <= float(time_value) <= upper:
+            rank_key = (float(upper - lower), abs(float(time_value) - layer_time_center(layer)))
+            if best_key is None or rank_key < best_key:
+                best_key = rank_key
+                best_layer = layer
+    return best_layer
+
+
+def assign_seed_layers_by_time(seeds_df: pd.DataFrame, layers_df: pd.DataFrame) -> pd.DataFrame:
+    if seeds_df.empty or layers_df.empty:
+        return seeds_df.copy()
+    work = seeds_df.copy()
+    layer_cols = ["GeoIntervalKey", "StrataName", "TopSurfaceCode", "BaseSurfaceCode"]
+    for col in layer_cols:
+        if col not in work.columns:
+            work[col] = ""
+    for idx, seed in work.iterrows():
+        matched_layer = match_layer_by_time(resolve_seed_center_time(seed), layers_df)
+        if matched_layer is None:
+            continue
+        for col in layer_cols:
+            work.at[idx, col] = safe_str(matched_layer.get(col, ""))
+    return work
+
+
+def count_layer_seeds(seeds_df: pd.DataFrame) -> dict[tuple[str, str, str], int]:
+    if seeds_df.empty:
+        return {}
+    counts: dict[tuple[str, str, str], int] = {}
+    for _, row in seeds_df.iterrows():
+        layer_key = layer_lookup_key(row)
+        if not any(part.strip() for part in layer_key):
+            continue
+        counts[layer_key] = counts.get(layer_key, 0) + 1
+    return counts
+
+
+def build_layer_fill_plan(
+    layers_df: pd.DataFrame,
+    seeds_df: pd.DataFrame,
+    current_fill_df: pd.DataFrame,
+    config: GradientFillConfig,
+) -> pd.DataFrame:
+    rows: list[dict[str, object]] = []
+    input_counts = count_layer_seeds(seeds_df)
+    current_fill_counts = count_layer_seeds(current_fill_df)
+    target_ratio = float(config.target_fill_to_input_ratio)
+
+    for _, layer in layers_df.iterrows():
+        layer_key = layer_lookup_key(layer)
+        input_count = int(input_counts.get(layer_key, 0))
+        current_fill_count = int(current_fill_counts.get(layer_key, 0))
+        if input_count <= 0:
+            target_fill_count = 0
+        else:
+            ratio_target = int(math.ceil(input_count * target_ratio)) if target_ratio > 0 else 0
+            target_fill_count = max(ratio_target, input_count) if bool(config.enable_layer_min_constraint) else ratio_target
+        rows.append(
+            {
+                "GeoIntervalKey": str(layer.get("GeoIntervalKey", "")),
+                "StrataName": str(layer.get("StrataName", "")),
+                "TopSurfaceCode": str(layer.get("TopSurfaceCode", "")),
+                "BaseSurfaceCode": str(layer.get("BaseSurfaceCode", "")),
+                "InputSeedCount": int(input_count),
+                "CurrentFillCount": int(current_fill_count),
+                "TargetFillCount": int(target_fill_count),
+                "RemainingFillDeficit": int(max(0, target_fill_count - current_fill_count)),
+            }
+        )
+    return pd.DataFrame(rows)
+
+
 def summarize_seed_template(seed_df: pd.DataFrame) -> dict[str, float | str]:
     azimuth = circular_mean_degrees(pd.to_numeric(seed_df.get("Azimuth"), errors="coerce")) if not seed_df.empty else float("nan")
     dip = float(np.nanmedian(pd.to_numeric(seed_df.get("Dip"), errors="coerce"))) if not seed_df.empty else float("nan")
@@ -1185,30 +1318,14 @@ def build_target_ratio_fill_seeds(
     if seeds_df.empty or candidate_voxels.empty or not bool(config.enable_target_fill_ratio):
         return pd.DataFrame(columns=list(current_fill_df.columns) if not current_fill_df.empty else list(seeds_df.columns))
 
-    target_ratio = float(config.target_fill_to_input_ratio)
-    if target_ratio <= 0:
+    if float(config.target_fill_to_input_ratio) <= 0:
         return pd.DataFrame(columns=list(current_fill_df.columns) if not current_fill_df.empty else list(seeds_df.columns))
 
-    current_count = int(len(current_fill_df))
-    target_count = int(math.ceil(len(seeds_df) * target_ratio))
-    total_deficit = max(0, target_count - current_count)
-    if total_deficit <= 0:
-        return pd.DataFrame(columns=current_fill_df.columns if not current_fill_df.empty else list(seeds_df.columns))
-
     output_columns = list(current_fill_df.columns) if not current_fill_df.empty else list(seeds_df.columns)
-    layer_seed_counts = (
-        seeds_df.assign(
-            _LayerKey=seeds_df.apply(layer_lookup_key, axis=1),
-        )["_LayerKey"].value_counts().to_dict()
-        if not seeds_df.empty
-        else {}
-    )
-    current_fill_counts = (
-        current_fill_df.assign(_LayerKey=current_fill_df.apply(layer_lookup_key, axis=1))["_LayerKey"].value_counts().to_dict()
-        if not current_fill_df.empty
-        else {}
-    )
     layers_by_key = {layer_lookup_key(layer): layer for _, layer in layers_df.iterrows()}
+    layer_fill_plan_df = build_layer_fill_plan(layers_df, seeds_df, current_fill_df, config)
+    if layer_fill_plan_df.empty:
+        return pd.DataFrame(columns=output_columns)
 
     existing_keys: set[tuple[int, int, int, int, int]] = set()
     if not current_fill_df.empty:
@@ -1227,6 +1344,13 @@ def build_target_ratio_fill_seeds(
     layer_templates: dict[tuple[str, str, str], dict[str, float | str]] = {}
     layer_candidates: dict[tuple[str, str, str], pd.DataFrame] = {}
     for layer_key, layer_row in layers_by_key.items():
+        layer_seed_df = seeds_df[
+            (seeds_df["GeoIntervalKey"].astype(str) == layer_key[0])
+            & (seeds_df["TopSurfaceCode"].astype(str) == layer_key[1])
+            & (seeds_df["BaseSurfaceCode"].astype(str) == layer_key[2])
+        ].copy()
+        if layer_seed_df.empty:
+            continue
         layer_voxels = candidate_voxels[
             (candidate_voxels["GeoIntervalKey"] == layer_key[0])
             & (candidate_voxels["TopSurfaceCode"] == layer_key[1])
@@ -1234,11 +1358,6 @@ def build_target_ratio_fill_seeds(
         ].copy()
         if layer_voxels.empty:
             continue
-        layer_seed_df = seeds_df[
-            (seeds_df["GeoIntervalKey"].astype(str) == layer_key[0])
-            & (seeds_df["TopSurfaceCode"].astype(str) == layer_key[1])
-            & (seeds_df["BaseSurfaceCode"].astype(str) == layer_key[2])
-        ].copy()
         layer_voxels = filter_voxels_by_seed_exclusion(layer_voxels, layer_seed_df, config)
         if layer_voxels.empty:
             continue
@@ -1246,79 +1365,29 @@ def build_target_ratio_fill_seeds(
         if layer_voxels.empty:
             continue
         layer_candidates[layer_key] = layer_voxels
-        layer_templates[layer_key] = (
-            summarize_seed_template(layer_seed_df)
-            if not layer_seed_df.empty
-            else resolve_seedless_layer_template(layer_row, layers_df, seeds_df)
-        )
+        layer_templates[layer_key] = summarize_seed_template(layer_seed_df)
 
     if not layer_candidates:
         return pd.DataFrame(columns=output_columns)
 
     selected_rows: list[dict[str, object]] = []
-    pending_layer_keys = [key for key in layers_by_key if key in layer_candidates and layer_seed_counts.get(key, 0) > 0]
-
-    if bool(config.target_fill_layer_weighted):
-        for layer_key in pending_layer_keys:
-            input_count = int(layer_seed_counts.get(layer_key, 0))
-            if input_count <= 0:
-                continue
-            current_layer_fill = int(current_fill_counts.get(layer_key, 0))
-            target_layer_fill = int(math.ceil(input_count * target_ratio))
-            layer_deficit = max(0, target_layer_fill - current_layer_fill)
-            if layer_deficit <= 0:
-                continue
-
-            layer_row = layers_by_key[layer_key]
-            template = layer_templates[layer_key]
-            selected_for_layer = 0
-            for candidate in layer_candidates[layer_key].itertuples(index=False):
-                if len(selected_rows) >= total_deficit or selected_for_layer >= layer_deficit:
-                    break
-                dedup_key = make_fill_dedup_key(
-                    float(candidate.X),
-                    float(candidate.Y),
-                    float(candidate.TIME),
-                    float(template["Azimuth"]),
-                    float(template["Dip"]),
-                    config,
-                )
-                if dedup_key in existing_keys:
-                    continue
-                existing_keys.add(dedup_key)
-                selected_rows.append(
-                    build_fill_seed_row(
-                        unit_row=unit_row,
-                        layer_row=layer_row,
-                        center_x=float(candidate.X),
-                        center_y=float(candidate.Y),
-                        center_time=float(candidate.TIME),
-                        gradient_value=float(candidate.GradientValue),
-                        cluster_point_count=1,
-                        seed_id=f"{unit_row['UnitID']}::GF_TARGET::{layer_key[0]}::{selected_for_layer + 1:04d}",
-                        source_name="seismic_gradient_fill_target",
-                        azimuth=float(template["Azimuth"]),
-                        dip=float(template["Dip"]),
-                        density_weight=float(template["DensityWeight"]) * float(config.fill_density_scale) * (0.75 + 0.75 * float(candidate.GradientValue)),
-                        length_weight=float(template["LengthWeight"]) * float(config.fill_length_scale),
-                        confidence=min(0.98, float(template["Confidence"]) * 0.72 + 0.12),
-                        parent_seed_id="",
-                        parent_source_kind=str(template["SourceKind"]),
-                    )
-                )
-                selected_for_layer += 1
-
-    if len(selected_rows) < total_deficit:
-        global_candidates = []
-        for layer_key, layer_voxels in layer_candidates.items():
-            layer_row = layers_by_key[layer_key]
-            template = layer_templates[layer_key]
-            for candidate in layer_voxels.itertuples(index=False):
-                global_candidates.append((float(candidate.GradientValue), layer_key, layer_row, template, candidate))
-        global_candidates.sort(key=lambda item: item[0], reverse=True)
-
-        for _, layer_key, layer_row, template, candidate in global_candidates:
-            if len(selected_rows) >= total_deficit:
+    for plan_row in layer_fill_plan_df.itertuples(index=False):
+        layer_key = (
+            str(plan_row.GeoIntervalKey),
+            str(plan_row.TopSurfaceCode),
+            str(plan_row.BaseSurfaceCode),
+        )
+        layer_deficit = int(getattr(plan_row, "RemainingFillDeficit", 0))
+        if layer_deficit <= 0 or layer_key not in layer_candidates:
+            continue
+            
+            # 修改这里：确保地震裂缝数量 >= 测井裂缝数量
+        layer_row = layers_by_key[layer_key]
+        template = layer_templates[layer_key]
+        selected_for_layer = 0
+                # 师兄要求：每个地层的地震裂缝数量不少于同层的测井裂缝数量
+        for candidate in layer_candidates[layer_key].itertuples(index=False):
+            if selected_for_layer >= layer_deficit:
                 break
             dedup_key = make_fill_dedup_key(
                 float(candidate.X),
@@ -1331,7 +1400,6 @@ def build_target_ratio_fill_seeds(
             if dedup_key in existing_keys:
                 continue
             existing_keys.add(dedup_key)
-            layer_count = sum(1 for row in selected_rows if str(row.get("GeoIntervalKey", "")) == str(layer_key[0]))
             selected_rows.append(
                 build_fill_seed_row(
                     unit_row=unit_row,
@@ -1341,7 +1409,7 @@ def build_target_ratio_fill_seeds(
                     center_time=float(candidate.TIME),
                     gradient_value=float(candidate.GradientValue),
                     cluster_point_count=1,
-                    seed_id=f"{unit_row['UnitID']}::GF_TARGET::{layer_key[0]}::{layer_count + 1:04d}",
+                    seed_id=f"{unit_row['UnitID']}::GF_TARGET::{layer_key[0]}::{selected_for_layer + 1:04d}",
                     source_name="seismic_gradient_fill_target",
                     azimuth=float(template["Azimuth"]),
                     dip=float(template["Dip"]),
@@ -1352,6 +1420,7 @@ def build_target_ratio_fill_seeds(
                     parent_source_kind=str(template["SourceKind"]),
                 )
             )
+            selected_for_layer += 1
 
     if not selected_rows:
         return pd.DataFrame(columns=output_columns)
@@ -1365,6 +1434,7 @@ def build_gradient_fill_seeds(
     gradient_voxel_df: pd.DataFrame,
     config: GradientFillConfig,
 ) -> pd.DataFrame:
+    seeds_df = assign_seed_layers_by_time(seeds_df, layers_df)
     extra_cols = ["GradientValue", "ClusterPointCount", "ParentSeedID", "ParentSourceKind"]
     output_cols = list(seeds_df.columns) + [col for col in extra_cols if col not in seeds_df.columns]
     if gradient_voxel_df.empty:
@@ -1395,15 +1465,18 @@ def build_gradient_fill_seeds(
     if candidate_voxels.empty:
         return pd.DataFrame(columns=output_cols)
 
-    real_seed_layer_keys = set(
-        layers_df.loc[pd.to_numeric(layers_df.get("RealSeedCount"), errors="coerce").fillna(0) > 0, "GeoIntervalKey"]
-        .astype(str)
-        .tolist()
-    ) if not layers_df.empty else set()
+    real_seed_layer_keys = (
+        {
+            layer_lookup_key(row)
+            for _, row in seeds_df[seeds_df["SourceKind"].astype(str).str.lower().eq("real")].iterrows()
+        }
+        if not seeds_df.empty
+        else set()
+    )
 
     parent_seed_df = seeds_df.copy()
     if data_mode == "real_virtual":
-        layer_keys = parent_seed_df["GeoIntervalKey"].astype(str)
+        layer_keys = parent_seed_df.apply(layer_lookup_key, axis=1)
         source_kinds = parent_seed_df["SourceKind"].astype(str).str.lower()
         use_real_mask = layer_keys.isin(real_seed_layer_keys)
         parent_seed_df = parent_seed_df[(~use_real_mask) | source_kinds.eq("real")].copy()
@@ -1514,11 +1587,19 @@ def build_gradient_fill_seeds(
             layer_key = layer_lookup_key(layer)
             if layer_key in parent_layer_keys:
                 continue
+            layer_input_seed_df = seeds_df[
+                (seeds_df["GeoIntervalKey"].astype(str) == layer_key[0])
+                & (seeds_df["TopSurfaceCode"].astype(str) == layer_key[1])
+                & (seeds_df["BaseSurfaceCode"].astype(str) == layer_key[2])
+            ].copy()
+            if layer_input_seed_df.empty:
+                continue
             layer_voxels = candidate_voxels[
                 (candidate_voxels["GeoIntervalKey"] == layer_key[0])
                 & (candidate_voxels["TopSurfaceCode"] == layer_key[1])
                 & (candidate_voxels["BaseSurfaceCode"] == layer_key[2])
             ].copy()
+            layer_voxels = filter_voxels_by_seed_exclusion(layer_voxels, layer_input_seed_df, config)
             if len(layer_voxels) < int(config.seedless_layer_min_voxels):
                 continue
 
@@ -1532,7 +1613,7 @@ def build_gradient_fill_seeds(
             if cluster_df.empty:
                 continue
 
-            template = resolve_seedless_layer_template(layer, layers_df, template_seed_df)
+            template = summarize_seed_template(layer_input_seed_df if not layer_input_seed_df.empty else template_seed_df)
             for cluster_idx, cluster in enumerate(cluster_df.itertuples(index=False), start=1):
                 fill_rows.append(
                     {
@@ -1945,6 +2026,7 @@ def main() -> int:
     unit_row = select_target_unit(catalog_df, args.unit_id.strip(), args.auto_select_richest, args.data_mode)
     unit_id = str(unit_row["UnitID"])
     layers_df, seeds_df, meta = load_unit_package(package_run_dir, unit_id)
+    seeds_df = assign_seed_layers_by_time(seeds_df, layers_df)
     trace_header_df = load_trace_header(args.trace_header_csv.resolve())
     unit_row = derive_unit_bounds_from_block(
         unit_row,
@@ -2053,6 +2135,7 @@ def main() -> int:
         gradient_summary["GradientFillLayerCounts"] = (
             gradient_fill_df.groupby("GeoIntervalKey")["SeedID"].count().to_dict() if not gradient_fill_df.empty else {}
         )
+        gradient_summary["LayerFillPlan"] = build_layer_fill_plan(layers_df, seeds_df, gradient_fill_df, gradient_config).to_dict(orient="records")
     patch_df = build_unit_dfn_patches(unit_row, layers_df, merged_seeds_df, config)
     patch_df = with_sequential_index(patch_df, "PatchIndex")
     merged_seeds_output_df = with_sequential_index(merged_seeds_df, "SeedIndex")
