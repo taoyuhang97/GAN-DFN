@@ -39,9 +39,9 @@ from instance_roundtrip_common import (  # type: ignore
 
 
 DEFAULT_OUTPUT_ROOT = Path(
-    r"E:\项目\石油项目\断缝储\原始数据\wx数据\砂砾岩\优化阶段一\研究内容三\GAN训练准备\训练样本打包"
+    r"/data/shared/project-oil/wx数据/砂砾岩/优化阶段一/研究内容三/GAN训练准备/训练样本打包"
 )
-DEFAULT_SGY_FILE = Path(r"E:\项目\石油项目\断缝储\原始数据\wx数据\砂砾岩\psdm_final_time.sgy")
+DEFAULT_SGY_FILE = Path(r"/data/shared/project-oil/wx数据/砂砾岩/psdm_final_time.sgy")
 DEFAULT_BLOCK_SIZE = 25
 DEFAULT_SOURCE_WEIGHTS = {
     "real": 1.0,

@@ -9,19 +9,19 @@ plt.rcParams['axes.unicode_minus'] = False    # 正常显示负号
 well_name = "车页1导眼"
 # 优化前预测
 # version = "预测结果"
-# file_path = fr'E:\项目\石油项目\断缝储\原始数据\wx数据\砂砾岩\研究内容一\裂缝角度预测\井斜\{well_name}_predicted_angles.csv'
+# file_path = fr'/data/shared/project-oil/wx数据/砂砾岩/研究内容一/裂缝角度预测/井斜/{well_name}_predicted_angles.csv'
 # data = pd.read_csv(file_path)
 # azimuth_true = data['Dip_Azimuth']
 # radius_true = data['Dip_Angle']
 # 原始裂缝
 version = "原始裂缝"
-file_path = fr'E:\项目\石油项目\断缝储\原始数据\wx数据\砂砾岩\优化阶段一\研究内容一\成像测井\裂缝提取\{well_name}_fractures.csv'
+file_path = fr'/data/shared/project-oil/wx数据/砂砾岩/优化阶段一/研究内容一/成像测井/裂缝提取/{well_name}_fractures.csv'
 data = pd.read_csv(file_path)
 azimuth_true = data['Azimuth(0~360)']
 radius_true = data['Angle(0~90)']
 # 第一轮优化
 # version = "第一轮优化"
-# file_path = fr'E:\项目\石油项目\断缝储\原始数据\wx数据\砂砾岩\优化阶段一\研究内容一\两阶段裂缝预测流程结果\现有常规测井裂缝预测\{well_name}\final_fracture_points.csv'
+# file_path = fr'/data/shared/project-oil/wx数据/砂砾岩/优化阶段一/研究内容一/两阶段裂缝预测流程结果/现有常规测井裂缝预测/{well_name}/final_fracture_points.csv'
 # data = pd.read_csv(file_path)
 # azimuth_true = data['PointAzimuth']
 # radius_true = data['PointDip']

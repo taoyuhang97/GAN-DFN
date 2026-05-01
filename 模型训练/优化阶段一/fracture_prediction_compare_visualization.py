@@ -18,7 +18,7 @@ from typing import Iterable
 ENCODINGS = ("utf-8-sig", "utf-8", "gb18030", "gbk")
 SCRIPT_DIR = Path(__file__).resolve().parent
 DEFAULT_OUTPUT_DIR = Path(
-    r"E:\项目\石油项目\断缝储\原始数据\wx数据\砂砾岩\优化阶段一\方案对比\研究内容一"
+    r"/data/shared/project-oil/wx数据/砂砾岩/优化阶段一/方案对比/研究内容一"
 )
 
 POWERSHELL_SVG_TO_PNG = r"""
@@ -280,15 +280,15 @@ def parse_args() -> argparse.Namespace:
 
 def build_default_cases() -> list[CompareCase]:
     raw_prediction_dir = Path(
-        r"E:\项目\石油项目\断缝储\原始数据\wx数据\砂砾岩\研究内容一\裂缝角度预测\井斜"
+        r"/data/shared/project-oil/wx数据/砂砾岩/研究内容一/裂缝角度预测/井斜"
     )
     actual_dir = Path(
-        r"E:\项目\石油项目\断缝储\原始数据\wx数据\砂砾岩\优化阶段一\研究内容一\成像测井\裂缝提取"
+        r"/data/shared/project-oil/wx数据/砂砾岩/优化阶段一/研究内容一/成像测井/裂缝提取"
     )
     optimized_che151_path = Path(
-        r"E:\项目\石油项目\断缝储\原始数据\wx数据\砂砾岩\优化阶段一\研究内容一\两阶段裂缝预测流程结果\现有常规测井裂缝预测\车151HF\final_fracture_points.csv"
+        r"/data/shared/project-oil/wx数据/砂砾岩/优化阶段一/研究内容一/两阶段裂缝预测流程结果/现有常规测井裂缝预测/车151HF/final_fracture_points.csv"
     )
-    track_dir = Path(r"E:\项目\石油项目\断缝储\原始数据\wx数据\砂砾岩\井斜")
+    track_dir = Path(r"/data/shared/project-oil/wx数据/砂砾岩/井斜")
 
     return [
         CompareCase(

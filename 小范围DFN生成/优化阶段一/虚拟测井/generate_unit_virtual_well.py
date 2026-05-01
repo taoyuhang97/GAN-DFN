@@ -29,16 +29,16 @@ except ImportError:
 
 
 DEFAULT_TRACE_HEADER = Path(
-    r"E:\项目\石油项目\断缝储\原始数据\wx数据\砂砾岩\研究内容一\trace_header_xy.csv"
+    r"/data/shared/project-oil/wx数据/砂砾岩/研究内容一/trace_header_xy.csv"
 )
 DEFAULT_SURFACE_DIR = Path(
-    r"E:\项目\石油项目\断缝储\原始数据\wx数据\砂砾岩\层位"
+    r"/data/shared/project-oil/wx数据/砂砾岩/层位"
 )
 DEFAULT_ZONE_DATA_DIR = Path(
-    r"E:\项目\石油项目\断缝储\原始数据\wx数据\砂砾岩\优化阶段一\研究内容二\虚拟测井构建\相对深度重采样数据"
+    r"/data/shared/project-oil/wx数据/砂砾岩/优化阶段一/研究内容二/虚拟测井构建/相对深度重采样数据"
 )
 DEFAULT_OUTPUT_ROOT = Path(
-    r"E:\项目\石油项目\断缝储\原始数据\wx数据\砂砾岩\优化阶段一\研究内容二\虚拟测井构建\虚拟测井批量生成"
+    r"/data/shared/project-oil/wx数据/砂砾岩/优化阶段一/研究内容二/虚拟测井构建/虚拟测井批量生成"
 )
 DEFAULT_OUTPUT_FILES = (
     "virtual_well_index.csv",
@@ -57,7 +57,7 @@ DEFAULT_NEIGHBORS = 12
 DEFAULT_METHOD = "knn"
 SUPPORTED_METHODS = ("knn", "xgboost", "kriging")
 DEFAULT_SGY_FILE = Path(
-    r"E:\项目\石油项目\断缝储\原始数据\wx数据\砂砾岩\psdm_final_time.sgy"
+    r"/data/shared/project-oil/wx数据/砂砾岩/psdm_final_time.sgy"
 )
 DEFAULT_SEISMIC_GRID_SPACING = 12.5
 DEFAULT_SAMPLING_START_MS = 1100.0

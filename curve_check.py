@@ -22,7 +22,7 @@ def extract_curve_names_from_las(filepath):
     return curve_names
 
 # 路径设置
-las_dir = r"E:\项目\石油项目\断缝储\原始数据\wx数据\砂砾岩\测井"
+las_dir = r"/data/shared/project-oil/wx数据/砂砾岩/测井"
 all_files = [f for f in os.listdir(las_dir) if f.lower().endswith('.las')]
 
 # 提取每个文件的属性集合

@@ -58,9 +58,9 @@ def get_xgb_classifier():
 
 # ===================== 路径 =====================
 
-DATA_DIR = r"E:\项目\石油项目\断缝储\原始数据\wx数据\砂砾岩\优化阶段一\研究内容一\成像测井\裂缝样本"
+DATA_DIR = r"/data/shared/project-oil/wx数据/砂砾岩/优化阶段一/研究内容一/成像测井/裂缝样本"
 
-SAVE_DIR = r"E:\项目\石油项目\断缝储\原始数据\wx数据\砂砾岩\优化阶段一\研究内容一\裂缝存在性预测\成像测井数据分布分析"
+SAVE_DIR = r"/data/shared/project-oil/wx数据/砂砾岩/优化阶段一/研究内容一/裂缝存在性预测/成像测井数据分布分析"
 
 os.makedirs(SAVE_DIR, exist_ok=True)
 

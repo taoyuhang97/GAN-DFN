@@ -155,7 +155,7 @@ def build_fracture_seismic_samples(around_csv, fracture_file, density_file, colu
 
 
 if __name__ == "__main__":
-    project_dir = r"E:\项目\石油项目\断缝储\原始数据\wx数据\砂砾岩"
+    project_dir = r"/data/shared/project-oil/wx数据/砂砾岩"
     around_data_dir = os.path.join(project_dir, "优化阶段一", "研究内容一", "成像测井", "测井-地震时窗")
     fracture_angle_dir = os.path.join(project_dir, "研究内容一", "成像测井", "裂缝标注")
     fracture_density_dir = os.path.join(project_dir, "车镇成像测井")
@@ -194,7 +194,7 @@ if __name__ == "__main__":
             "columns": ["DEPTH", "PHIT", "VISO", "FVDC", "FVTL", "FVA", "FVAH", "FVPA"]
         },
     }
-    output_dir = r"E:\项目\石油项目\断缝储\原始数据\wx数据\砂砾岩\优化阶段一\研究内容一\成像测井\裂缝样本"
+    output_dir = r"/data/shared/project-oil/wx数据/砂砾岩/优化阶段一/研究内容一/成像测井/裂缝样本"
     os.makedirs(output_dir, exist_ok=True)
     for well in well_info:
         build_fracture_seismic_samples(

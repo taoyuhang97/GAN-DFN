@@ -350,9 +350,9 @@ def find_dfn_files(dfn_dir):
 
 
 if __name__=="__main__":
-    dfn_dir = r"E:\项目\石油项目\断缝储\原始数据\wx数据\砂砾岩\研究内容三\训练用数据\裂缝片表示"
-    trace_header_file = r"E:\项目\石油项目\断缝储\原始数据\wx数据\砂砾岩\研究内容一\trace_header_xy.csv"
-    out_dir = r"E:\项目\石油项目\断缝储\原始数据\wx数据\砂砾岩\研究内容三\训练用数据\体素表示"
+    dfn_dir = r"/data/shared/project-oil/wx数据/砂砾岩/研究内容三/训练用数据/裂缝片表示"
+    trace_header_file = r"/data/shared/project-oil/wx数据/砂砾岩/研究内容一/trace_header_xy.csv"
+    out_dir = r"/data/shared/project-oil/wx数据/砂砾岩/研究内容三/训练用数据/体素表示"
     os.makedirs(out_dir, exist_ok=True)
 
     # --------------------------------------------------------

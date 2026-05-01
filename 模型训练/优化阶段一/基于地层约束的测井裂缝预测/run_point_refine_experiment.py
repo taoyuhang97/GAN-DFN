@@ -16,12 +16,12 @@ from workflow_paths import FRACTURE_POINT_REFINE_SCRIPT_PATH, WORKFLOW_ROOT
 ROOT = WORKFLOW_ROOT
 SCRIPT_PATH = FRACTURE_POINT_REFINE_SCRIPT_PATH
 BASE_SAVE_DIR = Path(
-    r"E:\项目\石油项目\断缝储\原始数据\wx数据\砂砾岩\优化阶段一\研究内容一\裂缝位置预测\基于密度的裂缝点位分析\裂缝点位精细化"
+    r"/data/shared/project-oil/wx数据/砂砾岩/优化阶段一/研究内容一/裂缝位置预测/基于密度的裂缝点位分析/裂缝点位精细化"
 )
 DEFAULT_EXIST_EXP_DIR = Path(
-    r"E:\项目\石油项目\断缝储\原始数据\wx数据\砂砾岩\优化阶段一\研究内容一\裂缝存在性预测\LSTM\单井验证\成像测井裂缝预测\cnn+lstm\exp40_missing_drop_ac_gr_3x3_seq5_AC_GR"
+    r"/data/shared/project-oil/wx数据/砂砾岩/优化阶段一/研究内容一/裂缝存在性预测/LSTM/单井验证/成像测井裂缝预测/cnn+lstm/exp40_missing_drop_ac_gr_3x3_seq5_AC_GR"
 )
-DEFAULT_DOCX_PATH = Path(r"D:\项目\石油开采\断缝储实验\实验记录20260319.docx")
+DEFAULT_DOCX_PATH = Path(r"/data/shared/project-oil/wx数据/砂砾岩/优化阶段一/实验记录/实验记录20260319.docx")
 
 
 def sanitize(text: str) -> str:

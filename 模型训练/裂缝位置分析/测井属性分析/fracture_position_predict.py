@@ -11,9 +11,9 @@ plt.rcParams['font.sans-serif'] = ['SimHei']
 plt.rcParams['axes.unicode_minus'] = False
 
 # ===== 配置 =====
-# data_dir = r"E:\项目\石油项目\断缝储\原始数据\wx数据\砂砾岩\研究内容一\井斜\测井-地震时窗"
-data_dir = r"E:\项目\石油项目\断缝储\原始数据\wx数据\砂砾岩\研究内容一\测井\测井-地震时窗"
-method_path_dir = r"E:\项目\石油项目\断缝储\原始数据\wx数据\砂砾岩\研究内容一\裂缝位置预测\小波变换方法"
+# data_dir = r"/data/shared/project-oil/wx数据/砂砾岩/研究内容一/井斜/测井-地震时窗"
+data_dir = r"/data/shared/project-oil/wx数据/砂砾岩/研究内容一/测井/测井-地震时窗"
+method_path_dir = r"/data/shared/project-oil/wx数据/砂砾岩/研究内容一/裂缝位置预测/小波变换方法"
 # output_dir = os.path.join(method_path_dir, "井斜")
 output_dir = os.path.join(method_path_dir, "测井")
 os.makedirs(output_dir, exist_ok=True)

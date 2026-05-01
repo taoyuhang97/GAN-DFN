@@ -18,21 +18,21 @@ from manual_strata_workflow.common import DEFAULT_WELL_NAMES as MANUAL_DEFAULT_W
 from workflow_paths import NEAREST_SCRIPT_PATH, RAW_POINT_SCRIPT_PATH, WORKFLOW_ROOT
 
 ROOT = WORKFLOW_ROOT
-PYTHON_EXE_DEFAULT = Path(r"D:\Python\python.exe")
+PYTHON_EXE_DEFAULT = Path(os.environ.get("PYTHON_EXE", sys.executable))
 STAGE1_WRAPPER_PATH = ROOT / "run_manual_strata_lstm_experiment.py"
 STAGE2_WRAPPER_PATH = ROOT / "run_manual_strata_raw_point_refine.py"
 
 FLOW_RESULT_ROOT = Path(
-    r"E:\项目\石油项目\断缝储\原始数据\wx数据\砂砾岩\优化阶段一\研究内容一\两阶段裂缝预测流程结果"
+    r"/data/shared/project-oil/wx数据/砂砾岩/优化阶段一/研究内容一/两阶段裂缝预测流程结果"
 )
 DEFAULT_SAVE_ROOT = FLOW_RESULT_ROOT / "outer_holdout"
 DEFAULT_SAMPLE_DIR = Path(
-    r"E:\项目\石油项目\断缝储\原始数据\wx数据\砂砾岩\优化阶段一\研究内容一\成像测井\裂缝样本"
+    r"/data/shared/project-oil/wx数据/砂砾岩/优化阶段一/研究内容一/成像测井/裂缝样本"
 )
 DEFAULT_RAW_LABEL_DIR = Path(
-    r"E:\项目\石油项目\断缝储\原始数据\wx数据\砂砾岩\研究内容一\成像测井\裂缝标注"
+    r"/data/shared/project-oil/wx数据/砂砾岩/研究内容一/成像测井/裂缝标注"
 )
-DEFAULT_DOCX_PATH = Path(r"D:\项目\石油开采\断缝储实验\实验记录20260323.docx")
+DEFAULT_DOCX_PATH = Path(r"/data/shared/project-oil/wx数据/砂砾岩/优化阶段一/实验记录/实验记录20260323.docx")
 DOC_TITLE = "实验记录 20260323"
 
 DEFAULT_WELL_NAMES = list(MANUAL_DEFAULT_WELL_NAMES)
@@ -53,14 +53,14 @@ _MODULE_CACHE: dict[str, object] = {}
 STAGE1_WRAPPER_PATH = ROOT.parent / "rebuild_0p2ms_stage1_lstm" / "run_manual_strata_lstm_experiment.py"
 STAGE2_WRAPPER_PATH = ROOT.parent / "rebuild_0p2ms_stage2_refine" / "run_manual_strata_raw_point_refine.py"
 FLOW_RESULT_ROOT = Path(
-    r"E:\项目\石油项目\断缝储\原始数据\wx数据\砂砾岩\优化阶段一\研究内容一\两阶段裂缝预测流程结果"
+    r"/data/shared/project-oil/wx数据/砂砾岩/优化阶段一/研究内容一/两阶段裂缝预测流程结果"
 )
 DEFAULT_SAVE_ROOT = FLOW_RESULT_ROOT / "outer_holdout_uniform_0p2ms"
 DEFAULT_SAMPLE_DIR = Path(
-    r"E:\项目\石油项目\断缝储\原始数据\wx数据\砂砾岩\优化阶段一\研究内容一\成像测井\裂缝样本_uniform_0p2ms"
+    r"/data/shared/project-oil/wx数据/砂砾岩/优化阶段一/研究内容一/成像测井/裂缝样本_uniform_0p2ms"
 )
 DEFAULT_RAW_LABEL_DIR = Path(
-    r"E:\项目\石油项目\断缝储\原始数据\wx数据\砂砾岩\研究内容一\成像测井\裂缝标注"
+    r"/data/shared/project-oil/wx数据/砂砾岩/研究内容一/成像测井/裂缝标注"
 )
 DEFAULT_HOLDOUT_WELL = "车页1导眼"
 

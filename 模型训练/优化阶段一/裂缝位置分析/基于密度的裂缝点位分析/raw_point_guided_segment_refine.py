@@ -29,27 +29,27 @@ except ImportError:
 
 ROOT = Path(__file__).resolve().parent
 DEFAULT_EXIST_EXP_DIR = Path(
-    r"E:/项目/石油项目/断缝储/原始数据/wx数据/砂砾岩/优化阶段一/研究内容一/裂缝存在性预测/LSTM/单井验证/成像测井裂缝预测/cnn+lstm/exp40_missing_drop_ac_gr_3x3_seq5_AC_GR"
+    r"/data/shared/project-oil/wx数据/砂砾岩/优化阶段一/研究内容一/裂缝存在性预测/LSTM/单井验证/成像测井裂缝预测/cnn+lstm/exp40_missing_drop_ac_gr_3x3_seq5_AC_GR"
 )
 DEFAULT_SAMPLE_DIR = Path(
-    r"E:/项目/石油项目/断缝储/原始数据/wx数据/砂砾岩/优化阶段一/研究内容一/成像测井/裂缝样本"
+    r"/data/shared/project-oil/wx数据/砂砾岩/优化阶段一/研究内容一/成像测井/裂缝样本"
 )
 DEFAULT_RAW_LABEL_DIR = Path(
-    r"E:/项目/石油项目/断缝储/原始数据/wx数据/砂砾岩/研究内容一/成像测井/裂缝标注"
+    r"/data/shared/project-oil/wx数据/砂砾岩/研究内容一/成像测井/裂缝标注"
 )
 DEFAULT_EXTRA_RAW_LABEL_DIRS = [
     Path(
-        r"E:/项目/石油项目/断缝储/原始数据/wx数据/砂砾岩/优化阶段一/研究内容一/成像测井/裂缝提取"
+        r"/data/shared/project-oil/wx数据/砂砾岩/优化阶段一/研究内容一/成像测井/裂缝提取"
     )
 ]
 BASE_SAVE_DIR = Path(
-    r"E:/项目/石油项目/断缝储/原始数据/wx数据/砂砾岩/优化阶段一/研究内容一/裂缝位置预测/基于密度的裂缝点位分析/裂缝点位精细化"
+    r"/data/shared/project-oil/wx数据/砂砾岩/优化阶段一/研究内容一/裂缝位置预测/基于密度的裂缝点位分析/裂缝点位精细化"
 )
 FLOW_RESULT_ROOT = Path(
-    r"E:/项目/石油项目/断缝储/原始数据/wx数据/砂砾岩/优化阶段一/研究内容一/两阶段裂缝预测流程结果"
+    r"/data/shared/project-oil/wx数据/砂砾岩/优化阶段一/研究内容一/两阶段裂缝预测流程结果"
 )
 BASE_SAVE_DIR = FLOW_RESULT_ROOT / "manual_runs" / "raw_point_guided_segment_refine"
-DEFAULT_DOCX_PATH = Path(r"D:/项目/石油开采/断缝储实验/实验记录20260323.docx")
+DEFAULT_DOCX_PATH = Path(r"/data/shared/project-oil/wx数据/砂砾岩/优化阶段一/实验记录/实验记录20260323.docx")
 DOC_TITLE = "实验记录 20260323"
 
 WELL_TO_RAW_FILE = {

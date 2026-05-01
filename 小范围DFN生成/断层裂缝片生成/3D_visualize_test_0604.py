@@ -131,7 +131,7 @@ def build_fault_surfaces(txt_path):
 
 if __name__ == "__main__":
     # 设置文件路径
-    txt_file = r"断层\FaultStick_0604.dat"
+    txt_file = r"断层/FaultStick_0604.dat"
 
     # 构建断层面
     meshes = build_fault_surfaces(txt_file)

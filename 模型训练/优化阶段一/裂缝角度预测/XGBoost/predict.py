@@ -7,14 +7,14 @@ from xgboost import XGBRegressor
 from sklearn.multioutput import MultiOutputRegressor
 
 # ===== 配置 =====
-model_path = r"E:\项目\石油项目\断缝储\原始数据\wx数据\砂砾岩\优化阶段一\研究内容一\裂缝角度预测\XGBoost\模型\fracture_angle_model.pkl"
-# well_log_dir = r"E:\项目\石油项目\断缝储\原始数据\wx数据\砂砾岩\研究内容一\测井\测井-地震时窗"
-# well_log_dir = r"E:\项目\石油项目\断缝储\原始数据\wx数据\砂砾岩\研究内容一\井斜\测井-地震时窗"
-# fracture_depth_dir = r"E:\项目\石油项目\断缝储\原始数据\wx数据\砂砾岩\研究内容一\裂缝位置预测\峰值检测方法\测井"
-# fracture_depth_dir = r"E:\项目\石油项目\断缝储\原始数据\wx数据\砂砾岩\研究内容一\裂缝位置预测\峰值检测方法\井斜"
-fracture_depth_dir = r"E:\项目\石油项目\断缝储\原始数据\wx数据\砂砾岩\优化阶段一\研究内容一\裂缝位置预测\峰值检测方法\成像测井预测"
-# output_dir = r"E:\项目\石油项目\断缝储\原始数据\wx数据\砂砾岩\研究内容一\裂缝角度预测\测井"
-output_dir = r"E:\项目\石油项目\断缝储\原始数据\wx数据\砂砾岩\优化阶段一\研究内容一\裂缝角度预测\成像测井预测"
+model_path = r"/data/shared/project-oil/wx数据/砂砾岩/优化阶段一/研究内容一/裂缝角度预测/XGBoost/模型/fracture_angle_model.pkl"
+# well_log_dir = r"/data/shared/project-oil/wx数据/砂砾岩/研究内容一/测井/测井-地震时窗"
+# well_log_dir = r"/data/shared/project-oil/wx数据/砂砾岩/研究内容一/井斜/测井-地震时窗"
+# fracture_depth_dir = r"/data/shared/project-oil/wx数据/砂砾岩/研究内容一/裂缝位置预测/峰值检测方法/测井"
+# fracture_depth_dir = r"/data/shared/project-oil/wx数据/砂砾岩/研究内容一/裂缝位置预测/峰值检测方法/井斜"
+fracture_depth_dir = r"/data/shared/project-oil/wx数据/砂砾岩/优化阶段一/研究内容一/裂缝位置预测/峰值检测方法/成像测井预测"
+# output_dir = r"/data/shared/project-oil/wx数据/砂砾岩/研究内容一/裂缝角度预测/测井"
+output_dir = r"/data/shared/project-oil/wx数据/砂砾岩/优化阶段一/研究内容一/裂缝角度预测/成像测井预测"
 os.makedirs(output_dir, exist_ok=True)
 
 # ===== 加载模型 =====
@@ -27,7 +27,7 @@ features = model_dict['features']
 # ===== 遍历井 =====
 # csv_files = glob.glob(os.path.join(well_log_dir, "*.csv"))
 csv_files = [
-    r"E:\项目\石油项目\断缝储\原始数据\wx数据\砂砾岩\优化阶段一\研究内容一\成像测井\裂缝样本\车页1导眼_sample.csv"]
+    r"/data/shared/project-oil/wx数据/砂砾岩/优化阶段一/研究内容一/成像测井/裂缝样本/车页1导眼_sample.csv"]
 
 for csv_path in csv_files:
     well_name = os.path.basename(csv_path).replace("_sample.csv", "")

@@ -86,10 +86,10 @@ def process_all_wells(trace_header_file, xy_input_dir, output_dir,
 # 参数配置与运行
 # ===========================================================
 if __name__ == "__main__":
-    TRACE_HEADER_FILE = r"E:\项目\石油项目\断缝储\原始数据\wx数据\砂砾岩\研究内容一\trace_header_xy.csv"
-    # XY_INPUT_DIR = r"E:\项目\石油项目\断缝储\原始数据\wx数据\砂砾岩\研究内容一\裂缝角度预测\测井"
-    XY_INPUT_DIR = r"E:\项目\石油项目\断缝储\原始数据\wx数据\砂砾岩\研究内容一\裂缝角度预测\井斜"
-    OUTPUT_DIR = r"E:\项目\石油项目\断缝储\原始数据\wx数据\砂砾岩\研究内容二\测井区块生成\裂缝单元归属"
+    TRACE_HEADER_FILE = r"/data/shared/project-oil/wx数据/砂砾岩/研究内容一/trace_header_xy.csv"
+    # XY_INPUT_DIR = r"/data/shared/project-oil/wx数据/砂砾岩/研究内容一/裂缝角度预测/测井"
+    XY_INPUT_DIR = r"/data/shared/project-oil/wx数据/砂砾岩/研究内容一/裂缝角度预测/井斜"
+    OUTPUT_DIR = r"/data/shared/project-oil/wx数据/砂砾岩/研究内容二/测井区块生成/裂缝单元归属"
     os.makedirs(OUTPUT_DIR, exist_ok=True)
 
     X_ORIGIN = 556150.0

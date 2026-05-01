@@ -656,15 +656,15 @@ def nearest_distance_stats(src_depths: np.ndarray, ref_depths: np.ndarray) -> di
 
 def main() -> None:
     default_exist_exp_dir = (
-        r"E:\项目\石油项目\断缝储\原始数据\wx数据\砂砾岩\优化阶段一\研究内容一\裂缝存在性预测\LSTM\单井验证\成像测井裂缝预测\cnn+lstm"
+        r"/data/shared/project-oil/wx数据/砂砾岩/优化阶段一/研究内容一/裂缝存在性预测/LSTM/单井验证/成像测井裂缝预测/cnn+lstm"
         r"\exp40_missing_drop_ac_gr_3x3_seq5_AC_GR"
     )
     default_density_exp_dir = (
-        r"E:\项目\石油项目\断缝储\原始数据\wx数据\砂砾岩\优化阶段一\研究内容一\裂缝位置预测\基于密度的裂缝点位分析\裂缝密度预测"
+        r"/data/shared/project-oil/wx数据/砂砾岩/优化阶段一/研究内容一/裂缝位置预测/基于密度的裂缝点位分析/裂缝密度预测"
         r"\cnn+lstm_p10_only_scaled"
     )
     default_save_dir = (
-        r"E:\项目\石油项目\断缝储\原始数据\wx数据\砂砾岩\优化阶段一\研究内容一\裂缝位置预测\基于密度的裂缝点位分析\裂缝点位精细化"
+        r"/data/shared/project-oil/wx数据/砂砾岩/优化阶段一/研究内容一/裂缝位置预测/基于密度的裂缝点位分析/裂缝点位精细化"
         r"\density_integral"
     )
 

@@ -208,7 +208,7 @@ def build_fault_surfaces(txt_path):
 
 if __name__ == "__main__":
     # 设置文件路径（注意：这里用 Landmark2003.dat）
-    txt_file = r"D:\workDocument_temp\25.9.6_石油\断层\FaultStick-GeoEast.dat"
+    txt_file = r"/data/shared/project-oil/wx数据/砂砾岩/断层/FaultStick-GeoEast.dat"
 
     meshes = build_fault_surfaces(txt_file)
     visualize_faults(meshes)

@@ -21,14 +21,14 @@ except Exception:  # pragma: no cover
 
 
 DEFAULT_UNIT_DFN_ROOT = Path(
-    r"E:\项目\石油项目\断缝储\原始数据\wx数据\砂砾岩\优化阶段一\研究内容二\单元DFN构建\批量生成"
+    r"/data/shared/project-oil/wx数据/砂砾岩/优化阶段一/研究内容二/单元DFN构建/批量生成"
 )
 DEFAULT_OUTPUT_ROOT = Path(
-    r"E:\项目\石油项目\断缝储\原始数据\wx数据\砂砾岩\优化阶段一\研究内容三\DFN体素互转实验"
+    r"/data/shared/project-oil/wx数据/砂砾岩/优化阶段一/研究内容三/DFN体素互转实验"
 )
-DEFAULT_DOCX_PATH = Path(r"D:\项目\石油开采\断缝储实验\实验记录20260328.docx")
+DEFAULT_DOCX_PATH = Path(r"/data/shared/project-oil/wx数据/砂砾岩/优化阶段一/实验记录/实验记录20260328.docx")
 DEFAULT_TRACE_HEADER_CSV = Path(
-    r"E:\项目\石油项目\断缝储\原始数据\wx数据\砂砾岩\研究内容一\trace_header_xy.csv"
+    r"/data/shared/project-oil/wx数据/砂砾岩/研究内容一/trace_header_xy.csv"
 )
 DEFAULT_BLOCK_SIZE = 25
 

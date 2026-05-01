@@ -5,8 +5,8 @@ import re
 import chardet
 
 # === 输入路径 ===
-other_well_position_file = r"E:\项目\石油项目\断缝储\原始数据\wx数据\砂砾岩\ExportWellHead.dat"
-deep_time_dir = r"E:\项目\石油项目\断缝储\原始数据\wx数据\砂砾岩\时深"
+other_well_position_file = r"/data/shared/project-oil/wx数据/砂砾岩/ExportWellHead.dat"
+deep_time_dir = r"/data/shared/project-oil/wx数据/砂砾岩/时深"
 
 # === 已知井坐标 ===
 well_positions = {

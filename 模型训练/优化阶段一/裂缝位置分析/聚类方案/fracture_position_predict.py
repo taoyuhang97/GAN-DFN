@@ -6,10 +6,10 @@ from sklearn.cluster import DBSCAN
 from tqdm import tqdm
 
 # ===== 配置 =====
-# predict_output_dir = r"E:\项目\石油项目\断缝储\原始数据\wx数据\砂砾岩\研究内容一\XGboost\裂缝存在预测\测井"
-# predict_output_dir = r"E:\项目\石油项目\断缝储\原始数据\wx数据\砂砾岩\研究内容一\XGboost\裂缝存在预测\井斜"
-predict_output_dir = r"E:\项目\石油项目\断缝储\原始数据\wx数据\砂砾岩\优化阶段一\研究内容一\裂缝存在性预测\成像测井预测"
-method_path_dir = r"E:\项目\石油项目\断缝储\原始数据\wx数据\砂砾岩\优化阶段一\研究内容一"
+# predict_output_dir = r"/data/shared/project-oil/wx数据/砂砾岩/研究内容一/XGboost/裂缝存在预测/测井"
+# predict_output_dir = r"/data/shared/project-oil/wx数据/砂砾岩/研究内容一/XGboost/裂缝存在预测/井斜"
+predict_output_dir = r"/data/shared/project-oil/wx数据/砂砾岩/优化阶段一/研究内容一/裂缝存在性预测/成像测井预测"
+method_path_dir = r"/data/shared/project-oil/wx数据/砂砾岩/优化阶段一/研究内容一"
 # cluster_output_dir = os.path.join(method_path_dir, "裂缝位置预测", "聚类方法", "测井")
 # cluster_output_dir = os.path.join(method_path_dir, "裂缝位置预测", "聚类方法", "井斜")
 cluster_output_dir = os.path.join(method_path_dir, "裂缝位置预测", "聚类方法", "成像测井预测")

@@ -81,7 +81,7 @@ def extract_sgy_data(sgy_file_path, trace_list_csv, output_data_csv):
 
 # --- 参数配置区 ---
 # SGY文件名
-SGY_FILE = r"E:\项目\石油项目\断缝储\原始数据\wx数据\砂砾岩\psdm_final_time.sgy"
+SGY_FILE = r"/data/shared/project-oil/wx数据/砂砾岩/psdm_final_time.sgy"
 
 # 当前处理的网格XY
 unitX, unitY = 32, 24

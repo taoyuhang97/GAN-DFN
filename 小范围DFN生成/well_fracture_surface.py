@@ -1,6 +1,7 @@
 import numpy as np
 import pandas as pd
 import os
+from pathlib import Path
 import matplotlib.pyplot as plt
 from mpl_toolkits.mplot3d.art3d import Poly3DCollection
 
@@ -8,10 +9,10 @@ plt.rcParams['font.sans-serif'] = ['SimHei']  # 设置中文字体
 plt.rcParams['axes.unicode_minus'] = False    # 正常显示负号
 
 # ===== 配置 =====
-# fracture_csv = r"E:\项目\石油项目\断缝储\原始数据\wx数据\砂砾岩\研究内容一\裂缝角度预测\井斜\车页1导眼_predicted_angles.csv"
-# fracture_csv = r"E:\项目\石油项目\断缝储\原始数据\wx数据\砂砾岩\研究内容一\裂缝角度预测\测井\车22_predicted_angles.csv"
-fracture_csv = r"E:\项目\石油项目\断缝储\原始数据\wx数据\砂砾岩\研究内容一\裂缝角度预测\测井\车15_predicted_angles.csv"
-output_dir = r"E:\项目\石油项目\断缝储\输出\裂缝片模型"
+# fracture_csv = r"/data/shared/project-oil/wx数据/砂砾岩/研究内容一/裂缝角度预测/井斜/车页1导眼_predicted_angles.csv"
+# fracture_csv = r"/data/shared/project-oil/wx数据/砂砾岩/研究内容一/裂缝角度预测/测井/车22_predicted_angles.csv"
+fracture_csv = r"/data/shared/project-oil/wx数据/砂砾岩/研究内容一/裂缝角度预测/测井/车15_predicted_angles.csv"
+output_dir = str(Path(__file__).resolve().parents[1] / "_outputs" / "裂缝片模型")
 os.makedirs(output_dir, exist_ok=True)
 
 # 裂缝片基础边长 (m)

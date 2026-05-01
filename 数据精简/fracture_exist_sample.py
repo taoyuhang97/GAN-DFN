@@ -3,26 +3,26 @@ import pandas as pd
 import numpy as np
 
 # 成像测井
-pretreat_data_dir = r"E:\项目\石油项目\断缝储\原始数据\wx数据\砂砾岩\研究内容一\成像测井\FMI提取数据"
+pretreat_data_dir = r"/data/shared/project-oil/wx数据/砂砾岩/研究内容一/成像测井/FMI提取数据"
 imaging_wells = {
     "车660_1": {
-        "data_file": r"E:\项目\石油项目\断缝储\原始数据\wx数据\砂砾岩\车镇成像测井\che660_FMI\che660-client-result\che660-fmi-result\txt\fracture-porosity.txt",
+        "data_file": r"/data/shared/project-oil/wx数据/砂砾岩/车镇成像测井/che660_FMI/che660-client-result/che660-fmi-result/txt/fracture-porosity.txt",
         "columns": ["DEPTH", "PHIT", "VISO", "FVDC", "FVTL", "FVA", "FVAH", "FVPA"]
     },
     "车660_2": {
-        "data_file": r"E:\项目\石油项目\断缝储\原始数据\wx数据\砂砾岩\车镇成像测井\che660_FMI_1\che660-run2-result\che660-run2-fmi-result\txt\che660-down-fracture-porosity.txt",
+        "data_file": r"/data/shared/project-oil/wx数据/砂砾岩/车镇成像测井/che660_FMI_1/che660-run2-result/che660-run2-fmi-result/txt/che660-down-fracture-porosity.txt",
         "columns": ["DEPTH", "PHIT", "VISO", "FVPA", "FVAH", "FVA", "FVTL", "FVDC"]
     },
     "车662": {
-        "data_file": r"E:\项目\石油项目\断缝储\原始数据\wx数据\砂砾岩\车镇成像测井\che662_686_FMI\che662-fmi-client-disk\txt\che662-fracture.txt",
+        "data_file": r"/data/shared/project-oil/wx数据/砂砾岩/车镇成像测井/che662_686_FMI/che662-fmi-client-disk/txt/che662-fracture.txt",
         "columns": ["DEPTH", "FVDC", "FVTL", "FVA", "FVAH", "FVPA"]
     },
     "车663": {
-        "data_file": r"E:\项目\石油项目\断缝储\原始数据\wx数据\砂砾岩\车镇成像测井\che663_687_FMI\che663-fmi-client-disk\txt\che663-fracture-porosity.txt",
+        "data_file": r"/data/shared/project-oil/wx数据/砂砾岩/车镇成像测井/che663_687_FMI/che663-fmi-client-disk/txt/che663-fracture-porosity.txt",
         "columns": ["DEPTH", "PHIT", "VISO", "FVDC", "FVTL", "FVA", "FVAH", "FVPA"]
     }
 }
-output_dir = r"E:\项目\石油项目\断缝储\原始数据\wx数据\砂砾岩\研究内容一\成像测井\裂缝存在样本"
+output_dir = r"/data/shared/project-oil/wx数据/砂砾岩/研究内容一/成像测井/裂缝存在样本"
 os.makedirs(output_dir, exist_ok=True)
 
 

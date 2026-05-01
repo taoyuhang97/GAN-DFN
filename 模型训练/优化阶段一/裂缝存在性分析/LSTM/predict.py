@@ -10,9 +10,9 @@ from sklearn.preprocessing import StandardScaler
 # ===================== 基本设置 =====================
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
-MODEL_DIR = r"E:\项目\石油项目\断缝储\原始数据\wx数据\砂砾岩\优化阶段一\研究内容一\裂缝存在性预测\LSTM\verify_车151HF"
-INPUT_CSV = r"E:\项目\石油项目\断缝储\原始数据\wx数据\砂砾岩\优化阶段一\研究内容一\测井\测井-地震时窗\车22_around_data.csv"
-OUTPUT_DIR = r"E:\项目\石油项目\断缝储\原始数据\wx数据\砂砾岩\优化阶段一\研究内容一\裂缝存在性预测\LSTM\常规测井预测"
+MODEL_DIR = r"/data/shared/project-oil/wx数据/砂砾岩/优化阶段一/研究内容一/裂缝存在性预测/LSTM/verify_车151HF"
+INPUT_CSV = r"/data/shared/project-oil/wx数据/砂砾岩/优化阶段一/研究内容一/测井/测井-地震时窗/车22_around_data.csv"
+OUTPUT_DIR = r"/data/shared/project-oil/wx数据/砂砾岩/优化阶段一/研究内容一/裂缝存在性预测/LSTM/常规测井预测"
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 # ===================== 1. 读取配置 =====================

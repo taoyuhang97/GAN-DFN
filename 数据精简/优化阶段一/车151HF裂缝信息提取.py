@@ -6,14 +6,14 @@ import os
 # ============================================================
 
 # 成像测井裂缝解释 LAS 文件路径
-LAS_FILE = r"E:\项目\石油项目\断缝储\原始数据\wx数据\砂砾岩\车镇成像测井\che151HF_20240415XRMI\车151HF-成果数据\车151HF电成像  裂缝LAS文件\车151HF_层理_裂缝产状_类型_裂缝宽度Dips_Final.las"
+LAS_FILE = r"/data/shared/project-oil/wx数据/砂砾岩/车镇成像测井/che151HF_20240415XRMI/车151HF-成果数据/车151HF电成像  裂缝LAS文件/车151HF_层理_裂缝产状_类型_裂缝宽度Dips_Final.las"
 well_name = "车151HF"
 
 # LAS 文件头段行数（不同软件可能不同）
 SKIP_ROWS = 68
 
 # 输出目录
-OUTPUT_DIR = r"E:\项目\石油项目\断缝储\原始数据\wx数据\砂砾岩\优化阶段一\研究内容一\成像测井\裂缝提取"
+OUTPUT_DIR = r"/data/shared/project-oil/wx数据/砂砾岩/优化阶段一/研究内容一/成像测井/裂缝提取"
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 # 原始文件属性

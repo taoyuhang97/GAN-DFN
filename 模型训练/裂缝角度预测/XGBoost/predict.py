@@ -7,13 +7,13 @@ from xgboost import XGBRegressor
 from sklearn.multioutput import MultiOutputRegressor
 
 # ===== 配置 =====
-model_path = r"E:\项目\石油项目\断缝储\原始数据\wx数据\砂砾岩\研究内容一\裂缝角度预测\模型\XGBoost\fracture_angle_model.pkl"
-# well_log_dir = r"E:\项目\石油项目\断缝储\原始数据\wx数据\砂砾岩\研究内容一\测井\测井-地震时窗"
-well_log_dir = r"E:\项目\石油项目\断缝储\原始数据\wx数据\砂砾岩\研究内容一\井斜\测井-地震时窗"
-# fracture_depth_dir = r"E:\项目\石油项目\断缝储\原始数据\wx数据\砂砾岩\研究内容一\裂缝位置预测\峰值检测方法\测井"
-fracture_depth_dir = r"E:\项目\石油项目\断缝储\原始数据\wx数据\砂砾岩\研究内容一\裂缝位置预测\峰值检测方法\井斜"
-# output_dir = r"E:\项目\石油项目\断缝储\原始数据\wx数据\砂砾岩\研究内容一\裂缝角度预测\测井"
-output_dir = r"E:\项目\石油项目\断缝储\原始数据\wx数据\砂砾岩\研究内容一\裂缝角度预测\井斜"
+model_path = r"/data/shared/project-oil/wx数据/砂砾岩/研究内容一/裂缝角度预测/模型/XGBoost/fracture_angle_model.pkl"
+# well_log_dir = r"/data/shared/project-oil/wx数据/砂砾岩/研究内容一/测井/测井-地震时窗"
+well_log_dir = r"/data/shared/project-oil/wx数据/砂砾岩/研究内容一/井斜/测井-地震时窗"
+# fracture_depth_dir = r"/data/shared/project-oil/wx数据/砂砾岩/研究内容一/裂缝位置预测/峰值检测方法/测井"
+fracture_depth_dir = r"/data/shared/project-oil/wx数据/砂砾岩/研究内容一/裂缝位置预测/峰值检测方法/井斜"
+# output_dir = r"/data/shared/project-oil/wx数据/砂砾岩/研究内容一/裂缝角度预测/测井"
+output_dir = r"/data/shared/project-oil/wx数据/砂砾岩/研究内容一/裂缝角度预测/井斜"
 os.makedirs(output_dir, exist_ok=True)
 
 # 特征列

@@ -20,19 +20,19 @@ from strata_expert_deploy.runtime import DEFAULT_LOG_FEATURES, parse_json_list, 
 
 
 DEFAULT_TARGET_SAMPLE_CSV = Path(
-    r"E:\项目\石油项目\断缝储\原始数据\wx数据\砂砾岩\优化阶段一\研究内容一\井斜\测井-地震时窗\车斜255_around_data.csv"
+    r"/data/shared/project-oil/wx数据/砂砾岩/优化阶段一/研究内容一/井斜/测井-地震时窗/车斜255_around_data.csv"
 )
-DEFAULT_LAYER_DIR = Path(r"E:\项目\石油项目\断缝储\原始数据\wx数据\砂砾岩\层位")
+DEFAULT_LAYER_DIR = Path(r"/data/shared/project-oil/wx数据/砂砾岩/层位")
 DEFAULT_STAGE1_LIBRARY_DIR = Path(
-    r"E:\项目\石油项目\断缝储\原始数据\wx数据\砂砾岩\优化阶段一\研究内容一\两阶段裂缝预测流程结果\outer_holdout\outer_holdout_cheye1_v3\inner_stage1_library"
+    r"/data/shared/project-oil/wx数据/砂砾岩/优化阶段一/研究内容一/两阶段裂缝预测流程结果/outer_holdout/outer_holdout_cheye1_v3/inner_stage1_library"
 )
 DEFAULT_STAGE2_LIBRARY_DIR = Path(
-    r"E:\项目\石油项目\断缝储\原始数据\wx数据\砂砾岩\优化阶段一\研究内容一\两阶段裂缝预测流程结果\outer_holdout\outer_holdout_cheye1_v3\inner_stage2_library"
+    r"/data/shared/project-oil/wx数据/砂砾岩/优化阶段一/研究内容一/两阶段裂缝预测流程结果/outer_holdout/outer_holdout_cheye1_v3/inner_stage2_library"
 )
 DEFAULT_OUTPUT_ROOT = Path(
-    r"E:\项目\石油项目\断缝储\原始数据\wx数据\砂砾岩\优化阶段一\研究内容一\两阶段裂缝预测流程结果\常规测井验证"
+    r"/data/shared/project-oil/wx数据/砂砾岩/优化阶段一/研究内容一/两阶段裂缝预测流程结果/常规测井验证"
 )
-DEFAULT_DOCX_PATH = Path(r"D:\项目\石油开采\断缝储实验\实验记录20260323.docx")
+DEFAULT_DOCX_PATH = Path(r"/data/shared/project-oil/wx数据/砂砾岩/优化阶段一/实验记录/实验记录20260323.docx")
 
 SURFACE_CODE_PATTERN = re.compile(r"^(T\d+)")
 CSV_ENCODINGS = ("utf-8-sig", "utf-8", "gb18030", "gbk")

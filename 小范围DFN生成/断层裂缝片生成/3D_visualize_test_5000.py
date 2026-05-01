@@ -133,7 +133,7 @@ def build_fault_surfaces(txt_path):
 
 if __name__ == "__main__":
     # 设置文件路径
-    txt_file = r"D:\workDocument_temp\25.9.6_石油\断层\FaultStick-Landmark2003.dat"
+    txt_file = r"/data/shared/project-oil/wx数据/砂砾岩/断层/FaultStick-Landmark2003.dat"
 
     # 构建断层面
     meshes = build_fault_surfaces(txt_file)

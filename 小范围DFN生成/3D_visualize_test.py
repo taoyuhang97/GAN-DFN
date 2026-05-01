@@ -1,5 +1,6 @@
 import numpy as np
 import os
+from pathlib import Path
 import pyvista as pv
 import re
 import chardet
@@ -252,15 +253,16 @@ def visualize_merged_fault_fractures(merged_file):
 # ================== 使用示例 ==================
 if __name__ == "__main__":
     fault_files = [
-        r"E:\项目\石油项目\断缝储\原始数据\wx数据\砂砾岩\研究内容二\单元实验\fault_patches_out_npy\npy\F02\F02__i14_j21.npy",
-        r"E:\项目\石油项目\断缝储\原始数据\wx数据\砂砾岩\研究内容二\单元实验\fault_patches_out_npy\npy\fp_F_che32_bei\fp_F_che32_bei__i14_j21.npy"
+        r"/data/shared/project-oil/wx数据/砂砾岩/研究内容二/单元实验/fault_patches_out_npy/npy/F02/F02__i14_j21.npy",
+        r"/data/shared/project-oil/wx数据/砂砾岩/研究内容二/单元实验/fault_patches_out_npy/npy/fp_F_che32_bei/fp_F_che32_bei__i14_j21.npy"
     ]
-    fracture_file = r"E:\项目\石油项目\断缝储\原始数据\wx数据\砂砾岩\研究内容二\测井区块生成\单元裂缝网络\block_X14_Y21_fractures.npy"
-    output_file = r"E:\项目\石油项目\断缝储\输出\block_X14_Y21_faults_fractures.npy"
-    td_file = r"E:\项目\石油项目\断缝储\原始数据\wx数据\砂砾岩\时深\车32.dat"
+    fracture_file = r"/data/shared/project-oil/wx数据/砂砾岩/研究内容二/测井区块生成/单元裂缝网络/block_X14_Y21_fractures.npy"
+    output_file = str(Path(__file__).resolve().parents[1] / "_outputs" / "block_X14_Y21_faults_fractures.npy")
+    td_file = r"/data/shared/project-oil/wx数据/砂砾岩/时深/车32.dat"
     convert_mode = "depth2time"
     # 断层根目录列表（脚本会递归搜索这些目录下的子目录来查找断层文件）"
     output_dir = os.path.dirname(output_file)
+    os.makedirs(output_dir, exist_ok=True)
 
     # === 时深转换 ===
     print("加载时深曲线中...")

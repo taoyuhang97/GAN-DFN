@@ -61,7 +61,7 @@ from build_sparse_instance_gan_dataset import (
 
 
 UNIT_ID_PATTERN = re.compile(r"^BX(?P<block_x>\d+)_BY(?P<block_y>\d+)$", flags=re.IGNORECASE)
-DEFAULT_SURFACE_DIR = Path(r"E:\项目\石油项目\断缝储\原始数据\wx数据\砂砾岩\层位")
+DEFAULT_SURFACE_DIR = Path(r"/data/shared/project-oil/wx数据/砂砾岩/层位")
 AUTO_LAYER_SURFACE_CODES = ["T1", "T2", "T3", "T4", "T5", "T6", "T7"]
 AUTO_LAYER_SURFACE_HINTS = {
     "T1": ["馆陶底"],

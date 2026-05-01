@@ -17,11 +17,11 @@ plt.rcParams['font.sans-serif'] = ['SimHei']  # 设置中文字体
 plt.rcParams['axes.unicode_minus'] = False  # 正常显示负号
 
 # ===== 配置 =====
-logging_dir = r"E:\项目\石油项目\断缝储\原始数据\wx数据\砂砾岩\优化阶段一\研究内容一\裂缝角度预测\XGBoost\模型"
+logging_dir = r"/data/shared/project-oil/wx数据/砂砾岩/优化阶段一/研究内容一/裂缝角度预测/XGBoost/模型"
 os.makedirs(logging_dir, exist_ok=True)
 
-# well_log_dir = r"E:\项目\石油项目\断缝储\原始数据\wx数据\砂砾岩\研究内容一\成像测井\测井-地震时窗"
-# fracture_dir = r"E:\项目\石油项目\断缝储\原始数据\wx数据\砂砾岩\研究内容一\成像测井\裂缝标注"
+# well_log_dir = r"/data/shared/project-oil/wx数据/砂砾岩/研究内容一/成像测井/测井-地震时窗"
+# fracture_dir = r"/data/shared/project-oil/wx数据/砂砾岩/研究内容一/成像测井/裂缝标注"
 model_save_path = os.path.join(logging_dir, "fracture_angle_model.pkl")
 
 # 特征选择
@@ -33,7 +33,7 @@ X_all, y_all = [], []
 
 # csv_files = glob.glob(os.path.join(well_log_dir, "*.csv"))
 csv_files = [
-    r"E:\项目\石油项目\断缝储\原始数据\wx数据\砂砾岩\优化阶段一\研究内容一\成像测井\裂缝样本\车151HF_sample.csv"]
+    r"/data/shared/project-oil/wx数据/砂砾岩/优化阶段一/研究内容一/成像测井/裂缝样本/车151HF_sample.csv"]
 
 for csv_path in csv_files:
     well_name = os.path.basename(csv_path).replace("_around_data.csv", "")

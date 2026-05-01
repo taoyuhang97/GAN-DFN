@@ -8,7 +8,7 @@ import re
 
 # 路径设置
 # 输入
-data_dir = r"E:\项目\石油项目\断缝储\原始数据\wx数据\砂砾岩"
+data_dir = r"/data/shared/project-oil/wx数据/砂砾岩"
 sgy_file = os.path.join(data_dir, "psdm_final_time.sgy")
 # 输出
 output_dir = os.path.join(data_dir, "研究内容一")

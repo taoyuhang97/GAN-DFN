@@ -7,16 +7,16 @@ from sklearn.preprocessing import StandardScaler
 import logging
 
 # ========== 配置路径 ==========
-model_path = r"E:\项目\石油项目\断缝储\原始数据\wx数据\砂砾岩\研究内容一\XGboost\模型\fracture_xgb_model.pkl"
-scaler_path = r"E:\项目\石油项目\断缝储\原始数据\wx数据\砂砾岩\研究内容一\XGboost\模型\fracture_scaler.pkl"
+model_path = r"/data/shared/project-oil/wx数据/砂砾岩/研究内容一/XGboost/模型/fracture_xgb_model.pkl"
+scaler_path = r"/data/shared/project-oil/wx数据/砂砾岩/研究内容一/XGboost/模型/fracture_scaler.pkl"
 
-predict_input_dir = r"E:\项目\石油项目\断缝储\原始数据\wx数据\砂砾岩\研究内容一\测井\测井-地震时窗"   # 需要预测的文件夹
-predict_output_dir = r"E:\项目\石油项目\断缝储\原始数据\wx数据\砂砾岩\研究内容一\XGboost\裂缝存在预测\测井"    # 输出结果的目录
+predict_input_dir = r"/data/shared/project-oil/wx数据/砂砾岩/研究内容一/测井/测井-地震时窗"   # 需要预测的文件夹
+predict_output_dir = r"/data/shared/project-oil/wx数据/砂砾岩/研究内容一/XGboost/裂缝存在预测/测井"    # 输出结果的目录
 log_file = os.path.join(predict_output_dir, 'prediction_log.txt')
 os.makedirs(predict_output_dir, exist_ok=True)
 
-# predict_input_dir = r"E:\项目\石油项目\断缝储\原始数据\wx数据\砂砾岩\研究内容一\井斜\测井-地震时窗"   # 需要预测的文件夹
-# predict_output_dir = r"E:\项目\石油项目\断缝储\原始数据\wx数据\砂砾岩\研究内容一\XGboost\裂缝存在预测\井斜"    # 输出结果的目录
+# predict_input_dir = r"/data/shared/project-oil/wx数据/砂砾岩/研究内容一/井斜/测井-地震时窗"   # 需要预测的文件夹
+# predict_output_dir = r"/data/shared/project-oil/wx数据/砂砾岩/研究内容一/XGboost/裂缝存在预测/井斜"    # 输出结果的目录
 # log_file = os.path.join(predict_output_dir, 'prediction_log.txt')
 # os.makedirs(predict_output_dir, exist_ok=True)
 # ========== 设置日志 ==========

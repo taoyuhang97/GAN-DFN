@@ -15,7 +15,7 @@ y_counts.columns = ['Y坐标值', '出现次数']
 y_counts = y_counts.sort_values('Y坐标值')  # 按坐标值排序
 
 # 保存为Excel文件
-outdir = r"E:\项目\石油项目\断缝储\原始数据\wx数据\砂砾岩\研究内容一"
+outdir = r"/data/shared/project-oil/wx数据/砂砾岩/研究内容一"
 x_output_file = os.path.join(outdir, "X坐标统计.xlsx")
 y_output_file = os.path.join(outdir, "Y坐标统计.xlsx")
 

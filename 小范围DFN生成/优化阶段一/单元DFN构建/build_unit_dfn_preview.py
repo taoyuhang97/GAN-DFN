@@ -21,27 +21,25 @@ from mpl_toolkits.mplot3d.art3d import Poly3DCollection
 from scipy.ndimage import gaussian_filter
 from sklearn.cluster import DBSCAN
 
+from layer_intensity_profiles import (
+    DEFAULT_LAYER_INTENSITY_PROFILE_NAME,
+    available_layer_intensity_profiles,
+    build_layer_surface_pair_key,
+    get_layer_intensity_profile,
+)
+
 
 DEFAULT_PACKAGE_RUN_DIR = Path(
-    r"E:\项目\石油项目\断缝储\原始数据\wx数据\砂砾岩\优化阶段一\研究内容二\虚拟测井构建\单元裂缝归属\smoke_20260328_pkg_min"
+    r"/data/shared/project-oil/wx数据/砂砾岩/优化阶段一/研究内容二/单元DFN构建/单元测井裂缝_新层位重拆分/full_t1_t7_resplit_20260501"
 )
 DEFAULT_OUTPUT_ROOT = Path(
-    r"E:\项目\石油项目\断缝储\原始数据\wx数据\砂砾岩\优化阶段一\研究内容二\虚拟测井构建\单元DFN构建"
+    r"/data/shared/project-oil/wx数据/砂砾岩/优化阶段一/研究内容二/单元DFN构建/单元DFN预览"
 )
-
-
 DEFAULT_TRACE_HEADER_CSV = Path(
-    r"E:\项目\石油项目\断缝储\原始数据\wx数据\砂砾岩\研究内容一\trace_header_xy.csv"
+    r"/data/shared/project-oil/wx数据/砂砾岩/研究内容一/trace_header_xy.csv"
 )
 DEFAULT_SEGY_FILE = Path(
-    r"E:\项目\石油项目\断缝储\原始数据\wx数据\砂砾岩\psdm_final_time.sgy"
-)
-
-DEFAULT_PACKAGE_RUN_DIR = Path(
-    r"E:\项目\石油项目\断缝储\原始数据\wx数据\砂砾岩\优化阶段一\研究内容二\单元DFN构建\单元测井裂缝"
-)
-DEFAULT_OUTPUT_ROOT = Path(
-    r"E:\项目\石油项目\断缝储\原始数据\wx数据\砂砾岩\优化阶段一\研究内容二\单元DFN构建\单元DFN预览"
+    r"/data/shared/project-oil/wx数据/砂砾岩/psdm_final_time.sgy"
 )
 DEFAULT_BLOCK_SIZE_TRACES = 25
 DEFAULT_BLOCK_STRIDE_TRACES = 24
@@ -49,20 +47,6 @@ DEFAULT_TOP_BOUNDARY_TIME_MS = 1100.0
 DEFAULT_BOTTOM_BOUNDARY_TIME_MS = 3800.0
 DEFAULT_TOP_BOUNDARY_CODE = "TOP_1100MS"
 DEFAULT_BOTTOM_BOUNDARY_CODE = "BOTTOM_3800MS"
-
-# Override legacy defaults with the merged unit-fracture package used in phase 2.
-DEFAULT_PACKAGE_RUN_DIR = Path(
-    r"E:\项目\石油项目\断缝储\原始数据\wx数据\砂砾岩\优化阶段一\研究内容二\单元DFN构建\单元测井裂缝"
-)
-DEFAULT_OUTPUT_ROOT = Path(
-    r"E:\项目\石油项目\断缝储\原始数据\wx数据\砂砾岩\优化阶段一\研究内容二\单元DFN构建\单元测井裂缝"
-)
-DEFAULT_TRACE_HEADER_CSV = Path(
-    r"E:\项目\石油项目\断缝储\原始数据\wx数据\砂砾岩\研究内容一\trace_header_xy.csv"
-)
-DEFAULT_SEGY_FILE = Path(
-    r"E:\项目\石油项目\断缝储\原始数据\wx数据\砂砾岩\psdm_final_time.sgy"
-)
 
 @dataclass(frozen=True)
 class PatchConfig:
@@ -121,6 +105,10 @@ class GradientFillConfig:
     enable_target_fill_ratio: bool = True
     target_fill_to_input_ratio: float = 1.5
     target_fill_layer_weighted: bool = True
+    enable_layer_intensity_scaling: bool = True
+    layer_intensity_profile_name: str = DEFAULT_LAYER_INTENSITY_PROFILE_NAME
+    layer_intensity_default: float = 1.0
+    layer_intensity_factors: dict[str, float] | None = None
     target_fill_max_candidate_voxels_per_layer: int = 4000
     enable_layer_min_constraint: bool = True  # 启用按地层最少数量约束
 
@@ -582,6 +570,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--disable-target-fill-ratio", action="store_true")
     parser.add_argument("--target-fill-to-input-ratio", type=float, default=1.5)
     parser.add_argument("--disable-target-fill-layer-weighted", action="store_true")
+    parser.add_argument("--disable-layer-intensity-scaling", action="store_true")
+    parser.add_argument(
+        "--layer-intensity-profile",
+        type=str,
+        default=DEFAULT_LAYER_INTENSITY_PROFILE_NAME,
+        choices=available_layer_intensity_profiles(),
+    )
+    parser.add_argument("--layer-intensity-default", type=float, default=1.0)
     parser.add_argument("--target-fill-max-candidate-voxels-per-layer", type=int, default=4000)
     parser.add_argument("--disable-gradient-fill", action="store_true")
     parser.add_argument("--disable-vtk-export", action="store_true")
@@ -1060,6 +1056,32 @@ def count_layer_seeds(seeds_df: pd.DataFrame) -> dict[tuple[str, str, str], int]
     return counts
 
 
+def layer_surface_pair_key_from_row(row: pd.Series) -> str:
+    return build_layer_surface_pair_key(row.get("TopSurfaceCode", ""), row.get("BaseSurfaceCode", ""))
+
+
+def resolve_layer_intensity_factor(row: pd.Series, config: GradientFillConfig) -> float:
+    if not bool(config.enable_layer_intensity_scaling):
+        return 1.0
+    factor_map = config.layer_intensity_factors or {}
+    layer_pair_key = layer_surface_pair_key_from_row(row)
+    fallback = max(0.0, float(config.layer_intensity_default))
+    numeric = pd.to_numeric(factor_map.get(layer_pair_key, fallback), errors="coerce")
+    if pd.isna(numeric):
+        return fallback
+    return max(0.0, float(numeric))
+
+
+def scale_cluster_budget(base_clusters: int, layer_factor: float) -> int:
+    base_value = max(0, int(base_clusters))
+    if base_value <= 0:
+        return 0
+    factor_value = max(0.0, float(layer_factor))
+    if factor_value <= 0.0:
+        return 0
+    return int(math.ceil(base_value * factor_value))
+
+
 def build_layer_fill_plan(
     layers_df: pd.DataFrame,
     seeds_df: pd.DataFrame,
@@ -1073,21 +1095,43 @@ def build_layer_fill_plan(
 
     for _, layer in layers_df.iterrows():
         layer_key = layer_lookup_key(layer)
+        layer_surface_pair_key = layer_surface_pair_key_from_row(layer)
+        layer_intensity_factor = resolve_layer_intensity_factor(layer, config)
+        adjusted_ratio = (
+            float(target_ratio * layer_intensity_factor)
+            if bool(config.target_fill_layer_weighted)
+            else float(target_ratio)
+        )
         input_count = int(input_counts.get(layer_key, 0))
         current_fill_count = int(current_fill_counts.get(layer_key, 0))
+        base_target_fill_count = int(math.ceil(input_count * target_ratio)) if input_count > 0 and target_ratio > 0 else 0
+        adjusted_target_fill_count = (
+            int(math.ceil(input_count * adjusted_ratio))
+            if input_count > 0 and adjusted_ratio > 0
+            else 0
+        )
         if input_count <= 0:
             target_fill_count = 0
         else:
-            ratio_target = int(math.ceil(input_count * target_ratio)) if target_ratio > 0 else 0
-            target_fill_count = max(ratio_target, input_count) if bool(config.enable_layer_min_constraint) else ratio_target
+            target_fill_count = (
+                max(adjusted_target_fill_count, input_count)
+                if bool(config.enable_layer_min_constraint)
+                else adjusted_target_fill_count
+            )
         rows.append(
             {
                 "GeoIntervalKey": str(layer.get("GeoIntervalKey", "")),
                 "StrataName": str(layer.get("StrataName", "")),
                 "TopSurfaceCode": str(layer.get("TopSurfaceCode", "")),
                 "BaseSurfaceCode": str(layer.get("BaseSurfaceCode", "")),
+                "LayerSurfacePairKey": layer_surface_pair_key,
+                "LayerIntensityFactor": float(layer_intensity_factor),
+                "BaseTargetRatio": float(target_ratio),
+                "AdjustedTargetRatio": float(adjusted_ratio),
                 "InputSeedCount": int(input_count),
                 "CurrentFillCount": int(current_fill_count),
+                "BaseTargetFillCount": int(base_target_fill_count),
+                "AdjustedTargetFillCount": int(adjusted_target_fill_count),
                 "TargetFillCount": int(target_fill_count),
                 "RemainingFillDeficit": int(max(0, target_fill_count - current_fill_count)),
             }
@@ -1602,11 +1646,18 @@ def build_gradient_fill_seeds(
             layer_voxels = filter_voxels_by_seed_exclusion(layer_voxels, layer_input_seed_df, config)
             if len(layer_voxels) < int(config.seedless_layer_min_voxels):
                 continue
+            layer_intensity_factor = resolve_layer_intensity_factor(layer, config)
+            scaled_max_clusters = scale_cluster_budget(
+                int(config.seedless_layer_max_clusters_per_layer),
+                layer_intensity_factor,
+            )
+            if scaled_max_clusters <= 0:
+                continue
 
             cluster_df = cluster_gradient_voxels(
                 layer_voxels,
                 config,
-                max_clusters=int(config.seedless_layer_max_clusters_per_layer),
+                max_clusters=scaled_max_clusters,
                 max_candidate_voxels=int(config.seedless_layer_max_candidate_voxels),
                 min_cluster_samples=int(config.seedless_layer_min_cluster_samples),
             )
@@ -1718,6 +1769,15 @@ def build_layer_lookup(layers_df: pd.DataFrame) -> dict[tuple[str, str, str], pd
     for _, row in layers_df.iterrows():
         lookup[layer_lookup_key(row)] = row
     return lookup
+
+
+def build_layer_intensity_summary(config: GradientFillConfig) -> dict[str, object]:
+    return {
+        "LayerIntensityScalingEnabled": bool(config.enable_layer_intensity_scaling),
+        "LayerIntensityProfileName": str(config.layer_intensity_profile_name),
+        "LayerIntensityDefault": float(config.layer_intensity_default),
+        "LayerIntensityFactors": dict(config.layer_intensity_factors or {}),
+    }
 
 
 def compute_density_scale(value: float, gain: float) -> float:
@@ -2050,6 +2110,7 @@ def main() -> int:
     gradient_fill_df = pd.DataFrame(columns=list(seeds_df.columns) + ["GradientValue", "ClusterPointCount", "ParentSeedID", "ParentSourceKind"])
     merged_seeds_df = seeds_df.copy()
     if not args.disable_gradient_fill and not layers_df.empty:
+        layer_intensity_profile = get_layer_intensity_profile(args.layer_intensity_profile)
         gradient_config = GradientFillConfig(
             trace_header_csv=args.trace_header_csv.resolve(),
             segy_file=args.segy_file.resolve(),
@@ -2089,6 +2150,10 @@ def main() -> int:
             enable_target_fill_ratio=not args.disable_target_fill_ratio,
             target_fill_to_input_ratio=args.target_fill_to_input_ratio,
             target_fill_layer_weighted=not args.disable_target_fill_layer_weighted,
+            enable_layer_intensity_scaling=not args.disable_layer_intensity_scaling,
+            layer_intensity_profile_name=str(args.layer_intensity_profile),
+            layer_intensity_default=max(0.0, float(args.layer_intensity_default)),
+            layer_intensity_factors=layer_intensity_profile,
             target_fill_max_candidate_voxels_per_layer=args.target_fill_max_candidate_voxels_per_layer,
         )
         seismic_cube, x_axis, y_axis, time_axis, seismic_summary = load_unit_seismic_cube(
@@ -2135,6 +2200,7 @@ def main() -> int:
         gradient_summary["GradientFillLayerCounts"] = (
             gradient_fill_df.groupby("GeoIntervalKey")["SeedID"].count().to_dict() if not gradient_fill_df.empty else {}
         )
+        gradient_summary.update(build_layer_intensity_summary(gradient_config))
         gradient_summary["LayerFillPlan"] = build_layer_fill_plan(layers_df, seeds_df, gradient_fill_df, gradient_config).to_dict(orient="records")
     patch_df = build_unit_dfn_patches(unit_row, layers_df, merged_seeds_df, config)
     patch_df = with_sequential_index(patch_df, "PatchIndex")

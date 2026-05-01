@@ -12,18 +12,18 @@ import numpy as np
 import pandas as pd
 
 
-DEFAULT_TRACE_HEADER_CSV = Path(r"E:\项目\石油项目\断缝储\原始数据\wx数据\砂砾岩\研究内容一\trace_header_xy.csv")
+DEFAULT_TRACE_HEADER_CSV = Path(r"/data/shared/project-oil/wx数据/砂砾岩/研究内容一/trace_header_xy.csv")
 DEFAULT_AGGREGATE_DIR = Path(
-    r"E:\项目\石油项目\断缝储\原始数据\wx数据\砂砾岩\优化阶段一\研究内容一\两阶段裂缝预测流程结果\现有常规测井裂缝预测\汇总结果"
+    r"/data/shared/project-oil/wx数据/砂砾岩/优化阶段一/研究内容一/两阶段裂缝预测流程结果/现有常规测井裂缝预测/汇总结果"
 )
 DEFAULT_INCLINED_AROUND_DIR = Path(
-    r"E:\项目\石油项目\断缝储\原始数据\wx数据\砂砾岩\优化阶段一\研究内容一\井斜\测井-地震时窗"
+    r"/data/shared/project-oil/wx数据/砂砾岩/优化阶段一/研究内容一/井斜/测井-地震时窗"
 )
 DEFAULT_VERTICAL_AROUND_DIR = Path(
-    r"E:\项目\石油项目\断缝储\原始数据\wx数据\砂砾岩\优化阶段一\研究内容一\测井\测井-地震时窗"
+    r"/data/shared/project-oil/wx数据/砂砾岩/优化阶段一/研究内容一/测井/测井-地震时窗"
 )
 DEFAULT_OUTPUT_ROOT = Path(
-    r"E:\项目\石油项目\断缝储\原始数据\wx数据\砂砾岩\优化阶段一\研究内容二\虚拟测井构建\单元裂缝归属"
+    r"/data/shared/project-oil/wx数据/砂砾岩/优化阶段一/研究内容二/虚拟测井构建/单元裂缝归属"
 )
 
 POINT_NUMERIC_COLS = [

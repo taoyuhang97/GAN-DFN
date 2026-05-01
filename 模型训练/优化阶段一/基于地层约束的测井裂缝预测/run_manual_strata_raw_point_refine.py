@@ -27,28 +27,28 @@ from workflow_paths import RAW_POINT_SCRIPT_PATH, WORKFLOW_ROOT
 ROOT = WORKFLOW_ROOT
 RUN_REFINE_SCRIPT = RAW_POINT_SCRIPT_PATH
 DEFAULT_SAMPLE_DIR = Path(
-    r"E:\项目\石油项目\断缝储\原始数据\wx数据\砂砾岩\优化阶段一\研究内容一\成像测井\裂缝样本"
+    r"/data/shared/project-oil/wx数据/砂砾岩/优化阶段一/研究内容一/成像测井/裂缝样本"
 )
 DEFAULT_RAW_LABEL_DIR = Path(
-    r"E:\项目\石油项目\断缝储\原始数据\wx数据\砂砾岩\研究内容一\成像测井\裂缝标注"
+    r"/data/shared/project-oil/wx数据/砂砾岩/研究内容一/成像测井/裂缝标注"
 )
 DEFAULT_SAVE_ROOT = Path(
-    r"E:\项目\石油项目\断缝储\原始数据\wx数据\砂砾岩\优化阶段一\研究内容一\裂缝位置预测\基于密度的裂缝点位分析\裂缝点位精细化\地层划分验证"
+    r"/data/shared/project-oil/wx数据/砂砾岩/优化阶段一/研究内容一/裂缝位置预测/基于密度的裂缝点位分析/裂缝点位精细化/地层划分验证"
 )
-DEFAULT_DOCX_PATH = Path(r"D:\项目\石油开采\断缝储实验\实验记录20260323.docx")
+DEFAULT_DOCX_PATH = Path(r"/data/shared/project-oil/wx数据/砂砾岩/优化阶段一/实验记录/实验记录20260323.docx")
 FLOW_RESULT_ROOT = Path(
-    r"E:\项目\石油项目\断缝储\原始数据\wx数据\砂砾岩\优化阶段一\研究内容一\两阶段裂缝预测流程结果"
+    r"/data/shared/project-oil/wx数据/砂砾岩/优化阶段一/研究内容一/两阶段裂缝预测流程结果"
 )
 DEFAULT_SAVE_ROOT = FLOW_RESULT_ROOT / "stage2_refine"
 DEFAULT_EXIST_DIR_MAP = {
     "沙三段": str(
         Path(
-            r"E:\项目\石油项目\断缝储\原始数据\wx数据\砂砾岩\优化阶段一\研究内容一\裂缝存在性预测\LSTM\地层划分验证\exp_strata_s3_balanced_logscale_v1\沙三段_lstm"
+            r"/data/shared/project-oil/wx数据/砂砾岩/优化阶段一/研究内容一/裂缝存在性预测/LSTM/地层划分验证/exp_strata_s3_balanced_logscale_v1/沙三段_lstm"
         )
     ),
     "沙四段": str(
         Path(
-            r"E:\项目\石油项目\断缝储\原始数据\wx数据\砂砾岩\优化阶段一\研究内容一\裂缝存在性预测\LSTM\地层划分验证\exp_strata_ac_gr_v1\沙四段_lstm"
+            r"/data/shared/project-oil/wx数据/砂砾岩/优化阶段一/研究内容一/裂缝存在性预测/LSTM/地层划分验证/exp_strata_ac_gr_v1/沙四段_lstm"
         )
     ),
 }

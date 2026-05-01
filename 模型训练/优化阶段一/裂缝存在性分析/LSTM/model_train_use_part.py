@@ -22,8 +22,8 @@ EPOCHS = 20
 LR = 1e-3
 N_FOLDS = 5
 
-DATA_DIR = r"E:\项目\石油项目\断缝储\原始数据\wx数据\砂砾岩\优化阶段一\研究内容一\成像测井\裂缝样本"
-SAVE_DIR = r"E:\项目\石油项目\断缝储\原始数据\wx数据\砂砾岩\优化阶段一\研究内容一\裂缝存在性预测\LSTM\井段拆分验证"
+DATA_DIR = r"/data/shared/project-oil/wx数据/砂砾岩/优化阶段一/研究内容一/成像测井/裂缝样本"
+SAVE_DIR = r"/data/shared/project-oil/wx数据/砂砾岩/优化阶段一/研究内容一/裂缝存在性预测/LSTM/井段拆分验证"
 os.makedirs(SAVE_DIR, exist_ok=True)
 
 # ===================== 特征定义 =====================

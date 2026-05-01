@@ -16,17 +16,17 @@ from sklearn.preprocessing import StandardScaler
 
 ROOT = Path(__file__).resolve().parent
 FIRST_STAGE_DEFAULT_EXP_DIR = Path(
-    r"E:\项目\石油项目\断缝储\原始数据\wx数据\砂砾岩\优化阶段一\研究内容一\裂缝存在性预测\LSTM\单井验证\成像测井裂缝预测\cnn+lstm\exp40_missing_drop_ac_gr_3x3_seq5_AC_GR"
+    r"/data/shared/project-oil/wx数据/砂砾岩/优化阶段一/研究内容一/裂缝存在性预测/LSTM/单井验证/成像测井裂缝预测/cnn+lstm/exp40_missing_drop_ac_gr_3x3_seq5_AC_GR"
 )
 SECOND_STAGE_DEFAULT_EXP_DIR = Path(
-    r"E:\项目\石油项目\断缝储\原始数据\wx数据\砂砾岩\优化阶段一\研究内容一\裂缝位置预测\基于密度的裂缝点位分析\裂缝点位精细化\raw_point_tweedie_probmass_max_v1"
+    r"/data/shared/project-oil/wx数据/砂砾岩/优化阶段一/研究内容一/裂缝位置预测/基于密度的裂缝点位分析/裂缝点位精细化/raw_point_tweedie_probmass_max_v1"
 )
 OUTPUT_BASE_DIR = Path(
-    r"E:\项目\石油项目\断缝储\原始数据\wx数据\砂砾岩\优化阶段一\研究内容一\裂缝位置预测\基于密度的裂缝点位分析\常规测井最近成像井预测"
+    r"/data/shared/project-oil/wx数据/砂砾岩/优化阶段一/研究内容一/裂缝位置预测/基于密度的裂缝点位分析/常规测井最近成像井预测"
 )
 DEFAULT_CANDIDATE_WELLS = ["车660-1", "车660-2", "车662", "车663"]
 FLOW_RESULT_ROOT = Path(
-    r"E:\项目\石油项目\断缝储\原始数据\wx数据\砂砾岩\优化阶段一\研究内容一\两阶段裂缝预测流程结果"
+    r"/data/shared/project-oil/wx数据/砂砾岩/优化阶段一/研究内容一/两阶段裂缝预测流程结果"
 )
 OUTPUT_BASE_DIR = FLOW_RESULT_ROOT / "manual_runs" / "nearest_predict_then_refine"
 RAW_POINT_GUIDED_SCRIPT = ROOT / "raw_point_guided_segment_refine.py"

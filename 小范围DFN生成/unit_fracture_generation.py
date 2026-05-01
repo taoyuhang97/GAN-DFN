@@ -1,6 +1,7 @@
 import numpy as np
 import pandas as pd
 import os
+from pathlib import Path
 import matplotlib.pyplot as plt
 from mpl_toolkits.mplot3d.art3d import Poly3DCollection
 from scipy.interpolate import RegularGridInterpolator
@@ -409,9 +410,9 @@ def main_single_unit():
 
 if __name__ == "__main__":
     # ===== 配置 =====
-    fracture_csv = r"E:\项目\石油项目\断缝储\原始数据\wx数据\砂砾岩\研究内容一\裂缝角度预测\测井\车22_predicted_angles.csv"
-    seismic_csv = r"单元地震信息抽取\seismic_data_block_X32_Y24.csv"  # 替换为实际CSV地震数据路径
-    output_dir = r"E:\项目\石油项目\断缝储\输出\裂缝片模型"
+    fracture_csv = r"/data/shared/project-oil/wx数据/砂砾岩/研究内容一/裂缝角度预测/测井/车22_predicted_angles.csv"
+    seismic_csv = r"单元地震信息抽取/seismic_data_block_X32_Y24.csv"  # 替换为实际CSV地震数据路径
+    output_dir = str(Path(__file__).resolve().parents[1] / "_outputs" / "裂缝片模型")
     os.makedirs(output_dir, exist_ok=True)
 
     # 裂缝片基础边长 (m)

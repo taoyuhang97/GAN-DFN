@@ -13,20 +13,20 @@ warnings.filterwarnings('ignore')
 
 # ==================== 路径配置 ====================
 # 断层曲面数据目录（.dat文件）
-FAULT_SURFACE_DIR = r"D:\康宁畅\中国石油\阶段二\按照地层分类\层位"
+FAULT_SURFACE_DIR = r"/data/shared/project-oil/wx数据/砂砾岩/层位"
 
 # 重采样后的地层数据目录（按断层段划分的CSV文件）
-ZONE_DATA_DIR = r"D:\康宁畅\中国石油\阶段二\按照地层分类\相对深度重采样数据"
+ZONE_DATA_DIR = r"/data/shared/project-oil/wx数据/砂砾岩/优化阶段一/研究内容二/虚拟测井构建/相对深度重采样数据"
 
-# 原始测井数据目录（可选，用于获取坐标范围）
-RAW_WELL_DIR = r"D:\康宁畅\中国石油\阶段二\按照地层分类\原始井数据"
+# 坐标范围来源目录
+RAW_WELL_DIR = ZONE_DATA_DIR
 
 # 输出目录
-OUTPUT_DIR = r"D:\康宁畅\中国石油\阶段二\按照地层分类\构建虚拟井\虚拟井预测结果"
+OUTPUT_DIR = r"/data/shared/project-oil/wx数据/砂砾岩/优化阶段一/研究内容二/虚拟测井构建/虚拟井预测结果"
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 # 模型保存目录
-MODEL_DIR = r"D:\康宁畅\中国石油\阶段二\按照地层分类\构建虚拟井\训练好的模型"
+MODEL_DIR = r"/data/shared/project-oil/wx数据/砂砾岩/优化阶段一/研究内容二/虚拟测井构建/训练好的模型"
 os.makedirs(MODEL_DIR, exist_ok=True)
 
 # 已训练好的模型文件路径（如果存在，可以直接加载使用）

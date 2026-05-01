@@ -6,7 +6,7 @@ from tqdm import tqdm
 
 # 路径设置
 # 输入
-data_dir = r"E:\项目\石油项目\断缝储\原始数据\wx数据\砂砾岩"
+data_dir = r"/data/shared/project-oil/wx数据/砂砾岩"
 # sgy_file = os.path.join(data_dir, "psdm_final_time.sgy")
 sgy_file = os.path.join(data_dir, "che66_2019_psdm_time.sgy")
 # 输出

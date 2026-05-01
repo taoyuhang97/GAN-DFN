@@ -149,17 +149,17 @@ def build_fracture_seismic_samples(around_csv, fracture_csv, density_las, output
 if __name__ == "__main__":
     well_info = {
         "车151HF": {
-            "around_csv": r"E:\项目\石油项目\断缝储\原始数据\wx数据\砂砾岩\优化阶段一\研究内容一\井斜\测井-地震时窗\车151HF_around_data.csv",
-            "fracture_csv": r"E:\项目\石油项目\断缝储\原始数据\wx数据\砂砾岩\优化阶段一\研究内容一\成像测井\裂缝提取\车151HF_fractures.csv",
-            "density_las": r"E:\项目\石油项目\断缝储\原始数据\wx数据\砂砾岩\车镇成像测井\che151HF_20240415XRMI\车151HF-成果数据\车151HF电成像  裂缝LAS文件\车151HF_裂缝参数_P10、P21、P33.las",
+            "around_csv": r"/data/shared/project-oil/wx数据/砂砾岩/优化阶段一/研究内容一/井斜/测井-地震时窗/车151HF_around_data.csv",
+            "fracture_csv": r"/data/shared/project-oil/wx数据/砂砾岩/优化阶段一/研究内容一/成像测井/裂缝提取/车151HF_fractures.csv",
+            "density_las": r"/data/shared/project-oil/wx数据/砂砾岩/车镇成像测井/che151HF_20240415XRMI/车151HF-成果数据/车151HF电成像  裂缝LAS文件/车151HF_裂缝参数_P10、P21、P33.las",
         },
         "车页1导眼": {
-            "around_csv": r"E:\项目\石油项目\断缝储\原始数据\wx数据\砂砾岩\优化阶段一\研究内容一\井斜\测井-地震时窗\车页1导眼_around_data.csv",
-            "fracture_csv": r"E:\项目\石油项目\断缝储\原始数据\wx数据\砂砾岩\优化阶段一\研究内容一\成像测井\裂缝提取\车页1导眼_fractures.csv",
-            "density_las": r"E:\项目\石油项目\断缝储\原始数据\wx数据\砂砾岩\车镇成像测井\车页1HF（导眼）井-FMI\DLIS&LAS成果数据\车页1HF井裂缝密度、裂缝长度、裂缝孔隙度成果数据_3496.5-3755m.las",
+            "around_csv": r"/data/shared/project-oil/wx数据/砂砾岩/优化阶段一/研究内容一/井斜/测井-地震时窗/车页1导眼_around_data.csv",
+            "fracture_csv": r"/data/shared/project-oil/wx数据/砂砾岩/优化阶段一/研究内容一/成像测井/裂缝提取/车页1导眼_fractures.csv",
+            "density_las": r"/data/shared/project-oil/wx数据/砂砾岩/车镇成像测井/车页1HF（导眼）井-FMI/DLIS&LAS成果数据/车页1HF井裂缝密度、裂缝长度、裂缝孔隙度成果数据_3496.5-3755m.las",
         }
     }
-    output_dir = r"E:\项目\石油项目\断缝储\原始数据\wx数据\砂砾岩\优化阶段一\研究内容一\成像测井\裂缝样本"
+    output_dir = r"/data/shared/project-oil/wx数据/砂砾岩/优化阶段一/研究内容一/成像测井/裂缝样本"
     os.makedirs(output_dir, exist_ok=True)
     for well in well_info:
         build_fracture_seismic_samples(

@@ -82,7 +82,7 @@ def extract_block(trace_header_file, output_csv_file, block_index_x, block_index
 
 # --- 参数配置区 ---
 # 输入文件名
-trace_header_xy_file = r"E:\项目\石油项目\断缝储\原始数据\wx数据\砂砾岩\研究内容一\trace_header_xy.csv"
+trace_header_xy_file = r"/data/shared/project-oil/wx数据/砂砾岩/研究内容一/trace_header_xy.csv"
 
 
 # 请在这里指定您想要提取的区块的X和Y方向的“编号”

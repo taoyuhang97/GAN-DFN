@@ -25,15 +25,15 @@ from fracture_prediction_compare_visualization import (
 
 
 DEFAULT_PREDICTION_PATH = Path(
-    # r"E:\项目\石油项目\断缝储\原始数据\wx数据\砂砾岩\优化阶段一\研究内容一\两阶段裂缝预测流程结果\现有常规测井裂缝预测\车151HF\final_fracture_points.csv"
-    r"E:\项目\石油项目\断缝储\原始数据\wx数据\砂砾岩\优化阶段一\研究内容一\两阶段裂缝预测流程结果\现有常规测井裂缝预测\车页1导眼\final_fracture_points.csv"
+    # r"/data/shared/project-oil/wx数据/砂砾岩/优化阶段一/研究内容一/两阶段裂缝预测流程结果/现有常规测井裂缝预测/车151HF/final_fracture_points.csv"
+    r"/data/shared/project-oil/wx数据/砂砾岩/优化阶段一/研究内容一/两阶段裂缝预测流程结果/现有常规测井裂缝预测/车页1导眼/final_fracture_points.csv"
 )
 DEFAULT_ACTUAL_PATH = Path(
-    # r"E:\项目\石油项目\断缝储\原始数据\wx数据\砂砾岩\优化阶段一\研究内容一\成像测井\裂缝提取\车151HF_fractures.csv"
-    r"E:\项目\石油项目\断缝储\原始数据\wx数据\砂砾岩\优化阶段一\研究内容一\成像测井\裂缝提取\车页1导眼_fractures.csv"
+    # r"/data/shared/project-oil/wx数据/砂砾岩/优化阶段一/研究内容一/成像测井/裂缝提取/车151HF_fractures.csv"
+    r"/data/shared/project-oil/wx数据/砂砾岩/优化阶段一/研究内容一/成像测井/裂缝提取/车页1导眼_fractures.csv"
 )
 DEFAULT_OUTPUT_DIR = Path(
-    r"E:\项目\石油项目\断缝储\原始数据\wx数据\砂砾岩\优化阶段一\方案对比\研究内容一\第一轮优化深度分布分析"
+    r"/data/shared/project-oil/wx数据/砂砾岩/优化阶段一/方案对比/研究内容一/第一轮优化深度分布分析"
 )
 # DEFAULT_DEPTH_MIN = 3655.0
 # DEFAULT_DEPTH_MAX = 4935.0

@@ -16,10 +16,10 @@ from scipy.spatial import Delaunay
 # =========================
 # 用户需要修改的输入参数
 # =========================
-sticks_path = r"E:\项目\石油项目\断缝储\原始数据\wx数据\砂砾岩\断层\FaultStick_0604.dat"  # 输入文件
+sticks_path = r"/data/shared/project-oil/wx数据/砂砾岩/断层/FaultStick_0604.dat"  # 输入文件
 origin_x = 556150.0  # 网格原点X（与你们300m网格对齐）
 origin_y = 4193975.0  # 网格原点Y
-outdir = r"E:\项目\石油项目\断缝储\原始数据\wx数据\砂砾岩\研究内容二\单元实验\fault_patches_out"  # 输出目录
+outdir = r"/data/shared/project-oil/wx数据/砂砾岩/研究内容二/单元实验/fault_patches_out"  # 输出目录
 
 cell_size = 300.0  # 单元边长
 zpad = 5000.0  # Z向加厚

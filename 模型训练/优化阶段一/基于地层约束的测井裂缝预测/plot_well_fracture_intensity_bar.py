@@ -12,7 +12,7 @@ import pandas as pd
 
 
 DEFAULT_INPUT_ROOT = Path(
-    r"E:\项目\石油项目\断缝储\原始数据\wx数据\砂砾岩\优化阶段一\研究内容一\两阶段裂缝预测流程结果\层位裂缝发育情况统计"
+    r"/data/shared/project-oil/wx数据/砂砾岩/优化阶段一/研究内容一/两阶段裂缝预测流程结果/层位裂缝发育情况统计"
 )
 DEFAULT_OUTPUT_DIRNAME = "井层位裂缝发育柱状图"
 INPUT_FILE_SUFFIX = "_fracture_intensity.csv"

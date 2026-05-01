@@ -7,16 +7,16 @@ from sklearn.preprocessing import StandardScaler
 import logging
 
 # ========== 配置路径 ==========
-base_model_path = r"E:\项目\石油项目\断缝储\原始数据\wx数据\砂砾岩\优化阶段一\研究内容一\裂缝存在性预测\XGboost\模型"
+base_model_path = r"/data/shared/project-oil/wx数据/砂砾岩/优化阶段一/研究内容一/裂缝存在性预测/XGboost/模型"
 model_path = os.path.join(base_model_path, r"fracture_xgb_model.pkl")
 scaler_path = os.path.join(base_model_path, r"fracture_scaler.pkl")
 feature_path = os.path.join(base_model_path, r"fracture_features.pkl")
 
-# predict_input_dir = r"E:\项目\石油项目\断缝储\原始数据\wx数据\砂砾岩\研究内容一\测井\测井-地震时窗"   # 需要预测的文件夹
-# predict_output_dir = r"E:\项目\石油项目\断缝储\原始数据\wx数据\砂砾岩\研究内容一\XGboost\裂缝存在预测\测井"    # 输出结果的目录
-# predict_input_dir = r"E:\项目\石油项目\断缝储\原始数据\wx数据\砂砾岩\研究内容一\井斜\测井-地震时窗"   # 需要预测的文件夹
-# predict_output_dir = r"E:\项目\石油项目\断缝储\原始数据\wx数据\砂砾岩\研究内容一\XGboost\裂缝存在预测\井斜"    # 输出结果的目录
-predict_output_dir = r"E:\项目\石油项目\断缝储\原始数据\wx数据\砂砾岩\优化阶段一\研究内容一\裂缝存在性预测\成像测井预测"
+# predict_input_dir = r"/data/shared/project-oil/wx数据/砂砾岩/研究内容一/测井/测井-地震时窗"   # 需要预测的文件夹
+# predict_output_dir = r"/data/shared/project-oil/wx数据/砂砾岩/研究内容一/XGboost/裂缝存在预测/测井"    # 输出结果的目录
+# predict_input_dir = r"/data/shared/project-oil/wx数据/砂砾岩/研究内容一/井斜/测井-地震时窗"   # 需要预测的文件夹
+# predict_output_dir = r"/data/shared/project-oil/wx数据/砂砾岩/研究内容一/XGboost/裂缝存在预测/井斜"    # 输出结果的目录
+predict_output_dir = r"/data/shared/project-oil/wx数据/砂砾岩/优化阶段一/研究内容一/裂缝存在性预测/成像测井预测"
 
 log_file = os.path.join(predict_output_dir, 'prediction_log.txt')
 os.makedirs(predict_output_dir, exist_ok=True)
@@ -38,7 +38,7 @@ features = ['SEIS_TRUE'] + [f'SEIS_{i}' for i in range(63)] + ['AC', 'GR']
 
 # ========== 遍历所有文件 ==========
 # csv_files = glob.glob(os.path.join(predict_input_dir, "*.csv"))
-csv_files = [r"E:\项目\石油项目\断缝储\原始数据\wx数据\砂砾岩\优化阶段一\研究内容一\成像测井\裂缝样本\车页1导眼_sample.csv"]
+csv_files = [r"/data/shared/project-oil/wx数据/砂砾岩/优化阶段一/研究内容一/成像测井/裂缝样本/车页1导眼_sample.csv"]
 
 for file in csv_files:
     try:

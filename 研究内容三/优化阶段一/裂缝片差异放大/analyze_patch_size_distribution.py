@@ -15,7 +15,7 @@ import pandas as pd
 
 
 DEFAULT_RUN_ROOT = Path(
-    r"E:\项目\石油项目\断缝储\原始数据\wx数据\砂砾岩\优化阶段一\研究内容三\单元DFN批量生成\bx33_35_by33_35_surface_scaled_x5_20260331"
+    r"/data/shared/project-oil/wx数据/砂砾岩/优化阶段一/研究内容三/单元DFN批量生成/bx33_35_by33_35_surface_scaled_x5_20260331"
 )
 
 REQUIRED_COLUMNS = ["UnitID", "PatchLength", "PatchHeight"]

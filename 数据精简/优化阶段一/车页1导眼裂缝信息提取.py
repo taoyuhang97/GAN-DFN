@@ -5,11 +5,11 @@ import os
 # 参数区
 # ============================================================
 
-LAS_FILE = r"E:\项目\石油项目\断缝储\原始数据\wx数据\砂砾岩\车镇成像测井\车页1HF（导眼）井-FMI\DLIS&LAS成果数据\车页1HF井成像测井蝌蚪成果数据_3496.5-3755m.las"
+LAS_FILE = r"/data/shared/project-oil/wx数据/砂砾岩/车镇成像测井/车页1HF（导眼）井-FMI/DLIS&LAS成果数据/车页1HF井成像测井蝌蚪成果数据_3496.5-3755m.las"
 well_name = "车页1导眼"
 SKIP_ROWS = 435
 
-OUTPUT_DIR = r"E:\项目\石油项目\断缝储\原始数据\wx数据\砂砾岩\优化阶段一\研究内容一\成像测井\裂缝提取"
+OUTPUT_DIR = r"/data/shared/project-oil/wx数据/砂砾岩/优化阶段一/研究内容一/成像测井/裂缝提取"
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 # 需要保留的裂缝类型（白名单）

@@ -200,26 +200,26 @@ def visualize_merged_fault_fractures(merged_file):
 
 # ---------------- 使用示例 ----------------
 # 断层面展示
-# fault_path = "E:/项目/石油项目/断缝储/原始数据/wx数据/砂砾岩/研究内容二/单元实验/fault_patches_out_npy/npy/F01/F01__i47_j4.npy"
-# fault_path = r"E:\项目\石油项目\断缝储\原始数据\wx数据\砂砾岩\研究内容二\测井区块生成\block_X73_Y47_fractures.csv"
-# fault_path = r"E:\项目\石油项目\断缝储\原始数据\wx数据\砂砾岩\研究内容二\单元实验\fault_patches_out_npy\npy\fp_F_che32_bei\fp_F_che32_bei__i14_j21.npy"
+# fault_path = "/data/shared/project-oil/wx数据/砂砾岩/研究内容二/单元实验/fault_patches_out_npy/npy/F01/F01__i47_j4.npy"
+# fault_path = r"/data/shared/project-oil/wx数据/砂砾岩/研究内容二/测井区块生成/block_X73_Y47_fractures.csv"
+# fault_path = r"/data/shared/project-oil/wx数据/砂砾岩/研究内容二/单元实验/fault_patches_out_npy/npy/fp_F_che32_bei/fp_F_che32_bei__i14_j21.npy"
 # inspect_npy_file(fault_path)
 # visualize_npy_fault(fault_path)
-# fault_path = r"E:\项目\石油项目\断缝储\原始数据\wx数据\砂砾岩\研究内容二\单元实验\fault_patches_out_npy\npy\F02\F02__i14_j21.npy"
+# fault_path = r"/data/shared/project-oil/wx数据/砂砾岩/研究内容二/单元实验/fault_patches_out_npy/npy/F02/F02__i14_j21.npy"
 # inspect_npy_file(fault_path)
 # visualize_npy_fault(fault_path)
 
 # 裂缝片展示
-fracture_path = r"E:\项目\石油项目\断缝储\原始数据\wx数据\砂砾岩\研究内容二\测井区块生成\单元裂缝网络\block_X14_Y21_fractures.npy"
+fracture_path = r"/data/shared/project-oil/wx数据/砂砾岩/研究内容二/测井区块生成/单元裂缝网络/block_X14_Y21_fractures.npy"
 inspect_npy_file(fracture_path)
 visualize_npy_fractures(fracture_path)
 
 # 单元DFN展示
 # fault_files = [
-#     r"E:\项目\石油项目\断缝储\原始数据\wx数据\砂砾岩\研究内容二\单元实验\fault_patches_out_npy\npy\F02\F02__i14_j21.npy",
-#     r"E:\项目\石油项目\断缝储\原始数据\wx数据\砂砾岩\研究内容二\单元实验\fault_patches_out_npy\npy\fp_F_che32_bei\fp_F_che32_bei__i14_j21.npy"
+#     r"/data/shared/project-oil/wx数据/砂砾岩/研究内容二/单元实验/fault_patches_out_npy/npy/F02/F02__i14_j21.npy",
+#     r"/data/shared/project-oil/wx数据/砂砾岩/研究内容二/单元实验/fault_patches_out_npy/npy/fp_F_che32_bei/fp_F_che32_bei__i14_j21.npy"
 # ]
-# fracture_file = r"E:\项目\石油项目\断缝储\原始数据\wx数据\砂砾岩\研究内容二\测井区块生成\单元裂缝网络\block_X14_Y21_fractures.npy"
+# fracture_file = r"/data/shared/project-oil/wx数据/砂砾岩/研究内容二/测井区块生成/单元裂缝网络/block_X14_Y21_fractures.npy"
 # output_file = r"E:\项目\石油项目\断缝储\输出\block_X14_Y21_faults_fractures.npy"
 #
 # merge_fault_and_fractures(fault_files, fracture_file, output_file)

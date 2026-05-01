@@ -30,13 +30,13 @@ from strata_expert_deploy.runtime import DEFAULT_LOG_FEATURES, parse_json_list, 
 
 
 DEFAULT_INCLINED_DIR = Path(
-    r"E:\项目\石油项目\断缝储\原始数据\wx数据\砂砾岩\优化阶段一\研究内容一\井斜\测井-地震时窗"
+    r"/data/shared/project-oil/wx数据/砂砾岩/优化阶段一/研究内容一/井斜/测井-地震时窗"
 )
 DEFAULT_VERTICAL_DIR = Path(
-    r"E:\项目\石油项目\断缝储\原始数据\wx数据\砂砾岩\优化阶段一\研究内容一\测井\测井-地震时窗"
+    r"/data/shared/project-oil/wx数据/砂砾岩/优化阶段一/研究内容一/测井/测井-地震时窗"
 )
 DEFAULT_OUTPUT_ROOT = Path(
-    r"E:\项目\石油项目\断缝储\原始数据\wx数据\砂砾岩\优化阶段一\研究内容一\两阶段裂缝预测流程结果\现有常规测井裂缝预测"
+    r"/data/shared/project-oil/wx数据/砂砾岩/优化阶段一/研究内容一/两阶段裂缝预测流程结果/现有常规测井裂缝预测"
 )
 
 SUMMARY_CSV_NAME = "batch_prediction_summary.csv"

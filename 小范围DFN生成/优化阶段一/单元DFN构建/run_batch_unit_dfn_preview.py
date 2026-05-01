@@ -12,7 +12,7 @@ import build_unit_dfn_preview as preview
 
 
 DEFAULT_OUTPUT_ROOT = Path(
-    r"E:\项目\石油项目\断缝储\原始数据\wx数据\砂砾岩\优化阶段一\研究内容二\单元DFN构建\批量生成"
+    r"/data/shared/project-oil/wx数据/砂砾岩/优化阶段一/研究内容二/单元DFN构建/批量生成"
 )
 
 
@@ -73,6 +73,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--disable-target-fill-ratio", action="store_true")
     parser.add_argument("--target-fill-to-input-ratio", type=float, default=1.5)
     parser.add_argument("--disable-target-fill-layer-weighted", action="store_true")
+    parser.add_argument("--disable-layer-intensity-scaling", action="store_true")
+    parser.add_argument(
+        "--layer-intensity-profile",
+        type=str,
+        default=preview.DEFAULT_LAYER_INTENSITY_PROFILE_NAME,
+        choices=preview.available_layer_intensity_profiles(),
+    )
+    parser.add_argument("--layer-intensity-default", type=float, default=1.0)
     parser.add_argument("--target-fill-max-candidate-voxels-per-layer", type=int, default=4000)
     parser.add_argument("--disable-gradient-fill", action="store_true")
     parser.add_argument("--disable-vtk-export", action="store_true")
@@ -109,6 +117,7 @@ def build_patch_config(args: argparse.Namespace) -> preview.PatchConfig:
 
 
 def build_gradient_config(args: argparse.Namespace) -> preview.GradientFillConfig:
+    layer_intensity_profile = preview.get_layer_intensity_profile(args.layer_intensity_profile)
     return preview.GradientFillConfig(
         trace_header_csv=args.trace_header_csv.resolve(),
         segy_file=args.segy_file.resolve(),
@@ -148,6 +157,10 @@ def build_gradient_config(args: argparse.Namespace) -> preview.GradientFillConfi
         enable_target_fill_ratio=not args.disable_target_fill_ratio,
         target_fill_to_input_ratio=args.target_fill_to_input_ratio,
         target_fill_layer_weighted=not args.disable_target_fill_layer_weighted,
+        enable_layer_intensity_scaling=not args.disable_layer_intensity_scaling,
+        layer_intensity_profile_name=str(args.layer_intensity_profile),
+        layer_intensity_default=max(0.0, float(args.layer_intensity_default)),
+        layer_intensity_factors=layer_intensity_profile,
         target_fill_max_candidate_voxels_per_layer=args.target_fill_max_candidate_voxels_per_layer,
     )
 
@@ -227,6 +240,7 @@ def build_gradient_fill(
     gradient_summary["GradientFillLayerCounts"] = (
         gradient_fill_df.groupby("GeoIntervalKey")["SeedID"].count().to_dict() if not gradient_fill_df.empty else {}
     )
+    gradient_summary.update(preview.build_layer_intensity_summary(gradient_config))
     gradient_summary["LayerFillPlan"] = preview.build_layer_fill_plan(layers_df, seeds_df, gradient_fill_df, gradient_config).to_dict(orient="records")
     return gradient_fill_df, merged_seeds_df, gradient_summary
 
@@ -380,8 +394,14 @@ def main() -> int:
                         "StrataName": layer_row.get("StrataName", ""),
                         "TopSurfaceCode": layer_row.get("TopSurfaceCode", ""),
                         "BaseSurfaceCode": layer_row.get("BaseSurfaceCode", ""),
+                        "LayerSurfacePairKey": layer_row.get("LayerSurfacePairKey", ""),
+                        "LayerIntensityFactor": layer_row.get("LayerIntensityFactor", 1.0),
+                        "BaseTargetRatio": layer_row.get("BaseTargetRatio", 0.0),
+                        "AdjustedTargetRatio": layer_row.get("AdjustedTargetRatio", 0.0),
                         "InputSeedCount": layer_row.get("InputSeedCount", 0),
                         "CurrentFillCount": layer_row.get("CurrentFillCount", 0),
+                        "BaseTargetFillCount": layer_row.get("BaseTargetFillCount", 0),
+                        "AdjustedTargetFillCount": layer_row.get("AdjustedTargetFillCount", 0),
                         "TargetFillCount": layer_row.get("TargetFillCount", 0),
                         "RemainingFillDeficit": layer_row.get("RemainingFillDeficit", 0),
                     }

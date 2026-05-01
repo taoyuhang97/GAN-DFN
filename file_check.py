@@ -11,7 +11,7 @@ def get_basename(filename):
     return os.path.splitext(filename)[0]  # "车15.las" → "车15"
 
 # 主目录路径
-data_path = r"E:\项目\石油项目\断缝储\原始数据\wx数据\砂砾岩"
+data_path = r"/data/shared/project-oil/wx数据/砂砾岩"
 
 # 要处理的子目录
 subdirs = ['测井', '井斜', '时深']

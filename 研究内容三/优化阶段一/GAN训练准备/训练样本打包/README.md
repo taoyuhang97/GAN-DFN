@@ -33,13 +33,13 @@
 
 ## 默认输出目录
 
-- `E:\项目\石油项目\断缝储\原始数据\wx数据\砂砾岩\优化阶段一\研究内容三\GAN训练准备\训练样本打包`
+- `/data/shared/project-oil/wx数据/砂砾岩/优化阶段一/研究内容三/GAN训练准备/训练样本打包`
 
 ## 推荐起步参数
 
 ```powershell
 py -3.12 .\研究内容三\优化阶段一\GAN训练准备\训练样本打包\build_sparse_instance_gan_dataset.py `
-  --stats-run-dir E:\项目\石油项目\断缝储\原始数据\wx数据\砂砾岩\优化阶段一\研究内容三\GAN训练准备\窗口级实例统计\full_20260330_t128_t160_ov50 `
+  --stats-run-dir /data/shared/project-oil/wx数据/砂砾岩/优化阶段一/研究内容三/GAN训练准备/窗口级实例统计/full_20260330_t128_t160_ov50 `
   --run-name phase1_t128_sparse_v1 `
   --window-size 128 `
   --overlap-ratio 0.5 `

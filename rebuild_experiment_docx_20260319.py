@@ -6,9 +6,9 @@ from docx import Document
 
 
 RESULT_ROOT = Path(
-    r"E:\项目\石油项目\断缝储\原始数据\wx数据\砂砾岩\优化阶段一\研究内容一\裂缝位置预测\基于密度的裂缝点位分析\裂缝点位精细化"
+    r"/data/shared/project-oil/wx数据/砂砾岩/优化阶段一/研究内容一/裂缝位置预测/基于密度的裂缝点位分析/裂缝点位精细化"
 )
-OUTPUT_DOCX = Path(r"D:\项目\石油开采\断缝储实验\实验记录20260319.docx")
+OUTPUT_DOCX = Path(r"/data/shared/project-oil/wx数据/砂砾岩/优化阶段一/实验记录/实验记录20260319.docx")
 TARGET_DATE_PREFIX = "2026-03-19"
 
 

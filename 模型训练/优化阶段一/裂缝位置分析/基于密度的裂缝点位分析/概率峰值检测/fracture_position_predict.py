@@ -11,10 +11,10 @@ plt.rcParams['font.sans-serif'] = ['SimHei']
 plt.rcParams['axes.unicode_minus'] = False
 
 # ===== 配置 =====
-# predict_output_dir = r"E:\项目\石油项目\断缝储\原始数据\wx数据\砂砾岩\研究内容一\XGboost\裂缝存在预测\井斜"
-# predict_output_dir = r"E:\项目\石油项目\断缝储\原始数据\wx数据\砂砾岩\研究内容一\XGboost\裂缝存在预测\测井"
-predict_output_dir = r"E:\项目\石油项目\断缝储\原始数据\wx数据\砂砾岩\优化阶段一\研究内容一\裂缝存在性预测\成像测井预测"
-method_path_dir = r"E:\项目\石油项目\断缝储\原始数据\wx数据\砂砾岩\优化阶段一\研究内容一\裂缝位置预测\峰值检测方法"
+# predict_output_dir = r"/data/shared/project-oil/wx数据/砂砾岩/研究内容一/XGboost/裂缝存在预测/井斜"
+# predict_output_dir = r"/data/shared/project-oil/wx数据/砂砾岩/研究内容一/XGboost/裂缝存在预测/测井"
+predict_output_dir = r"/data/shared/project-oil/wx数据/砂砾岩/优化阶段一/研究内容一/裂缝存在性预测/成像测井预测"
+method_path_dir = r"/data/shared/project-oil/wx数据/砂砾岩/优化阶段一/研究内容一/裂缝位置预测/峰值检测方法"
 # output_dir = os.path.join(method_path_dir, "井斜")
 # output_dir = os.path.join(method_path_dir, "测井")
 output_dir = os.path.join(method_path_dir, "成像测井预测")

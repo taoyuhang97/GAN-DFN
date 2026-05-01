@@ -315,10 +315,10 @@ def construct_imaging_samples(xy, use_timedeep, output_dir, well_name, las_file,
 
 # ==== 执行 ====
 if __name__ == "__main__":
-    data_dir = r"E:\项目\石油项目\断缝储\原始数据\wx数据\砂砾岩"
+    data_dir = r"/data/shared/project-oil/wx数据/砂砾岩"
 
     # 成像测井
-    pretreat_data_path = r"E:\项目\石油项目\断缝储\原始数据\wx数据\砂砾岩\研究内容一\成像测井\FMI提取数据"
+    pretreat_data_path = r"/data/shared/project-oil/wx数据/砂砾岩/研究内容一/成像测井/FMI提取数据"
     imaging_wells = {
         "车660_1": {
             "xy": [592331, 4212564],

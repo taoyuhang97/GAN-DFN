@@ -59,14 +59,14 @@ def open_dlis(dlis_file_path, output_file_path):
                 #     print()
                 # print(channel_names, '\n')
 
-imaging_logging_path = r"E:\项目\石油项目\断缝储\原始数据\wx数据\砂砾岩\车镇成像测井"
+imaging_logging_path = r"/data/shared/project-oil/wx数据/砂砾岩/车镇成像测井"
 dlis_files = {
-    "车660_1": r"che660_FMI\che660-client-result\che660-fmi-result\dlis",
-    "车660_2": r"che660_FMI_1\che660-run2-result\che660-run2-fmi-result\dlis",
-    "车662": r"che662_686_FMI\che662-fmi-client-disk\dlis",
-    "车663": r"che663_687_FMI\che663-fmi-client-disk\dlis"
+    "车660_1": r"che660_FMI/che660-client-result/che660-fmi-result/dlis",
+    "车660_2": r"che660_FMI_1/che660-run2-result/che660-run2-fmi-result/dlis",
+    "车662": r"che662_686_FMI/che662-fmi-client-disk/dlis",
+    "车663": r"che663_687_FMI/che663-fmi-client-disk/dlis"
 }
-output_base_file = r"E:\项目\石油项目\断缝储\原始数据\wx数据\砂砾岩\研究内容一"
+output_base_file = r"/data/shared/project-oil/wx数据/砂砾岩/研究内容一"
 
 for well in dlis_files:
     dlis_file = os.path.join(imaging_logging_path, dlis_files[well])

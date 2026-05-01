@@ -71,9 +71,9 @@ TARGET_TRANSFORM_SCALES = {"P10": 1.0, "P21": 1.0, "P33": 10000.0}
 SEIS_MODE = "3x3"
 SAVE_PRED_FOR_ALL_CENTERS = False  # Default: only save predictions where GT density exists
 
-DISTANCE_ANALYSIS_DIR = r"E:\项目\石油项目\断缝储\原始数据\wx数据\砂砾岩\优化阶段一\研究内容一\裂缝存在性预测\成像测井数据分布分析\well_distance_analysis"
-DATA_DIR = r"E:\项目\石油项目\断缝储\原始数据\wx数据\砂砾岩\优化阶段一\研究内容一\成像测井\裂缝样本"
-SAVE_DIR = r"E:\项目\石油项目\断缝储\原始数据\wx数据\砂砾岩\优化阶段一\研究内容一\裂缝位置预测\基于密度的裂缝点位分析\裂缝密度预测\cnn+lstm"
+DISTANCE_ANALYSIS_DIR = r"/data/shared/project-oil/wx数据/砂砾岩/优化阶段一/研究内容一/裂缝存在性预测/成像测井数据分布分析/well_distance_analysis"
+DATA_DIR = r"/data/shared/project-oil/wx数据/砂砾岩/优化阶段一/研究内容一/成像测井/裂缝样本"
+SAVE_DIR = r"/data/shared/project-oil/wx数据/砂砾岩/优化阶段一/研究内容一/裂缝位置预测/基于密度的裂缝点位分析/裂缝密度预测/cnn+lstm"
 
 imaging_well_features = ["AC", "GR"]
 only_val_wells = []

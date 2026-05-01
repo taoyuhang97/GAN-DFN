@@ -191,8 +191,8 @@ def visualize_dfn(dfn):
     pl.show()
 
 if __name__ == "__main__":
-    folder_path = r"E:\项目\石油项目\断缝储\原始数据\wx数据\砂砾岩\研究内容三\3D_GAN输出\裂缝片转化"
-    out_dir = r"E:\项目\石油项目\断缝储\原始数据\wx数据\砂砾岩\研究内容三\DFN合并"
+    folder_path = r"/data/shared/project-oil/wx数据/砂砾岩/研究内容三/3D_GAN输出/裂缝片转化"
+    out_dir = r"/data/shared/project-oil/wx数据/砂砾岩/研究内容三/DFN合并"
     os.makedirs(out_dir, exist_ok=True)
 
     merged_dfn = merge_dfns_in_folder(folder_path, cell_size=(300,300,0), out_file=os.path.join(out_dir, "merged_dfn.npy"))

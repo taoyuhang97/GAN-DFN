@@ -14,9 +14,9 @@ from workflow_paths import FRACTURE_EXISTENCE_LSTM_SCRIPT_PATH, WORKFLOW_ROOT
 
 ROOT = WORKFLOW_ROOT
 SCRIPT_PATH = FRACTURE_EXISTENCE_LSTM_SCRIPT_PATH
-BASE_SAVE_DIR = Path(r"E:\项目\石油项目\断缝储\原始数据\wx数据\砂砾岩\优化阶段一\研究内容一\裂缝存在性预测\LSTM\单井验证\成像测井裂缝预测\cnn+lstm")
+BASE_SAVE_DIR = Path(r"/data/shared/project-oil/wx数据/砂砾岩/优化阶段一/研究内容一/裂缝存在性预测/LSTM/单井验证/成像测井裂缝预测/cnn+lstm")
 FLOW_RESULT_ROOT = Path(
-    r"E:\项目\石油项目\断缝储\原始数据\wx数据\砂砾岩\优化阶段一\研究内容一\两阶段裂缝预测流程结果"
+    r"/data/shared/project-oil/wx数据/砂砾岩/优化阶段一/研究内容一/两阶段裂缝预测流程结果"
 )
 BASE_SAVE_DIR = FLOW_RESULT_ROOT / "manual_runs" / "run_lstm_experiment"
 

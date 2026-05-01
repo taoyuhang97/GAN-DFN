@@ -39,10 +39,10 @@ from instance_roundtrip_common import (  # type: ignore
 
 
 DEFAULT_DATASET_RUN_DIR = Path(
-    r"E:\项目\石油项目\断缝储\原始数据\wx数据\砂砾岩\优化阶段一\研究内容三\GAN训练准备\训练样本打包\phase1_t128_sparse_v1_full_fix1_20260330"
+    r"/data/shared/project-oil/wx数据/砂砾岩/优化阶段一/研究内容三/GAN训练准备/训练样本打包/phase1_t128_sparse_v1_full_fix1_20260330"
 )
 DEFAULT_OUTPUT_ROOT = Path(
-    r"E:\项目\石油项目\断缝储\原始数据\wx数据\砂砾岩\优化阶段一\研究内容三\G_DFN监督基线"
+    r"/data/shared/project-oil/wx数据/砂砾岩/优化阶段一/研究内容三/G_DFN监督基线"
 )
 DEFAULT_SLOTS_PER_VOXEL = 16
 DEFAULT_XY_RESOLUTION = 24

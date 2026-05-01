@@ -10,10 +10,10 @@ import pandas as pd
 ROOT = Path(__file__).resolve().parent
 POINT_REFINE_PATH = ROOT / "fracture_point_refine_by_density.py"
 DEFAULT_EXIST_EXP_DIR = Path(
-    r"E:\项目\石油项目\断缝储\原始数据\wx数据\砂砾岩\优化阶段一\研究内容一\裂缝存在性预测\LSTM\单井验证\成像测井裂缝预测\cnn+lstm\exp40_missing_drop_ac_gr_3x3_seq5_AC_GR"
+    r"/data/shared/project-oil/wx数据/砂砾岩/优化阶段一/研究内容一/裂缝存在性预测/LSTM/单井验证/成像测井裂缝预测/cnn+lstm/exp40_missing_drop_ac_gr_3x3_seq5_AC_GR"
 )
 DEFAULT_SAVE_DIR = Path(
-    r"E:\项目\石油项目\断缝储\原始数据\wx数据\砂砾岩\优化阶段一\研究内容一\裂缝位置预测\基于密度的裂缝点位分析\裂缝点位精细化\segment_count_dataset"
+    r"/data/shared/project-oil/wx数据/砂砾岩/优化阶段一/研究内容一/裂缝位置预测/基于密度的裂缝点位分析/裂缝点位精细化/segment_count_dataset"
 )
 HIGH_PROB_THRESHOLDS = (0.5, 0.6, 0.7, 0.8, 0.9)
 EXCESS_PROB_THRESHOLDS = (0.6, 0.8)

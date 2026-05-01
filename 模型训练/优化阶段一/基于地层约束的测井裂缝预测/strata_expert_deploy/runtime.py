@@ -14,7 +14,7 @@ PROJECT_ROOT = WORKFLOW_ROOT
 OUTER_FLOW_SCRIPT = PROJECT_ROOT / "run_outer_holdout_expert_validation.py"
 
 FLOW_RESULT_ROOT = Path(
-    r"E:\项目\石油项目\断缝储\原始数据\wx数据\砂砾岩\优化阶段一\研究内容一\两阶段裂缝预测流程结果"
+    r"/data/shared/project-oil/wx数据/砂砾岩/优化阶段一/研究内容一/两阶段裂缝预测流程结果"
 )
 DEFAULT_SAVE_ROOT = FLOW_RESULT_ROOT / "deploy_runs"
 DEFAULT_LOG_FEATURES = ["AC", "GR"]

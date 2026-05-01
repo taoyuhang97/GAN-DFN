@@ -14,18 +14,18 @@ from docx.opc.exceptions import PackageNotFoundError
 
 
 DEFAULT_REAL_ROOT = Path(
-    r"E:\项目\石油项目\断缝储\原始数据\wx数据\砂砾岩\优化阶段一\研究内容二\虚拟测井构建\单元裂缝归属\smoke_20260328_pkg_min"
+    r"/data/shared/project-oil/wx数据/砂砾岩/优化阶段一/研究内容二/虚拟测井构建/单元裂缝归属/smoke_20260328_pkg_min"
 )
 DEFAULT_VIRTUAL_FRACTURE_ROOT = Path(
-    r"E:\项目\石油项目\断缝储\原始数据\wx数据\砂砾岩\优化阶段一\研究内容二\虚拟测井构建\虚拟裂缝预测"
+    r"/data/shared/project-oil/wx数据/砂砾岩/优化阶段一/研究内容二/虚拟测井构建/虚拟裂缝预测"
 )
 DEFAULT_VIRTUAL_WELL_ROOT = Path(
-    r"E:\项目\石油项目\断缝储\原始数据\wx数据\砂砾岩\优化阶段一\研究内容二\虚拟测井构建\虚拟测井批量生成"
+    r"/data/shared/project-oil/wx数据/砂砾岩/优化阶段一/研究内容二/虚拟测井构建/虚拟测井批量生成"
 )
 DEFAULT_OUTPUT_ROOT = Path(
-    r"E:\项目\石油项目\断缝储\原始数据\wx数据\砂砾岩\优化阶段一\研究内容二\单元DFN构建\单元测井裂缝"
+    r"/data/shared/project-oil/wx数据/砂砾岩/优化阶段一/研究内容二/单元DFN构建/单元测井裂缝"
 )
-DEFAULT_DOCX_PATH = Path(r"D:\项目\石油开采\断缝储实验\实验记录20260328.docx")
+DEFAULT_DOCX_PATH = Path(r"/data/shared/project-oil/wx数据/砂砾岩/优化阶段一/实验记录/实验记录20260328.docx")
 
 LAYER_COLUMNS = [
     "UnitID",

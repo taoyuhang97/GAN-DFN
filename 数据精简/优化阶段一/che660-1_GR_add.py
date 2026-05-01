@@ -94,7 +94,7 @@ def append_additional_las_to_samples(base_csv, add_las_file, output_csv, depth_c
 # 示例调用（按需修改路径）
 # =========================
 if __name__ == "__main__":
-    project_dir = r"E:\项目\石油项目\断缝储\原始数据\wx数据\砂砾岩"
+    project_dir = r"/data/shared/project-oil/wx数据/砂砾岩"
     base_csv = os.path.join(project_dir, "优化阶段一", "研究内容一", "成像测井", "测井-地震时窗",
                             "车660_1_around_data.csv")
     add_las_file = os.path.join(project_dir, "成像测井-测井曲线", "车660@常规测井评价(2006-01-15)@1.las")

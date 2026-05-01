@@ -400,14 +400,14 @@ def main(well_block_csv, trace_header_xy_file, sgy_file, output_dir,
 
 # ========================= 主入口 =========================
 if __name__ == "__main__":
-    trace_header_xy_file = r"E:\项目\石油项目\断缝储\原始数据\wx数据\砂砾岩\研究内容一\trace_header_xy.csv"
-    SGY_FILE = r"E:\项目\石油项目\断缝储\原始数据\wx数据\砂砾岩\psdm_final_time.sgy"
-    TRACE_LIST_DIR = r"E:\项目\石油项目\断缝储\原始数据\wx数据\砂砾岩\研究内容二\测井区块生成\裂缝单元归属"
-    OUTPUT_DIR = r"E:\项目\石油项目\断缝储\原始数据\wx数据\砂砾岩\研究内容三\训练用数据\裂缝片表示"
+    trace_header_xy_file = r"/data/shared/project-oil/wx数据/砂砾岩/研究内容一/trace_header_xy.csv"
+    SGY_FILE = r"/data/shared/project-oil/wx数据/砂砾岩/psdm_final_time.sgy"
+    TRACE_LIST_DIR = r"/data/shared/project-oil/wx数据/砂砾岩/研究内容二/测井区块生成/裂缝单元归属"
+    OUTPUT_DIR = r"/data/shared/project-oil/wx数据/砂砾岩/研究内容三/训练用数据/裂缝片表示"
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     # 断层根目录列表（脚本会递归搜索这些目录下的子目录来查找断层文件）
     FAULT_ROOT_DIRS = [
-        r"E:\项目\石油项目\断缝储\原始数据\wx数据\砂砾岩\研究内容二\单元实验\fault_patches_out_npy\npy",
+        r"/data/shared/project-oil/wx数据/砂砾岩/研究内容二/单元实验/fault_patches_out_npy/npy",
         # 若有其他目录，可继续添加
     ]
     os.makedirs(OUTPUT_DIR, exist_ok=True)

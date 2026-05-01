@@ -11,7 +11,7 @@ from scipy.spatial.transform import Rotation
 
 
 DEFAULT_INPUT_CSV = Path(
-    r"E:\项目\石油项目\断缝储\原始数据\wx数据\砂砾岩\优化阶段一\研究内容三\单元DFN批量生成\bx33_35_by33_35_surface_scaled_x5_20260331\units\BX33_BY33\predicted_unit_patches.csv"
+    r"/data/shared/project-oil/wx数据/砂砾岩/优化阶段一/研究内容三/单元DFN批量生成/bx33_35_by33_35_surface_scaled_x5_20260331/units/BX33_BY33/predicted_unit_patches.csv"
 )
 
 VERTEX_COLUMNS = [

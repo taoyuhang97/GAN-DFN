@@ -110,7 +110,7 @@ def find_multiple_wells_blocks(trace_header_file, wells_coordinates):
 
 # --- 参数配置区 ---
 # 输入文件名
-TRACE_HEADER_FILE = r"E:\项目\石油项目\断缝储\原始数据\wx数据\砂砾岩\研究内容一\trace_header_xy.csv"
+TRACE_HEADER_FILE = r"/data/shared/project-oil/wx数据/砂砾岩/研究内容一/trace_header_xy.csv"
 
 # --- 使用示例 ---
 if __name__ == "__main__":

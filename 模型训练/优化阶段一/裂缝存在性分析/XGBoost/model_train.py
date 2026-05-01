@@ -15,13 +15,13 @@ plt.rcParams['font.sans-serif'] = ['SimHei']  # 设置中文字体
 plt.rcParams['axes.unicode_minus'] = False    # 正常显示负号
 
 # ===== 1. 读取已标记样本 =====
-# data_dir = r"E:\项目\石油项目\断缝储\原始数据\wx数据\砂砾岩\研究内容一\成像测井\裂缝存在样本"
+# data_dir = r"/data/shared/project-oil/wx数据/砂砾岩/研究内容一/成像测井/裂缝存在样本"
 
 # 使用glob查找所有csv文件
 # csv_files = glob.glob(os.path.join(data_dir, '*.csv'))
 
 # 当前使用指定测井作为样本
-csv_files = [r"E:\项目\石油项目\断缝储\原始数据\wx数据\砂砾岩\优化阶段一\研究内容一\成像测井\裂缝样本\车151HF_sample.csv"]
+csv_files = [r"/data/shared/project-oil/wx数据/砂砾岩/优化阶段一/研究内容一/成像测井/裂缝样本/车151HF_sample.csv"]
 
 # 创建一个空的列表，用于存储每口井的数据
 df_list = []
@@ -173,7 +173,7 @@ plt.show()
 # plt.show()
 
 # ===== 7. 保存模型与 scaler =====
-model_dir = r"E:\项目\石油项目\断缝储\原始数据\wx数据\砂砾岩\优化阶段一\研究内容一\裂缝存在性预测\XGboost\模型"
+model_dir = r"/data/shared/project-oil/wx数据/砂砾岩/优化阶段一/研究内容一/裂缝存在性预测/XGboost/模型"
 os.makedirs(model_dir, exist_ok=True)
 
 joblib.dump(model, os.path.join(model_dir, "fracture_xgb_model.pkl"))

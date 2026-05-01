@@ -19,11 +19,11 @@
 ## 默认输入
 
 - 轻量版训练样本：
-  - `E:\项目\石油项目\断缝储\原始数据\wx数据\砂砾岩\优化阶段一\研究内容三\GAN训练准备\训练样本打包\phase1_t128_sparse_v1_full_fix1_20260330`
+  - `/data/shared/project-oil/wx数据/砂砾岩/优化阶段一/研究内容三/GAN训练准备/训练样本打包/phase1_t128_sparse_v1_full_fix1_20260330`
 
 ## 默认输出
 
-- `E:\项目\石油项目\断缝储\原始数据\wx数据\砂砾岩\优化阶段一\研究内容三\G_DFN监督基线`
+- `/data/shared/project-oil/wx数据/砂砾岩/优化阶段一/研究内容三/G_DFN监督基线`
 
 ## 推荐执行顺序
 
@@ -31,7 +31,7 @@
 
 ```powershell
 py -3.12 .\研究内容三\优化阶段一\G_DFN监督基线\build_unit_level_split.py `
-  --dataset-run-dir E:\项目\石油项目\断缝储\原始数据\wx数据\砂砾岩\优化阶段一\研究内容三\GAN训练准备\训练样本打包\phase1_t128_sparse_v1_full_fix1_20260330 `
+  --dataset-run-dir /data/shared/project-oil/wx数据/砂砾岩/优化阶段一/研究内容三/GAN训练准备/训练样本打包/phase1_t128_sparse_v1_full_fix1_20260330 `
   --run-name phase1_unit_split_v1
 ```
 
@@ -39,7 +39,7 @@ py -3.12 .\研究内容三\优化阶段一\G_DFN监督基线\build_unit_level_sp
 
 ```powershell
 py -3.12 .\研究内容三\优化阶段一\G_DFN监督基线\train_supervised_baseline.py `
-  --split-run-dir E:\项目\石油项目\断缝储\原始数据\wx数据\砂砾岩\优化阶段一\研究内容三\G_DFN监督基线\数据切分\phase1_unit_split_v1 `
+  --split-run-dir /data/shared/project-oil/wx数据/砂砾岩/优化阶段一/研究内容三/G_DFN监督基线/数据切分/phase1_unit_split_v1 `
   --run-name baseline_v1
 ```
 
@@ -47,7 +47,7 @@ py -3.12 .\研究内容三\优化阶段一\G_DFN监督基线\train_supervised_ba
 
 ```powershell
 py -3.12 .\研究内容三\优化阶段一\G_DFN监督基线\infer_and_evaluate_baseline.py `
-  --split-run-dir E:\项目\石油项目\断缝储\原始数据\wx数据\砂砾岩\优化阶段一\研究内容三\G_DFN监督基线\数据切分\phase1_unit_split_v1 `
-  --checkpoint E:\项目\石油项目\断缝储\原始数据\wx数据\砂砾岩\优化阶段一\研究内容三\G_DFN监督基线\训练结果\baseline_v1\checkpoints\best_model.pt `
+  --split-run-dir /data/shared/project-oil/wx数据/砂砾岩/优化阶段一/研究内容三/G_DFN监督基线/数据切分/phase1_unit_split_v1 `
+  --checkpoint /data/shared/project-oil/wx数据/砂砾岩/优化阶段一/研究内容三/G_DFN监督基线/训练结果/baseline_v1/checkpoints/best_model.pt `
   --run-name baseline_eval_v1
 ```

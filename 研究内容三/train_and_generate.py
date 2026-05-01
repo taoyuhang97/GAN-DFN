@@ -286,9 +286,9 @@ def inference(generator, seismic_block):
 # 示例运行
 # ------------------------------
 if __name__=="__main__":
-    seismic_dir = r"E:\项目\石油项目\断缝储\原始数据\wx数据\砂砾岩\研究内容三\3D_GAN输入\seismic"
-    voxel_in = r"E:\项目\石油项目\断缝储\原始数据\wx数据\砂砾岩\研究内容三\训练用数据\体素表示"
-    out_dir = r"E:\项目\石油项目\断缝储\原始数据\wx数据\砂砾岩\研究内容三\3D_GAN输出"
+    seismic_dir = r"/data/shared/project-oil/wx数据/砂砾岩/研究内容三/3D_GAN输入/seismic"
+    voxel_in = r"/data/shared/project-oil/wx数据/砂砾岩/研究内容三/训练用数据/体素表示"
+    out_dir = r"/data/shared/project-oil/wx数据/砂砾岩/研究内容三/3D_GAN输出"
     os.makedirs(out_dir, exist_ok=True)
     model_dir = os.path.join(out_dir, "模型")
     os.makedirs(model_dir, exist_ok=True)

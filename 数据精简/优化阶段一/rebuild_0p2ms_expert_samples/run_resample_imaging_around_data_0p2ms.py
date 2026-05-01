@@ -12,16 +12,16 @@ from sample_reconstruction_utils import (
 
 
 DEFAULT_INPUT_DIR = Path(
-    r"E:\项目\石油项目\断缝储\原始数据\wx数据\砂砾岩\优化阶段一\研究内容一\成像测井\测井-地震时窗"
+    r"/data/shared/project-oil/wx数据/砂砾岩/优化阶段一/研究内容一/成像测井/测井-地震时窗"
 )
 DEFAULT_OUTPUT_DIR = Path(
-    r"E:\项目\石油项目\断缝储\原始数据\wx数据\砂砾岩\优化阶段一\研究内容一\成像测井\测井-地震时窗_uniform_0p2ms"
+    r"/data/shared/project-oil/wx数据/砂砾岩/优化阶段一/研究内容一/成像测井/测井-地震时窗_uniform_0p2ms"
 )
 DEFAULT_SECONDARY_INPUT_DIR = Path(
-    r"E:\项目\石油项目\断缝储\原始数据\wx数据\砂砾岩\优化阶段一\研究内容一\井斜\测井-地震时窗"
+    r"/data/shared/project-oil/wx数据/砂砾岩/优化阶段一/研究内容一/井斜/测井-地震时窗"
 )
 DEFAULT_SECONDARY_OUTPUT_DIR = Path(
-    r"E:\项目\石油项目\断缝储\原始数据\wx数据\砂砾岩\优化阶段一\研究内容一\井斜\测井-地震时窗_uniform_0p2ms"
+    r"/data/shared/project-oil/wx数据/砂砾岩/优化阶段一/研究内容一/井斜/测井-地震时窗_uniform_0p2ms"
 )
 DEFAULT_INTERVAL = 0.2
 

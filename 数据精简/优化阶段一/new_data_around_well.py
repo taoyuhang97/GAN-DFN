@@ -636,7 +636,7 @@ def construct_imaging_samples(xy, use_timedeep, output_dir, well_name):
 
 # ==== 执行 ====
 if __name__ == "__main__":
-    data_dir = r"E:\项目\石油项目\断缝储\原始数据\wx数据\砂砾岩"
+    data_dir = r"/data/shared/project-oil/wx数据/砂砾岩"
     # # 斜井
     inclined_wells_path = os.path.join(data_dir, '井斜')
     inclined_wells = list(well.split('.')[0] for well in os.listdir(inclined_wells_path))
@@ -663,7 +663,7 @@ if __name__ == "__main__":
     #     construct_logging_samples(data_dir, output_logging_wells_to_time_window_file, well_name)
 
     # 成像测井
-    # pretreat_data_path = r"E:\项目\石油项目\断缝储\原始数据\wx数据\砂砾岩\研究内容一\成像测井\FMI提取数据"
+    # pretreat_data_path = r"/data/shared/project-oil/wx数据/砂砾岩/研究内容一/成像测井/FMI提取数据"
     # imaging_wells = {
     #     "车660_1": {
     #         "file_path": r"车660_1\boreid-image\B72405.csv",

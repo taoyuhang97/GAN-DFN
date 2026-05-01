@@ -7,26 +7,26 @@ from scipy.interpolate import interp1d
 from tqdm import tqdm
 
 # 数据目录和文件路径
-pretreat_data_path = r"E:\项目\石油项目\断缝储\原始数据\wx数据\砂砾岩\研究内容一\成像测井\FMI提取数据"
-base_time_deep_dir = r"E:\项目\石油项目\断缝储\原始数据\wx数据\砂砾岩\时深"
+pretreat_data_path = r"/data/shared/project-oil/wx数据/砂砾岩/研究内容一/成像测井/FMI提取数据"
+base_time_deep_dir = r"/data/shared/project-oil/wx数据/砂砾岩/时深"
 useful_datas = {
     "车660_1": {
-        "file_path": r"车660_1\boreid-image\B72405.csv",
+        "file_path": r"车660_1/boreid-image/B72405.csv",
         "xy": [592331, 4212564],
         "use_timedeep": "车斜84"
     },
     "车660_2": {
-        "file_path": r"车660_2\che660-down-boreid-image\B79911.csv",
+        "file_path": r"车660_2/che660-down-boreid-image/B79911.csv",
         "xy": [592331, 4212564],
         "use_timedeep": "车古25"
     },
     "车662": {
-        "file_path": r"车662\che662-fmi-boreid-image\B239983.csv",
+        "file_path": r"车662/che662-fmi-boreid-image/B239983.csv",
         "xy": [592350, 4210905],
         "use_timedeep": "车74"
     },
     "车663": {
-        "file_path": r"车663\che663-fmi-boreid-image\B227207.csv",
+        "file_path": r"车663/che663-fmi-boreid-image/B227207.csv",
         "xy": [590100, 4212075],
         "use_timedeep": "车斜84"
     },
@@ -110,7 +110,7 @@ for well, well_info in useful_datas.items():
     # 重命名列（添加单位）
     df.rename(columns={col: unit_map[col] for col in df.columns if col in unit_map}, inplace=True)
 
-    df_td = read_timedepth_file(os.path.join(base_time_deep_dir, f"{well_info["use_timedeep"]}.dat"))
+    df_td = read_timedepth_file(os.path.join(base_time_deep_dir, f"{well_info['use_timedeep']}.dat"))
     f_t = interp1d(df_td['TVD'], df_td['TIME'], bounds_error=False, fill_value="extrapolate")
     # 获取 TVD 列的索引位置
     tvd_index = df.columns.get_loc("TVD")

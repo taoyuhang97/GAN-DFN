@@ -532,10 +532,10 @@ def find_voxel_files(voxel_dir):
 
 
 if __name__ == "__main__":
-    # voxel_dir = r"E:\项目\石油项目\断缝储\原始数据\wx数据\砂砾岩\研究内容三\训练用数据\体素表示"
-    # out_dfn_dir = r"E:\项目\石油项目\断缝储\原始数据\wx数据\砂砾岩\研究内容三\训练用数据\转化后DFN"
-    voxel_dir = r"E:\项目\石油项目\断缝储\原始数据\wx数据\砂砾岩\研究内容三\3D_GAN输出\体素文件"
-    out_dfn_dir = r"E:\项目\石油项目\断缝储\原始数据\wx数据\砂砾岩\研究内容三\3D_GAN输出\裂缝片转化"
+    # voxel_dir = r"/data/shared/project-oil/wx数据/砂砾岩/研究内容三/训练用数据/体素表示"
+    # out_dfn_dir = r"/data/shared/project-oil/wx数据/砂砾岩/研究内容三/训练用数据/转化后DFN"
+    voxel_dir = r"/data/shared/project-oil/wx数据/砂砾岩/研究内容三/3D_GAN输出/体素文件"
+    out_dfn_dir = r"/data/shared/project-oil/wx数据/砂砾岩/研究内容三/3D_GAN输出/裂缝片转化"
     os.makedirs(out_dfn_dir, exist_ok=True)
 
     # marching cubes 参数
@@ -553,8 +553,8 @@ if __name__ == "__main__":
     voxel_files = find_voxel_files(voxel_dir)
     print(f"共找到 {len(voxel_files)} 个 voxel 文件")
     # 单文件转化
-    # voxel_files = [r"E:\项目\石油项目\断缝储\原始数据\wx数据\砂砾岩\研究内容三\3D_GAN输出\体素文件\voxel_pred_X0_Y0.npy"]
-    # voxel_files = [r"E:\项目\石油项目\断缝储\原始数据\wx数据\砂砾岩\研究内容三\训练用数据\体素表示\voxel_block_X34_Y25.npy"]
+    # voxel_files = [r"/data/shared/project-oil/wx数据/砂砾岩/研究内容三/3D_GAN输出/体素文件/voxel_pred_X0_Y0.npy"]
+    # voxel_files = [r"/data/shared/project-oil/wx数据/砂砾岩/研究内容三/训练用数据/体素表示/voxel_block_X34_Y25.npy"]
     visualize = True
 
     # ---------------------------

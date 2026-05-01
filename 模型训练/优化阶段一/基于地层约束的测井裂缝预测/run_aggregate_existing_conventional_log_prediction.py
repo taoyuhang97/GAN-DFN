@@ -16,7 +16,7 @@ from run_conventional_log_strata_validation import (
 
 
 DEFAULT_BATCH_ROOT = Path(
-    r"E:\项目\石油项目\断缝储\原始数据\wx数据\砂砾岩\优化阶段一\研究内容一\两阶段裂缝预测流程结果\现有常规测井裂缝预测"
+    r"/data/shared/project-oil/wx数据/砂砾岩/优化阶段一/研究内容一/两阶段裂缝预测流程结果/现有常规测井裂缝预测"
 )
 DEFAULT_SUMMARY_CSV = "batch_prediction_summary.csv"
 DEFAULT_AGGREGATE_DIRNAME = "汇总结果"

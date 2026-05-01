@@ -17,10 +17,10 @@ UNIT_ID_PATTERN = re.compile(r"^BX(?P<block_x>\d+)_BY(?P<block_y>\d+)$", flags=r
 FAULT_PATCH_PATTERN = re.compile(r"^(?P<fault_name>.+)__i(?P<cell_i>\d+)_j(?P<cell_j>\d+)$", flags=re.IGNORECASE)
 
 DEFAULT_FAULT_PATCHES_ROOT = Path(
-    r"E:\项目\石油项目\断缝储\原始数据\wx数据\砂砾岩\研究内容二\单元实验\fault_patches_out\patches"
+    r"/data/shared/project-oil/wx数据/砂砾岩/研究内容二/单元实验/fault_patches_out/patches"
 )
 DEFAULT_FAULT_SUMMARY_CSV = Path(
-    r"E:\项目\石油项目\断缝储\原始数据\wx数据\砂砾岩\研究内容二\单元实验\fault_patches_out\fault_patches_summary.csv"
+    r"/data/shared/project-oil/wx数据/砂砾岩/研究内容二/单元实验/fault_patches_out/fault_patches_summary.csv"
 )
 
 MANIFEST_COLUMNS = [

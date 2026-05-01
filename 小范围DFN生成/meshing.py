@@ -8,7 +8,7 @@ plt.rcParams['font.sans-serif'] = ['SimHei']  # 设置中文字体
 plt.rcParams['axes.unicode_minus'] = False    # 正常显示负号
 
 # ===== 1. 加载地震道坐标数据 =====
-trace_header_csv = r"E:\项目\石油项目\断缝储\原始数据\wx数据\砂砾岩\研究内容一\trace_header_xy.csv"
+trace_header_csv = r"/data/shared/project-oil/wx数据/砂砾岩/研究内容一/trace_header_xy.csv"
 
 df = pd.read_csv(trace_header_csv, usecols=['TraceIdx', 'X', 'Y'], dtype={'TraceIdx': np.int32, 'X': np.int32, 'Y': np.int32})
 

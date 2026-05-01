@@ -11,7 +11,7 @@ from baseline_common import DEFAULT_DOCX_PATH, DEFAULT_OUTPUT_ROOT, DEFAULT_UNIT
 
 
 DEFAULT_CHECKPOINT = Path(
-    r"E:\项目\石油项目\断缝储\原始数据\wx数据\砂砾岩\优化阶段一\研究内容三\G_DFN监督基线\训练结果\quick_cpu_train_v2_20260330\checkpoints\best_model.pt"
+    r"/data/shared/project-oil/wx数据/砂砾岩/优化阶段一/研究内容三/G_DFN监督基线/训练结果/quick_cpu_train_v2_20260330/checkpoints/best_model.pt"
 )
 
 DEFAULT_SELECTED_UNITS: list[tuple[str, str, str]] = [
