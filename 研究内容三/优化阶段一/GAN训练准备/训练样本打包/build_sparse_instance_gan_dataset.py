@@ -78,6 +78,16 @@ SOURCE_CODE_MAP = {
     "virtual": 2,
     "seismic_gradient_fill": 3,
 }
+
+
+def build_layer_surface_pair_key(top_surface_code: Any, base_surface_code: Any) -> str:
+    top = "" if pd.isna(top_surface_code) else str(top_surface_code).strip()
+    base = "" if pd.isna(base_surface_code) else str(base_surface_code).strip()
+    if top.lower() == "nan":
+        top = ""
+    if base.lower() == "nan":
+        base = ""
+    return f"{top}->{base}"
 SOURCE_WEIGHT_MAP = {
     "real": 1.0,
     "virtual": 0.8,
@@ -721,6 +731,10 @@ def main() -> None:
                             "StrataName": str(layer_row.get("StrataName", "")),
                             "TopSurfaceCode": str(layer_row.get("TopSurfaceCode", "")),
                             "BaseSurfaceCode": str(layer_row.get("BaseSurfaceCode", "")),
+                            "LayerSurfacePairKey": build_layer_surface_pair_key(
+                                layer_row.get("TopSurfaceCode", ""),
+                                layer_row.get("BaseSurfaceCode", ""),
+                            ),
                             "WindowIndex": int(window_idx),
                             "WindowTopTime": float(window_top),
                             "WindowBaseTime": float(window_base),

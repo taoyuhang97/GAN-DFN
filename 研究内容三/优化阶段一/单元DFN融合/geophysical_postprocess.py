@@ -71,6 +71,11 @@ for candidate in (THIS_DIR, BASELINE_DIR):
         sys.path.insert(0, candidate_str)
 
 from baseline_common import DEFAULT_DOCX_PATH, append_lines_to_docx, write_csv_utf8, write_json
+from layer_model_registry import (
+    LAYER_SURFACE_PAIR_KEY_COL,
+    UNIT_LAYER_SEGMENT_KEY_COL,
+    build_layer_surface_pair_key,
+)
 from merge_unit_dfn_vtks import read_legacy_vtk_polygons, write_legacy_vtk_polygons
 
 
@@ -93,6 +98,65 @@ def _azimuth_mean_weighted(azimuths: np.ndarray, weights: np.ndarray) -> float:
     wy = np.sum(weights * np.sin(rad))
     mean_rad = np.arctan2(wy, wx) / 2.0
     return float(np.rad2deg(mean_rad) % 180.0)
+
+
+def _normalize_layer_key_text(value: Any) -> str:
+    text = str(value or "").strip()
+    return "" if (not text or text.lower() == "nan") else text
+
+
+def _resolve_layer_surface_pair_key(row: pd.Series | dict[str, Any]) -> str:
+    if not hasattr(row, "get"):
+        return ""
+    existing = _normalize_layer_key_text(row.get(LAYER_SURFACE_PAIR_KEY_COL, ""))
+    if existing:
+        return existing
+    top_surface_code = _normalize_layer_key_text(row.get("TopSurfaceCode", ""))
+    base_surface_code = _normalize_layer_key_text(row.get("BaseSurfaceCode", ""))
+    if top_surface_code or base_surface_code:
+        return build_layer_surface_pair_key(top_surface_code, base_surface_code)
+    return _normalize_layer_key_text(row.get("GeoIntervalKey", ""))
+
+
+def _resolve_unit_layer_segment_key(row: pd.Series | dict[str, Any]) -> str:
+    if not hasattr(row, "get"):
+        return ""
+    existing = _normalize_layer_key_text(row.get(UNIT_LAYER_SEGMENT_KEY_COL, ""))
+    if existing:
+        return existing
+    pair_key = _resolve_layer_surface_pair_key(row)
+    unit_id = _normalize_layer_key_text(row.get("UnitID", ""))
+    interval_key = _normalize_layer_key_text(row.get("GeoIntervalKey", ""))
+    if unit_id or interval_key or pair_key:
+        return f"{unit_id or 'UNKNOWN_UNIT'}__{interval_key or 'UNKNOWN_INTERVAL'}__{pair_key or 'UNKNOWN_LAYER_PAIR'}"
+    return ""
+
+
+def _preferred_layer_series(df: pd.DataFrame, prefer_unit_segment: bool = False) -> pd.Series:
+    fallback = df.get("GeoIntervalKey", pd.Series([""] * len(df), index=df.index, dtype="object")).fillna("").astype(str)
+    pair_series = (
+        df.get(LAYER_SURFACE_PAIR_KEY_COL, pd.Series([""] * len(df), index=df.index, dtype="object"))
+        .fillna("")
+        .astype(str)
+        .str.strip()
+    )
+    if prefer_unit_segment:
+        segment_series = (
+            df.get(UNIT_LAYER_SEGMENT_KEY_COL, pd.Series([""] * len(df), index=df.index, dtype="object"))
+            .fillna("")
+            .astype(str)
+            .str.strip()
+        )
+        return segment_series.mask(segment_series.eq(""), pair_series).mask(lambda s: s.eq(""), fallback)
+    return pair_series.mask(pair_series.eq(""), fallback)
+
+
+def _same_physical_layer(row_i: pd.Series | dict[str, Any], row_j: pd.Series | dict[str, Any]) -> bool:
+    layer_i = _resolve_layer_surface_pair_key(row_i)
+    layer_j = _resolve_layer_surface_pair_key(row_j)
+    if layer_i or layer_j:
+        return layer_i == layer_j
+    return _normalize_layer_key_text(row_i.get("GeoIntervalKey", "")) == _normalize_layer_key_text(row_j.get("GeoIntervalKey", ""))
 
 
 # ---------------------------------------------------------------------------
@@ -349,8 +413,8 @@ def multi_dimensional_reliability_scoring(
 
     # 4) StratigraphyScore: 层位一致性 (预留, 默认全 1.0)
     if "StratigraphyScore" not in df.columns:
-        if known_fracture_layers and "GeoIntervalKey" in df.columns:
-            df["StratigraphyScore"] = df["GeoIntervalKey"].isin(known_fracture_layers).astype(float)
+        if known_fracture_layers:
+            df["StratigraphyScore"] = _preferred_layer_series(df, prefer_unit_segment=False).isin(known_fracture_layers).astype(float)
         else:
             df["StratigraphyScore"] = 1.0
 
@@ -467,9 +531,8 @@ def boundary_match_only(
                     continue
 
             # 层位一致
-            if "GeoIntervalKey" in df.columns:
-                if row_i.get("GeoIntervalKey", "") != row_j.get("GeoIntervalKey", ""):
-                    continue
+            if not _same_physical_layer(row_i, row_j):
+                continue
 
             # 产状匹配
             az_d = _azimuth_diff(np.array([row_i["Azimuth"]]), np.array([row_j["Azimuth"]]))[0]
@@ -1060,9 +1123,8 @@ def boundary_connect_postprocess(
                 continue
 
             # 条件 2: 同层 (如有)
-            if "GeoIntervalKey" in df.columns:
-                if str(row_i.get("GeoIntervalKey", "")) != str(row_j.get("GeoIntervalKey", "")):
-                    continue
+            if not _same_physical_layer(row_i, row_j):
+                continue
 
             # 条件 3: 产状匹配 (放宽: 聚合后产状是统计平均, 允许更大偏差)
             az_d = _azimuth_diff(

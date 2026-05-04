@@ -40,9 +40,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--fault-surface-vtk", type=Path)
     parser.add_argument("--output-root", type=Path, required=True)
     parser.add_argument("--run-name", type=str, default=f"regional_fault_postfusion_{datetime.now().strftime('%Y%m%d_%H%M%S')}")
-    parser.add_argument("--fault-half-band-ms", type=float, default=25.0)
-    parser.add_argument("--fault-remove-ms", type=float, default=10.0)
-    parser.add_argument("--fault-transition-ms", type=float, default=15.0)
+    parser.add_argument("--fault-half-band-ms", type=float, default=100.0)
+    parser.add_argument("--fault-remove-ms", type=float, default=50.0)
+    parser.add_argument("--fault-transition-ms", type=float, default=100.0)
     parser.add_argument("--panel-xy-buffer", type=float, default=180.0)
     parser.add_argument("--parallel-ratio", type=float, default=0.65)
     parser.add_argument("--random-seed", type=int, default=42)
@@ -595,6 +595,7 @@ def combine_with_fault_surface_vtk(
             polygons=fracture_payload["polygons"],
             cell_data=fracture_payload["cell_data"],
             scalar_types=fracture_payload["scalar_types"],
+            recompute_patch_area=True,
         )
         return {
             "surface_polygon_count": 0,
@@ -611,6 +612,7 @@ def combine_with_fault_surface_vtk(
         polygons=merged_payload["polygons"],
         cell_data=merged_payload["cell_data"],
         scalar_types=merged_payload["scalar_types"],
+        recompute_patch_area=True,
     )
     return {
         "surface_polygon_count": surface_polygon_count,
@@ -689,6 +691,11 @@ def run_fault_postfusion(
         "input_vtk": str(input_vtk),
         "fault_panel_csv": str(fault_panel_csv),
         "fault_surface_vtk": str(fault_surface_vtk) if fault_surface_vtk else "",
+        "fault_half_band_ms": float(fault_half_band_ms),
+        "fault_remove_ms": float(fault_remove_ms),
+        "fault_transition_ms": float(fault_transition_ms),
+        "panel_xy_buffer": float(panel_xy_buffer),
+        "parallel_ratio": float(parallel_ratio),
         "input_patch_count": int(len(regional_df)),
         "fault_panel_count": int(len(panel_df)),
         "fault_parallel_patch_count": int(len(parallel_df)),

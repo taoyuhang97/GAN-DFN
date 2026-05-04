@@ -45,9 +45,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--surface-normal-pad", type=float, default=30.0)
     parser.add_argument("--surface-gap-ratio", type=float, default=0.95)
     parser.add_argument("--surface-display-offset-ms", type=float, default=0.6)
-    parser.add_argument("--fault-half-band-ms", type=float, default=25.0)
-    parser.add_argument("--fault-remove-ms", type=float, default=10.0)
-    parser.add_argument("--fault-transition-ms", type=float, default=15.0)
+    parser.add_argument("--surface-max-fragment-area-ratio", type=float, default=1500.0)
+    parser.add_argument("--fault-half-band-ms", type=float, default=100.0)
+    parser.add_argument("--fault-remove-ms", type=float, default=50.0)
+    parser.add_argument("--fault-transition-ms", type=float, default=100.0)
     parser.add_argument("--panel-xy-buffer", type=float, default=180.0)
     parser.add_argument("--parallel-ratio", type=float, default=0.65)
     parser.add_argument("--random-seed", type=int, default=42)
@@ -76,6 +77,7 @@ def run_uniform_scale_step(input_vtk: Path, scale_factor: float, output_dir: Pat
         polygons=scaled_polygons,
         cell_data=scaled_cell_data,
         scalar_types=payload.get("scalar_types", {}),
+        recompute_patch_area=True,
     )
     summary = {
         "input_vtk": str(input_vtk),
@@ -128,6 +130,7 @@ def main() -> None:
         surface_normal_pad=float(args.surface_normal_pad),
         surface_gap_ratio=float(args.surface_gap_ratio),
         surface_display_offset_ms=float(args.surface_display_offset_ms),
+        surface_max_fragment_area_ratio=float(args.surface_max_fragment_area_ratio),
     )
     fuse_summary = run_fault_postfusion(
         input_vtk=Path(args.input_vtk),
@@ -157,6 +160,10 @@ def main() -> None:
         "run_root": str(run_root),
         "input_vtk": str(args.input_vtk),
         "fault_patches_root": str(args.fault_patches_root),
+        "fault_half_band_ms": float(args.fault_half_band_ms),
+        "fault_remove_ms": float(args.fault_remove_ms),
+        "fault_transition_ms": float(args.fault_transition_ms),
+        "surface_max_fragment_area_ratio": float(args.surface_max_fragment_area_ratio),
         "fault_panels": panel_summary,
         "fault_surface": surface_summary,
         "fault_postfusion": fuse_summary,

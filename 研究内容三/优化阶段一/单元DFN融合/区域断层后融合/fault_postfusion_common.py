@@ -508,6 +508,7 @@ def write_df_to_regional_vtk(
         polygons=new_polygons,
         cell_data=out_cell_data,
         scalar_types=out_scalar_types,
+        recompute_patch_area=True,
     )
 
 
@@ -546,12 +547,13 @@ def write_legacy_vtk_polygons_preserve_patch_area(
     polygons: list[list[int]],
     cell_data: dict[str, np.ndarray],
     scalar_types: dict[str, str],
+    recompute_patch_area: bool = False,
 ) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     local_points = np.asarray(points, dtype=float)
     local_cell_data = {name: np.asarray(values) for name, values in cell_data.items()}
     local_scalar_types = dict(scalar_types)
-    if polygons and "PatchArea" not in local_cell_data:
+    if polygons and (bool(recompute_patch_area) or "PatchArea" not in local_cell_data):
         local_cell_data["PatchArea"] = compute_polygon_areas_for_vtk(local_points, polygons)
         local_scalar_types["PatchArea"] = "float"
 

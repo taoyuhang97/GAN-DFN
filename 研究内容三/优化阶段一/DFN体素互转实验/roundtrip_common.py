@@ -31,6 +31,8 @@ DEFAULT_TRACE_HEADER_CSV = Path(
     r"/data/shared/project-oil/wx数据/砂砾岩/研究内容一/trace_header_xy.csv"
 )
 DEFAULT_BLOCK_SIZE = 25
+LAYER_SURFACE_PAIR_KEY_COL = "LayerSurfacePairKey"
+UNIT_LAYER_SEGMENT_KEY_COL = "UnitLayerSegmentKey"
 
 PATCH_VERTEX_COLUMNS = [
     f"V{vertex_idx}{axis}"
@@ -45,6 +47,8 @@ PATCH_OUTPUT_COLUMNS = [
     "BlockX",
     "BlockY",
     "GeoIntervalKey",
+    LAYER_SURFACE_PAIR_KEY_COL,
+    UNIT_LAYER_SEGMENT_KEY_COL,
     "StrataName",
     "TopSurfaceCode",
     "BaseSurfaceCode",
@@ -113,6 +117,63 @@ class GridSpec:
 class VtkPatchExportConfig:
     display_z_scale: float = 5.0
     invert_time: bool = False
+
+
+def _normalize_layer_key_text(value: Any) -> str:
+    text = str(value or "").strip()
+    return "" if (not text or text.lower() == "nan") else text
+
+
+def build_layer_surface_pair_key(top_surface_code: Any, base_surface_code: Any) -> str:
+    return f"{_normalize_layer_key_text(top_surface_code)}->{_normalize_layer_key_text(base_surface_code)}"
+
+
+def resolve_layer_surface_pair_key_from_row(row: pd.Series | dict[str, Any]) -> str:
+    if hasattr(row, "get"):
+        existing = _normalize_layer_key_text(row.get(LAYER_SURFACE_PAIR_KEY_COL, ""))
+        if existing:
+            return existing
+        top_surface_code = _normalize_layer_key_text(row.get("TopSurfaceCode", ""))
+        base_surface_code = _normalize_layer_key_text(row.get("BaseSurfaceCode", ""))
+        if top_surface_code or base_surface_code:
+            return build_layer_surface_pair_key(top_surface_code, base_surface_code)
+        return _normalize_layer_key_text(row.get("GeoIntervalKey", ""))
+    return ""
+
+
+def resolve_unit_layer_segment_key_from_row(row: pd.Series | dict[str, Any]) -> str:
+    if hasattr(row, "get"):
+        existing = _normalize_layer_key_text(row.get(UNIT_LAYER_SEGMENT_KEY_COL, ""))
+        if existing:
+            return existing
+        pair_key = resolve_layer_surface_pair_key_from_row(row)
+        unit_id = _normalize_layer_key_text(row.get("UnitID", ""))
+        interval_key = _normalize_layer_key_text(row.get("GeoIntervalKey", ""))
+        if unit_id or interval_key or pair_key:
+            return f"{unit_id or 'UNKNOWN_UNIT'}__{interval_key or 'UNKNOWN_INTERVAL'}__{pair_key or 'UNKNOWN_LAYER_PAIR'}"
+    return ""
+
+
+def preferred_layer_group_series(
+    patch_df: pd.DataFrame,
+    prefer_unit_segment: bool = False,
+) -> pd.Series:
+    fallback = patch_df.get("GeoIntervalKey", pd.Series([""] * len(patch_df), index=patch_df.index, dtype="object")).fillna("").astype(str)
+    pair_series = (
+        patch_df.get(LAYER_SURFACE_PAIR_KEY_COL, pd.Series([""] * len(patch_df), index=patch_df.index, dtype="object"))
+        .fillna("")
+        .astype(str)
+        .str.strip()
+    )
+    if prefer_unit_segment:
+        segment_series = (
+            patch_df.get(UNIT_LAYER_SEGMENT_KEY_COL, pd.Series([""] * len(patch_df), index=patch_df.index, dtype="object"))
+            .fillna("")
+            .astype(str)
+            .str.strip()
+        )
+        return segment_series.mask(segment_series.eq(""), pair_series).mask(lambda s: s.eq(""), fallback)
+    return pair_series.mask(pair_series.eq(""), fallback)
 
 
 def read_csv_utf8(path: Path) -> pd.DataFrame:
@@ -259,7 +320,31 @@ def load_patch_table(path: Path) -> pd.DataFrame:
             df[col] = pd.to_numeric(df[col], errors="coerce")
     for col in PATCH_OUTPUT_COLUMNS:
         if col not in df.columns:
-            df[col] = np.nan if col not in {"PatchID", "UnitID", "GeoIntervalKey", "StrataName", "TopSurfaceCode", "BaseSurfaceCode", "SeedID", "SourceKind", "SourceName", "SeedType", "ParentSeedID", "ParentSourceKind"} else ""
+            df[col] = np.nan if col not in {
+                "PatchID",
+                "UnitID",
+                "GeoIntervalKey",
+                LAYER_SURFACE_PAIR_KEY_COL,
+                UNIT_LAYER_SEGMENT_KEY_COL,
+                "StrataName",
+                "TopSurfaceCode",
+                "BaseSurfaceCode",
+                "SeedID",
+                "SourceKind",
+                "SourceName",
+                "SeedType",
+                "ParentSeedID",
+                "ParentSourceKind",
+            } else ""
+    if len(df) > 0:
+        pair_series = df.apply(resolve_layer_surface_pair_key_from_row, axis=1)
+        pair_fill_mask = df[LAYER_SURFACE_PAIR_KEY_COL].fillna("").astype(str).str.strip().eq("")
+        if pair_fill_mask.any():
+            df.loc[pair_fill_mask, LAYER_SURFACE_PAIR_KEY_COL] = pair_series.loc[pair_fill_mask]
+        segment_series = df.apply(resolve_unit_layer_segment_key_from_row, axis=1)
+        segment_fill_mask = df[UNIT_LAYER_SEGMENT_KEY_COL].fillna("").astype(str).str.strip().eq("")
+        if segment_fill_mask.any():
+            df.loc[segment_fill_mask, UNIT_LAYER_SEGMENT_KEY_COL] = segment_series.loc[segment_fill_mask]
     return df[PATCH_OUTPUT_COLUMNS].copy()
 
 
@@ -545,7 +630,8 @@ def build_patch_vtk_cell_data(
 ) -> tuple[dict[str, np.ndarray], dict[str, dict[int, str]]]:
     source_codes, source_map = build_category_code_map(patch_df.get("SourceKind", pd.Series(dtype=str)))
     seed_type_codes, seed_type_map = build_category_code_map(patch_df.get("SeedType", pd.Series(dtype=str)))
-    layer_codes, layer_map = build_category_code_map(patch_df.get("GeoIntervalKey", pd.Series(dtype=str)))
+    layer_codes, layer_map = build_category_code_map(preferred_layer_group_series(patch_df, prefer_unit_segment=False))
+    layer_segment_codes, layer_segment_map = build_category_code_map(preferred_layer_group_series(patch_df, prefer_unit_segment=True))
     top_surface_codes, top_surface_map = build_category_code_map(patch_df.get("TopSurfaceCode", pd.Series(dtype=str)))
     base_surface_codes, base_surface_map = build_category_code_map(patch_df.get("BaseSurfaceCode", pd.Series(dtype=str)))
 
@@ -566,6 +652,7 @@ def build_patch_vtk_cell_data(
         "SourceKindCode": source_codes,
         "SeedTypeCode": seed_type_codes,
         "LayerCode": layer_codes,
+        "LayerSegmentCode": layer_segment_codes,
         "TopSurfaceCodeInt": top_surface_codes,
         "BaseSurfaceCodeInt": base_surface_codes,
         "CenterTime": series_float("CenterTIME"),
@@ -584,6 +671,7 @@ def build_patch_vtk_cell_data(
         "SourceKindCode": source_map,
         "SeedTypeCode": seed_type_map,
         "LayerCode": layer_map,
+        "LayerSegmentCode": layer_segment_map,
         "TopSurfaceCodeInt": top_surface_map,
         "BaseSurfaceCodeInt": base_surface_map,
     }
@@ -598,10 +686,17 @@ def export_patch_vtk_files(
     config: VtkPatchExportConfig,
     extra_cell_data: dict[str, np.ndarray] | None = None,
 ) -> dict[str, Any]:
+    raw_path = output_dir / f"{base_name}_raw_time.vtk"
+    display_path = output_dir / f"{base_name}_display.vtk"
     if patch_df.empty:
+        empty_points = np.empty((0, 3), dtype=float)
+        empty_polygons: list[list[int]] = []
+        empty_cell_data: dict[str, np.ndarray] = {}
+        write_legacy_vtk_polygons(raw_path, f"{title_prefix}_raw_time", empty_points, empty_polygons, empty_cell_data)
+        write_legacy_vtk_polygons(display_path, f"{title_prefix}_display", empty_points, empty_polygons, empty_cell_data)
         return {
-            "raw_vtk": "",
-            "display_vtk": "",
+            "raw_vtk": str(raw_path),
+            "display_vtk": str(display_path),
             "mappings": {},
             "patch_count": 0,
         }
@@ -618,8 +713,6 @@ def export_patch_vtk_files(
         display_points.extend(display_vertices.tolist())
         polygons.append([start_idx, start_idx + 1, start_idx + 2, start_idx + 3])
 
-    raw_path = output_dir / f"{base_name}_raw_time.vtk"
-    display_path = output_dir / f"{base_name}_display.vtk"
     write_legacy_vtk_polygons(raw_path, f"{title_prefix}_raw_time", np.asarray(raw_points, dtype=float), polygons, cell_data)
     write_legacy_vtk_polygons(display_path, f"{title_prefix}_display", np.asarray(display_points, dtype=float), polygons, cell_data)
     return {
@@ -1031,6 +1124,8 @@ def fit_voxel_components_to_patches(
                 "BlockX": int(grid.block_x),
                 "BlockY": int(grid.block_y),
                 "GeoIntervalKey": str(layer_info.get("GeoIntervalKey", "")),
+                LAYER_SURFACE_PAIR_KEY_COL: resolve_layer_surface_pair_key_from_row(layer_info),
+                UNIT_LAYER_SEGMENT_KEY_COL: resolve_unit_layer_segment_key_from_row(layer_info),
                 "StrataName": str(layer_info.get("StrataName", "")),
                 "TopSurfaceCode": str(layer_info.get("TopSurfaceCode", "")),
                 "BaseSurfaceCode": str(layer_info.get("BaseSurfaceCode", "")),
@@ -1105,7 +1200,7 @@ def build_patch_match_metrics(
             az_cost = patch_angle_diff_deg(float(src["Azimuth"]), float(dst["Azimuth"])) / 180.0
             dip_cost = abs(float(src["Dip"]) - float(dst["Dip"])) / 90.0
             interval_penalty = 0.0
-            if str(src.get("GeoIntervalKey", "")) != str(dst.get("GeoIntervalKey", "")):
+            if resolve_layer_surface_pair_key_from_row(src) != resolve_layer_surface_pair_key_from_row(dst):
                 interval_penalty = 0.5
             cost[i, j] = center_cost + 0.25 * az_cost + 0.25 * dip_cost + interval_penalty
 

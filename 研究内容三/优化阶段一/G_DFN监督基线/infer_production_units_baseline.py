@@ -26,6 +26,8 @@ if str(PACK_DIR) not in sys.path:
     sys.path.append(str(PACK_DIR))
 
 from baseline_common import (
+    DEFAULT_LAYER_DENSITY_SOURCE,
+    LAYER_DENSITY_SOURCE_CHOICES,
     DEFAULT_DOCX_PATH,
     DEFAULT_OUTPUT_ROOT,
     DEFAULT_SLOTS_PER_VOXEL,
@@ -33,18 +35,29 @@ from baseline_common import (
     DEFAULT_WINDOW_SIZE,
     DEFAULT_Z_STEP_MS,
     VtkPatchExportConfig,
+    apply_layer_density_budget,
     append_lines_to_docx,
     build_grid_spec,
+    decode_window_predictions_with_optional_second_pass,
     dedupe_patch_df,
-    decode_instance_label_to_patches,
     export_patch_vtk_files,
     load_layer_table,
+    load_layer_density_calibration_payload,
     load_unit_summary,
-    prediction_to_label_payload,
     write_csv_utf8,
     write_json,
 )
 from baseline_model import SparseInstanceBaselineUNet
+from layer_model_registry import (
+    LAYER_SURFACE_PAIR_KEY_COL,
+    UNIT_LAYER_SEGMENT_KEY_COL,
+    build_layer_surface_pair_key,
+    build_layer_surface_pair_key_from_row,
+    build_unit_layer_segment_key_from_row,
+    load_layer_model_registry,
+    resolve_layer_decode_config,
+    resolve_layer_checkpoint,
+)
 from build_sparse_instance_gan_dataset import (
     DEFAULT_INPUT_CHANNELS,
     DEFAULT_SGY_FILE,
@@ -63,6 +76,10 @@ from build_sparse_instance_gan_dataset import (
 UNIT_ID_PATTERN = re.compile(r"^BX(?P<block_x>\d+)_BY(?P<block_y>\d+)$", flags=re.IGNORECASE)
 DEFAULT_SURFACE_DIR = Path(r"/data/shared/project-oil/wx数据/砂砾岩/层位")
 AUTO_LAYER_SURFACE_CODES = ["T1", "T2", "T3", "T4", "T5", "T6", "T7"]
+DEFAULT_LAYER_TOP_BOUNDARY_MS = 1100.0
+DEFAULT_LAYER_BOTTOM_BOUNDARY_MS = 3800.0
+TOP_BOUNDARY_SURFACE_CODE = "TOP_1100MS"
+BOTTOM_BOUNDARY_SURFACE_CODE = "BOTTOM_3800MS"
 AUTO_LAYER_SURFACE_HINTS = {
     "T1": ["馆陶底"],
     "T2": ["沙一下特殊岩性顶"],
@@ -88,7 +105,8 @@ class SurfaceNearestLookup:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Run production DFN inference for new units using a trained supervised baseline.")
-    parser.add_argument("--checkpoint", type=Path, required=True)
+    parser.add_argument("--checkpoint", type=Path)
+    parser.add_argument("--layer-model-registry-py", type=Path)
     parser.add_argument("--unit-dfn-root", type=Path, default=DEFAULT_UNIT_DFN_ROOT)
     parser.add_argument("--surface-dir", type=Path, default=DEFAULT_SURFACE_DIR)
     parser.add_argument("--trace-header-csv", type=Path, default=DEFAULT_TRACE_HEADER_CSV)
@@ -103,11 +121,15 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--block-y-start", type=int)
     parser.add_argument("--block-y-end", type=int)
     parser.add_argument("--limit-units", type=int)
+    parser.add_argument("--unit-shard-index", type=int, default=0)
+    parser.add_argument("--unit-shard-count", type=int, default=1)
     parser.add_argument("--limit-windows-per-unit", type=int)
     parser.add_argument("--no-layer-constraint", action="store_true")
     parser.add_argument("--disable-seismic-bound-extension", action="store_true")
     parser.add_argument("--time-min", type=float)
     parser.add_argument("--time-max", type=float)
+    parser.add_argument("--layer-top-boundary-ms", type=float, default=DEFAULT_LAYER_TOP_BOUNDARY_MS)
+    parser.add_argument("--layer-bottom-boundary-ms", type=float, default=DEFAULT_LAYER_BOTTOM_BOUNDARY_MS)
     parser.add_argument("--window-size", type=int, default=DEFAULT_WINDOW_SIZE)
     parser.add_argument("--z-step-ms", type=float, default=DEFAULT_Z_STEP_MS)
     parser.add_argument("--overlap-ratio", type=float, default=0.5)
@@ -116,13 +138,22 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--patch-scale-factor", type=float, default=1.0)
     parser.add_argument("--decode-mode", type=str, default="strict", choices=["strict", "relaxed"])
     parser.add_argument("--relaxed-min-count", type=int, default=1)
+    parser.add_argument("--count-activation-threshold", type=float, default=0.5)
+    parser.add_argument("--min-count-if-active", type=int, default=1)
     parser.add_argument("--max-slots-per-voxel", type=int, default=DEFAULT_SLOTS_PER_VOXEL)
     parser.add_argument("--max-total-patches-per-window", type=int, default=256)
     parser.add_argument("--dedupe-xy-tol-m", type=float, default=6.25)
     parser.add_argument("--dedupe-time-tol-ms", type=float, default=0.4)
     parser.add_argument("--dedupe-azimuth-tol-deg", type=float, default=20.0)
     parser.add_argument("--dedupe-dip-tol-deg", type=float, default=12.0)
+    parser.add_argument("--disable-layer-density-control", action="store_true")
+    parser.add_argument("--layer-density-source", type=str, default=DEFAULT_LAYER_DENSITY_SOURCE, choices=list(LAYER_DENSITY_SOURCE_CHOICES))
+    parser.add_argument("--layer-density-scale", type=float, default=1.0)
+    parser.add_argument("--layer-density-calibration-json", type=Path)
+    parser.add_argument("--layer-density-calibration-min-scale", type=float, default=0.25)
+    parser.add_argument("--layer-density-calibration-max-scale", type=float, default=4.0)
     parser.add_argument("--device", type=str, default="auto")
+    parser.add_argument("--artifact-profile", type=str, default="compact", choices=["compact", "standard", "debug"])
     parser.add_argument("--display-z-scale", type=float, default=5.0)
     parser.add_argument("--vtk-no-invert-time", action="store_true")
     parser.add_argument("--save-window-csv", action="store_true")
@@ -155,6 +186,37 @@ def load_checkpoint_model(checkpoint_path: Path, device: torch.device) -> tuple[
     model.load_state_dict(checkpoint["model_state"])
     model.eval()
     return model, checkpoint
+
+
+def validate_model_source_args(args: argparse.Namespace) -> None:
+    if args.checkpoint is None and args.layer_model_registry_py is None:
+        raise ValueError("please provide --checkpoint or --layer-model-registry-py")
+    if int(args.unit_shard_count) <= 0:
+        raise ValueError("--unit-shard-count must be >= 1")
+    if int(args.unit_shard_index) < 0 or int(args.unit_shard_index) >= int(args.unit_shard_count):
+        raise ValueError("--unit-shard-index must satisfy 0 <= index < count")
+
+
+def resolve_artifact_flags(args: argparse.Namespace) -> dict[str, bool]:
+    profile = str(args.artifact_profile).lower().strip()
+    if profile not in {"compact", "standard", "debug"}:
+        raise ValueError(f"unsupported artifact_profile: {args.artifact_profile}")
+    return {
+        "save_display_vtk": profile == "debug",
+        "save_window_concat_csv": profile in {"standard", "debug"},
+        "save_window_summary_csv": profile in {"standard", "debug"},
+        "save_source_metadata": profile in {"standard", "debug"},
+        "save_resolved_surfaces": profile in {"standard", "debug"},
+        "save_progress_json": profile == "debug",
+        "save_partial_outputs": profile == "debug",
+        "save_vtk_mappings": profile == "debug",
+    }
+
+
+def build_shard_suffix(args: argparse.Namespace) -> str:
+    if int(args.unit_shard_count) <= 1:
+        return ""
+    return f"_shard_{int(args.unit_shard_index):02d}of{int(args.unit_shard_count):02d}"
 
 
 def parse_unit_id(unit_id: str) -> tuple[int, int]:
@@ -190,6 +252,10 @@ def collect_selected_unit_ids(args: argparse.Namespace) -> list[str]:
     ordered = sorted(unit_ids, key=lambda unit_id: parse_unit_id(unit_id))
     if args.limit_units:
         ordered = ordered[: int(args.limit_units)]
+    shard_count = int(args.unit_shard_count)
+    shard_index = int(args.unit_shard_index)
+    if shard_count > 1:
+        ordered = [unit_id for idx, unit_id in enumerate(ordered) if idx % shard_count == shard_index]
     return ordered
 
 
@@ -202,6 +268,29 @@ def sort_layers(layers_df: pd.DataFrame) -> pd.DataFrame:
     work["SortTop"] = np.nanmin(np.vstack([top.to_numpy(dtype=float), base.to_numpy(dtype=float)]), axis=0)
     work = work.sort_values(["SortTop", "GeoIntervalKey"], na_position="last").reset_index(drop=True)
     return work.drop(columns=["SortTop"], errors="ignore")
+
+
+def ensure_stable_layer_keys(layers_df: pd.DataFrame) -> pd.DataFrame:
+    work = sort_layers(layers_df).copy()
+    if work.empty:
+        if LAYER_SURFACE_PAIR_KEY_COL not in work.columns:
+            work[LAYER_SURFACE_PAIR_KEY_COL] = pd.Series(dtype="object")
+        if UNIT_LAYER_SEGMENT_KEY_COL not in work.columns:
+            work[UNIT_LAYER_SEGMENT_KEY_COL] = pd.Series(dtype="object")
+        return work
+
+    work[LAYER_SURFACE_PAIR_KEY_COL] = [
+        build_layer_surface_pair_key(top_surface_code, base_surface_code)
+        for top_surface_code, base_surface_code in zip(
+            work.get("TopSurfaceCode", pd.Series([""] * len(work))),
+            work.get("BaseSurfaceCode", pd.Series([""] * len(work))),
+        )
+    ]
+    work[UNIT_LAYER_SEGMENT_KEY_COL] = [
+        build_unit_layer_segment_key_from_row(row)
+        for _, row in work.iterrows()
+    ]
+    return work
 
 
 def compute_unit_time_bounds(layers_df: pd.DataFrame, unit_summary: dict[str, Any]) -> tuple[float, float]:
@@ -223,7 +312,8 @@ def compute_unit_time_bounds(layers_df: pd.DataFrame, unit_summary: dict[str, An
 def build_no_constraint_layers_df(block_x: int, block_y: int, time_min: float, time_max: float) -> pd.DataFrame:
     top_time = float(min(time_min, time_max))
     base_time = float(max(time_min, time_max))
-    return pd.DataFrame(
+    return ensure_stable_layer_keys(
+        pd.DataFrame(
         [
             {
                 "UnitID": f"BX{int(block_x)}_BY{int(block_y)}",
@@ -239,6 +329,7 @@ def build_no_constraint_layers_df(block_x: int, block_y: int, time_min: float, t
                 "BaseDepth": np.nan,
             }
         ]
+        )
     )
 
 
@@ -270,6 +361,122 @@ def snap_to_interval(value: float | None, interval: float) -> float | None:
     if not np.isfinite(value):
         return None
     return round(round(value / float(interval)) * float(interval), 6)
+
+
+def canonicalize_boundary_surface_code(value: Any) -> str:
+    text = str(value or "").strip()
+    if not text or text.lower() == "nan":
+        return ""
+    upper = text.upper()
+    if upper == "SEIS_TOP":
+        return TOP_BOUNDARY_SURFACE_CODE
+    if upper == "SEIS_BASE":
+        return BOTTOM_BOUNDARY_SURFACE_CODE
+    return text
+
+
+def adjust_surface_times_for_inversions(surface_df: pd.DataFrame, time_col: str = "SnappedTime") -> pd.DataFrame:
+    work = surface_df.copy()
+    raw_times = pd.to_numeric(work[time_col], errors="coerce").to_numpy(dtype=float)
+    adjusted = raw_times.copy()
+    inversion_flags = np.zeros(len(adjusted), dtype=bool)
+    for idx in range(len(adjusted) - 2, -1, -1):
+        next_value = adjusted[idx + 1]
+        current_value = adjusted[idx]
+        if np.isfinite(current_value) and np.isfinite(next_value) and current_value > next_value:
+            adjusted[idx] = next_value
+            inversion_flags[idx] = True
+    work["AdjustedTime"] = adjusted
+    work["AdjustedUpward"] = inversion_flags
+    work["IntervalToNextValid"] = True
+    for idx in range(len(work) - 1):
+        top_time = adjusted[idx]
+        base_time = adjusted[idx + 1]
+        work.at[idx, "IntervalToNextValid"] = bool(np.isfinite(top_time) and np.isfinite(base_time) and base_time > top_time)
+    if len(work) > 0:
+        work.at[len(work) - 1, "IntervalToNextValid"] = True
+    return work
+
+
+def clamp_surface_times_to_window(
+    surface_df: pd.DataFrame,
+    top_boundary_time_ms: float,
+    bottom_boundary_time_ms: float,
+    z_step_ms: float,
+) -> pd.DataFrame:
+    work = surface_df.copy()
+    lower = snap_to_interval(min(float(top_boundary_time_ms), float(bottom_boundary_time_ms)), z_step_ms)
+    upper = snap_to_interval(max(float(top_boundary_time_ms), float(bottom_boundary_time_ms)), z_step_ms)
+    adjusted = pd.to_numeric(work["AdjustedTime"], errors="coerce").to_numpy(dtype=float)
+    clamped = adjusted.copy()
+    finite_mask = np.isfinite(clamped)
+    clamped[finite_mask] = np.clip(clamped[finite_mask], lower, upper)
+    work["WindowAdjustedTime"] = clamped
+    work["ClampedToWindow"] = finite_mask & (~np.isclose(clamped, adjusted, equal_nan=True))
+    work["IntervalToNextValid"] = True
+    for idx in range(len(work) - 1):
+        top_time = clamped[idx]
+        base_time = clamped[idx + 1]
+        work.at[idx, "IntervalToNextValid"] = bool(np.isfinite(top_time) and np.isfinite(base_time) and base_time > top_time)
+    if len(work) > 0:
+        work.at[len(work) - 1, "IntervalToNextValid"] = True
+    return work
+
+
+def build_layers_from_adjusted_surfaces(
+    unit_id: str,
+    block_x: int,
+    block_y: int,
+    adjusted_surface_df: pd.DataFrame,
+    top_boundary_time_ms: float,
+    bottom_boundary_time_ms: float,
+    min_layer_thickness_ms: float,
+    z_step_ms: float,
+) -> pd.DataFrame:
+    boundary_rows: list[tuple[str, float | None]] = [
+        (TOP_BOUNDARY_SURFACE_CODE, snap_to_interval(top_boundary_time_ms, z_step_ms))
+    ]
+    time_col = "WindowAdjustedTime" if "WindowAdjustedTime" in adjusted_surface_df.columns else "AdjustedTime"
+    for row in adjusted_surface_df.itertuples(index=False):
+        boundary_rows.append((str(row.SurfaceCode), getattr(row, time_col)))
+    boundary_rows.append((BOTTOM_BOUNDARY_SURFACE_CODE, snap_to_interval(bottom_boundary_time_ms, z_step_ms)))
+
+    rows: list[dict[str, Any]] = []
+    interval_idx = 1
+    min_thickness = float(max(min_layer_thickness_ms, 0.0))
+    for idx in range(len(boundary_rows) - 1):
+        top_code, top_time = boundary_rows[idx]
+        base_code, base_time = boundary_rows[idx + 1]
+        if top_time is None or base_time is None:
+            continue
+        if not np.isfinite(top_time) or not np.isfinite(base_time):
+            continue
+        if (float(base_time) - float(top_time)) < min_thickness:
+            continue
+        rows.append(
+            {
+                "UnitID": str(unit_id),
+                "BlockX": int(block_x),
+                "BlockY": int(block_y),
+                "GeoIntervalKey": f"{interval_idx:03d}_interval_{interval_idx:03d}",
+                "StrataName": f"{top_code}->{base_code}",
+                "TopSurfaceCode": str(top_code),
+                "BaseSurfaceCode": str(base_code),
+                "TopDepth": float(top_time),
+                "BaseDepth": float(base_time),
+                "TopTime": float(top_time),
+                "BaseTime": float(base_time),
+                "RealPointSeedCount": 0,
+                "RealSegmentSeedCount": 0,
+                "VirtualPointSeedCount": 0,
+                "VirtualSegmentSeedCount": 0,
+                "RealSeedCount": 0,
+                "VirtualSeedCount": 0,
+                "PreferredSource": "",
+            }
+        )
+        interval_idx += 1
+    return ensure_stable_layer_keys(pd.DataFrame(rows))
 
 
 def extract_surface_code_from_name(name: str) -> str:
@@ -398,44 +605,35 @@ def build_auto_layers_from_surface_rows(
     block_x: int,
     block_y: int,
     resolved_surface_df: pd.DataFrame,
+    top_boundary_time_ms: float,
+    bottom_boundary_time_ms: float,
     z_step_ms: float,
 ) -> pd.DataFrame:
     if resolved_surface_df.empty:
         return pd.DataFrame()
     work = resolved_surface_df.copy()
+    work["SurfaceCode"] = work["SurfaceCode"].apply(canonicalize_boundary_surface_code)
     work["SnappedTime"] = pd.to_numeric(work["SnappedTime"], errors="coerce")
-    work = work.dropna(subset=["SnappedTime"]).sort_values(["SnappedTime", "SurfaceCode"]).reset_index(drop=True)
-    if len(work) < 2:
+    work = work.dropna(subset=["SnappedTime"]).reset_index(drop=True)
+    if work.empty:
         return pd.DataFrame()
-
-    rows: list[dict[str, Any]] = []
-    interval_idx = 1
-    for idx in range(len(work) - 1):
-        top_row = work.iloc[idx]
-        base_row = work.iloc[idx + 1]
-        top_time = float(top_row["SnappedTime"])
-        base_time = float(base_row["SnappedTime"])
-        if not np.isfinite(top_time) or not np.isfinite(base_time):
-            continue
-        if (base_time - top_time) < float(z_step_ms):
-            continue
-        rows.append(
-            {
-                "UnitID": str(unit_id),
-                "BlockX": int(block_x),
-                "BlockY": int(block_y),
-                "GeoIntervalKey": f"{interval_idx:03d}_interval_{interval_idx:03d}",
-                "StrataName": f"{top_row['SurfaceCode']}->{base_row['SurfaceCode']}",
-                "TopSurfaceCode": str(top_row["SurfaceCode"]),
-                "BaseSurfaceCode": str(base_row["SurfaceCode"]),
-                "TopTime": float(top_time),
-                "BaseTime": float(base_time),
-                "TopDepth": float(top_time),
-                "BaseDepth": float(base_time),
-            }
-        )
-        interval_idx += 1
-    return pd.DataFrame(rows)
+    work = adjust_surface_times_for_inversions(work, time_col="SnappedTime")
+    work = clamp_surface_times_to_window(
+        work,
+        top_boundary_time_ms=float(top_boundary_time_ms),
+        bottom_boundary_time_ms=float(bottom_boundary_time_ms),
+        z_step_ms=float(z_step_ms),
+    )
+    return build_layers_from_adjusted_surfaces(
+        unit_id=unit_id,
+        block_x=block_x,
+        block_y=block_y,
+        adjusted_surface_df=work,
+        top_boundary_time_ms=float(top_boundary_time_ms),
+        bottom_boundary_time_ms=float(bottom_boundary_time_ms),
+        min_layer_thickness_ms=float(z_step_ms),
+        z_step_ms=float(z_step_ms),
+    )
 
 
 def extend_layers_to_seismic_bounds(
@@ -443,21 +641,24 @@ def extend_layers_to_seismic_bounds(
     unit_id: str,
     block_x: int,
     block_y: int,
-    seismic_time_min: float,
-    seismic_time_max: float,
+    top_boundary_time_ms: float,
+    bottom_boundary_time_ms: float,
     z_step_ms: float,
 ) -> pd.DataFrame:
     if layers_df.empty:
         return layers_df.copy()
     work = sort_layers(layers_df).copy()
+    for col in ("TopSurfaceCode", "BaseSurfaceCode"):
+        if col in work.columns:
+            work[col] = work[col].apply(canonicalize_boundary_surface_code)
     work["TopTime"] = pd.to_numeric(work.get("TopTime"), errors="coerce")
     work["BaseTime"] = pd.to_numeric(work.get("BaseTime"), errors="coerce")
     work = work.dropna(subset=["TopTime", "BaseTime"]).reset_index(drop=True)
     if work.empty:
         return work
 
-    seismic_top = snap_to_interval(float(min(seismic_time_min, seismic_time_max)), z_step_ms)
-    seismic_base = snap_to_interval(float(max(seismic_time_min, seismic_time_max)), z_step_ms)
+    seismic_top = snap_to_interval(float(min(top_boundary_time_ms, bottom_boundary_time_ms)), z_step_ms)
+    seismic_base = snap_to_interval(float(max(top_boundary_time_ms, bottom_boundary_time_ms)), z_step_ms)
     if seismic_top is None or seismic_base is None:
         return work
 
@@ -467,8 +668,8 @@ def extend_layers_to_seismic_bounds(
     last_base = float(max(last_row["TopTime"], last_row["BaseTime"]))
     rows_to_add: list[dict[str, Any]] = []
 
-    first_surface_code = str(first_row.get("TopSurfaceCode", "")).strip() or "T1"
-    last_surface_code = str(last_row.get("BaseSurfaceCode", "")).strip() or "T7"
+    first_surface_code = canonicalize_boundary_surface_code(first_row.get("TopSurfaceCode", "")) or "T1"
+    last_surface_code = canonicalize_boundary_surface_code(last_row.get("BaseSurfaceCode", "")) or "T7"
 
     if (first_top - seismic_top) >= float(z_step_ms):
         rows_to_add.append(
@@ -477,8 +678,8 @@ def extend_layers_to_seismic_bounds(
                 "BlockX": int(block_x),
                 "BlockY": int(block_y),
                 "GeoIntervalKey": "000_interval_pre_top",
-                "StrataName": f"SEIS_TOP->{first_surface_code}",
-                "TopSurfaceCode": "SEIS_TOP",
+                "StrataName": f"{TOP_BOUNDARY_SURFACE_CODE}->{first_surface_code}",
+                "TopSurfaceCode": TOP_BOUNDARY_SURFACE_CODE,
                 "BaseSurfaceCode": first_surface_code,
                 "TopTime": float(seismic_top),
                 "BaseTime": float(first_top),
@@ -494,9 +695,9 @@ def extend_layers_to_seismic_bounds(
                 "BlockX": int(block_x),
                 "BlockY": int(block_y),
                 "GeoIntervalKey": "999_interval_post_base",
-                "StrataName": f"{last_surface_code}->SEIS_BASE",
+                "StrataName": f"{last_surface_code}->{BOTTOM_BOUNDARY_SURFACE_CODE}",
                 "TopSurfaceCode": last_surface_code,
-                "BaseSurfaceCode": "SEIS_BASE",
+                "BaseSurfaceCode": BOTTOM_BOUNDARY_SURFACE_CODE,
                 "TopTime": float(last_base),
                 "BaseTime": float(seismic_base),
                 "TopDepth": float(last_base),
@@ -509,8 +710,14 @@ def extend_layers_to_seismic_bounds(
 
     extended = pd.concat([work, pd.DataFrame(rows_to_add)], ignore_index=True, sort=False)
     extended = sort_layers(extended).reset_index(drop=True)
+    extended["TopSurfaceCode"] = extended["TopSurfaceCode"].apply(canonicalize_boundary_surface_code)
+    extended["BaseSurfaceCode"] = extended["BaseSurfaceCode"].apply(canonicalize_boundary_surface_code)
+    extended["StrataName"] = [
+        f"{top_code}->{base_code}"
+        for top_code, base_code in zip(extended["TopSurfaceCode"].astype(str), extended["BaseSurfaceCode"].astype(str))
+    ]
     extended["GeoIntervalKey"] = [f"{idx:03d}_interval_{idx:03d}" for idx in range(1, len(extended) + 1)]
-    return extended
+    return ensure_stable_layer_keys(extended)
 
 
 def scale_patch_geometry_about_center(patch_df: pd.DataFrame, scale_factor: float) -> pd.DataFrame:
@@ -573,6 +780,30 @@ def run_single_window(
     return center_probs, count_pred, geom_pred
 
 
+def resolve_decode_runtime_config(
+    registry_payload: dict[str, Any] | None,
+    layer_surface_pair_key: str,
+    args: argparse.Namespace,
+) -> dict[str, Any]:
+    layer_config = resolve_layer_decode_config(registry_payload, layer_surface_pair_key)
+    decode_mode = str(layer_config.get("decode_mode", args.decode_mode)).strip().lower()
+    if decode_mode not in {"strict", "relaxed"}:
+        decode_mode = str(args.decode_mode)
+    return {
+        "center_threshold": float(layer_config.get("center_threshold", args.center_threshold)),
+        "decode_mode": decode_mode,
+        "relaxed_min_count": int(layer_config.get("relaxed_min_count", args.relaxed_min_count)),
+        "count_activation_threshold": float(
+            layer_config.get("count_activation_threshold", args.count_activation_threshold)
+        ),
+        "min_count_if_active": int(layer_config.get("min_count_if_active", args.min_count_if_active)),
+        "max_total_patches_per_window": int(
+            layer_config.get("max_total_patches_per_window", args.max_total_patches_per_window)
+        ),
+        "second_pass": layer_config.get("second_pass", {}),
+    }
+
+
 def save_window_package(output_path: Path, input_features: np.ndarray, valid_z_mask: np.ndarray, target_z_centers: np.ndarray) -> Path:
     output_path.parent.mkdir(parents=True, exist_ok=True)
     np.savez_compressed(
@@ -590,9 +821,17 @@ def build_output_unit_summary(
     block_y: int,
     layers_df: pd.DataFrame,
     predicted_all: pd.DataFrame,
+    predicted_dedup_before_density_count: int,
     dedup_pred: pd.DataFrame,
+    density_control_summary_df: pd.DataFrame,
     predicted_vtk: dict[str, Any],
     unit_source_dir: Path,
+    layer_density_control_enabled: bool,
+    layer_density_source: str,
+    layer_density_scale: float,
+    layer_density_calibration_json: Path | None,
+    layer_density_calibration_min_scale: float,
+    layer_density_calibration_max_scale: float,
 ) -> dict[str, Any]:
     return {
         "UnitID": str(unit_id),
@@ -600,7 +839,26 @@ def build_output_unit_summary(
         "BlockY": int(block_y),
         "LayerCount": int(len(layers_df)),
         "PredictedWindowPatchCount": int(len(predicted_all)),
+        "PredictedDedupPatchCountBeforeDensityControl": int(predicted_dedup_before_density_count),
         "PredictedDedupPatchCount": int(len(dedup_pred)),
+        "LayerDensityControlEnabled": bool(layer_density_control_enabled),
+        "LayerDensitySource": str(layer_density_source),
+        "LayerDensityScale": float(layer_density_scale),
+        "LayerDensityCalibrationJSON": str(Path(layer_density_calibration_json).resolve()) if layer_density_calibration_json else "",
+        "LayerDensityCalibrationMinScale": float(layer_density_calibration_min_scale),
+        "LayerDensityCalibrationMaxScale": float(layer_density_calibration_max_scale),
+        "LayerDensityControlledLayerCount": int(
+            density_control_summary_df["TargetPatchCount"].notna().sum()
+        ) if not density_control_summary_df.empty and "TargetPatchCount" in density_control_summary_df.columns else 0,
+        "PredictedNonZeroLayerCountBeforeDensityControl": int(
+            density_control_summary_df["PredictedNonZeroBeforeDensityControl"].fillna(False).astype(bool).sum()
+        ) if not density_control_summary_df.empty and "PredictedNonZeroBeforeDensityControl" in density_control_summary_df.columns else 0,
+        "PredictedNonZeroLayerCount": int(
+            density_control_summary_df["PredictedNonZeroAfterDensityControl"].fillna(False).astype(bool).sum()
+        ) if not density_control_summary_df.empty and "PredictedNonZeroAfterDensityControl" in density_control_summary_df.columns else 0,
+        "SuppressedLayerCountByActivationThreshold": int(
+            density_control_summary_df["SuppressedByActivationThreshold"].fillna(False).astype(bool).sum()
+        ) if not density_control_summary_df.empty and "SuppressedByActivationThreshold" in density_control_summary_df.columns else 0,
         "PredictedRawVTK": predicted_vtk.get("raw_vtk", ""),
         "PredictedDisplayVTK": predicted_vtk.get("display_vtk", ""),
         "SourceUnitDir": str(unit_source_dir),
@@ -654,6 +912,7 @@ def write_partial_unit_outputs(
     dedupe_time_tol_ms: float,
     dedupe_azimuth_tol_deg: float,
     dedupe_dip_tol_deg: float,
+    artifact_flags: dict[str, bool],
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     unit_output_dir.mkdir(parents=True, exist_ok=True)
     predicted_all = pd.concat(per_unit_frames, ignore_index=True, sort=False) if per_unit_frames else pd.DataFrame()
@@ -665,23 +924,26 @@ def write_partial_unit_outputs(
         dip_tol_deg=float(dedupe_dip_tol_deg),
     )
     write_csv_utf8(layers_df, unit_output_dir / "unit_layers_input.csv")
-    write_json(unit_output_dir / "source_unit_summary.json", unit_summary)
-    write_csv_utf8(predicted_all, unit_output_dir / "predicted_window_concat_patches.partial.csv")
-    write_csv_utf8(dedup_pred, unit_output_dir / "predicted_unit_patches.partial.csv")
-    write_json(
-        unit_output_dir / "unit_prediction_progress.json",
-        build_unit_progress_payload(
-            unit_id=unit_id,
-            block_x=block_x,
-            block_y=block_y,
-            total_window_count=total_window_count,
-            completed_window_count=completed_window_count,
-            inferred_window_count=inferred_window_count,
-            predicted_all=predicted_all,
-            dedup_pred=dedup_pred,
-            is_final=False,
-        ),
-    )
+    if artifact_flags.get("save_source_metadata", False):
+        write_json(unit_output_dir / "source_unit_summary.json", unit_summary)
+    if artifact_flags.get("save_window_concat_csv", False):
+        write_csv_utf8(predicted_all, unit_output_dir / "predicted_window_concat_patches.partial.csv")
+        write_csv_utf8(dedup_pred, unit_output_dir / "predicted_unit_patches.partial.csv")
+    if artifact_flags.get("save_progress_json", False):
+        write_json(
+            unit_output_dir / "unit_prediction_progress.json",
+            build_unit_progress_payload(
+                unit_id=unit_id,
+                block_x=block_x,
+                block_y=block_y,
+                total_window_count=total_window_count,
+                completed_window_count=completed_window_count,
+                inferred_window_count=inferred_window_count,
+                predicted_all=predicted_all,
+                dedup_pred=dedup_pred,
+                is_final=False,
+            ),
+        )
     return predicted_all, dedup_pred
 
 
@@ -697,6 +959,8 @@ def build_unit_window_jobs(
     jobs: list[dict[str, Any]] = []
     for _, layer_row in layers_df.iterrows():
         layer_key = str(layer_row.get("GeoIntervalKey", ""))
+        layer_surface_pair_key = build_layer_surface_pair_key_from_row(layer_row)
+        unit_layer_segment_key = build_unit_layer_segment_key_from_row(layer_row)
         layer_top = pd.to_numeric(layer_row.get("TopTime"), errors="coerce")
         layer_base = pd.to_numeric(layer_row.get("BaseTime"), errors="coerce")
         if pd.isna(layer_top) or pd.isna(layer_base):
@@ -715,6 +979,8 @@ def build_unit_window_jobs(
                 {
                     "layer_row": layer_row,
                     "layer_key": layer_key,
+                    LAYER_SURFACE_PAIR_KEY_COL: layer_surface_pair_key,
+                    UNIT_LAYER_SEGMENT_KEY_COL: unit_layer_segment_key,
                     "layer_top": float(layer_top),
                     "layer_base": float(layer_base),
                     "window_idx": int(window_idx),
@@ -729,29 +995,51 @@ def build_unit_window_jobs(
 
 def main() -> None:
     args = build_parser().parse_args()
+    validate_model_source_args(args)
     device = resolve_device(args.device)
     show_progress = not bool(args.no_progress)
     input_channels = list(dict.fromkeys(args.input_channels))
+    artifact_flags = resolve_artifact_flags(args)
     if not input_channels:
         raise ValueError("input_channels must not be empty")
     if (args.time_min is None) ^ (args.time_max is None):
         raise ValueError("time_min and time_max must be provided together")
     if (not np.isfinite(float(args.patch_scale_factor))) or float(args.patch_scale_factor) <= 0.0:
         raise ValueError(f"patch_scale_factor must be a finite positive number, got {args.patch_scale_factor}")
+    layer_top_boundary_ms = float(args.layer_top_boundary_ms)
+    layer_bottom_boundary_ms = float(args.layer_bottom_boundary_ms)
+    if not np.isfinite(layer_top_boundary_ms) or not np.isfinite(layer_bottom_boundary_ms):
+        raise ValueError("layer boundary times must be finite")
+    if layer_bottom_boundary_ms <= layer_top_boundary_ms:
+        raise ValueError("layer_bottom_boundary_ms must be greater than layer_top_boundary_ms")
     enable_seismic_bound_extension = not bool(args.disable_seismic_bound_extension)
+    registry_payload = load_layer_model_registry(Path(args.layer_model_registry_py)) if args.layer_model_registry_py else None
+    layer_density_calibration_payload = load_layer_density_calibration_payload(args.layer_density_calibration_json)
+    model_cache: dict[str, tuple[SparseInstanceBaselineUNet, dict[str, Any]]] = {}
 
-    model, checkpoint = load_checkpoint_model(Path(args.checkpoint), device)
-    checkpoint_config = checkpoint.get("model_config") or {}
-    checkpoint_in_channels = int(checkpoint_config.get("in_channels", len(input_channels)))
-    checkpoint_slots = int(checkpoint_config.get("slots_per_voxel", int(args.max_slots_per_voxel)))
-    if checkpoint_in_channels != len(input_channels):
-        raise ValueError(
-            f"checkpoint expects in_channels={checkpoint_in_channels}, but input_channels={len(input_channels)}: {input_channels}"
-        )
-    if int(args.max_slots_per_voxel) != checkpoint_slots:
-        raise ValueError(
-            f"checkpoint expects slots_per_voxel={checkpoint_slots}, but max_slots_per_voxel={int(args.max_slots_per_voxel)}"
-        )
+    def get_or_load_model(checkpoint_path: Path) -> tuple[SparseInstanceBaselineUNet, dict[str, Any]]:
+        resolved_path = str(Path(checkpoint_path).resolve())
+        if resolved_path in model_cache:
+            return model_cache[resolved_path]
+        model, checkpoint = load_checkpoint_model(Path(resolved_path), device)
+        checkpoint_config = checkpoint.get("model_config") or {}
+        checkpoint_in_channels = int(checkpoint_config.get("in_channels", len(input_channels)))
+        checkpoint_slots = int(checkpoint_config.get("slots_per_voxel", int(args.max_slots_per_voxel)))
+        if checkpoint_in_channels != len(input_channels):
+            raise ValueError(
+                f"checkpoint {resolved_path} expects in_channels={checkpoint_in_channels}, "
+                f"but input_channels={len(input_channels)}: {input_channels}"
+            )
+        if int(args.max_slots_per_voxel) != checkpoint_slots:
+            raise ValueError(
+                f"checkpoint {resolved_path} expects slots_per_voxel={checkpoint_slots}, "
+                f"but max_slots_per_voxel={int(args.max_slots_per_voxel)}"
+            )
+        model_cache[resolved_path] = (model, checkpoint)
+        return model_cache[resolved_path]
+
+    if args.checkpoint is not None:
+        get_or_load_model(Path(args.checkpoint))
 
     target_unit_ids = collect_selected_unit_ids(args)
     run_dir = Path(args.output_root) / args.run_name
@@ -772,7 +1060,7 @@ def main() -> None:
             surface_lookups = {}
     selected_rows: list[dict[str, Any]] = []
     skipped_rows: list[dict[str, Any]] = []
-    window_rows: list[dict[str, Any]] = []
+    window_rows: list[dict[str, Any]] | None = [] if artifact_flags.get("save_window_summary_csv", False) else None
     unit_rows: list[dict[str, Any]] = []
     vtk_config = VtkPatchExportConfig(
         display_z_scale=float(args.display_z_scale),
@@ -816,7 +1104,7 @@ def main() -> None:
                 }
                 layer_source_mode = "full_interval"
             else:
-                layers_df = sort_layers(load_layer_table(source_unit_dir)) if source_unit_dir.exists() else pd.DataFrame()
+                layers_df = ensure_stable_layer_keys(load_layer_table(source_unit_dir)) if source_unit_dir.exists() else pd.DataFrame()
                 if not layers_df.empty:
                     if enable_seismic_bound_extension:
                         layers_df = extend_layers_to_seismic_bounds(
@@ -824,8 +1112,8 @@ def main() -> None:
                             unit_id=unit_id,
                             block_x=block_x,
                             block_y=block_y,
-                            seismic_time_min=seismic_time_min,
-                            seismic_time_max=seismic_time_max,
+                            top_boundary_time_ms=layer_top_boundary_ms,
+                            bottom_boundary_time_ms=layer_bottom_boundary_ms,
                             z_step_ms=float(args.z_step_ms),
                         )
                     unit_summary = load_unit_summary(source_unit_dir)
@@ -837,9 +1125,11 @@ def main() -> None:
                     unit_summary["TimeMax"] = float(z_max)
                     unit_summary["LayerMode"] = layer_source_mode
                     unit_summary["SeismicBoundExtensionEnabled"] = bool(enable_seismic_bound_extension)
+                    unit_summary["LayerTopBoundaryMs"] = float(layer_top_boundary_ms)
+                    unit_summary["LayerBottomBoundaryMs"] = float(layer_bottom_boundary_ms)
                     if enable_seismic_bound_extension:
-                        unit_summary["ExtendedSeismicTimeMin"] = float(seismic_time_min)
-                        unit_summary["ExtendedSeismicTimeMax"] = float(seismic_time_max)
+                        unit_summary["ExtendedSeismicTimeMin"] = float(layer_top_boundary_ms)
+                        unit_summary["ExtendedSeismicTimeMax"] = float(layer_bottom_boundary_ms)
                 else:
                     if not surface_lookups:
                         skipped_rows.append({"UnitID": unit_id, "BlockX": block_x, "BlockY": block_y, "Reason": "missing_layer_table_and_surface_catalog"})
@@ -863,18 +1153,10 @@ def main() -> None:
                         block_x=block_x,
                         block_y=block_y,
                         resolved_surface_df=resolved_surface_df,
+                        top_boundary_time_ms=layer_top_boundary_ms,
+                        bottom_boundary_time_ms=layer_bottom_boundary_ms,
                         z_step_ms=float(args.z_step_ms),
                     )
-                    if enable_seismic_bound_extension:
-                        layers_df = extend_layers_to_seismic_bounds(
-                            layers_df=layers_df,
-                            unit_id=unit_id,
-                            block_x=block_x,
-                            block_y=block_y,
-                            seismic_time_min=seismic_time_min,
-                            seismic_time_max=seismic_time_max,
-                            z_step_ms=float(args.z_step_ms),
-                        )
                     if layers_df.empty:
                         skipped_rows.append({"UnitID": unit_id, "BlockX": block_x, "BlockY": block_y, "Reason": "auto_surface_layer_resolution_failed"})
                         unit_bar.update(1)
@@ -893,13 +1175,15 @@ def main() -> None:
                         "ValidSurfaceCount": int(len(resolved_surface_df)),
                         "IntervalCount": int(len(layers_df)),
                         "SeismicBoundExtensionEnabled": bool(enable_seismic_bound_extension),
+                        "LayerTopBoundaryMs": float(layer_top_boundary_ms),
+                        "LayerBottomBoundaryMs": float(layer_bottom_boundary_ms),
                         "MeanNearestDistance": float(valid_distance.mean()) if len(valid_distance) else None,
                         "MaxNearestDistance": float(valid_distance.max()) if len(valid_distance) else None,
                         "MinNearestDistance": float(valid_distance.min()) if len(valid_distance) else None,
                     }
                     if enable_seismic_bound_extension:
-                        layer_resolution_summary["ExtendedSeismicTimeMin"] = float(seismic_time_min)
-                        layer_resolution_summary["ExtendedSeismicTimeMax"] = float(seismic_time_max)
+                        layer_resolution_summary["ExtendedSeismicTimeMin"] = float(layer_top_boundary_ms)
+                        layer_resolution_summary["ExtendedSeismicTimeMax"] = float(layer_bottom_boundary_ms)
                     unit_summary = {
                         "UnitID": unit_id,
                         "BlockX": int(block_x),
@@ -912,7 +1196,7 @@ def main() -> None:
                         **layer_resolution_summary,
                     }
 
-            layers_df = sort_layers(layers_df)
+            layers_df = ensure_stable_layer_keys(layers_df)
             selected_rows.append(
                 {
                     "UnitID": unit_id,
@@ -925,8 +1209,9 @@ def main() -> None:
             unit_output_dir = units_dir / unit_id
             unit_output_dir.mkdir(parents=True, exist_ok=True)
             write_csv_utf8(layers_df, unit_output_dir / "unit_layers_input.csv")
-            write_json(unit_output_dir / "source_unit_summary.json", unit_summary)
-            if not resolved_surface_df.empty:
+            if artifact_flags.get("save_source_metadata", False):
+                write_json(unit_output_dir / "source_unit_summary.json", unit_summary)
+            if artifact_flags.get("save_resolved_surfaces", False) and not resolved_surface_df.empty:
                 write_csv_utf8(resolved_surface_df, unit_output_dir / "resolved_layer_surfaces.csv")
                 write_json(unit_output_dir / "layer_resolution_summary.json", layer_resolution_summary)
 
@@ -959,20 +1244,21 @@ def main() -> None:
                 limit_windows_per_unit=int(args.limit_windows_per_unit) if args.limit_windows_per_unit else None,
             )
             total_window_count = int(len(window_jobs))
-            write_json(
-                unit_output_dir / "unit_prediction_progress.json",
-                build_unit_progress_payload(
-                    unit_id=unit_id,
-                    block_x=block_x,
-                    block_y=block_y,
-                    total_window_count=total_window_count,
-                    completed_window_count=0,
-                    inferred_window_count=0,
-                    predicted_all=pd.DataFrame(),
-                    dedup_pred=pd.DataFrame(),
-                    is_final=False,
-                ),
-            )
+            if artifact_flags.get("save_progress_json", False):
+                write_json(
+                    unit_output_dir / "unit_prediction_progress.json",
+                    build_unit_progress_payload(
+                        unit_id=unit_id,
+                        block_x=block_x,
+                        block_y=block_y,
+                        total_window_count=total_window_count,
+                        completed_window_count=0,
+                        inferred_window_count=0,
+                        predicted_all=pd.DataFrame(),
+                        dedup_pred=pd.DataFrame(),
+                        is_final=False,
+                    ),
+                )
             emit_progress_message(
                 (
                     f"[UnitStart] {unit_id} "
@@ -992,9 +1278,13 @@ def main() -> None:
                 dynamic_ncols=True,
                 disable=not bool(show_progress),
             )
+            unit_layer_surface_pair_keys_used: set[str] = set()
+            unit_checkpoint_paths_used: set[str] = set()
             for job in window_jobs:
                 layer_row = job["layer_row"]
                 layer_key = str(job["layer_key"])
+                layer_surface_pair_key = str(job.get(LAYER_SURFACE_PAIR_KEY_COL, ""))
+                unit_layer_segment_key = str(job.get(UNIT_LAYER_SEGMENT_KEY_COL, ""))
                 layer_top = float(job["layer_top"])
                 layer_base = float(job["layer_base"])
                 window_idx = int(job["window_idx"])
@@ -1009,7 +1299,11 @@ def main() -> None:
                     )
                 if int(valid_z_mask.sum()) <= 0:
                     completed_window_count += 1
-                    if int(args.partial_save_every_windows) > 0 and completed_window_count % int(args.partial_save_every_windows) == 0:
+                    if (
+                        artifact_flags.get("save_partial_outputs", False)
+                        and int(args.partial_save_every_windows) > 0
+                        and completed_window_count % int(args.partial_save_every_windows) == 0
+                    ):
                         partial_all, partial_dedup = write_partial_unit_outputs(
                             unit_output_dir=unit_output_dir,
                             unit_id=unit_id,
@@ -1025,18 +1319,20 @@ def main() -> None:
                             dedupe_time_tol_ms=float(args.dedupe_time_tol_ms),
                             dedupe_azimuth_tol_deg=float(args.dedupe_azimuth_tol_deg),
                             dedupe_dip_tol_deg=float(args.dedupe_dip_tol_deg),
+                            artifact_flags=artifact_flags,
                         )
-                        emit_progress_message(
-                            (
-                                f"[UnitProgress] {unit_id} "
-                                f"completed={completed_window_count}/{total_window_count} "
-                                f"inferred={processed_window_count} "
-                                f"raw_patches={len(partial_all)} "
-                                f"dedup_patches={len(partial_dedup)}"
-                            ),
-                            show_progress=show_progress,
-                            progress_bar=window_bar,
-                        )
+                        if artifact_flags.get("save_progress_json", False) or artifact_flags.get("save_window_concat_csv", False):
+                            emit_progress_message(
+                                (
+                                    f"[UnitProgress] {unit_id} "
+                                    f"completed={completed_window_count}/{total_window_count} "
+                                    f"inferred={processed_window_count} "
+                                    f"raw_patches={len(partial_all)} "
+                                    f"dedup_patches={len(partial_dedup)}"
+                                ),
+                                show_progress=show_progress,
+                                progress_bar=window_bar,
+                            )
                     window_bar.update(1)
                     continue
                 input_features, input_stats = build_input_features(
@@ -1057,18 +1353,24 @@ def main() -> None:
                     save_window_package(pkg_path, input_features=input_features, valid_z_mask=valid_z_mask, target_z_centers=target_z_centers)
                     package_path = str(pkg_path)
 
-                center_probs, count_pred, geom_pred = run_single_window(model, input_features, device)
-                label_payload, decode_filter_stats = prediction_to_label_payload(
-                        center_probs=center_probs,
-                        count_pred=count_pred,
-                        geom_pred=geom_pred,
-                        valid_z_mask=valid_z_mask,
-                        threshold=float(args.center_threshold),
-                        max_slots_per_voxel=int(args.max_slots_per_voxel),
-                        max_total_patches=int(args.max_total_patches_per_window) if args.max_total_patches_per_window else None,
-                        decode_mode=str(args.decode_mode),
-                        relaxed_min_count=int(args.relaxed_min_count),
+                checkpoint_path = (
+                    resolve_layer_checkpoint(
+                        registry_payload=registry_payload,
+                        layer_surface_pair_key=layer_surface_pair_key,
+                        fallback_checkpoint=args.checkpoint,
                     )
+                    if registry_payload is not None
+                    else str(Path(args.checkpoint).resolve())
+                )
+                decode_runtime_config = resolve_decode_runtime_config(
+                    registry_payload=registry_payload,
+                    layer_surface_pair_key=layer_surface_pair_key,
+                    args=args,
+                )
+                model, checkpoint = get_or_load_model(Path(checkpoint_path))
+                unit_layer_surface_pair_keys_used.add(layer_surface_pair_key)
+                unit_checkpoint_paths_used.add(str(checkpoint_path))
+                center_probs, count_pred, geom_pred = run_single_window(model, input_features, device)
                 window_grid = build_grid_spec(
                         unit_id=unit_id,
                         block_x=block_x,
@@ -1079,11 +1381,21 @@ def main() -> None:
                         xy_resolution=24,
                         z_step_ms=float(args.z_step_ms),
                     )
-                window_patch_df, decoded_df, decode_summary = decode_instance_label_to_patches(
-                        label_payload=label_payload,
+                window_patch_df, decoded_df, decode_summary, decode_filter_stats = decode_window_predictions_with_optional_second_pass(
+                        center_probs=center_probs,
+                        count_pred=count_pred,
+                        geom_pred=geom_pred,
+                        valid_z_mask=valid_z_mask,
                         grid=window_grid,
                         layers_df=layers_df,
-                        threshold=float(args.center_threshold),
+                        decode_runtime_config=decode_runtime_config,
+                        max_slots_per_voxel=int(args.max_slots_per_voxel),
+                        dedupe_xy_tol_m=float(args.dedupe_xy_tol_m),
+                        dedupe_time_tol_ms=float(args.dedupe_time_tol_ms),
+                        dedupe_azimuth_tol_deg=float(args.dedupe_azimuth_tol_deg),
+                        dedupe_dip_tol_deg=float(args.dedupe_dip_tol_deg),
+                        layer_surface_pair_key=layer_surface_pair_key,
+                        calibration_payload=layer_density_calibration_payload,
                     )
                 window_patch_df = scale_patch_geometry_about_center(
                     patch_df=window_patch_df,
@@ -1094,6 +1406,16 @@ def main() -> None:
                     scale_factor=float(args.patch_scale_factor),
                 )
                 if not window_patch_df.empty:
+                    if LAYER_SURFACE_PAIR_KEY_COL not in window_patch_df.columns:
+                        window_patch_df[LAYER_SURFACE_PAIR_KEY_COL] = ""
+                    pair_fill_mask = window_patch_df[LAYER_SURFACE_PAIR_KEY_COL].fillna("").astype(str).str.strip().eq("")
+                    if pair_fill_mask.any():
+                        window_patch_df.loc[pair_fill_mask, LAYER_SURFACE_PAIR_KEY_COL] = layer_surface_pair_key
+                    if UNIT_LAYER_SEGMENT_KEY_COL not in window_patch_df.columns:
+                        window_patch_df[UNIT_LAYER_SEGMENT_KEY_COL] = ""
+                    segment_fill_mask = window_patch_df[UNIT_LAYER_SEGMENT_KEY_COL].fillna("").astype(str).str.strip().eq("")
+                    if segment_fill_mask.any():
+                        window_patch_df.loc[segment_fill_mask, UNIT_LAYER_SEGMENT_KEY_COL] = unit_layer_segment_key
                     window_patch_df["PredWindowIndex"] = int(window_idx)
                     window_patch_df["PredWindowTopTime"] = float(window_top)
                     window_patch_df["PredWindowBaseTime"] = float(window_base)
@@ -1105,35 +1427,53 @@ def main() -> None:
                 processed_window_count += 1
                 completed_window_count += 1
 
-                window_rows.append(
-                    {
-                        "SampleID": sample_id,
-                        "UnitID": unit_id,
-                        "BlockX": block_x,
-                        "BlockY": block_y,
-                        "GeoIntervalKey": layer_key,
-                        "StrataName": str(layer_row.get("StrataName", "")),
-                        "TopSurfaceCode": str(layer_row.get("TopSurfaceCode", "")),
-                        "BaseSurfaceCode": str(layer_row.get("BaseSurfaceCode", "")),
-                        "WindowIndex": int(window_idx),
-                        "WindowTopTime": float(window_top),
-                        "WindowBaseTime": float(window_base),
-                        "WindowValidZCount": int(valid_z_mask.sum()),
-                        "PredictedPatchCount": int(len(window_patch_df)),
-                        "DecodedActiveSlotCount": int(decode_summary["active_slot_count"]),
-                        "RawCandidateCount": int(decode_filter_stats["raw_candidate_count"]),
-                        "KeptCandidateCount": int(decode_filter_stats["kept_candidate_count"]),
-                        "MeanPredCount": float(decode_filter_stats["mean_pred_count"]),
-                        "MaxPredCount": int(decode_filter_stats["max_pred_count"]),
-                        "ForcedVoxelCount": int(decode_filter_stats["forced_voxel_count"]),
-                        "PatchScaleFactor": float(args.patch_scale_factor),
-                        "DecodeMode": str(decode_filter_stats["decode_mode"]),
-                        "AmpAbsQ995": float(input_stats["amp_abs_q995"]),
-                        "GradMagAbsQ995": float(input_stats["grad_mag_abs_q995"]),
-                        "InputChannels": ",".join(input_channels),
-                        "PackagePath": package_path,
-                    }
-                )
+                if window_rows is not None:
+                    window_rows.append(
+                        {
+                            "SampleID": sample_id,
+                            "UnitID": unit_id,
+                            "BlockX": block_x,
+                            "BlockY": block_y,
+                            "GeoIntervalKey": layer_key,
+                            LAYER_SURFACE_PAIR_KEY_COL: layer_surface_pair_key,
+                            UNIT_LAYER_SEGMENT_KEY_COL: unit_layer_segment_key,
+                            "StrataName": str(layer_row.get("StrataName", "")),
+                            "TopSurfaceCode": str(layer_row.get("TopSurfaceCode", "")),
+                            "BaseSurfaceCode": str(layer_row.get("BaseSurfaceCode", "")),
+                            "CheckpointPath": str(checkpoint_path),
+                            "WindowIndex": int(window_idx),
+                            "WindowTopTime": float(window_top),
+                            "WindowBaseTime": float(window_base),
+                            "WindowValidZCount": int(valid_z_mask.sum()),
+                            "PredictedPatchCount": int(len(window_patch_df)),
+                            "DecodedActiveSlotCount": int(decode_summary["active_slot_count"]),
+                            "RawCandidateCount": int(decode_filter_stats["raw_candidate_count"]),
+                            "KeptCandidateCount": int(decode_filter_stats["kept_candidate_count"]),
+                            "MeanPredCount": float(decode_filter_stats["mean_pred_count"]),
+                            "MaxPredCount": int(decode_filter_stats["max_pred_count"]),
+                            "ForcedVoxelCount": int(decode_filter_stats["forced_voxel_count"]),
+                            "PrimaryPatchCount": int(decode_filter_stats.get("primary_patch_count", len(window_patch_df))),
+                            "PrimaryActiveSlotCount": int(decode_filter_stats.get("primary_active_slot_count", 0)),
+                            "SecondPassTriggered": bool(decode_filter_stats.get("second_pass_triggered", False)),
+                            "SecondPassReason": str(decode_filter_stats.get("second_pass_reason", "")),
+                            "SecondPassCalibrationScale": decode_filter_stats.get("second_pass_calibration_scale"),
+                            "SecondPassRawCandidateCount": int(decode_filter_stats.get("second_pass_raw_candidate_count", 0)),
+                            "SecondPassKeptCandidateCount": int(decode_filter_stats.get("second_pass_kept_candidate_count", 0)),
+                            "SecondPassPatchCount": int(decode_filter_stats.get("second_pass_patch_count", 0)),
+                            "SecondPassActiveSlotCount": int(decode_filter_stats.get("second_pass_active_slot_count", 0)),
+                            "MergedPatchCount": int(decode_filter_stats.get("merged_patch_count", len(window_patch_df))),
+                            "PatchScaleFactor": float(args.patch_scale_factor),
+                            "DecodeMode": str(decode_filter_stats["decode_mode"]),
+                            "CenterThreshold": float(decode_runtime_config["center_threshold"]),
+                            "CountActivationThreshold": float(decode_runtime_config["count_activation_threshold"]),
+                            "MinCountIfActive": int(decode_runtime_config["min_count_if_active"]),
+                            "MaxTotalPatchesPerWindow": int(decode_runtime_config["max_total_patches_per_window"]),
+                            "AmpAbsQ995": float(input_stats["amp_abs_q995"]),
+                            "GradMagAbsQ995": float(input_stats["grad_mag_abs_q995"]),
+                            "InputChannels": ",".join(input_channels),
+                            "PackagePath": package_path,
+                        }
+                    )
                 if args.save_window_csv:
                     window_dir = units_dir / unit_id / "windows" / layer_key
                     window_dir.mkdir(parents=True, exist_ok=True)
@@ -1145,7 +1485,11 @@ def main() -> None:
                     kept=int(decode_filter_stats["kept_candidate_count"]),
                     forced=int(decode_filter_stats["forced_voxel_count"]),
                 )
-                if int(args.partial_save_every_windows) > 0 and completed_window_count % int(args.partial_save_every_windows) == 0:
+                if (
+                    artifact_flags.get("save_partial_outputs", False)
+                    and int(args.partial_save_every_windows) > 0
+                    and completed_window_count % int(args.partial_save_every_windows) == 0
+                ):
                     partial_all, partial_dedup = write_partial_unit_outputs(
                         unit_output_dir=unit_output_dir,
                         unit_id=unit_id,
@@ -1161,6 +1505,7 @@ def main() -> None:
                         dedupe_time_tol_ms=float(args.dedupe_time_tol_ms),
                         dedupe_azimuth_tol_deg=float(args.dedupe_azimuth_tol_deg),
                         dedupe_dip_tol_deg=float(args.dedupe_dip_tol_deg),
+                        artifact_flags=artifact_flags,
                     )
                     emit_progress_message(
                         (
@@ -1183,8 +1528,22 @@ def main() -> None:
                 azimuth_tol_deg=float(args.dedupe_azimuth_tol_deg),
                 dip_tol_deg=float(args.dedupe_dip_tol_deg),
             )
+            predicted_dedup_before_density_count = int(len(dedup_pred))
+            dedup_pred, density_control_summary_df = apply_layer_density_budget(
+                patch_df=dedup_pred,
+                layers_df=layers_df,
+                registry_payload=registry_payload,
+                density_source=str(args.layer_density_source),
+                density_scale=float(args.layer_density_scale),
+                calibration_payload=layer_density_calibration_payload,
+                calibration_min_scale=float(args.layer_density_calibration_min_scale),
+                calibration_max_scale=float(args.layer_density_calibration_max_scale),
+                enabled=not bool(args.disable_layer_density_control),
+            )
             write_csv_utf8(layers_df, unit_output_dir / "unit_layers_input.csv")
-            write_csv_utf8(predicted_all, unit_output_dir / "predicted_window_concat_patches.csv")
+            if artifact_flags.get("save_window_concat_csv", False):
+                write_csv_utf8(predicted_all, unit_output_dir / "predicted_window_concat_patches.csv")
+            write_csv_utf8(density_control_summary_df, unit_output_dir / "unit_layer_density_control.csv")
             write_csv_utf8(dedup_pred, unit_output_dir / "predicted_unit_patches.csv")
             predicted_vtk = export_patch_vtk_files(
                 patch_df=dedup_pred,
@@ -1193,23 +1552,30 @@ def main() -> None:
                 title_prefix="predicted_patches",
                 config=vtk_config,
             )
-            write_json(unit_output_dir / "source_unit_summary.json", unit_summary)
-            if predicted_vtk.get("mappings"):
+            if not artifact_flags.get("save_display_vtk", False) and predicted_vtk.get("display_vtk"):
+                display_vtk_path = Path(str(predicted_vtk["display_vtk"]))
+                if display_vtk_path.exists():
+                    display_vtk_path.unlink()
+                predicted_vtk["display_vtk"] = ""
+            if artifact_flags.get("save_source_metadata", False):
+                write_json(unit_output_dir / "source_unit_summary.json", unit_summary)
+            if artifact_flags.get("save_vtk_mappings", False) and predicted_vtk.get("mappings"):
                 write_json(unit_output_dir / "vtk_attribute_mappings.json", predicted_vtk["mappings"])
-            write_json(
-                unit_output_dir / "unit_prediction_progress.json",
-                build_unit_progress_payload(
-                    unit_id=unit_id,
-                    block_x=block_x,
-                    block_y=block_y,
-                    total_window_count=total_window_count,
-                    completed_window_count=completed_window_count,
-                    inferred_window_count=processed_window_count,
-                    predicted_all=predicted_all,
-                    dedup_pred=dedup_pred,
-                    is_final=True,
-                ),
-            )
+            if artifact_flags.get("save_progress_json", False):
+                write_json(
+                    unit_output_dir / "unit_prediction_progress.json",
+                    build_unit_progress_payload(
+                        unit_id=unit_id,
+                        block_x=block_x,
+                        block_y=block_y,
+                        total_window_count=total_window_count,
+                        completed_window_count=completed_window_count,
+                        inferred_window_count=processed_window_count,
+                        predicted_all=predicted_all,
+                        dedup_pred=dedup_pred,
+                        is_final=True,
+                    ),
+                )
 
             unit_summary_row = build_output_unit_summary(
                 unit_id=unit_id,
@@ -1217,18 +1583,35 @@ def main() -> None:
                 block_y=block_y,
                 layers_df=layers_df,
                 predicted_all=predicted_all,
+                predicted_dedup_before_density_count=predicted_dedup_before_density_count,
                 dedup_pred=dedup_pred,
+                density_control_summary_df=density_control_summary_df,
                 predicted_vtk=predicted_vtk,
                 unit_source_dir=source_unit_dir,
+                layer_density_control_enabled=not bool(args.disable_layer_density_control),
+                layer_density_source=str(args.layer_density_source),
+                layer_density_scale=float(args.layer_density_scale),
+                layer_density_calibration_json=args.layer_density_calibration_json,
+                layer_density_calibration_min_scale=float(args.layer_density_calibration_min_scale),
+                layer_density_calibration_max_scale=float(args.layer_density_calibration_max_scale),
             )
             unit_summary_row["NoLayerConstraint"] = bool(args.no_layer_constraint)
             unit_summary_row["LayerSourceMode"] = layer_source_mode
+            unit_summary_row["TimeMin"] = float(z_min)
+            unit_summary_row["TimeMax"] = float(z_max)
+            unit_summary_row["UnitShardIndex"] = int(args.unit_shard_index)
+            unit_summary_row["UnitShardCount"] = int(args.unit_shard_count)
+            unit_summary_row["CheckpointCount"] = int(len(unit_checkpoint_paths_used))
+            unit_summary_row["LayerSurfacePairCount"] = int(len(unit_layer_surface_pair_keys_used))
+            unit_summary_row["LayerSurfacePairsUsed"] = ";".join(sorted(unit_layer_surface_pair_keys_used))
+            unit_summary_row["CheckpointPathsUsed"] = ";".join(sorted(unit_checkpoint_paths_used))
             unit_rows.append(unit_summary_row)
             write_json(unit_output_dir / "unit_prediction_summary.json", unit_summary_row)
             unit_message = (
                 f"[Unit] {unit_id} "
                 f"windows={processed_window_count} "
                 f"raw_patches={len(predicted_all)} "
+                f"dedup_before_density={predicted_dedup_before_density_count} "
                 f"dedup_patches={len(dedup_pred)}"
             )
             if show_progress:
@@ -1245,37 +1628,56 @@ def main() -> None:
 
     selected_units_df = pd.DataFrame(selected_rows)
     skipped_units_df = pd.DataFrame(skipped_rows)
-    window_df = pd.DataFrame(window_rows)
+    window_df = pd.DataFrame(window_rows) if window_rows is not None else pd.DataFrame()
     unit_df = pd.DataFrame(unit_rows)
-    write_csv_utf8(selected_units_df, aggregated_dir / "selected_units.csv")
-    write_csv_utf8(skipped_units_df, aggregated_dir / "skipped_units.csv")
-    write_csv_utf8(window_df, aggregated_dir / "window_prediction_summary.csv")
-    write_csv_utf8(unit_df, aggregated_dir / "unit_prediction.csv")
+    shard_suffix = build_shard_suffix(args)
+    write_csv_utf8(selected_units_df, aggregated_dir / f"selected_units{shard_suffix}.csv")
+    write_csv_utf8(skipped_units_df, aggregated_dir / f"skipped_units{shard_suffix}.csv")
+    if artifact_flags.get("save_window_summary_csv", False):
+        write_csv_utf8(window_df, aggregated_dir / f"window_prediction_summary{shard_suffix}.csv")
+    write_csv_utf8(unit_df, aggregated_dir / f"unit_prediction{shard_suffix}.csv")
 
     summary = {
         "run_dir": str(run_dir),
-        "checkpoint": str(args.checkpoint),
+        "checkpoint": str(args.checkpoint) if args.checkpoint else "",
+        "layer_model_registry_py": str(args.layer_model_registry_py) if args.layer_model_registry_py else "",
         "unit_dfn_root": str(args.unit_dfn_root),
         "surface_dir": str(args.surface_dir),
         "trace_header_csv": str(args.trace_header_csv),
         "sgy_file": str(args.sgy_file),
         "device": str(device),
+        "artifact_profile": str(args.artifact_profile),
         "selected_unit_count": int(len(selected_units_df)),
         "skipped_unit_count": int(len(skipped_units_df)),
         "processed_unit_count": int(len(unit_df)),
         "window_count": int(len(window_df)),
+        "unit_shard_index": int(args.unit_shard_index),
+        "unit_shard_count": int(args.unit_shard_count),
+        "unique_checkpoint_count": int(len(model_cache)),
+        "loaded_checkpoint_paths": sorted(model_cache.keys()),
         "mean_raw_candidate_count": float(window_df["RawCandidateCount"].mean()) if not window_df.empty else 0.0,
         "mean_kept_candidate_count": float(window_df["KeptCandidateCount"].mean()) if not window_df.empty else 0.0,
         "mean_forced_voxel_count": float(window_df["ForcedVoxelCount"].mean()) if not window_df.empty else 0.0,
         "mean_predicted_window_patch_count": float(window_df["PredictedPatchCount"].mean()) if not window_df.empty else 0.0,
+        "mean_predicted_dedup_before_density_patch_count": float(unit_df["PredictedDedupPatchCountBeforeDensityControl"].mean()) if "PredictedDedupPatchCountBeforeDensityControl" in unit_df.columns and not unit_df.empty else 0.0,
         "mean_predicted_dedup_patch_count": float(unit_df["PredictedDedupPatchCount"].mean()) if not unit_df.empty else 0.0,
         "input_channels": list(input_channels),
         "center_threshold": float(args.center_threshold),
         "patch_scale_factor": float(args.patch_scale_factor),
         "decode_mode": str(args.decode_mode),
         "relaxed_min_count": int(args.relaxed_min_count),
+        "count_activation_threshold": float(args.count_activation_threshold),
+        "min_count_if_active": int(args.min_count_if_active),
+        "layer_density_control_enabled": bool(not args.disable_layer_density_control),
+        "layer_density_source": str(args.layer_density_source),
+        "layer_density_scale": float(args.layer_density_scale),
+        "layer_density_calibration_json": str(Path(args.layer_density_calibration_json).resolve()) if args.layer_density_calibration_json else "",
+        "layer_density_calibration_min_scale": float(args.layer_density_calibration_min_scale),
+        "layer_density_calibration_max_scale": float(args.layer_density_calibration_max_scale),
         "no_layer_constraint": bool(args.no_layer_constraint),
         "seismic_bound_extension_enabled": bool(enable_seismic_bound_extension),
+        "layer_top_boundary_ms": float(layer_top_boundary_ms),
+        "layer_bottom_boundary_ms": float(layer_bottom_boundary_ms),
         "time_min": float(args.time_min) if args.time_min is not None else None,
         "time_max": float(args.time_max) if args.time_max is not None else None,
         "max_total_patches_per_window": int(args.max_total_patches_per_window),
@@ -1285,38 +1687,59 @@ def main() -> None:
         "partial_save_every_windows": int(args.partial_save_every_windows),
         "save_window_csv": bool(args.save_window_csv),
         "save_window_packages": bool(args.save_window_packages),
+        "save_window_summary_csv": bool(artifact_flags.get("save_window_summary_csv", False)),
+        "save_window_concat_csv": bool(artifact_flags.get("save_window_concat_csv", False)),
+        "save_source_metadata": bool(artifact_flags.get("save_source_metadata", False)),
+        "save_progress_json": bool(artifact_flags.get("save_progress_json", False)),
+        "save_display_vtk": bool(artifact_flags.get("save_display_vtk", False)),
     }
-    summary_path = aggregated_dir / "production_inference_summary.json"
+    summary_path = aggregated_dir / f"production_inference_summary{shard_suffix}.json"
     summary["summary_json"] = str(summary_path)
     write_json(summary_path, summary)
 
-    append_lines_to_docx(
-        docx_path=args.docx_path,
-        title="G-DFN监督基线 - 新单元生产推理",
-        lines=[
-            f"checkpoint: {args.checkpoint}",
-            f"run_dir: {run_dir}",
-            f"device: {device}",
-            f"surface_dir: {args.surface_dir}",
-            f"selected_unit_count: {summary['selected_unit_count']}",
-            f"skipped_unit_count: {summary['skipped_unit_count']}",
-            f"processed_unit_count: {summary['processed_unit_count']}",
-            f"window_count: {summary['window_count']}",
-            f"patch_scale_factor: {summary['patch_scale_factor']}",
-            f"mean_raw_candidate_count: {summary['mean_raw_candidate_count']}",
-            f"mean_kept_candidate_count: {summary['mean_kept_candidate_count']}",
-            f"mean_forced_voxel_count: {summary['mean_forced_voxel_count']}",
-            f"decode_mode: {summary['decode_mode']}",
-            f"relaxed_min_count: {summary['relaxed_min_count']}",
-            f"no_layer_constraint: {summary['no_layer_constraint']}",
-            f"seismic_bound_extension_enabled: {summary['seismic_bound_extension_enabled']}",
-            f"time_min: {summary['time_min']}",
-            f"time_max: {summary['time_max']}",
-            f"mean_predicted_window_patch_count: {summary['mean_predicted_window_patch_count']}",
-            f"mean_predicted_dedup_patch_count: {summary['mean_predicted_dedup_patch_count']}",
-            f"summary_json: {summary_path}",
-        ],
-    )
+    if int(args.unit_shard_count) <= 1 or int(args.unit_shard_index) == 0:
+        append_lines_to_docx(
+            docx_path=args.docx_path,
+            title="G-DFN监督基线 - 新单元生产推理",
+            lines=[
+                f"checkpoint: {args.checkpoint if args.checkpoint else 'None'}",
+                f"layer_model_registry_py: {args.layer_model_registry_py if args.layer_model_registry_py else 'None'}",
+                f"run_dir: {run_dir}",
+                f"device: {device}",
+                f"artifact_profile: {summary['artifact_profile']}",
+                f"unit_shard_index: {summary['unit_shard_index']}",
+                f"unit_shard_count: {summary['unit_shard_count']}",
+                f"surface_dir: {args.surface_dir}",
+                f"layer_top_boundary_ms: {layer_top_boundary_ms}",
+                f"layer_bottom_boundary_ms: {layer_bottom_boundary_ms}",
+                f"selected_unit_count: {summary['selected_unit_count']}",
+                f"skipped_unit_count: {summary['skipped_unit_count']}",
+                f"processed_unit_count: {summary['processed_unit_count']}",
+                f"window_count: {summary['window_count']}",
+                f"patch_scale_factor: {summary['patch_scale_factor']}",
+                f"mean_raw_candidate_count: {summary['mean_raw_candidate_count']}",
+                f"mean_kept_candidate_count: {summary['mean_kept_candidate_count']}",
+                f"mean_forced_voxel_count: {summary['mean_forced_voxel_count']}",
+                f"decode_mode: {summary['decode_mode']}",
+                f"relaxed_min_count: {summary['relaxed_min_count']}",
+                f"count_activation_threshold: {summary['count_activation_threshold']}",
+                f"min_count_if_active: {summary['min_count_if_active']}",
+                f"layer_density_control_enabled: {summary['layer_density_control_enabled']}",
+                f"layer_density_source: {summary['layer_density_source']}",
+                f"layer_density_scale: {summary['layer_density_scale']}",
+                f"layer_density_calibration_json: {summary['layer_density_calibration_json'] if summary['layer_density_calibration_json'] else 'None'}",
+                f"layer_density_calibration_min_scale: {summary['layer_density_calibration_min_scale']}",
+                f"layer_density_calibration_max_scale: {summary['layer_density_calibration_max_scale']}",
+                f"no_layer_constraint: {summary['no_layer_constraint']}",
+                f"seismic_bound_extension_enabled: {summary['seismic_bound_extension_enabled']}",
+                f"time_min: {summary['time_min']}",
+                f"time_max: {summary['time_max']}",
+                f"mean_predicted_window_patch_count: {summary['mean_predicted_window_patch_count']}",
+                f"mean_predicted_dedup_before_density_patch_count: {summary['mean_predicted_dedup_before_density_patch_count']}",
+                f"mean_predicted_dedup_patch_count: {summary['mean_predicted_dedup_patch_count']}",
+                f"summary_json: {summary_path}",
+            ],
+        )
 
     print(f"run_dir: {run_dir}")
     print(f"processed_unit_count: {summary['processed_unit_count']}")

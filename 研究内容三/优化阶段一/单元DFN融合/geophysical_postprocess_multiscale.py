@@ -50,8 +50,10 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import sys
 from datetime import datetime
+from itertools import product
 from pathlib import Path
 from typing import Any
 
@@ -60,6 +62,16 @@ import pandas as pd
 from scipy.spatial import cKDTree
 from sklearn.mixture import GaussianMixture
 from sklearn.cluster import DBSCAN
+
+try:
+    import torch
+except Exception:  # pragma: no cover
+    torch = None
+
+try:
+    from threadpoolctl import threadpool_limits
+except Exception:  # pragma: no cover
+    threadpool_limits = None
 
 THIS_DIR = Path(__file__).resolve().parent
 OPT_STAGE_DIR = THIS_DIR.parent
@@ -71,7 +83,17 @@ for candidate in (THIS_DIR, BASELINE_DIR):
         sys.path.insert(0, candidate_str)
 
 from baseline_common import DEFAULT_DOCX_PATH, append_lines_to_docx, write_csv_utf8, write_json
+from layer_model_registry import (
+    LAYER_SURFACE_PAIR_KEY_COL,
+    UNIT_LAYER_SEGMENT_KEY_COL,
+    build_layer_surface_pair_key,
+)
 from merge_unit_dfn_vtks import read_legacy_vtk_polygons, write_legacy_vtk_polygons
+
+
+DEFAULT_POSTPROCESS_COMPUTE_BACKEND = "auto"
+DEFAULT_POSTPROCESS_MAX_CPU_THREADS = 24
+DEFAULT_POSTPROCESS_GPU_TILE_POINTS = 2048
 
 
 # ---------------------------------------------------------------------------
@@ -93,6 +115,318 @@ def _azimuth_mean_weighted(azimuths: np.ndarray, weights: np.ndarray) -> float:
     wy = np.sum(weights * np.sin(rad))
     mean_rad = np.arctan2(wy, wx) / 2.0
     return float(np.rad2deg(mean_rad) % 180.0)
+
+
+def _normalize_layer_key_text(value: Any) -> str:
+    text = str(value or "").strip()
+    return "" if (not text or text.lower() == "nan") else text
+
+
+def _resolve_layer_surface_pair_key(row: pd.Series | dict[str, Any]) -> str:
+    if not hasattr(row, "get"):
+        return ""
+    existing = _normalize_layer_key_text(row.get(LAYER_SURFACE_PAIR_KEY_COL, ""))
+    if existing:
+        return existing
+    top_surface_code = _normalize_layer_key_text(row.get("TopSurfaceCode", ""))
+    base_surface_code = _normalize_layer_key_text(row.get("BaseSurfaceCode", ""))
+    if top_surface_code or base_surface_code:
+        return build_layer_surface_pair_key(top_surface_code, base_surface_code)
+    return _normalize_layer_key_text(row.get("GeoIntervalKey", ""))
+
+
+def _resolve_unit_layer_segment_key(row: pd.Series | dict[str, Any]) -> str:
+    if not hasattr(row, "get"):
+        return ""
+    existing = _normalize_layer_key_text(row.get(UNIT_LAYER_SEGMENT_KEY_COL, ""))
+    if existing:
+        return existing
+    pair_key = _resolve_layer_surface_pair_key(row)
+    unit_id = _normalize_layer_key_text(row.get("UnitID", ""))
+    interval_key = _normalize_layer_key_text(row.get("GeoIntervalKey", ""))
+    if unit_id or interval_key or pair_key:
+        return f"{unit_id or 'UNKNOWN_UNIT'}__{interval_key or 'UNKNOWN_INTERVAL'}__{pair_key or 'UNKNOWN_LAYER_PAIR'}"
+    return ""
+
+
+def _preferred_layer_series(df: pd.DataFrame, prefer_unit_segment: bool = False) -> pd.Series:
+    fallback = df.get("GeoIntervalKey", pd.Series([""] * len(df), index=df.index, dtype="object")).fillna("").astype(str)
+    pair_series = (
+        df.get(LAYER_SURFACE_PAIR_KEY_COL, pd.Series([""] * len(df), index=df.index, dtype="object"))
+        .fillna("")
+        .astype(str)
+        .str.strip()
+    )
+    if prefer_unit_segment:
+        segment_series = (
+            df.get(UNIT_LAYER_SEGMENT_KEY_COL, pd.Series([""] * len(df), index=df.index, dtype="object"))
+            .fillna("")
+            .astype(str)
+            .str.strip()
+        )
+        return segment_series.mask(segment_series.eq(""), pair_series).mask(lambda s: s.eq(""), fallback)
+    return pair_series.mask(pair_series.eq(""), fallback)
+
+
+def _same_physical_layer(row_i: pd.Series | dict[str, Any], row_j: pd.Series | dict[str, Any]) -> bool:
+    layer_i = _resolve_layer_surface_pair_key(row_i)
+    layer_j = _resolve_layer_surface_pair_key(row_j)
+    if layer_i or layer_j:
+        return layer_i == layer_j
+    return _normalize_layer_key_text(row_i.get("GeoIntervalKey", "")) == _normalize_layer_key_text(row_j.get("GeoIntervalKey", ""))
+
+
+def _normalize_compute_backend(compute_backend: str | None) -> str:
+    backend = str(compute_backend or DEFAULT_POSTPROCESS_COMPUTE_BACKEND).strip().lower()
+    if backend not in {"auto", "cpu", "gpu"}:
+        raise ValueError(f"unsupported compute_backend: {compute_backend}")
+    return backend
+
+
+def _resolve_compute_backend(compute_backend: str | None) -> str:
+    backend = _normalize_compute_backend(compute_backend)
+    has_cuda = bool(torch is not None and torch.cuda.is_available())
+    if backend == "auto":
+        return "gpu" if has_cuda else "cpu"
+    if backend == "gpu" and not has_cuda:
+        raise RuntimeError("compute_backend='gpu' requested, but CUDA torch is not available")
+    return backend
+
+
+@contextlib.contextmanager
+def _thread_limit_context(max_cpu_threads: int | None):
+    limit = int(max_cpu_threads or 0)
+    if limit <= 0 or threadpool_limits is None:
+        yield
+        return
+    with threadpool_limits(limits=limit):
+        if torch is not None:
+            try:
+                previous_threads = int(torch.get_num_threads())
+                torch.set_num_threads(max(1, min(previous_threads, limit)))
+            except Exception:  # pragma: no cover
+                previous_threads = None
+            try:
+                yield
+            finally:
+                if previous_threads is not None:
+                    try:
+                        torch.set_num_threads(previous_threads)
+                    except Exception:
+                        pass
+        else:
+            yield
+
+
+def _build_spatial_bucket_index(
+    coords: np.ndarray,
+    cell_size: float,
+) -> tuple[dict[tuple[int, ...], int], list[tuple[int, ...]], list[np.ndarray]]:
+    if len(coords) == 0:
+        return {}, [], []
+    safe_cell_size = float(max(cell_size, 1e-6))
+    cell_index = np.floor(np.asarray(coords, dtype=float) / safe_cell_size).astype(np.int64)
+    unique_cells, inverse = np.unique(cell_index, axis=0, return_inverse=True)
+    order = np.argsort(inverse, kind="mergesort")
+    sorted_inverse = inverse[order]
+    starts = np.concatenate([[0], np.flatnonzero(sorted_inverse[1:] != sorted_inverse[:-1]) + 1])
+    ends = np.concatenate([starts[1:], [len(order)]])
+
+    bucket_lookup: dict[tuple[int, ...], int] = {}
+    bucket_cells: list[tuple[int, ...]] = []
+    bucket_points: list[np.ndarray] = []
+    for start, end in zip(starts, ends):
+        bucket_id = int(sorted_inverse[start])
+        cell_key = tuple(int(value) for value in unique_cells[bucket_id].tolist())
+        bucket_lookup[cell_key] = len(bucket_cells)
+        bucket_cells.append(cell_key)
+        bucket_points.append(order[start:end])
+    return bucket_lookup, bucket_cells, bucket_points
+
+
+def _iter_bucket_pair_ids(
+    bucket_lookup: dict[tuple[int, ...], int],
+    bucket_cells: list[tuple[int, ...]],
+) -> list[tuple[int, int]]:
+    if not bucket_cells:
+        return []
+    dims = len(bucket_cells[0])
+    neighbor_offsets = list(product((-1, 0, 1), repeat=dims))
+    pairs: list[tuple[int, int]] = []
+    for bucket_id_a, cell in enumerate(bucket_cells):
+        for offset in neighbor_offsets:
+            neighbor_cell = tuple(cell[dim] + offset[dim] for dim in range(dims))
+            bucket_id_b = bucket_lookup.get(neighbor_cell)
+            if bucket_id_b is None or bucket_id_b < bucket_id_a:
+                continue
+            pairs.append((bucket_id_a, bucket_id_b))
+    return pairs
+
+
+def _pairwise_radius_mask_torch(
+    left_points: np.ndarray,
+    right_points: np.ndarray,
+    radius_squared: float,
+    device: torch.device,
+) -> torch.Tensor:
+    left_tensor = torch.as_tensor(left_points, dtype=torch.float32, device=device)
+    right_tensor = torch.as_tensor(right_points, dtype=torch.float32, device=device)
+    diff = left_tensor[:, None, :] - right_tensor[None, :, :]
+    dist_squared = torch.sum(diff * diff, dim=-1)
+    return dist_squared <= float(radius_squared)
+
+
+def _radius_neighbor_counts_gpu(
+    coords: np.ndarray,
+    radius: float,
+    gpu_tile_points: int,
+) -> np.ndarray:
+    row_count = int(len(coords))
+    if row_count <= 0:
+        return np.zeros(0, dtype=np.int32)
+    device = torch.device("cuda")
+    radius_squared = float(radius) * float(radius)
+    tile_points = max(int(gpu_tile_points), 256)
+    counts = np.zeros(row_count, dtype=np.int64)
+    bucket_lookup, bucket_cells, bucket_points = _build_spatial_bucket_index(coords, cell_size=radius)
+
+    for bucket_id_a, bucket_id_b in _iter_bucket_pair_ids(bucket_lookup, bucket_cells):
+        point_idx_a = bucket_points[bucket_id_a]
+        point_idx_b = bucket_points[bucket_id_b]
+        same_bucket = bucket_id_a == bucket_id_b
+        if len(point_idx_a) == 0 or len(point_idx_b) == 0:
+            continue
+
+        for start_a in range(0, len(point_idx_a), tile_points):
+            end_a = min(start_a + tile_points, len(point_idx_a))
+            block_idx_a = point_idx_a[start_a:end_a]
+            start_b_base = start_a if same_bucket else 0
+            for start_b in range(start_b_base, len(point_idx_b), tile_points):
+                end_b = min(start_b + tile_points, len(point_idx_b))
+                block_idx_b = point_idx_b[start_b:end_b]
+                mask = _pairwise_radius_mask_torch(
+                    left_points=coords[block_idx_a],
+                    right_points=coords[block_idx_b],
+                    radius_squared=radius_squared,
+                    device=device,
+                )
+                if same_bucket and start_a == start_b:
+                    diag_length = min(mask.shape[0], mask.shape[1])
+                    diag_index = torch.arange(diag_length, device=mask.device)
+                    mask[diag_index, diag_index] = False
+                    counts[block_idx_a] += mask.sum(dim=1).detach().cpu().numpy().astype(np.int64)
+                else:
+                    counts[block_idx_a] += mask.sum(dim=1).detach().cpu().numpy().astype(np.int64)
+                    counts[block_idx_b] += mask.sum(dim=0).detach().cpu().numpy().astype(np.int64)
+    return counts.astype(np.int32)
+
+
+def _radius_neighbor_counts_cpu(coords: np.ndarray, radius: float) -> np.ndarray:
+    if len(coords) <= 0:
+        return np.zeros(0, dtype=np.int32)
+    tree = cKDTree(np.asarray(coords, dtype=float))
+    return np.asarray(tree.query_ball_point(coords, r=float(radius), return_length=True), dtype=np.int32) - 1
+
+
+def _radius_neighbor_counts(
+    coords: np.ndarray,
+    radius: float,
+    compute_backend: str = DEFAULT_POSTPROCESS_COMPUTE_BACKEND,
+    gpu_tile_points: int = DEFAULT_POSTPROCESS_GPU_TILE_POINTS,
+) -> tuple[np.ndarray, str]:
+    resolved_backend = _resolve_compute_backend(compute_backend)
+    if resolved_backend == "gpu":
+        return _radius_neighbor_counts_gpu(coords, radius=float(radius), gpu_tile_points=int(gpu_tile_points)), resolved_backend
+    return _radius_neighbor_counts_cpu(coords, radius=float(radius)), resolved_backend
+
+
+def _radius_candidate_pairs_cpu(coords: np.ndarray, radius: float) -> tuple[np.ndarray, np.ndarray]:
+    if len(coords) <= 1:
+        empty = np.zeros(0, dtype=np.int64)
+        return empty, empty
+    tree = cKDTree(np.asarray(coords, dtype=float))
+    try:
+        pairs = tree.query_pairs(r=float(radius), output_type="ndarray")
+    except TypeError:  # pragma: no cover
+        pairs = np.asarray(list(tree.query_pairs(r=float(radius))), dtype=np.int64)
+    if pairs.size == 0:
+        empty = np.zeros(0, dtype=np.int64)
+        return empty, empty
+    return pairs[:, 0].astype(np.int64, copy=False), pairs[:, 1].astype(np.int64, copy=False)
+
+
+def _radius_candidate_pairs_gpu(
+    coords: np.ndarray,
+    radius: float,
+    gpu_tile_points: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    row_count = int(len(coords))
+    if row_count <= 1:
+        empty = np.zeros(0, dtype=np.int64)
+        return empty, empty
+    device = torch.device("cuda")
+    radius_squared = float(radius) * float(radius)
+    tile_points = max(int(gpu_tile_points), 256)
+    bucket_lookup, bucket_cells, bucket_points = _build_spatial_bucket_index(coords, cell_size=radius)
+    left_parts: list[np.ndarray] = []
+    right_parts: list[np.ndarray] = []
+
+    for bucket_id_a, bucket_id_b in _iter_bucket_pair_ids(bucket_lookup, bucket_cells):
+        point_idx_a = bucket_points[bucket_id_a]
+        point_idx_b = bucket_points[bucket_id_b]
+        same_bucket = bucket_id_a == bucket_id_b
+        if len(point_idx_a) == 0 or len(point_idx_b) == 0:
+            continue
+
+        for start_a in range(0, len(point_idx_a), tile_points):
+            end_a = min(start_a + tile_points, len(point_idx_a))
+            block_idx_a = point_idx_a[start_a:end_a]
+            start_b_base = start_a if same_bucket else 0
+            for start_b in range(start_b_base, len(point_idx_b), tile_points):
+                end_b = min(start_b + tile_points, len(point_idx_b))
+                block_idx_b = point_idx_b[start_b:end_b]
+                mask = _pairwise_radius_mask_torch(
+                    left_points=coords[block_idx_a],
+                    right_points=coords[block_idx_b],
+                    radius_squared=radius_squared,
+                    device=device,
+                )
+                if same_bucket and start_a == start_b:
+                    mask = torch.triu(mask, diagonal=1)
+                matched = torch.nonzero(mask, as_tuple=False)
+                if matched.numel() <= 0:
+                    continue
+                matched_np = matched.detach().cpu().numpy()
+                left_parts.append(block_idx_a[matched_np[:, 0]])
+                right_parts.append(block_idx_b[matched_np[:, 1]])
+
+    if not left_parts:
+        empty = np.zeros(0, dtype=np.int64)
+        return empty, empty
+    return np.concatenate(left_parts).astype(np.int64), np.concatenate(right_parts).astype(np.int64)
+
+
+def _radius_candidate_pairs(
+    coords: np.ndarray,
+    radius: float,
+    compute_backend: str = DEFAULT_POSTPROCESS_COMPUTE_BACKEND,
+    gpu_tile_points: int = DEFAULT_POSTPROCESS_GPU_TILE_POINTS,
+) -> tuple[np.ndarray, np.ndarray, str]:
+    resolved_backend = _resolve_compute_backend(compute_backend)
+    if resolved_backend == "gpu":
+        left_idx, right_idx = _radius_candidate_pairs_gpu(coords, radius=float(radius), gpu_tile_points=int(gpu_tile_points))
+        return left_idx, right_idx, resolved_backend
+    left_idx, right_idx = _radius_candidate_pairs_cpu(coords, radius=float(radius))
+    return left_idx, right_idx, resolved_backend
+
+
+def _pairwise_mean_axial_azimuth_deg(azimuth_a: np.ndarray, azimuth_b: np.ndarray) -> np.ndarray:
+    azimuth_a = np.asarray(azimuth_a, dtype=float)
+    azimuth_b = np.asarray(azimuth_b, dtype=float)
+    rad_a = np.deg2rad(2.0 * azimuth_a)
+    rad_b = np.deg2rad(2.0 * azimuth_b)
+    mean_rad = np.arctan2(np.sin(rad_a) + np.sin(rad_b), np.cos(rad_a) + np.cos(rad_b)) / 2.0
+    return np.mod(np.rad2deg(mean_rad), 180.0)
 
 
 # ---------------------------------------------------------------------------
@@ -381,8 +715,9 @@ def assign_scale_classes(
     df["AreaRankInSet"] = 0.0
 
     group_cols = ["FractureSet"]
-    if "GeoIntervalKey" in df.columns:
-        group_cols.insert(0, "GeoIntervalKey")
+    if LAYER_SURFACE_PAIR_KEY_COL in df.columns or "TopSurfaceCode" in df.columns or "BaseSurfaceCode" in df.columns or "GeoIntervalKey" in df.columns:
+        df[LAYER_SURFACE_PAIR_KEY_COL] = _preferred_layer_series(df, prefer_unit_segment=False)
+        group_cols.insert(0, LAYER_SURFACE_PAIR_KEY_COL)
 
     for _, group in df.groupby(group_cols, dropna=False):
         idx = group.index
@@ -502,6 +837,8 @@ def multi_dimensional_reliability_scoring(
     height_range: tuple[float, float] = (0.5, 100.0),
     # 层位参数 (预留)
     known_fracture_layers: list[str] | None = None,
+    compute_backend: str = DEFAULT_POSTPROCESS_COMPUTE_BACKEND,
+    gpu_tile_points: int = DEFAULT_POSTPROCESS_GPU_TILE_POINTS,
 ) -> pd.DataFrame:
     """多维度证据评分 + 综合结论判定。
 
@@ -536,11 +873,16 @@ def multi_dimensional_reliability_scoring(
 
     scale_z = neighbor_radius_xy / max(neighbor_radius_z, 1e-6)
     coords_scaled = np.column_stack([cx, cy, cz * scale_z])
-    tree = cKDTree(coords_scaled)
-    neighbor_counts = np.array(tree.query_ball_point(coords_scaled, r=neighbor_radius_xy, return_length=True)) - 1
+    neighbor_counts, resolved_backend = _radius_neighbor_counts(
+        coords=coords_scaled,
+        radius=float(neighbor_radius_xy),
+        compute_backend=compute_backend,
+        gpu_tile_points=int(gpu_tile_points),
+    )
     max_count = max(int(neighbor_counts.max()), 1)
     df["NeighborCount"] = neighbor_counts.astype(int)
     df["GeophysicsScore"] = np.clip(neighbor_counts / max_count, 0.0, 1.0).astype(float)
+    df.attrs["compute_backend"] = resolved_backend
 
     # 3) CorridorSupport: 已在 Step 3 中设置, 确保存在
     if "CorridorSupport" not in df.columns:
@@ -548,8 +890,8 @@ def multi_dimensional_reliability_scoring(
 
     # 4) StratigraphyScore: 层位一致性 (预留, 默认全 1.0)
     if "StratigraphyScore" not in df.columns:
-        if known_fracture_layers and "GeoIntervalKey" in df.columns:
-            df["StratigraphyScore"] = df["GeoIntervalKey"].isin(known_fracture_layers).astype(float)
+        if known_fracture_layers:
+            df["StratigraphyScore"] = _preferred_layer_series(df, prefer_unit_segment=False).isin(known_fracture_layers).astype(float)
         else:
             df["StratigraphyScore"] = 1.0
 
@@ -607,6 +949,8 @@ def boundary_match_only(
     alignment_tol_m: float = 50.0,
     azimuth_tol_deg: float = 20.0,
     dip_tol_deg: float = 12.0,
+    compute_backend: str = DEFAULT_POSTPROCESS_COMPUTE_BACKEND,
+    gpu_tile_points: int = DEFAULT_POSTPROCESS_GPU_TILE_POINTS,
 ) -> tuple[pd.DataFrame, list[dict[str, Any]]]:
     """在单元边界找到产状匹配的裂缝对, 标记 ConnectionType 但不插值补片。
 
@@ -616,90 +960,125 @@ def boundary_match_only(
     df = df.copy()
     matched_pairs: list[dict[str, Any]] = []
 
-    if "UnitID" not in df.columns and "BlockX" not in df.columns:
+    has_block = "BlockX" in df.columns and "BlockY" in df.columns
+    has_unit = "UnitID" in df.columns
+    if not has_block and not has_unit:
         return df, matched_pairs
 
-    if "BlockX" in df.columns and "BlockY" in df.columns:
-        unit_groups = df.groupby(["BlockX", "BlockY"])
-    elif "UnitID" in df.columns:
-        unit_groups = df.groupby("UnitID")
+    if has_block:
+        unit_key_arr = np.array(
+            [f"{int(block_x)}_{int(block_y)}" for block_x, block_y in zip(df["BlockX"].to_numpy(), df["BlockY"].to_numpy())],
+            dtype=object,
+        )
     else:
+        unit_key_arr = df["UnitID"].fillna("").astype(str).to_numpy(dtype=object)
+
+    cx_arr = pd.to_numeric(df["CenterX"], errors="coerce").to_numpy(dtype=float)
+    cy_arr = pd.to_numeric(df["CenterY"], errors="coerce").to_numpy(dtype=float)
+    az_arr = pd.to_numeric(df["Azimuth"], errors="coerce").to_numpy(dtype=float)
+    dip_arr = pd.to_numeric(df["Dip"], errors="coerce").to_numpy(dtype=float)
+    conf_series = df["Confidence"] if "Confidence" in df.columns else pd.Series([0.5] * len(df), index=df.index, dtype=float)
+    conf_arr = pd.to_numeric(conf_series, errors="coerce").fillna(0.5).to_numpy(dtype=float)
+
+    unit_bounds: dict[str, dict[str, float]] = {}
+    for idx, unit_key in enumerate(unit_key_arr):
+        if unit_key not in unit_bounds:
+            unit_bounds[unit_key] = {
+                "x_min": cx_arr[idx],
+                "x_max": cx_arr[idx],
+                "y_min": cy_arr[idx],
+                "y_max": cy_arr[idx],
+            }
+        else:
+            bounds = unit_bounds[unit_key]
+            bounds["x_min"] = min(bounds["x_min"], cx_arr[idx])
+            bounds["x_max"] = max(bounds["x_max"], cx_arr[idx])
+            bounds["y_min"] = min(bounds["y_min"], cy_arr[idx])
+            bounds["y_max"] = max(bounds["y_max"], cy_arr[idx])
+
+    is_boundary = np.zeros(len(df), dtype=bool)
+    for idx, unit_key in enumerate(unit_key_arr):
+        bounds = unit_bounds[unit_key]
+        if (
+            abs(cx_arr[idx] - bounds["x_min"]) < boundary_tol_xy
+            or abs(cx_arr[idx] - bounds["x_max"]) < boundary_tol_xy
+            or abs(cy_arr[idx] - bounds["y_min"]) < boundary_tol_xy
+            or abs(cy_arr[idx] - bounds["y_max"]) < boundary_tol_xy
+        ):
+            is_boundary[idx] = True
+
+    boundary_idx = np.flatnonzero(is_boundary)
+    if len(boundary_idx) < 2:
         return df, matched_pairs
 
-    # 收集边界裂缝
-    boundary_info: list[tuple[str, int, pd.Series]] = []
-    for unit_key, group in unit_groups:
-        x_min, x_max = group["CenterX"].min(), group["CenterX"].max()
-        y_min, y_max = group["CenterY"].min(), group["CenterY"].max()
-        for df_idx, row in group.iterrows():
-            is_boundary = (
-                abs(row["CenterX"] - x_min) < boundary_tol_xy
-                or abs(row["CenterX"] - x_max) < boundary_tol_xy
-                or abs(row["CenterY"] - y_min) < boundary_tol_xy
-                or abs(row["CenterY"] - y_max) < boundary_tol_xy
-            )
-            if is_boundary:
-                boundary_info.append((str(unit_key), df_idx, row))
-
-    if len(boundary_info) < 2:
+    boundary_coords = np.column_stack([cx_arr[boundary_idx], cy_arr[boundary_idx]])
+    pair_left_local, pair_right_local, _ = _radius_candidate_pairs(
+        coords=boundary_coords,
+        radius=float(alignment_tol_m),
+        compute_backend=compute_backend,
+        gpu_tile_points=int(gpu_tile_points),
+    )
+    if len(pair_left_local) <= 0:
         return df, matched_pairs
 
-    coords = np.array([[r["CenterX"], r["CenterY"]] for _, _, r in boundary_info])
-    tree = cKDTree(coords)
-    paired_set: set[tuple[int, int]] = set()
+    pair_left = boundary_idx[pair_left_local]
+    pair_right = boundary_idx[pair_right_local]
+    unit_code, _ = pd.factorize(unit_key_arr, sort=False)
+    layer_code, _ = pd.factorize(_preferred_layer_series(df, prefer_unit_segment=False), sort=False)
 
-    for i, (uid_i, idx_i, row_i) in enumerate(boundary_info):
-        candidates = tree.query_ball_point([row_i["CenterX"], row_i["CenterY"]], r=alignment_tol_m)
-        for j in candidates:
-            if j <= i:
-                continue
-            uid_j, idx_j, row_j = boundary_info[j]
-            if uid_i == uid_j:
-                continue
-            pair_key = (min(i, j), max(i, j))
-            if pair_key in paired_set:
-                continue
+    keep_mask = unit_code[pair_left] != unit_code[pair_right]
+    if "FractureSet" in df.columns:
+        fracture_set_arr = pd.to_numeric(df["FractureSet"], errors="coerce").fillna(-1).to_numpy(dtype=int)
+        keep_mask &= fracture_set_arr[pair_left] == fracture_set_arr[pair_right]
+    keep_mask &= layer_code[pair_left] == layer_code[pair_right]
 
-            # 必须同组
-            if "FractureSet" in df.columns:
-                if row_i.get("FractureSet", -1) != row_j.get("FractureSet", -2):
-                    continue
+    az_diff = _azimuth_diff(az_arr[pair_left], az_arr[pair_right])
+    dip_diff = np.abs(dip_arr[pair_left] - dip_arr[pair_right])
+    keep_mask &= az_diff <= float(azimuth_tol_deg)
+    keep_mask &= dip_diff <= float(dip_tol_deg)
 
-            # 层位一致
-            if "GeoIntervalKey" in df.columns:
-                if row_i.get("GeoIntervalKey", "") != row_j.get("GeoIntervalKey", ""):
-                    continue
+    dx = cx_arr[pair_right] - cx_arr[pair_left]
+    dy = cy_arr[pair_right] - cy_arr[pair_left]
+    mean_az_rad = np.deg2rad((az_arr[pair_left] + az_arr[pair_right]) / 2.0)
+    perp_dist = np.abs(-dx * np.sin(mean_az_rad) + dy * np.cos(mean_az_rad))
+    keep_mask &= perp_dist <= float(alignment_tol_m) * 0.5
 
-            # 产状匹配
-            az_d = _azimuth_diff(np.array([row_i["Azimuth"]]), np.array([row_j["Azimuth"]]))[0]
-            dip_d = abs(float(row_i["Dip"]) - float(row_j["Dip"]))
-            if az_d > azimuth_tol_deg or dip_d > dip_tol_deg:
-                continue
+    if not keep_mask.any():
+        return df, matched_pairs
 
-            # 几何连续: 沿走向对齐
-            mean_az_rad = np.deg2rad((float(row_i["Azimuth"]) + float(row_j["Azimuth"])) / 2.0)
-            dx = float(row_j["CenterX"]) - float(row_i["CenterX"])
-            dy = float(row_j["CenterY"]) - float(row_i["CenterY"])
-            perp_dist = abs(-dx * np.sin(mean_az_rad) + dy * np.cos(mean_az_rad))
-            if perp_dist > alignment_tol_m * 0.5:
-                continue
+    kept_left = pair_left[keep_mask]
+    kept_right = pair_right[keep_mask]
+    kept_az_diff = az_diff[keep_mask]
+    kept_dip_diff = dip_diff[keep_mask]
+    kept_perp = perp_dist[keep_mask]
+    kept_gap = np.hypot(dx[keep_mask], dy[keep_mask])
 
-            paired_set.add(pair_key)
+    matched_rows = np.unique(np.concatenate([kept_left, kept_right]))
+    matched_labels = df.index.to_numpy()[matched_rows]
+    df.loc[matched_labels, "ConnectionType"] = "boundary_matched"
 
-            # 标记为边界匹配
-            df.loc[idx_i, "ConnectionType"] = "boundary_matched"
-            df.loc[idx_j, "ConnectionType"] = "boundary_matched"
-
-            gap_dist = np.sqrt(dx ** 2 + dy ** 2)
-            matched_pairs.append({
-                "idx_i": idx_i, "idx_j": idx_j,
-                "unit_i": uid_i, "unit_j": uid_j,
-                "azimuth_diff": float(az_d), "dip_diff": float(dip_d),
-                "gap_distance_m": float(gap_dist),
-                "perp_distance_m": float(perp_dist),
-                "confidence_i": float(row_i.get("Confidence", 0.5)),
-                "confidence_j": float(row_j.get("Confidence", 0.5)),
-            })
+    for left_idx, right_idx, pair_az_diff, pair_dip_diff, pair_gap, pair_perp in zip(
+        kept_left,
+        kept_right,
+        kept_az_diff,
+        kept_dip_diff,
+        kept_gap,
+        kept_perp,
+    ):
+        matched_pairs.append(
+            {
+                "idx_i": int(df.index[left_idx]),
+                "idx_j": int(df.index[right_idx]),
+                "unit_i": str(unit_key_arr[left_idx]),
+                "unit_j": str(unit_key_arr[right_idx]),
+                "azimuth_diff": float(pair_az_diff),
+                "dip_diff": float(pair_dip_diff),
+                "gap_distance_m": float(pair_gap),
+                "perp_distance_m": float(pair_perp),
+                "confidence_i": float(conf_arr[left_idx]),
+                "confidence_j": float(conf_arr[right_idx]),
+            }
+        )
 
     return df, matched_pairs
 
@@ -840,8 +1219,9 @@ def aggregate_patches(
     new_patches: list[dict[str, Any]] = []
 
     group_cols = ["FractureSet"]
-    if "GeoIntervalKey" in df.columns:
-        group_cols.insert(0, "GeoIntervalKey")
+    if LAYER_SURFACE_PAIR_KEY_COL in df.columns or "TopSurfaceCode" in df.columns or "BaseSurfaceCode" in df.columns or "GeoIntervalKey" in df.columns:
+        df[LAYER_SURFACE_PAIR_KEY_COL] = _preferred_layer_series(df, prefer_unit_segment=False)
+        group_cols.insert(0, LAYER_SURFACE_PAIR_KEY_COL)
 
     def _aggregate_scale(scale_class: str, *, major_radius: float, minor_radius: float, max_length: float, max_height: float, mode_name: str) -> None:
         nonlocal keep_mask, new_patches
@@ -1202,6 +1582,8 @@ def boundary_connect_postprocess(
     enable_supplement: bool = True,
     max_stretch_ratio: float = 2.5,
     supplement_confidence_decay: float = 0.7,
+    compute_backend: str = DEFAULT_POSTPROCESS_COMPUTE_BACKEND,
+    gpu_tile_points: int = DEFAULT_POSTPROCESS_GPU_TILE_POINTS,
 ) -> tuple[pd.DataFrame, dict[str, Any]]:
     """边界带局部后处理 — 仅在单元边界窄带内做受约束的跨界连接。
 
@@ -1329,9 +1711,8 @@ def boundary_connect_postprocess(
                 continue
 
             # 条件 2: 同层 (如有)
-            if "GeoIntervalKey" in df.columns:
-                if str(row_i.get("GeoIntervalKey", "")) != str(row_j.get("GeoIntervalKey", "")):
-                    continue
+            if not _same_physical_layer(row_i, row_j):
+                continue
 
             # 条件 3: 产状匹配 (放宽: 聚合后产状是统计平均, 允许更大偏差)
             az_d = _azimuth_diff(
@@ -2036,6 +2417,8 @@ def run_phase1(
     boundary_tol_xy: float = 25.0,
     length_range: tuple[float, float] = (1.0, 200.0),
     height_range: tuple[float, float] = (0.5, 100.0),
+    compute_backend: str = DEFAULT_POSTPROCESS_COMPUTE_BACKEND,
+    gpu_tile_points: int = DEFAULT_POSTPROCESS_GPU_TILE_POINTS,
 ) -> tuple[pd.DataFrame, dict[str, Any]]:
     """第一轮: 裂缝组识别 + 可靠性评分 + 边界匹配 (不补片)。
 
@@ -2063,13 +2446,21 @@ def run_phase1(
         confidence_floor=confidence_floor,
         length_range=length_range,
         height_range=height_range,
+        compute_backend=compute_backend,
+        gpu_tile_points=gpu_tile_points,
     )
+    stats["compute_backend"] = str(df.attrs.get("compute_backend", _resolve_compute_backend(compute_backend)))
     stats["reliability_distribution"] = df["ReliabilityLevel"].value_counts().to_dict()
     stats["mean_geophysics_score"] = float(df["GeophysicsScore"].mean())
     stats["mean_geometry_score"] = float(df["GeometryScore"].mean())
 
     # Step 5a: 边界匹配 (仅标记)
-    df, matched_pairs = boundary_match_only(df, boundary_tol_xy=boundary_tol_xy)
+    df, matched_pairs = boundary_match_only(
+        df,
+        boundary_tol_xy=boundary_tol_xy,
+        compute_backend=compute_backend,
+        gpu_tile_points=gpu_tile_points,
+    )
     stats["boundary_matched_pairs"] = len(matched_pairs)
     stats["boundary_matched_patches"] = int((df["ConnectionType"] == "boundary_matched").sum())
 
@@ -2107,6 +2498,8 @@ def run_phase2(
     jitter_sigma_xy: float = 8.0,
     jitter_along_strike_factor: float = 1.5,
     jitter_seed: int = 42,
+    compute_backend: str = DEFAULT_POSTPROCESS_COMPUTE_BACKEND,
+    gpu_tile_points: int = DEFAULT_POSTPROCESS_GPU_TILE_POINTS,
 ) -> tuple[pd.DataFrame, dict[str, Any]]:
     """第二轮: 组内平滑 + 走廊检测 + 聚合 + 沿走向拉伸 + 有限补接 + 空间扰动。
 
@@ -2527,6 +2920,27 @@ VTK 中新增属性编码:
     g9b.add_argument("--bc-high-rel-boost", type=float, default=1.5,
                      help="高可靠段落填充加成倍数 (default: 1.5)")
 
+    g_runtime = p.add_argument_group("Runtime")
+    g_runtime.add_argument(
+        "--compute-backend",
+        type=str,
+        default=DEFAULT_POSTPROCESS_COMPUTE_BACKEND,
+        choices=["auto", "cpu", "gpu"],
+        help="数值密集步骤的计算后端",
+    )
+    g_runtime.add_argument(
+        "--max-cpu-threads",
+        type=int,
+        default=DEFAULT_POSTPROCESS_MAX_CPU_THREADS,
+        help="CPU 数值库最大线程数，0 表示不限制",
+    )
+    g_runtime.add_argument(
+        "--gpu-tile-points",
+        type=int,
+        default=DEFAULT_POSTPROCESS_GPU_TILE_POINTS,
+        help="GPU 分块近邻计算的 tile 大小",
+    )
+
     p.add_argument("--docx-path", type=Path, default=DEFAULT_DOCX_PATH)
     return p
 
@@ -2554,6 +2968,9 @@ def main() -> None:
             isolation_min_neighbors=args.min_neighbors,
             confidence_floor=args.conf_floor,
             boundary_tol_xy=args.boundary_tol,
+            compute_backend=args.compute_backend,
+            max_cpu_threads=args.max_cpu_threads,
+            gpu_tile_points=args.gpu_tile_points,
         )
         if args.phase == 2:
             vtk_kwargs.update(
@@ -2627,6 +3044,8 @@ def main() -> None:
                 isolation_min_neighbors=args.min_neighbors,
                 confidence_floor=args.conf_floor,
                 boundary_tol_xy=args.boundary_tol,
+                compute_backend=args.compute_backend,
+                gpu_tile_points=args.gpu_tile_points,
             )
         else:
             df, stats1 = run_phase1(
@@ -2638,6 +3057,8 @@ def main() -> None:
                 isolation_min_neighbors=args.min_neighbors,
                 confidence_floor=args.conf_floor,
                 boundary_tol_xy=args.boundary_tol,
+                compute_backend=args.compute_backend,
+                gpu_tile_points=args.gpu_tile_points,
             )
             df, stats2 = run_phase2(
                 df,
@@ -2664,6 +3085,8 @@ def main() -> None:
                 jitter_sigma_xy=0.0 if args.no_jitter else args.jitter_xy,
                 jitter_along_strike_factor=args.jitter_strike_factor,
                 jitter_seed=args.jitter_seed,
+                compute_backend=args.compute_backend,
+                gpu_tile_points=args.gpu_tile_points,
             )
             stats = {
                 **stats1,
@@ -2685,6 +3108,8 @@ def main() -> None:
                 perp_ratio=args.bc_perp_ratio,
                 enable_supplement=not args.bc_no_supplement,
                 max_stretch_ratio=args.bc_max_stretch,
+                compute_backend=args.compute_backend,
+                gpu_tile_points=args.gpu_tile_points,
             )
             stats["boundary_connect"] = bc_stats
 
@@ -2780,6 +3205,8 @@ def boundary_connect_postprocess(
     enable_supplement: bool = True,
     max_stretch_ratio: float = 2.5,
     supplement_confidence_decay: float = 0.7,
+    compute_backend: str = DEFAULT_POSTPROCESS_COMPUTE_BACKEND,
+    gpu_tile_points: int = DEFAULT_POSTPROCESS_GPU_TILE_POINTS,
 ) -> tuple[pd.DataFrame, dict[str, Any]]:
     """Boundary connection with multiscale gap control and anisotropic filtering."""
     df = df.copy()
@@ -2810,13 +3237,14 @@ def boundary_connect_postprocess(
     if has_block:
         bx_arr = df["BlockX"].to_numpy()
         by_arr = df["BlockY"].to_numpy()
-        unit_key_arr = [(int(bx_arr[i]), int(by_arr[i])) for i in range(len(df))]
+        unit_key_arr = [f"{int(bx_arr[i])}_{int(by_arr[i])}" for i in range(len(df))]
     else:
-        uid_arr = df["UnitID"].to_numpy()
-        unit_key_arr = [int(uid_arr[i]) for i in range(len(df))]
+        uid_arr = df["UnitID"].fillna("").astype(str).to_numpy(dtype=object)
+        unit_key_arr = [str(uid_arr[i]) for i in range(len(df))]
 
     cx_arr = pd.to_numeric(df["CenterX"], errors="coerce").to_numpy(dtype=float)
     cy_arr = pd.to_numeric(df["CenterY"], errors="coerce").to_numpy(dtype=float)
+    cz_arr = pd.to_numeric(df["CenterTIME"], errors="coerce").to_numpy(dtype=float)
     unit_bounds: dict[Any, dict[str, float]] = {}
     for i, key in enumerate(unit_key_arr):
         if key not in unit_bounds:
@@ -2856,94 +3284,98 @@ def boundary_connect_postprocess(
 
     search_radius = max(connect_max_gap, macro_connect_gap)
     boundary_coords = np.column_stack([cx_arr[boundary_idx], cy_arr[boundary_idx]])
-    tree = cKDTree(boundary_coords)
+    pair_left_local, pair_right_local, resolved_backend = _radius_candidate_pairs(
+        coords=boundary_coords,
+        radius=float(search_radius),
+        compute_backend=compute_backend,
+        gpu_tile_points=int(gpu_tile_points),
+    )
+    stats["compute_backend"] = resolved_backend
     connections: list[dict[str, Any]] = []
-    paired: set[tuple[int, int]] = set()
 
-    for i_local, i_global in enumerate(boundary_idx):
-        row_i = df.iloc[i_global]
-        unit_i = row_i["_unit_key"]
-        candidates = tree.query_ball_point(boundary_coords[i_local], r=search_radius)
-        for j_local in candidates:
-            if j_local <= i_local:
-                continue
-            j_global = boundary_idx[j_local]
-            row_j = df.iloc[j_global]
-            unit_j = row_j["_unit_key"]
-            if unit_i == unit_j:
-                continue
+    if len(pair_left_local) > 0:
+        pair_left = boundary_idx[pair_left_local]
+        pair_right = boundary_idx[pair_right_local]
+        unit_code, _ = pd.factorize(np.asarray(unit_key_arr, dtype=object), sort=False)
+        layer_code, _ = pd.factorize(_preferred_layer_series(df, prefer_unit_segment=False), sort=False)
+        fracture_set_series = df["FractureSet"] if "FractureSet" in df.columns else pd.Series([-1] * len(df), index=df.index, dtype=int)
+        corridor_series = df["CorridorSupport"] if "CorridorSupport" in df.columns else pd.Series([0] * len(df), index=df.index, dtype=int)
+        fracture_set_arr = pd.to_numeric(fracture_set_series, errors="coerce").fillna(-1).to_numpy(dtype=int)
+        corridor_arr = pd.to_numeric(corridor_series, errors="coerce").fillna(0).to_numpy(dtype=int)
 
-            pair_key = (min(i_global, j_global), max(i_global, j_global))
-            if pair_key in paired:
-                continue
+        score_parts: list[np.ndarray] = []
+        for col in ("GeophysicsScore", "GeometryScore", "SetProbability", "HierarchyScore"):
+            if col in df.columns:
+                score_parts.append(pd.to_numeric(df[col], errors="coerce").fillna(0.0).to_numpy(dtype=float))
+        if score_parts:
+            score_mean_arr = np.mean(np.vstack(score_parts), axis=0)
+        else:
+            score_mean_arr = np.full(len(df), 0.5, dtype=float)
 
-            scale_i = scale_class_arr[i_global]
-            scale_j = scale_class_arr[j_global]
-            if scale_i == "micro_bg" and scale_j == "micro_bg":
-                continue
-            target_gap = macro_connect_gap if "macro_core" in (scale_i, scale_j) else connect_max_gap
+        keep_mask = unit_code[pair_left] != unit_code[pair_right]
+        scale_left = scale_class_arr[pair_left]
+        scale_right = scale_class_arr[pair_right]
+        keep_mask &= ~((scale_left == "micro_bg") & (scale_right == "micro_bg"))
+        keep_mask &= fracture_set_arr[pair_left] == fracture_set_arr[pair_right]
+        keep_mask &= layer_code[pair_left] == layer_code[pair_right]
 
-            if int(row_i.get("FractureSet", -1)) != int(row_j.get("FractureSet", -2)):
-                continue
-            if "GeoIntervalKey" in df.columns and str(row_i.get("GeoIntervalKey", "")) != str(row_j.get("GeoIntervalKey", "")):
-                continue
+        az_diff = _azimuth_diff(work_az_arr[pair_left], work_az_arr[pair_right])
+        dip_diff = np.abs(work_dip_arr[pair_left] - work_dip_arr[pair_right])
+        keep_mask &= az_diff <= float(azimuth_tol_deg)
+        keep_mask &= dip_diff <= float(dip_tol_deg)
 
-            az_d = _azimuth_diff(
-                np.array([float(work_az_arr[i_global])]),
-                np.array([float(work_az_arr[j_global])]),
-            )[0]
-            dip_d = abs(float(work_dip_arr[i_global]) - float(work_dip_arr[j_global]))
-            if az_d > azimuth_tol_deg or dip_d > dip_tol_deg:
-                continue
+        has_corridor = (corridor_arr[pair_left] > 0) | (corridor_arr[pair_right] > 0)
+        if require_corridor:
+            keep_mask &= has_corridor
 
-            score_parts_i: list[float] = []
-            score_parts_j: list[float] = []
-            for col in ("GeophysicsScore", "GeometryScore", "SetProbability", "HierarchyScore"):
-                if col in df.columns:
-                    score_parts_i.append(float(row_i.get(col, 0.0)))
-                    score_parts_j.append(float(row_j.get(col, 0.0)))
-            avg_score_i = float(np.mean(score_parts_i)) if score_parts_i else 0.5
-            avg_score_j = float(np.mean(score_parts_j)) if score_parts_j else 0.5
+        pair_score = (score_mean_arr[pair_left] + score_mean_arr[pair_right]) / 2.0
+        pair_score += np.where(has_corridor, float(corridor_bonus), 0.0)
+        keep_mask &= pair_score >= float(min_score_threshold)
 
-            corridor_i = int(row_i.get("CorridorSupport", 0))
-            corridor_j = int(row_j.get("CorridorSupport", 0))
-            has_corridor = corridor_i > 0 or corridor_j > 0
-            if require_corridor and not has_corridor:
-                continue
+        dx = cx_arr[pair_right] - cx_arr[pair_left]
+        dy = cy_arr[pair_right] - cy_arr[pair_left]
+        dz = np.abs(cz_arr[pair_right] - cz_arr[pair_left])
+        euclidean_gap = np.hypot(dx, dy)
+        mean_az = _pairwise_mean_axial_azimuth_deg(work_az_arr[pair_left], work_az_arr[pair_right])
+        mean_az_rad = np.deg2rad(mean_az)
+        along_dist = np.abs(dx * np.cos(mean_az_rad) + dy * np.sin(mean_az_rad))
+        perp_dist = np.abs(-dx * np.sin(mean_az_rad) + dy * np.cos(mean_az_rad))
+        target_gap = np.where(
+            (scale_left == "macro_core") | (scale_right == "macro_core"),
+            float(macro_connect_gap),
+            float(connect_max_gap),
+        )
+        keep_mask &= along_dist <= target_gap
+        keep_mask &= perp_dist <= float(connect_minor_limit)
+        keep_mask &= dz <= float(connect_z_gap)
+        keep_mask &= perp_dist <= euclidean_gap * float(perp_ratio) + 1e-6
 
-            pair_score = (avg_score_i + avg_score_j) / 2.0 + (corridor_bonus if has_corridor else 0.0)
-            if pair_score < min_score_threshold:
-                continue
+        if keep_mask.any():
+            kept_left = pair_left[keep_mask]
+            kept_right = pair_right[keep_mask]
+            kept_score = pair_score[keep_mask]
+            kept_along = along_dist[keep_mask]
+            kept_gap = euclidean_gap[keep_mask]
+            kept_dz = dz[keep_mask]
+            kept_corridor = has_corridor[keep_mask]
+            kept_scale_left = scale_left[keep_mask]
+            kept_scale_right = scale_right[keep_mask]
 
-            mean_az = _azimuth_mean_weighted(
-                np.array([float(work_az_arr[i_global]), float(work_az_arr[j_global])]),
-                np.array([1.0, 1.0]),
-            )
-            mean_az_rad = np.deg2rad(mean_az)
-            dx = float(row_j["CenterX"]) - float(row_i["CenterX"])
-            dy = float(row_j["CenterY"]) - float(row_i["CenterY"])
-            dz = abs(float(row_j["CenterTIME"]) - float(row_i["CenterTIME"]))
-            along_dist = abs(dx * np.cos(mean_az_rad) + dy * np.sin(mean_az_rad))
-            perp_dist = abs(-dx * np.sin(mean_az_rad) + dy * np.cos(mean_az_rad))
-            euclidean_gap = float(np.hypot(dx, dy))
-
-            if along_dist > target_gap or perp_dist > connect_minor_limit or dz > connect_z_gap:
-                continue
-            if perp_dist > euclidean_gap * perp_ratio + 1e-6:
-                continue
-
-            paired.add(pair_key)
-            connections.append({
-                "i": i_global,
-                "j": j_global,
-                "along_gap": along_dist,
-                "euclidean_gap": euclidean_gap,
-                "z_gap": dz,
-                "score": pair_score,
-                "has_corridor": has_corridor,
-                "scale_i": scale_i,
-                "scale_j": scale_j,
-            })
+            order = np.argsort(kept_score)[::-1]
+            for order_idx in order:
+                connections.append(
+                    {
+                        "i": int(kept_left[order_idx]),
+                        "j": int(kept_right[order_idx]),
+                        "along_gap": float(kept_along[order_idx]),
+                        "euclidean_gap": float(kept_gap[order_idx]),
+                        "z_gap": float(kept_dz[order_idx]),
+                        "score": float(kept_score[order_idx]),
+                        "has_corridor": bool(kept_corridor[order_idx]),
+                        "scale_i": str(kept_scale_left[order_idx]),
+                        "scale_j": str(kept_scale_right[order_idx]),
+                    }
+                )
 
     def _rebuild_vertices(target_idx: int, new_len: float) -> None:
         row = df.iloc[target_idx]
@@ -3614,6 +4046,8 @@ def run_phase2(
     jitter_sigma_xy: float = 8.0,
     jitter_along_strike_factor: float = 1.5,
     jitter_seed: int = 42,
+    compute_backend: str = DEFAULT_POSTPROCESS_COMPUTE_BACKEND,
+    gpu_tile_points: int = DEFAULT_POSTPROCESS_GPU_TILE_POINTS,
 ) -> tuple[pd.DataFrame, dict[str, Any]]:
     """Phase 2 override with multiscale expert postprocess."""
     stats: dict[str, Any] = {"phase": 2, "input_count": len(df)}
@@ -3653,7 +4087,12 @@ def run_phase2(
     stats["micro_fraction"] = float(scale_counts.get("micro_bg", 0) / total_scale)
 
     if enable_supplement:
-        _, matched_pairs = boundary_match_only(df, boundary_tol_xy=boundary_tol_xy)
+        _, matched_pairs = boundary_match_only(
+            df,
+            boundary_tol_xy=boundary_tol_xy,
+            compute_backend=compute_backend,
+            gpu_tile_points=gpu_tile_points,
+        )
         count_before = len(df)
         df = conservative_boundary_supplement(
             df,
@@ -3730,6 +4169,7 @@ def run_phase2(
             "along_strike_factor": jitter_along_strike_factor,
         }
 
+    stats["compute_backend"] = _resolve_compute_backend(compute_backend)
     stats["output_count"] = len(df)
     return df, stats
 
@@ -3858,6 +4298,11 @@ def _df_to_vtk(df: pd.DataFrame, title: str, output_vtk: Path, scalar_types: dic
 
 def _run_pipeline_on_dataframe(df: pd.DataFrame, phase: int, **kwargs: Any) -> tuple[pd.DataFrame, dict[str, Any]]:
     """Run pipeline on a dataframe so VTK and CSV share the same logic."""
+    runtime_keys = {
+        "compute_backend",
+        "max_cpu_threads",
+        "gpu_tile_points",
+    }
     boundary_keys = {
         "enable_boundary_connect",
         "boundary_strip_width",
@@ -3884,74 +4329,91 @@ def _run_pipeline_on_dataframe(df: pd.DataFrame, phase: int, **kwargs: Any) -> t
         "seam_min_shared_ratio",
         "seam_high_rel_boost",
     }
+    runtime_kwargs = {k: v for k, v in kwargs.items() if k in runtime_keys}
     boundary_kwargs = {k: v for k, v in kwargs.items() if k in boundary_keys}
     enable_boundary_connect = bool(boundary_kwargs.pop("enable_boundary_connect", False))
     enable_seam_fill = bool(boundary_kwargs.pop("enable_seam_fill", False))
-    core_kwargs = {k: v for k, v in kwargs.items() if k not in boundary_keys}
+    core_kwargs = {k: v for k, v in kwargs.items() if k not in boundary_keys and k not in runtime_keys}
+    phase_runtime_kwargs = {
+        key: value
+        for key, value in runtime_kwargs.items()
+        if key in {"compute_backend", "gpu_tile_points"}
+    }
 
-    if phase == 1:
-        df, stats = run_phase1(df, **core_kwargs)
-    elif phase == 2:
-        p1_keys = {
-            "max_fracture_sets",
-            "n_fracture_sets",
-            "neighbor_radius_xy",
-            "neighbor_radius_z",
-            "isolation_min_neighbors",
-            "confidence_floor",
-            "boundary_tol_xy",
-            "length_range",
-            "height_range",
-        }
-        p1_kwargs = {k: v for k, v in core_kwargs.items() if k in p1_keys}
-        p2_kwargs = {k: v for k, v in core_kwargs.items() if k not in p1_keys}
-        df, stats1 = run_phase1(df, **p1_kwargs)
-        df, stats2 = run_phase2(df, **p2_kwargs)
-        stats = {
-            **stats1,
-            "phase1_output_count": stats1.get("output_count"),
-            "phase2": stats2,
-            "output_count": stats2.get("output_count", stats1.get("output_count")),
-        }
-    else:
-        raise ValueError(f"phase must be 1 or 2, got {phase}")
+    max_cpu_threads = int(runtime_kwargs.get("max_cpu_threads", DEFAULT_POSTPROCESS_MAX_CPU_THREADS) or 0)
+    with _thread_limit_context(max_cpu_threads):
+        if phase == 1:
+            p1_kwargs = dict(core_kwargs)
+            p1_kwargs.update(phase_runtime_kwargs)
+            df, stats = run_phase1(df, **p1_kwargs)
+        elif phase == 2:
+            p1_keys = {
+                "max_fracture_sets",
+                "n_fracture_sets",
+                "neighbor_radius_xy",
+                "neighbor_radius_z",
+                "isolation_min_neighbors",
+                "confidence_floor",
+                "boundary_tol_xy",
+                "length_range",
+                "height_range",
+                "compute_backend",
+                "gpu_tile_points",
+            }
+            p1_kwargs = {k: v for k, v in core_kwargs.items() if k in p1_keys}
+            p2_kwargs = {k: v for k, v in core_kwargs.items() if k not in p1_keys}
+            p1_kwargs.update(phase_runtime_kwargs)
+            p2_kwargs.update(phase_runtime_kwargs)
+            df, stats1 = run_phase1(df, **p1_kwargs)
+            df, stats2 = run_phase2(df, **p2_kwargs)
+            stats = {
+                **stats1,
+                "phase1_output_count": stats1.get("output_count"),
+                "phase2": stats2,
+                "output_count": stats2.get("output_count", stats1.get("output_count")),
+            }
+        else:
+            raise ValueError(f"phase must be 1 or 2, got {phase}")
 
-    if enable_boundary_connect:
-        bc_map = {
-            "boundary_strip_width": "boundary_strip_width",
-            "connect_max_gap": "connect_max_gap",
-            "bc_macro_gap": "macro_connect_gap",
-            "bc_minor_limit": "connect_minor_limit",
-            "bc_z_gap": "connect_z_gap",
-            "bc_azimuth_tol_deg": "azimuth_tol_deg",
-            "bc_dip_tol_deg": "dip_tol_deg",
-            "bc_min_score_threshold": "min_score_threshold",
-            "bc_corridor_bonus": "corridor_bonus",
-            "bc_require_corridor": "require_corridor",
-            "bc_perp_ratio": "perp_ratio",
-            "bc_enable_supplement": "enable_supplement",
-            "bc_max_stretch_ratio": "max_stretch_ratio",
-        }
-        bc_args = {bc_map[k]: v for k, v in boundary_kwargs.items() if k in bc_map}
-        df, bc_stats = boundary_connect_postprocess(df, **bc_args)
-        stats["boundary_connect"] = bc_stats
+        if enable_boundary_connect:
+            bc_map = {
+                "boundary_strip_width": "boundary_strip_width",
+                "connect_max_gap": "connect_max_gap",
+                "bc_macro_gap": "macro_connect_gap",
+                "bc_minor_limit": "connect_minor_limit",
+                "bc_z_gap": "connect_z_gap",
+                "bc_azimuth_tol_deg": "azimuth_tol_deg",
+                "bc_dip_tol_deg": "dip_tol_deg",
+                "bc_min_score_threshold": "min_score_threshold",
+                "bc_corridor_bonus": "corridor_bonus",
+                "bc_require_corridor": "require_corridor",
+                "bc_perp_ratio": "perp_ratio",
+                "bc_enable_supplement": "enable_supplement",
+                "bc_max_stretch_ratio": "max_stretch_ratio",
+            }
+            bc_args = {bc_map[k]: v for k, v in boundary_kwargs.items() if k in bc_map}
+            bc_args.update({k: v for k, v in runtime_kwargs.items() if k in {"compute_backend", "gpu_tile_points"}})
+            df, bc_stats = boundary_connect_postprocess(df, **bc_args)
+            stats["boundary_connect"] = bc_stats
 
-    if enable_seam_fill:
-        sf_map = {
-            "seam_half_width": "seam_half_width",
-            "seam_interior_depth": "interior_sample_depth",
-            "seam_fill_fraction": "fill_fraction",
-            "seam_confidence_decay": "confidence_decay",
-            "seam_seed": "seed",
-            "seam_blend_half_width": "blend_half_width",
-            "seam_blend_strength": "blend_strength",
-            "seam_min_shared_ratio": "min_shared_set_ratio",
-            "seam_high_rel_boost": "high_reliability_boost",
-        }
-        sf_args = {sf_map[k]: v for k, v in boundary_kwargs.items() if k in sf_map}
-        df, sf_stats = boundary_seam_fill(df, **sf_args)
-        stats["seam_fill"] = sf_stats
+        if enable_seam_fill:
+            sf_map = {
+                "seam_half_width": "seam_half_width",
+                "seam_interior_depth": "interior_sample_depth",
+                "seam_fill_fraction": "fill_fraction",
+                "seam_confidence_decay": "confidence_decay",
+                "seam_seed": "seed",
+                "seam_blend_half_width": "blend_half_width",
+                "seam_blend_strength": "blend_strength",
+                "seam_min_shared_ratio": "min_shared_set_ratio",
+                "seam_high_rel_boost": "high_reliability_boost",
+            }
+            sf_args = {sf_map[k]: v for k, v in boundary_kwargs.items() if k in sf_map}
+            df, sf_stats = boundary_seam_fill(df, **sf_args)
+            stats["seam_fill"] = sf_stats
 
+    stats["max_cpu_threads"] = int(max_cpu_threads)
+    stats["compute_backend"] = str(stats.get("compute_backend", runtime_kwargs.get("compute_backend", DEFAULT_POSTPROCESS_COMPUTE_BACKEND)))
     return df, stats
 
 
