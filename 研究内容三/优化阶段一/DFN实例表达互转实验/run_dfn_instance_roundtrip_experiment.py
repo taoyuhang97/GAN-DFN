@@ -119,6 +119,9 @@ def main() -> None:
             "center_threshold": float(args.center_threshold),
             "thickness_vox_for_compare": float(args.thickness_vox_for_compare),
             "reference_patch_stats": summarize_patch_statistics(input_patch_df),
+            "source_kind_mapping": encode_summary.get("source_kind_mapping", {}),
+            "layer_surface_pair_mapping": encode_summary.get("layer_surface_pair_mapping", {}),
+            "unit_layer_segment_mapping": encode_summary.get("unit_layer_segment_mapping", {}),
         },
     )
     write_csv_utf8(encoded_df, output_dir / "encoded_instances.csv")
@@ -129,6 +132,11 @@ def main() -> None:
         grid=grid,
         layers_df=layers_df,
         threshold=args.center_threshold,
+        label_metadata={
+            "source_kind_mapping": encode_summary.get("source_kind_mapping", {}),
+            "layer_surface_pair_mapping": encode_summary.get("layer_surface_pair_mapping", {}),
+            "unit_layer_segment_mapping": encode_summary.get("unit_layer_segment_mapping", {}),
+        },
     )
     write_csv_utf8(roundtrip_patch_df, output_dir / "roundtrip_patches.csv")
     write_csv_utf8(decoded_df, output_dir / "decoded_instances.csv")

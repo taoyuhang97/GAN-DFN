@@ -40,6 +40,7 @@ def main() -> None:
         grid=grid,
         layers_df=layers_df,
         threshold=args.center_threshold,
+        label_metadata=metadata,
     )
     output_dir = args.output_root / args.run_name / str(metadata.get("unit_id", grid.unit_id or "UNKNOWN_UNIT"))
     output_dir.mkdir(parents=True, exist_ok=True)

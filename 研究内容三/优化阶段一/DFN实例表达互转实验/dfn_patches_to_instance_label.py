@@ -95,6 +95,9 @@ def main() -> None:
             "z_padding_ms": float(args.z_padding_ms),
             "slots_per_voxel": int(args.slots_per_voxel),
             "reference_patch_stats": summarize_patch_statistics(patch_df),
+            "source_kind_mapping": encode_summary.get("source_kind_mapping", {}),
+            "layer_surface_pair_mapping": encode_summary.get("layer_surface_pair_mapping", {}),
+            "unit_layer_segment_mapping": encode_summary.get("unit_layer_segment_mapping", {}),
         },
     )
 

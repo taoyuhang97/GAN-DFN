@@ -78,6 +78,11 @@ SOURCE_CODE_MAP = {
     "virtual": 2,
     "seismic_gradient_fill": 3,
 }
+SOURCE_PRIORITY_MAP = {
+    "real": 0,
+    "virtual": 1,
+    "seismic_gradient_fill": 2,
+}
 
 
 def build_layer_surface_pair_key(top_surface_code: Any, base_surface_code: Any) -> str:
@@ -359,14 +364,39 @@ def sort_window_instances(window_df: pd.DataFrame) -> pd.DataFrame:
     if window_df.empty:
         return window_df.copy()
     work = window_df.copy()
+    work["SortSourcePriority"] = work["SourceKind"].astype(str).map(SOURCE_PRIORITY_MAP).fillna(9).astype(int)
     work["SortOffsetZ"] = pd.to_numeric(work["OffsetZ"], errors="coerce").fillna(0.0)
-    work["SortAzimuth"] = pd.to_numeric(work["Azimuth"], errors="coerce").fillna(0.0) % 360.0
+    work["SortOffsetX"] = pd.to_numeric(work["OffsetX"], errors="coerce").fillna(0.0)
+    work["SortOffsetY"] = pd.to_numeric(work["OffsetY"], errors="coerce").fillna(0.0)
+    work["SortNormalZ"] = pd.to_numeric(work["NormalZ"], errors="coerce").fillna(0.0)
+    work["SortNormalY"] = pd.to_numeric(work["NormalY"], errors="coerce").fillna(0.0)
+    work["SortNormalX"] = pd.to_numeric(work["NormalX"], errors="coerce").fillna(0.0)
+    work["SortUDirX"] = pd.to_numeric(work["UDirX"], errors="coerce").fillna(0.0)
+    work["SortUDirY"] = pd.to_numeric(work["UDirY"], errors="coerce").fillna(0.0)
+    work["SortUDirZ"] = pd.to_numeric(work["UDirZ"], errors="coerce").fillna(0.0)
     work["SortLength"] = pd.to_numeric(work["PatchLength"], errors="coerce").fillna(0.0)
     work["SortHeight"] = pd.to_numeric(work["PatchHeight"], errors="coerce").fillna(0.0)
     work["SortPatchIndex"] = pd.to_numeric(work["PatchIndex"], errors="coerce").fillna(0).astype(int)
     return work.sort_values(
-        ["VoxelI", "VoxelJ", "VoxelK", "SortOffsetZ", "SortAzimuth", "SortLength", "SortHeight", "SortPatchIndex"],
-        ascending=[True, True, True, True, True, False, False, True],
+        [
+            "VoxelI",
+            "VoxelJ",
+            "VoxelK",
+            "SortSourcePriority",
+            "SortOffsetZ",
+            "SortOffsetX",
+            "SortOffsetY",
+            "SortNormalZ",
+            "SortNormalY",
+            "SortNormalX",
+            "SortUDirX",
+            "SortUDirY",
+            "SortUDirZ",
+            "SortLength",
+            "SortHeight",
+            "SortPatchIndex",
+        ],
+        ascending=[True, True, True, True, True, True, True, True, True, True, True, True, True, False, False, True],
     ).reset_index(drop=True)
 
 
@@ -387,7 +417,7 @@ def encode_window_sparse_targets(
             "instance_patch_index": np.zeros((0,), dtype=np.int32),
         }
         if include_count_volume:
-            payload["count_volume"] = np.zeros((grid.nx, grid.ny, int(window_size)), dtype=np.uint8)
+            payload["count_volume"] = np.zeros((grid.nx, grid.ny, int(window_size)), dtype=np.uint16)
         summary = {
             "PatchCount": 0,
             "InstanceCount": 0,
@@ -458,7 +488,7 @@ def encode_window_sparse_targets(
             "instance_patch_index": np.zeros((0,), dtype=np.int32),
         }
         if include_count_volume:
-            payload["count_volume"] = np.zeros((grid.nx, grid.ny, int(window_size)), dtype=np.uint8)
+            payload["count_volume"] = np.zeros((grid.nx, grid.ny, int(window_size)), dtype=np.uint16)
         summary = {
             "PatchCount": 0,
             "InstanceCount": 0,
@@ -494,9 +524,9 @@ def encode_window_sparse_targets(
     }
     voxel_counts = inst_df.groupby(["VoxelI", "VoxelJ", "VoxelK"], dropna=False).size()
     if include_count_volume:
-        count_volume = np.zeros((grid.nx, grid.ny, int(window_size)), dtype=np.uint8)
+        count_volume = np.zeros((grid.nx, grid.ny, int(window_size)), dtype=np.uint16)
         for (i, j, k_local), count_value in voxel_counts.items():
-            count_volume[int(i), int(j), int(k_local)] = np.uint8(min(int(count_value), 255))
+            count_volume[int(i), int(j), int(k_local)] = np.uint16(min(int(count_value), 65535))
         payload["count_volume"] = count_volume
 
     summary = {
@@ -530,7 +560,7 @@ def save_sparse_sample_package(
         "instance_patch_index": np.asarray(sparse_payload["instance_patch_index"], dtype=np.int32),
     }
     if "count_volume" in sparse_payload:
-        save_payload["count_volume"] = np.asarray(sparse_payload["count_volume"], dtype=np.uint8)
+        save_payload["count_volume"] = np.asarray(sparse_payload["count_volume"], dtype=np.uint16)
     np.savez_compressed(output_path, **save_payload)
     return output_path
 

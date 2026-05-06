@@ -1022,6 +1022,10 @@ def load_sparse_npz_arrays(npz_path: Path) -> dict[str, np.ndarray]:
             "instance_geom": np.asarray(data["instance_geom"]),
             "instance_weight": np.asarray(data["instance_weight"]),
         }
+        if "instance_source" in data.files:
+            sparse_arrays["instance_source"] = np.asarray(data["instance_source"])
+        if "instance_patch_index" in data.files:
+            sparse_arrays["instance_patch_index"] = np.asarray(data["instance_patch_index"])
         if "count_volume" in data.files:
             sparse_arrays["count_volume"] = np.asarray(data["count_volume"])
     return sparse_arrays
@@ -1113,7 +1117,7 @@ def build_dense_targets_from_sparse_arrays(
     else:
         overflow_instance_count = 0
 
-    count_target = np.clip(count_volume, 0.0, float(slots_per_voxel)).astype(np.float32, copy=False)[None, ...]
+    count_target = np.maximum(count_volume, 0.0).astype(np.float32, copy=False)[None, ...]
     return {
         "input_features": input_features,
         "valid_z_mask": valid_z_mask,

@@ -55,7 +55,7 @@ from roundtrip_common import (  # type: ignore
 
 DEFAULT_OUTPUT_ROOT = LEGACY_DEFAULT_OUTPUT_ROOT.parent / "DFN实例表达互转实验"
 DEFAULT_DOCX_PATH = LEGACY_DEFAULT_DOCX_PATH
-DEFAULT_SLOTS_PER_VOXEL = 4
+DEFAULT_SLOTS_PER_VOXEL = 16
 
 INSTANCE_LABEL_CHANNELS = [
     "center_heatmap",
@@ -67,6 +67,10 @@ INSTANCE_LABEL_CHANNELS = [
     "heights",
     "confidence",
     "source_patch_index",
+    "source_kind_code",
+    "layer_surface_pair_code",
+    "unit_layer_segment_code",
+    "patch_area",
 ]
 
 INSTANCE_PATCH_EXTRA_COLUMNS = [
@@ -75,8 +79,136 @@ INSTANCE_PATCH_EXTRA_COLUMNS = [
     "CenterVoxelK",
     "CenterSlot",
     "CenterHeatmap",
+    "OriginalSourceKind",
+    "OriginalLayerSurfacePairKey",
+    "OriginalUnitLayerSegmentKey",
+    "PatchArea",
 ]
 INSTANCE_PATCH_OUTPUT_COLUMNS = PATCH_OUTPUT_COLUMNS + INSTANCE_PATCH_EXTRA_COLUMNS
+
+SOURCE_KIND_PRIORITY = {
+    "real": 0,
+    "virtual": 1,
+    "seismic_gradient_fill": 2,
+}
+
+
+def normalize_text(value: Any) -> str:
+    if pd.isna(value):
+        return ""
+    text = str(value).strip()
+    return "" if text.lower() == "nan" else text
+
+
+def build_value_code_maps(values: pd.Series | list[Any]) -> tuple[dict[str, int], dict[int, str]]:
+    series = pd.Series(values, dtype="object")
+    normalized_values = [normalize_text(value) for value in series.tolist()]
+    unique_values = sorted({value for value in normalized_values if value})
+    value_to_code = {value: idx + 1 for idx, value in enumerate(unique_values)}
+    code_to_value = {code: value for value, code in value_to_code.items()}
+    return value_to_code, code_to_value
+
+
+def canonicalize_vector_sign(vec: np.ndarray, axis_priority: tuple[int, ...]) -> np.ndarray:
+    work = normalize(np.asarray(vec, dtype=float))
+    if np.linalg.norm(work) <= 1e-8:
+        return work
+    for axis in axis_priority:
+        component = float(work[axis])
+        if abs(component) > 1e-8:
+            return work if component > 0.0 else -work
+    return work
+
+
+def canonicalize_frame(normal_vec: np.ndarray, u_vec: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    normal_vec = normalize(np.asarray(normal_vec, dtype=float))
+    if np.linalg.norm(normal_vec) <= 1e-8:
+        normal_vec = np.array([0.0, 0.0, 1.0], dtype=float)
+    normal_vec = canonicalize_vector_sign(normal_vec, axis_priority=(2, 1, 0))
+
+    u_vec = np.asarray(u_vec, dtype=float)
+    u_vec = u_vec - float(np.dot(u_vec, normal_vec)) * normal_vec
+    if np.linalg.norm(u_vec) <= 1e-8:
+        ref = np.array([1.0, 0.0, 0.0], dtype=float)
+        if abs(float(np.dot(ref, normal_vec))) > 0.9:
+            ref = np.array([0.0, 1.0, 0.0], dtype=float)
+        u_vec = ref - float(np.dot(ref, normal_vec)) * normal_vec
+    u_vec = normalize(u_vec)
+    if np.linalg.norm(u_vec) <= 1e-8:
+        u_vec = np.array([1.0, 0.0, 0.0], dtype=float)
+    u_vec = canonicalize_vector_sign(u_vec, axis_priority=(0, 1, 2))
+
+    v_vec = normalize(np.cross(normal_vec, u_vec))
+    if np.linalg.norm(v_vec) <= 1e-8:
+        v_vec = np.array([0.0, 1.0, 0.0], dtype=float)
+    return normal_vec, u_vec, v_vec
+
+
+def build_slot_selection_key(item: dict[str, Any]) -> tuple[float, float, float, int]:
+    source_kind = normalize_text(item.get("OriginalSourceKind", ""))
+    return (
+        float(SOURCE_KIND_PRIORITY.get(source_kind, 9)),
+        -float(item.get("Confidence", 0.0)),
+        -float(item.get("PatchArea", 0.0)),
+        int(item.get("PatchIndex", 0)),
+    )
+
+
+def build_slot_order_key(item: dict[str, Any]) -> tuple[float, ...]:
+    return (
+        float(item.get("OffsetZ", 0.0)),
+        float(item.get("OffsetX", 0.0)),
+        float(item.get("OffsetY", 0.0)),
+        float(item.get("NormalZ", 0.0)),
+        float(item.get("NormalY", 0.0)),
+        float(item.get("NormalX", 0.0)),
+        float(item.get("UDirX", 0.0)),
+        float(item.get("UDirY", 0.0)),
+        float(item.get("UDirZ", 0.0)),
+        -float(item.get("PatchLength", 0.0)),
+        -float(item.get("PatchHeight", 0.0)),
+        int(item.get("PatchIndex", 0)),
+    )
+
+
+def resolve_layer_info_from_code(
+    layer_surface_pair_code: int,
+    unit_layer_segment_code: int,
+    center_time: float,
+    layers_df: pd.DataFrame,
+    label_metadata: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    code_to_pair = {
+        int(key): str(value)
+        for key, value in dict((label_metadata or {}).get("layer_surface_pair_mapping", {})).items()
+        if str(key).strip()
+    }
+    code_to_segment = {
+        int(key): str(value)
+        for key, value in dict((label_metadata or {}).get("unit_layer_segment_mapping", {})).items()
+        if str(key).strip()
+    }
+    target_pair = code_to_pair.get(int(layer_surface_pair_code), "")
+    target_segment = code_to_segment.get(int(unit_layer_segment_code), "")
+    if not layers_df.empty:
+        if target_segment and UNIT_LAYER_SEGMENT_KEY_COL in layers_df.columns:
+            mask = layers_df[UNIT_LAYER_SEGMENT_KEY_COL].fillna("").astype(str).eq(target_segment)
+            if mask.any():
+                return dict(layers_df.loc[mask].iloc[0])
+        if target_pair and LAYER_SURFACE_PAIR_KEY_COL in layers_df.columns:
+            mask = layers_df[LAYER_SURFACE_PAIR_KEY_COL].fillna("").astype(str).eq(target_pair)
+            if mask.any():
+                return dict(layers_df.loc[mask].iloc[0])
+    return assign_layer_by_time(float(center_time), layers_df)
+
+
+def resolve_source_kind_from_code(source_kind_code: int, label_metadata: dict[str, Any] | None = None) -> str:
+    code_to_value = {
+        int(key): str(value)
+        for key, value in dict((label_metadata or {}).get("source_kind_mapping", {})).items()
+        if str(key).strip()
+    }
+    return code_to_value.get(int(source_kind_code), "")
 
 
 def patch_row_to_instance_geometry(row: pd.Series) -> dict[str, Any]:
@@ -111,12 +243,14 @@ def patch_row_to_instance_geometry(row: pd.Series) -> dict[str, Any]:
         u_dir = v_raw - float(np.dot(v_raw, normal_phys)) * normal_phys
     if np.linalg.norm(u_dir) <= 1e-8:
         u_dir = np.array([1.0, 0.0, 0.0], dtype=float)
+    normal_phys, u_dir, _ = canonicalize_frame(normal_phys, u_dir)
     row_length = pd.to_numeric(row.get("PatchLength"), errors="coerce")
     row_height = pd.to_numeric(row.get("PatchHeight"), errors="coerce")
     if pd.notna(row_length) and float(row_length) > 0:
         length_phys = float(row_length)
     if pd.notna(row_height) and float(row_height) > 0:
         height_phys = float(row_height)
+    patch_area = float(max(length_phys, 1e-6) * max(height_phys, 1e-6))
     confidence = pd.to_numeric(row.get("Confidence"), errors="coerce")
     patch_index = pd.to_numeric(row.get("PatchIndex"), errors="coerce")
     return {
@@ -125,6 +259,7 @@ def patch_row_to_instance_geometry(row: pd.Series) -> dict[str, Any]:
         "u_dir_phys": normalize(u_dir).astype(float),
         "length_phys": float(max(length_phys, 1e-6)),
         "height_phys": float(max(height_phys, 1e-6)),
+        "patch_area": patch_area,
         "confidence": float(confidence) if pd.notna(confidence) and np.isfinite(confidence) else 1.0,
         "patch_index": int(patch_index) if pd.notna(patch_index) else -1,
     }
@@ -142,6 +277,10 @@ def build_empty_instance_label(grid: GridSpec, slots_per_voxel: int) -> dict[str
         "heights": np.zeros(shape, dtype=np.float32),
         "confidence": np.zeros(shape, dtype=np.float32),
         "source_patch_index": np.full(shape, -1, dtype=np.int32),
+        "source_kind_code": np.zeros(shape, dtype=np.int16),
+        "layer_surface_pair_code": np.zeros(shape, dtype=np.int16),
+        "unit_layer_segment_code": np.zeros(shape, dtype=np.int16),
+        "patch_area": np.zeros(shape, dtype=np.float32),
     }
 
 
@@ -154,6 +293,15 @@ def encode_patches_to_instance_label(
     if slots_per_voxel <= 0:
         raise ValueError("slots_per_voxel must be > 0")
     label_payload = build_empty_instance_label(grid, slots_per_voxel)
+    source_kind_to_code, source_kind_mapping = build_value_code_maps(
+        patch_df.get("SourceKind", pd.Series(dtype="object"))
+    )
+    layer_pair_to_code, layer_pair_mapping = build_value_code_maps(
+        patch_df.get(LAYER_SURFACE_PAIR_KEY_COL, pd.Series(dtype="object"))
+    )
+    unit_segment_to_code, unit_segment_mapping = build_value_code_maps(
+        patch_df.get(UNIT_LAYER_SEGMENT_KEY_COL, pd.Series(dtype="object"))
+    )
     groups: dict[tuple[int, int, int], list[dict[str, Any]]] = {}
     for row_idx, row in patch_df.iterrows():
         geom = patch_row_to_instance_geometry(row)
@@ -164,6 +312,9 @@ def encode_patches_to_instance_label(
         k = int(np.clip(math.floor(center_idx[2]), 0, grid.nz - 1))
         voxel_center = np.array([grid.x_centers[i], grid.y_centers[j], grid.z_centers[k]], dtype=float)
         patch_index = int(geom["patch_index"]) if int(geom["patch_index"]) > 0 else int(row_idx + 1)
+        original_source_kind = normalize_text(row.get("SourceKind", ""))
+        original_layer_pair_key = normalize_text(row.get(LAYER_SURFACE_PAIR_KEY_COL, ""))
+        original_unit_segment_key = normalize_text(row.get(UNIT_LAYER_SEGMENT_KEY_COL, ""))
         groups.setdefault((i, j, k), []).append(
             {
                 "PatchIndex": patch_index,
@@ -185,7 +336,14 @@ def encode_patches_to_instance_label(
                 "UDirZ": float(np.asarray(geom["u_dir_phys"], dtype=float)[2]),
                 "PatchLength": float(geom["length_phys"]),
                 "PatchHeight": float(geom["height_phys"]),
+                "PatchArea": float(geom["patch_area"]),
                 "Confidence": float(geom["confidence"]),
+                "OriginalSourceKind": original_source_kind,
+                "OriginalLayerSurfacePairKey": original_layer_pair_key,
+                "OriginalUnitLayerSegmentKey": original_unit_segment_key,
+                "SourceKindCode": int(source_kind_to_code.get(original_source_kind, 0)),
+                "LayerSurfacePairCode": int(layer_pair_to_code.get(original_layer_pair_key, 0)),
+                "UnitLayerSegmentCode": int(unit_segment_to_code.get(original_unit_segment_key, 0)),
             }
         )
 
@@ -195,25 +353,21 @@ def encode_patches_to_instance_label(
     max_voxel_count = 0
     encoded_count = 0
     for (i, j, k), items in groups.items():
-        items.sort(
-            key=lambda item: (
-                -float(item["Confidence"]),
-                -float(item["PatchLength"]),
-                -float(item["PatchHeight"]),
-                int(item["PatchIndex"]),
-            )
-        )
+        selected_items = sorted(items, key=build_slot_selection_key)
+        kept_items = sorted(selected_items[:slots_per_voxel], key=build_slot_order_key)
+        overflow_items = selected_items[slots_per_voxel:]
         item_count = len(items)
         label_payload["center_count"][i, j, k] = np.int16(item_count)
         max_voxel_count = max(max_voxel_count, item_count)
         if item_count > 1:
             multi_voxel_count += 1
-        for slot, item in enumerate(items):
+        for item in overflow_items:
+            item["CenterSlot"] = int(slots_per_voxel)
+            item["CenterHeatmap"] = 1.0
+            overflow_rows.append(item)
+        for slot, item in enumerate(kept_items):
             item["CenterSlot"] = int(slot)
             item["CenterHeatmap"] = 1.0
-            if slot >= slots_per_voxel:
-                overflow_rows.append(item)
-                continue
             label_payload["center_heatmap"][i, j, k, slot] = 1.0
             label_payload["offsets"][i, j, k, slot, :] = np.array(
                 [item["OffsetX"], item["OffsetY"], item["OffsetZ"]], dtype=np.float32
@@ -228,6 +382,10 @@ def encode_patches_to_instance_label(
             label_payload["heights"][i, j, k, slot] = float(item["PatchHeight"])
             label_payload["confidence"][i, j, k, slot] = float(item["Confidence"])
             label_payload["source_patch_index"][i, j, k, slot] = int(item["PatchIndex"])
+            label_payload["source_kind_code"][i, j, k, slot] = np.int16(item["SourceKindCode"])
+            label_payload["layer_surface_pair_code"][i, j, k, slot] = np.int16(item["LayerSurfacePairCode"])
+            label_payload["unit_layer_segment_code"][i, j, k, slot] = np.int16(item["UnitLayerSegmentCode"])
+            label_payload["patch_area"][i, j, k, slot] = float(item["PatchArea"])
             assign_rows.append(item)
             encoded_count += 1
     assign_df = pd.DataFrame(assign_rows)
@@ -241,26 +399,15 @@ def encode_patches_to_instance_label(
         "overflow_patch_count": int(len(overflow_rows)),
         "slots_per_voxel": int(slots_per_voxel),
         "label_density": float(encoded_count / max(grid.nx * grid.ny * grid.nz * slots_per_voxel, 1)),
+        "source_kind_mapping": {int(key): value for key, value in source_kind_mapping.items()},
+        "layer_surface_pair_mapping": {int(key): value for key, value in layer_pair_mapping.items()},
+        "unit_layer_segment_mapping": {int(key): value for key, value in unit_segment_mapping.items()},
     }
     return label_payload, assign_df, overflow_df, summary
 
 
 def ensure_valid_frame(normal_vec: np.ndarray, u_vec: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    normal_vec = normalize(np.asarray(normal_vec, dtype=float))
-    if np.linalg.norm(normal_vec) <= 1e-8:
-        normal_vec = np.array([0.0, 0.0, 1.0], dtype=float)
-    u_vec = np.asarray(u_vec, dtype=float)
-    u_vec = u_vec - float(np.dot(u_vec, normal_vec)) * normal_vec
-    if np.linalg.norm(u_vec) <= 1e-8:
-        ref = np.array([1.0, 0.0, 0.0], dtype=float)
-        if abs(float(np.dot(ref, normal_vec))) > 0.9:
-            ref = np.array([0.0, 1.0, 0.0], dtype=float)
-        u_vec = ref - float(np.dot(ref, normal_vec)) * normal_vec
-    u_vec = normalize(u_vec)
-    v_vec = normalize(np.cross(normal_vec, u_vec))
-    if np.linalg.norm(v_vec) <= 1e-8:
-        v_vec = np.array([0.0, 1.0, 0.0], dtype=float)
-    return normal_vec, u_vec, v_vec
+    return canonicalize_frame(normal_vec, u_vec)
 
 
 def decode_instance_label_to_patches(
@@ -268,6 +415,7 @@ def decode_instance_label_to_patches(
     grid: GridSpec,
     layers_df: pd.DataFrame,
     threshold: float = 0.5,
+    label_metadata: dict[str, Any] | None = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame, dict[str, Any]]:
     heatmap = np.asarray(label_payload["center_heatmap"], dtype=np.float32)
     active_idx = np.argwhere(heatmap >= float(threshold))
@@ -278,6 +426,22 @@ def decode_instance_label_to_patches(
     heights = np.asarray(label_payload["heights"], dtype=np.float32)
     confidence = np.asarray(label_payload["confidence"], dtype=np.float32)
     source_patch_index = np.asarray(label_payload["source_patch_index"], dtype=np.int32)
+    source_kind_code = np.asarray(
+        label_payload.get("source_kind_code", np.zeros_like(heatmap, dtype=np.int16)),
+        dtype=np.int16,
+    )
+    layer_surface_pair_code = np.asarray(
+        label_payload.get("layer_surface_pair_code", np.zeros_like(heatmap, dtype=np.int16)),
+        dtype=np.int16,
+    )
+    unit_layer_segment_code = np.asarray(
+        label_payload.get("unit_layer_segment_code", np.zeros_like(heatmap, dtype=np.int16)),
+        dtype=np.int16,
+    )
+    patch_area = np.asarray(
+        label_payload.get("patch_area", np.maximum(lengths * heights, 0.0)),
+        dtype=np.float32,
+    )
     rows: list[dict[str, Any]] = []
     decoded_rows: list[dict[str, Any]] = []
     for i, j, k, slot in active_idx.tolist():
@@ -299,7 +463,38 @@ def decode_instance_label_to_patches(
             dtype=float,
         )
         azimuth, dip = normal_to_azimuth_dip(normal_vec)
-        layer_info = assign_layer_by_time(float(center_phys[2]), layers_df)
+        layer_info = resolve_layer_info_from_code(
+            layer_surface_pair_code=int(layer_surface_pair_code[i, j, k, slot]),
+            unit_layer_segment_code=int(unit_layer_segment_code[i, j, k, slot]),
+            center_time=float(center_phys[2]),
+            layers_df=layers_df,
+            label_metadata=label_metadata,
+        )
+        original_source_kind = resolve_source_kind_from_code(
+            source_kind_code=int(source_kind_code[i, j, k, slot]),
+            label_metadata=label_metadata,
+        )
+        original_layer_pair_key = normalize_text(layer_info.get(LAYER_SURFACE_PAIR_KEY_COL, ""))
+        original_unit_segment_key = normalize_text(layer_info.get(UNIT_LAYER_SEGMENT_KEY_COL, ""))
+        if label_metadata is not None:
+            code_to_pair = {
+                int(key): str(value)
+                for key, value in dict(label_metadata.get("layer_surface_pair_mapping", {})).items()
+                if str(key).strip()
+            }
+            code_to_segment = {
+                int(key): str(value)
+                for key, value in dict(label_metadata.get("unit_layer_segment_mapping", {})).items()
+                if str(key).strip()
+            }
+            original_layer_pair_key = code_to_pair.get(
+                int(layer_surface_pair_code[i, j, k, slot]),
+                original_layer_pair_key,
+            )
+            original_unit_segment_key = code_to_segment.get(
+                int(unit_layer_segment_code[i, j, k, slot]),
+                original_unit_segment_key,
+            )
         row: dict[str, Any] = {
             "PatchIndex": int(len(rows) + 1),
             "PatchID": f"{grid.unit_id}_INSTANCE_{len(rows) + 1:04d}",
@@ -337,6 +532,10 @@ def decode_instance_label_to_patches(
             "CenterVoxelK": int(k),
             "CenterSlot": int(slot),
             "CenterHeatmap": float(heatmap[i, j, k, slot]),
+            "OriginalSourceKind": original_source_kind,
+            "OriginalLayerSurfacePairKey": original_layer_pair_key,
+            "OriginalUnitLayerSegmentKey": original_unit_segment_key,
+            "PatchArea": float(max(patch_area[i, j, k, slot], 0.0)),
         }
         for vertex_idx, vertex in enumerate(vertices, start=1):
             row[f"V{vertex_idx}X"] = float(vertex[0])
@@ -359,6 +558,10 @@ def decode_instance_label_to_patches(
                 "Azimuth": float(azimuth),
                 "Dip": float(dip),
                 "Confidence": float(confidence[i, j, k, slot]),
+                "OriginalSourceKind": original_source_kind,
+                "OriginalLayerSurfacePairKey": original_layer_pair_key,
+                "OriginalUnitLayerSegmentKey": original_unit_segment_key,
+                "PatchArea": float(max(patch_area[i, j, k, slot], 0.0)),
             }
         )
     patch_df = pd.DataFrame(rows)
@@ -380,6 +583,9 @@ def decode_instance_label_to_patches(
                     "SeedType",
                     "ParentSeedID",
                     "ParentSourceKind",
+                    "OriginalSourceKind",
+                    "OriginalLayerSurfacePairKey",
+                    "OriginalUnitLayerSegmentKey",
                 } else ""
         patch_df = patch_df[INSTANCE_PATCH_OUTPUT_COLUMNS].copy()
     decoded_df = pd.DataFrame(decoded_rows)
