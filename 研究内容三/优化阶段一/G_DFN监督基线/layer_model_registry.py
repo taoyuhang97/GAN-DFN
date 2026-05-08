@@ -105,6 +105,33 @@ def _normalize_bool(value: Any, default: bool = False) -> bool:
     return bool(default)
 
 
+def normalize_unit_id(value: Any) -> str:
+    if value is None:
+        return ""
+    text = str(value).strip()
+    return "" if text.lower() == "nan" else text
+
+
+def build_unit_id_from_block_coords(block_x: Any, block_y: Any) -> str:
+    block_x_value = pd.to_numeric(block_x, errors="coerce")
+    block_y_value = pd.to_numeric(block_y, errors="coerce")
+    if pd.isna(block_x_value) or pd.isna(block_y_value):
+        return ""
+    return f"BX{int(round(float(block_x_value)))}_BY{int(round(float(block_y_value)))}"
+
+
+def resolve_unit_id_from_row(row: Any) -> str:
+    if not hasattr(row, "get"):
+        return ""
+    unit_id = normalize_unit_id(row.get("UnitID", ""))
+    if unit_id:
+        return unit_id
+    return build_unit_id_from_block_coords(
+        row.get("BlockX", ""),
+        row.get("BlockY", ""),
+    )
+
+
 def build_layer_surface_pair_key(top_surface_code: Any, base_surface_code: Any) -> str:
     return f"{normalize_surface_code(top_surface_code)}->{normalize_surface_code(base_surface_code)}"
 
@@ -126,7 +153,7 @@ def build_unit_layer_segment_key(
     geo_interval_key: Any,
     layer_surface_pair_key: Any,
 ) -> str:
-    unit_text = str(unit_id).strip() or "UNKNOWN_UNIT"
+    unit_text = normalize_unit_id(unit_id) or "UNKNOWN_UNIT"
     interval_text = str(geo_interval_key).strip() or "UNKNOWN_INTERVAL"
     pair_text = str(layer_surface_pair_key).strip() or "UNKNOWN_LAYER_PAIR"
     return f"{unit_text}__{interval_text}__{pair_text}"
@@ -144,7 +171,7 @@ def build_unit_layer_segment_key_from_row(
         return existing
     layer_surface_pair_key = build_layer_surface_pair_key_from_row(row, key_col=pair_key_col)
     return build_unit_layer_segment_key(
-        unit_id=row.get("UnitID", ""),
+        unit_id=resolve_unit_id_from_row(row),
         geo_interval_key=row.get("GeoIntervalKey", ""),
         layer_surface_pair_key=layer_surface_pair_key,
     )
@@ -187,12 +214,43 @@ def ensure_layer_surface_pair_key_column(
     return work
 
 
+def ensure_unit_id_column(
+    manifest_df: pd.DataFrame,
+    key_col: str = "UnitID",
+) -> pd.DataFrame:
+    work = manifest_df.copy()
+    if work.empty:
+        if key_col not in work.columns:
+            work[key_col] = pd.Series(dtype="object")
+        return work
+
+    if key_col in work.columns:
+        existing = work[key_col].apply(normalize_unit_id)
+    else:
+        existing = pd.Series([""] * len(work), index=work.index, dtype="object")
+    fill_mask = existing.eq("")
+    work[key_col] = existing
+    if fill_mask.any():
+        derived_keys = [
+            build_unit_id_from_block_coords(block_x, block_y)
+            for block_x, block_y in zip(
+                work.get("BlockX", pd.Series([""] * len(work))),
+                work.get("BlockY", pd.Series([""] * len(work))),
+            )
+        ]
+        work.loc[fill_mask, key_col] = pd.Series(derived_keys, index=work.index).loc[fill_mask]
+    return work
+
+
 def ensure_unit_layer_segment_key_column(
     manifest_df: pd.DataFrame,
     key_col: str = UNIT_LAYER_SEGMENT_KEY_COL,
     pair_key_col: str = LAYER_SURFACE_PAIR_KEY_COL,
 ) -> pd.DataFrame:
-    work = ensure_layer_surface_pair_key_column(manifest_df, key_col=pair_key_col)
+    work = ensure_unit_id_column(
+        ensure_layer_surface_pair_key_column(manifest_df, key_col=pair_key_col),
+        key_col="UnitID",
+    )
     if work.empty:
         if key_col not in work.columns:
             work[key_col] = pd.Series(dtype="object")
@@ -236,7 +294,10 @@ def summarize_manifest_by_layer_surface_pair(
     manifest_df: pd.DataFrame,
     key_col: str = LAYER_SURFACE_PAIR_KEY_COL,
 ) -> pd.DataFrame:
-    work = ensure_layer_surface_pair_key_column(manifest_df, key_col=key_col)
+    work = ensure_unit_id_column(
+        ensure_layer_surface_pair_key_column(manifest_df, key_col=key_col),
+        key_col="UnitID",
+    )
     if work.empty:
         return pd.DataFrame(
             columns=[

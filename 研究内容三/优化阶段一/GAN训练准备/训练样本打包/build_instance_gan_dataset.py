@@ -43,6 +43,10 @@ DEFAULT_OUTPUT_ROOT = Path(
 )
 DEFAULT_SGY_FILE = Path(r"/data/shared/project-oil/wx数据/砂砾岩/psdm_final_time.sgy")
 DEFAULT_BLOCK_SIZE = 25
+DEFAULT_TRAIN_UNIT_CSV_CANDIDATES = [
+    "all_train_units_with_confidence.csv",
+    "phase1_train_units.csv",
+]
 DEFAULT_SOURCE_WEIGHTS = {
     "real": 1.0,
     "virtual": 0.8,
@@ -74,6 +78,52 @@ INPUT_CHANNELS = [
     "block_x_norm",
     "block_y_norm",
 ]
+
+
+def resolve_default_train_unit_csv(stats_run_dir: Path) -> Path:
+    aggregate_dir = Path(stats_run_dir) / "aggregated"
+    for file_name in DEFAULT_TRAIN_UNIT_CSV_CANDIDATES:
+        candidate = aggregate_dir / file_name
+        if candidate.exists():
+            return candidate
+    return aggregate_dir / DEFAULT_TRAIN_UNIT_CSV_CANDIDATES[0]
+
+
+def coerce_confidence(value: Any, default: float = 1.0) -> float:
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):
+        numeric = float(default)
+    if not np.isfinite(numeric):
+        numeric = float(default)
+    return float(np.clip(numeric, 0.0, 1.0))
+
+
+def coerce_bool_flag(value: Any, default: bool = False) -> bool:
+    if isinstance(value, (bool, np.bool_)):
+        return bool(value)
+    if value is None:
+        return bool(default)
+    if isinstance(value, (int, float, np.integer, np.floating)):
+        if np.isnan(value):
+            return bool(default)
+        return bool(int(value))
+    text = str(value).strip().lower()
+    if text in {"1", "true", "yes", "y"}:
+        return True
+    if text in {"0", "false", "no", "n", ""}:
+        return False
+    return bool(default)
+
+
+def coerce_int_value(value: Any, default: int = 0) -> int:
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):
+        return int(default)
+    if not np.isfinite(numeric):
+        return int(default)
+    return int(numeric)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -457,7 +507,7 @@ def append_summary_to_docx(
 def main() -> None:
     args = build_parser().parse_args()
     stats_run_dir = Path(args.stats_run_dir)
-    train_unit_csv = Path(args.train_unit_csv) if args.train_unit_csv else (stats_run_dir / "aggregated" / "phase1_train_units.csv")
+    train_unit_csv = Path(args.train_unit_csv) if args.train_unit_csv else resolve_default_train_unit_csv(stats_run_dir)
     if not train_unit_csv.exists():
         raise FileNotFoundError(f"train_unit_csv not found: {train_unit_csv}")
 
@@ -470,6 +520,23 @@ def main() -> None:
     train_units_df = read_csv_utf8(train_unit_csv)
     if args.limit_units:
         train_units_df = train_units_df.head(int(args.limit_units)).copy()
+    train_units_df["UnitID"] = train_units_df["UnitID"].astype(str).str.strip()
+    if "UnitConfidence" not in train_units_df.columns:
+        train_units_df["UnitConfidence"] = 1.0
+    if "SampleConfidenceDefault" not in train_units_df.columns:
+        train_units_df["SampleConfidenceDefault"] = train_units_df["UnitConfidence"]
+    train_units_df["UnitConfidence"] = [coerce_confidence(value, default=1.0) for value in train_units_df["UnitConfidence"].tolist()]
+    train_units_df["SampleConfidenceDefault"] = [
+        coerce_confidence(value, default=unit_confidence)
+        for value, unit_confidence in zip(
+            train_units_df["SampleConfidenceDefault"].tolist(),
+            train_units_df["UnitConfidence"].tolist(),
+        )
+    ]
+    unit_meta_lookup = {
+        str(row["UnitID"]): row
+        for row in train_units_df.drop_duplicates(subset=["UnitID"], keep="first").to_dict("records")
+    }
     selected_unit_ids = set(train_units_df["UnitID"].astype(str).tolist())
 
     trace_df, unique_x, unique_y = load_trace_header(args.trace_header_csv)
@@ -502,8 +569,23 @@ def main() -> None:
                 continue
 
             unit_summary = load_unit_summary(unit_dir)
+            unit_meta = unit_meta_lookup.get(unit_id, {})
             block_x = int(unit_summary.get("BlockX", patch_df["BlockX"].iloc[0]))
             block_y = int(unit_summary.get("BlockY", patch_df["BlockY"].iloc[0]))
+            reliability_class = str(unit_meta.get("ReliabilityClass", unit_summary.get("ReliabilityClass", "")))
+            data_mode = str(unit_meta.get("DataMode", unit_summary.get("DataMode", "")))
+            has_real_data = coerce_bool_flag(unit_meta.get("HasRealData", unit_summary.get("HasRealData", False)))
+            has_virtual_data = coerce_bool_flag(unit_meta.get("HasVirtualData", unit_summary.get("HasVirtualData", False)))
+            real_seed_count = coerce_int_value(unit_meta.get("RealSeedCount", unit_summary.get("RealSeedCount", 0)))
+            virtual_seed_count = coerce_int_value(unit_meta.get("VirtualSeedCount", unit_summary.get("VirtualSeedCount", 0)))
+            gradient_fill_seed_count = coerce_int_value(
+                unit_meta.get("GradientFillSeedCount", unit_summary.get("GradientFillSeedCount", 0))
+            )
+            unit_confidence = coerce_confidence(unit_meta.get("UnitConfidence", 1.0), default=1.0)
+            sample_confidence = coerce_confidence(
+                unit_meta.get("SampleConfidenceDefault", unit_confidence),
+                default=unit_confidence,
+            )
 
             try:
                 x_min, x_max, y_min, y_max = compute_unit_bounds_from_trace_arrays(unique_x, unique_y, block_x, block_y)
@@ -595,6 +677,15 @@ def main() -> None:
                         "UnitID": unit_id,
                         "BlockX": block_x,
                         "BlockY": block_y,
+                        "ReliabilityClass": reliability_class,
+                        "DataMode": data_mode,
+                        "HasRealData": bool(has_real_data),
+                        "HasVirtualData": bool(has_virtual_data),
+                        "RealSeedCount": int(real_seed_count),
+                        "VirtualSeedCount": int(virtual_seed_count),
+                        "GradientFillSeedCount": int(gradient_fill_seed_count),
+                        "UnitConfidence": float(unit_confidence),
+                        "SampleConfidence": float(sample_confidence),
                         "GeoIntervalKey": layer_key,
                         "StrataName": str(layer_row.get("StrataName", "")),
                         "TopSurfaceCode": str(layer_row.get("TopSurfaceCode", "")),
@@ -633,6 +724,15 @@ def main() -> None:
                             "UnitID": unit_id,
                             "BlockX": block_x,
                             "BlockY": block_y,
+                            "ReliabilityClass": reliability_class,
+                            "DataMode": data_mode,
+                            "HasRealData": int(has_real_data),
+                            "HasVirtualData": int(has_virtual_data),
+                            "RealSeedCount": int(real_seed_count),
+                            "VirtualSeedCount": int(virtual_seed_count),
+                            "GradientFillSeedCount": int(gradient_fill_seed_count),
+                            "UnitConfidence": float(unit_confidence),
+                            "SampleConfidence": float(sample_confidence),
                             "GeoIntervalKey": layer_key,
                             "WindowIndex": int(window_idx),
                             "WindowTopTime": float(window_top),
@@ -664,6 +764,8 @@ def main() -> None:
         unit_manifest_df = (
             manifest_df.groupby(["UnitID", "BlockX", "BlockY"], dropna=False)
             .agg(
+                UnitConfidence=("UnitConfidence", "max"),
+                SampleConfidenceMean=("SampleConfidence", "mean"),
                 SampleCount=("SampleID", "count"),
                 PositiveSampleCount=("IsPositiveWindow", "sum"),
                 TotalPatchCount=("PatchCount", "sum"),
@@ -673,7 +775,20 @@ def main() -> None:
             .reset_index()
         )
     else:
-        unit_manifest_df = pd.DataFrame(columns=["UnitID", "BlockX", "BlockY", "SampleCount", "PositiveSampleCount", "TotalPatchCount", "OverflowInstanceCount", "MaxInstancesInSingleVoxel"])
+        unit_manifest_df = pd.DataFrame(
+            columns=[
+                "UnitID",
+                "BlockX",
+                "BlockY",
+                "UnitConfidence",
+                "SampleConfidenceMean",
+                "SampleCount",
+                "PositiveSampleCount",
+                "TotalPatchCount",
+                "OverflowInstanceCount",
+                "MaxInstancesInSingleVoxel",
+            ]
+        )
     write_csv_utf8(unit_manifest_df, aggregated_dir / "unit_manifest.csv")
 
     summary = {
@@ -690,10 +805,13 @@ def main() -> None:
         "total_patch_count": int(total_patch_count),
         "total_overflow_instance_count": int(total_overflow),
         "samples_with_overflow": int(samples_with_overflow),
-        "recommended_training_subset": "phase1_train_units + T128 + K16",
+        "recommended_training_subset": "all_train_units_with_confidence + T128 + K16",
         "input_channels": list(INPUT_CHANNELS),
         "target_geom_channels": list(TARGET_GEOM_CHANNELS),
         "source_weights": dict(DEFAULT_SOURCE_WEIGHTS),
+        "sample_confidence_mean": float(manifest_df["SampleConfidence"].mean()) if not manifest_df.empty else 0.0,
+        "sample_confidence_min": float(manifest_df["SampleConfidence"].min()) if not manifest_df.empty else 0.0,
+        "sample_confidence_max": float(manifest_df["SampleConfidence"].max()) if not manifest_df.empty else 0.0,
         "manifest_csv": str(aggregated_dir / "sample_manifest.csv"),
         "unit_manifest_csv": str(aggregated_dir / "unit_manifest.csv"),
     }

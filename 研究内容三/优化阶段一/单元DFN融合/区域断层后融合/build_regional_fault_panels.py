@@ -5,7 +5,7 @@ import argparse
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import numpy as np
 import pandas as pd
@@ -25,6 +25,13 @@ from fault_postfusion_common import (
     write_df_to_regional_vtk,
     write_json,
 )
+
+
+def emit_fault_panel_progress(stage: str, detail: str | None = None) -> None:
+    if detail:
+        print(f"[fault-panels] {stage} | {detail}", flush=True)
+    else:
+        print(f"[fault-panels] {stage}", flush=True)
 
 
 @dataclass
@@ -97,9 +104,14 @@ def collect_region_fault_patch_paths(
     return selected_paths
 
 
-def load_fault_patch_records(patch_paths: list[Path]) -> list[dict[str, Any]]:
+def load_fault_patch_records(
+    patch_paths: list[Path],
+    progress_hook: Callable[[str, str | None], None] | None = None,
+) -> list[dict[str, Any]]:
     records: list[dict[str, Any]] = []
-    for patch_path in patch_paths:
+    total_count = len(patch_paths)
+    emit_step = max(1, total_count // 20) if total_count > 0 else 1
+    for patch_idx, patch_path in enumerate(patch_paths, start=1):
         info = parse_fault_patch_file_info(patch_path)
         vtp_path = Path(patch_path)
         poly = load_fault_patch_polydata(vtp_path)
@@ -126,6 +138,10 @@ def load_fault_patch_records(patch_paths: list[Path]) -> list[dict[str, Any]]:
             "Points": points,
         }
         records.append(record)
+        if progress_hook is not None and (
+            patch_idx == 1 or patch_idx == total_count or patch_idx % emit_step == 0
+        ):
+            progress_hook("读取断层 patch 进度", f"{patch_idx}/{total_count}, last={vtp_path.name}")
     return records
 
 
@@ -135,6 +151,7 @@ def cluster_fault_patches_to_panels(
     merge_time: float,
     strike_tol: float,
     dip_tol: float,
+    progress_hook: Callable[[str, str | None], None] | None = None,
 ) -> pd.DataFrame:
     if patch_df.empty:
         patch_df = patch_df.copy()
@@ -143,7 +160,10 @@ def cluster_fault_patches_to_panels(
 
     output_frames: list[pd.DataFrame] = []
     panel_counter = 0
-    for fault_name, group in patch_df.groupby("FaultName", sort=False):
+    grouped_faults = list(patch_df.groupby("FaultName", sort=False))
+    total_fault_count = len(grouped_faults)
+    emit_step = max(1, total_fault_count // 10) if total_fault_count > 0 else 1
+    for fault_idx, (fault_name, group) in enumerate(grouped_faults, start=1):
         group = group.copy().reset_index(drop=True)
         if len(group) == 1:
             group["FaultPanelID"] = panel_counter
@@ -178,14 +198,27 @@ def cluster_fault_patches_to_panels(
             panel_ids.append(root_to_panel_id[root])
         group["FaultPanelID"] = panel_ids
         output_frames.append(group)
+        if progress_hook is not None and (
+            fault_idx == 1 or fault_idx == total_fault_count or fault_idx % emit_step == 0
+        ):
+            progress_hook(
+                "FaultName 聚类进度",
+                f"{fault_idx}/{total_fault_count}, fault_name={fault_name}, panel_count_so_far={panel_counter}",
+            )
     return pd.concat(output_frames, ignore_index=True, sort=False)
 
 
-def aggregate_fault_panels(clustered_df: pd.DataFrame) -> pd.DataFrame:
+def aggregate_fault_panels(
+    clustered_df: pd.DataFrame,
+    progress_hook: Callable[[str, str | None], None] | None = None,
+) -> pd.DataFrame:
     if clustered_df.empty:
         return pd.DataFrame()
     rows: list[dict[str, Any]] = []
-    for fault_panel_id, group in clustered_df.groupby("FaultPanelID", sort=True):
+    grouped_panels = list(clustered_df.groupby("FaultPanelID", sort=True))
+    total_panel_count = len(grouped_panels)
+    emit_step = max(1, total_panel_count // 20) if total_panel_count > 0 else 1
+    for panel_idx, (fault_panel_id, group) in enumerate(grouped_panels, start=1):
         all_points = np.vstack(group["Points"].tolist())
         plane = fit_plane_from_points(all_points)
         panel_vertices = np.asarray(plane["panel_vertices"], dtype=float)
@@ -225,6 +258,13 @@ def aggregate_fault_panels(clustered_df: pd.DataFrame) -> pd.DataFrame:
             row[f"V{vertex_idx}Y"] = float(panel_vertices[vertex_idx - 1, 1])
             row[f"V{vertex_idx}Z"] = float(panel_vertices[vertex_idx - 1, 2])
         rows.append(row)
+        if progress_hook is not None and (
+            panel_idx == 1 or panel_idx == total_panel_count or panel_idx % emit_step == 0
+        ):
+            progress_hook(
+                "FaultPanel 聚合进度",
+                f"{panel_idx}/{total_panel_count}, fault_panel_id={fault_panel_id}",
+            )
     panel_df = pd.DataFrame(rows)
     ordered_cols = [
         "FaultPanelID",
@@ -295,6 +335,10 @@ def run_build_regional_fault_panels(
     panel_dip_tol: float,
 ) -> dict[str, Any]:
     run_dir = Path(output_root) / str(run_name)
+    emit_fault_panel_progress(
+        "开始构建区域断层 panel",
+        f"region=BX{min(block_x_start, block_x_end)}-{max(block_x_start, block_x_end)}, BY{min(block_y_start, block_y_end)}-{max(block_y_start, block_y_end)}",
+    )
     patch_paths = collect_region_fault_patch_paths(
         fault_patches_root=Path(fault_patches_root),
         block_x_start=int(block_x_start),
@@ -302,17 +346,23 @@ def run_build_regional_fault_panels(
         block_y_start=int(block_y_start),
         block_y_end=int(block_y_end),
     )
-    patch_records = load_fault_patch_records(patch_paths)
+    emit_fault_panel_progress("完成目标断层 patch 收集", f"selected_patch_file_count={len(patch_paths)}")
+    patch_records = load_fault_patch_records(patch_paths, progress_hook=emit_fault_panel_progress)
     patch_df = pd.DataFrame(patch_records)
+    emit_fault_panel_progress("断层 patch 读取完成", f"fault_patch_count={len(patch_df)}")
     clustered_df = cluster_fault_patches_to_panels(
         patch_df=patch_df,
         merge_xy=float(panel_merge_xy),
         merge_time=float(panel_merge_time),
         strike_tol=float(panel_strike_tol),
         dip_tol=float(panel_dip_tol),
+        progress_hook=emit_fault_panel_progress,
     )
-    panel_df = aggregate_fault_panels(clustered_df)
+    emit_fault_panel_progress("patch 聚类完成", f"clustered_patch_count={len(clustered_df)}")
+    panel_df = aggregate_fault_panels(clustered_df, progress_hook=emit_fault_panel_progress)
+    emit_fault_panel_progress("panel 聚合完成", f"fault_panel_count={len(panel_df)}")
     output_paths = export_regional_fault_panels(panel_df, run_dir)
+    emit_fault_panel_progress("panel 导出完成", f"panel_vtk={output_paths['panel_vtk']}")
     summary = {
         "run_name": str(run_name),
         "fault_patches_root": str(fault_patches_root),

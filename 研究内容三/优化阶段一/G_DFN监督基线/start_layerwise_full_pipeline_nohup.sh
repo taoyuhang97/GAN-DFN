@@ -2,7 +2,7 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-DEFAULT_PIPELINE_OUTPUT_ROOT="/data/shared/project-oil/wx数据/砂砾岩/优化阶段一/研究内容三/G_DFN监督基线/后台全流程"
+DEFAULT_PIPELINE_OUTPUT_ROOT="/home/tyh/data/project-oil/砂砾岩/优化阶段一/研究内容三/G_DFN监督基线/后台全流程"
 
 run_name=""
 pipeline_output_root="$DEFAULT_PIPELINE_OUTPUT_ROOT"

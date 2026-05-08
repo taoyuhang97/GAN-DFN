@@ -45,6 +45,14 @@ DEFAULT_BLOCK_SIZE = 25
 DEFAULT_WINDOW_SIZES = [128, 160]
 DEFAULT_CANDIDATE_K = [4, 8, 12, 16, 24, 32, 40]
 PHASE1_RELIABILITY = {"real_controlled"}
+ALL_TRAIN_CONFIDENCE_RULE_VERSION = "v1_all_units_confidence_weighted"
+
+
+def emit_window_stats_progress(stage: str, detail: str | None = None) -> None:
+    if detail:
+        print(f"[window-stats] {stage} | {detail}", flush=True)
+    else:
+        print(f"[window-stats] {stage}", flush=True)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -283,11 +291,43 @@ def build_empty_window_df(candidate_k: list[int]) -> pd.DataFrame:
     return pd.DataFrame(columns=columns)
 
 
+def clamp_unit_confidence(value: Any, default: float = 1.0) -> float:
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):
+        numeric = float(default)
+    if not np.isfinite(numeric):
+        numeric = float(default)
+    return float(np.clip(numeric, 0.0, 1.0))
+
+
+def compute_unit_confidence(summary: dict[str, Any], patch_count: int) -> float:
+    if int(patch_count) <= 0:
+        return 0.0
+
+    has_real = bool(summary.get("HasRealData", False))
+    has_virtual = bool(summary.get("HasVirtualData", False))
+    data_mode = str(summary.get("DataMode", "")).strip().lower()
+    real_seed_count = int(summary.get("RealSeedCount", 0) or 0)
+
+    if data_mode == "real_only" or (has_real and not has_virtual):
+        confidence = 1.0
+    elif data_mode == "real_virtual" or (has_real and has_virtual):
+        confidence = 0.9 if real_seed_count > 0 else 0.85
+    elif data_mode == "virtual_only" or (has_virtual and not has_real):
+        confidence = 0.8
+    else:
+        confidence = 0.6
+    return clamp_unit_confidence(confidence, default=0.6)
+
+
 def build_unit_inventory_row(unit_dir: Path, summary: dict[str, Any], patch_count: int, layer_count: int) -> dict[str, Any]:
     reliability = str(summary.get("ReliabilityClass", ""))
     has_real = bool(summary.get("HasRealData", False))
     phase1 = has_real and reliability in PHASE1_RELIABILITY and int(summary.get("RealSeedCount", 0)) > 0
     phase2 = has_real and patch_count > 0
+    recommend_train = patch_count > 0 and layer_count > 0
+    unit_confidence = compute_unit_confidence(summary=summary, patch_count=patch_count)
     return {
         "UnitID": str(summary.get("UnitID", unit_dir.name)),
         "BlockX": int(summary.get("BlockX", 0)),
@@ -301,10 +341,13 @@ def build_unit_inventory_row(unit_dir: Path, summary: dict[str, Any], patch_coun
         "RealSeedCount": int(summary.get("RealSeedCount", 0)),
         "VirtualSeedCount": int(summary.get("VirtualSeedCount", 0)),
         "GradientFillSeedCount": int(summary.get("GradientFillSeedCount", 0)),
+        "UnitConfidence": float(unit_confidence),
+        "SampleConfidenceDefault": float(unit_confidence),
+        "RecommendTrain": int(recommend_train),
         "RecommendPhase1Train": int(phase1),
         "RecommendPhase2Train": int(phase2),
-        "RecommendExclude": int(not phase2),
-        "ExcludeReason": "" if phase2 else "no_real_seed_or_empty_patch",
+        "RecommendExclude": int(not recommend_train),
+        "ExcludeReason": "" if recommend_train else "empty_patch_or_missing_layer",
         "UnitDir": str(unit_dir),
     }
 
@@ -386,6 +429,13 @@ def append_summary_to_docx(
         f"overlap_ratio: {config.get('overlap_ratio', '')}",
         f"candidate_k: {config.get('candidate_k', '')}",
         f"processed_unit_count: {int(len(inventory_df))}",
+        f"all_train_unit_count: {int(inventory_df['RecommendTrain'].sum()) if not inventory_df.empty else 0}",
+        f"confidence_rule_version: {ALL_TRAIN_CONFIDENCE_RULE_VERSION}",
+        (
+            f"unit_confidence_mean: {float(inventory_df['UnitConfidence'].mean()):.4f}"
+            if not inventory_df.empty and "UnitConfidence" in inventory_df.columns
+            else "unit_confidence_mean: 0.0000"
+        ),
         f"phase1_train_unit_count: {int(inventory_df['RecommendPhase1Train'].sum()) if not inventory_df.empty else 0}",
         f"phase2_train_unit_count: {int(inventory_df['RecommendPhase2Train'].sum()) if not inventory_df.empty else 0}",
     ]
@@ -418,25 +468,55 @@ def main() -> None:
     unit_dirs = sorted([path for path in Path(args.unit_dfn_root).iterdir() if path.is_dir()])
     if args.limit_units:
         unit_dirs = unit_dirs[: int(args.limit_units)]
+    emit_window_stats_progress(
+        "开始窗口级实例统计",
+        f"candidate_unit_count={len(unit_dirs)}, output_dir={run_dir}",
+    )
 
     inventory_rows: list[dict[str, Any]] = []
     processed_units: list[dict[str, Any]] = []
     skipped_units: list[dict[str, Any]] = []
 
-    for unit_dir in unit_dirs:
+    total_unit_count = len(unit_dirs)
+    inventory_emit_step = max(1, total_unit_count // 20) if total_unit_count > 0 else 1
+    for unit_idx, unit_dir in enumerate(unit_dirs, start=1):
         patch_csv = unit_dir / "unit_dfn_patches.csv"
         if not patch_csv.exists():
             skipped_units.append({"UnitDir": str(unit_dir), "Reason": "missing_unit_dfn_patches_csv"})
+            if unit_idx == 1 or unit_idx == total_unit_count or unit_idx % inventory_emit_step == 0:
+                emit_window_stats_progress(
+                    "单元入库进度",
+                    (
+                        f"{unit_idx}/{total_unit_count}, processed_units={len(processed_units)}, "
+                        f"skipped_units={len(skipped_units)}"
+                    ),
+                )
             continue
 
         patch_df = load_patch_table(patch_csv)
         if patch_df.empty:
             skipped_units.append({"UnitDir": str(unit_dir), "Reason": "empty_patch_table"})
+            if unit_idx == 1 or unit_idx == total_unit_count or unit_idx % inventory_emit_step == 0:
+                emit_window_stats_progress(
+                    "单元入库进度",
+                    (
+                        f"{unit_idx}/{total_unit_count}, processed_units={len(processed_units)}, "
+                        f"skipped_units={len(skipped_units)}"
+                    ),
+                )
             continue
 
         layers_df = load_layer_table(unit_dir)
         if layers_df.empty:
             skipped_units.append({"UnitDir": str(unit_dir), "Reason": "missing_layer_table"})
+            if unit_idx == 1 or unit_idx == total_unit_count or unit_idx % inventory_emit_step == 0:
+                emit_window_stats_progress(
+                    "单元入库进度",
+                    (
+                        f"{unit_idx}/{total_unit_count}, processed_units={len(processed_units)}, "
+                        f"skipped_units={len(skipped_units)}"
+                    ),
+                )
             continue
 
         summary = load_unit_summary(unit_dir)
@@ -463,6 +543,14 @@ def main() -> None:
         instance_df = build_unit_instance_table(patch_df, grid)
         if instance_df.empty:
             skipped_units.append({"UnitDir": str(unit_dir), "Reason": "empty_instance_table"})
+            if unit_idx == 1 or unit_idx == total_unit_count or unit_idx % inventory_emit_step == 0:
+                emit_window_stats_progress(
+                    "单元入库进度",
+                    (
+                        f"{unit_idx}/{total_unit_count}, processed_units={len(processed_units)}, "
+                        f"skipped_units={len(skipped_units)}"
+                    ),
+                )
             continue
 
         inventory_rows.append(build_unit_inventory_row(unit_dir, summary, len(patch_df), len(layers_df)))
@@ -484,11 +572,20 @@ def main() -> None:
                 "Layers": layers_df.copy(),
             }
         )
+        if unit_idx == 1 or unit_idx == total_unit_count or unit_idx % inventory_emit_step == 0:
+            emit_window_stats_progress(
+                "单元入库进度",
+                (
+                    f"{unit_idx}/{total_unit_count}, processed_units={len(processed_units)}, "
+                    f"skipped_units={len(skipped_units)}"
+                ),
+            )
 
     inventory_df = pd.DataFrame(inventory_rows)
     write_csv_utf8(inventory_df, aggregate_dir / "unit_inventory.csv")
     write_csv_utf8(pd.DataFrame(skipped_units), aggregate_dir / "skipped_units.csv")
     if not inventory_df.empty:
+        write_csv_utf8(inventory_df[inventory_df["RecommendTrain"] == 1].copy(), aggregate_dir / "all_train_units_with_confidence.csv")
         write_csv_utf8(inventory_df[inventory_df["RecommendPhase1Train"] == 1].copy(), aggregate_dir / "phase1_train_units.csv")
         write_csv_utf8(inventory_df[inventory_df["RecommendPhase2Train"] == 1].copy(), aggregate_dir / "phase2_train_units.csv")
 
@@ -496,15 +593,22 @@ def main() -> None:
     unit_summary_rows: list[dict[str, Any]] = []
     window_size_comparison_rows: list[dict[str, Any]] = []
 
-    for window_size in sorted({int(v) for v in args.window_sizes}):
+    total_window_size_count = len(sorted({int(v) for v in args.window_sizes}))
+    for window_size_idx, window_size in enumerate(sorted({int(v) for v in args.window_sizes}), start=1):
         tag = f"T{int(window_size)}_OV{int(round(float(args.overlap_ratio) * 100.0))}"
         size_dir = run_dir / tag
         size_dir.mkdir(parents=True, exist_ok=True)
+        emit_window_stats_progress(
+            "开始窗口尺寸统计",
+            f"{window_size_idx}/{total_window_size_count}, tag={tag}, processed_unit_count={len(processed_units)}",
+        )
 
         window_rows: list[dict[str, Any]] = []
         voxel_count_values: list[int] = []
 
-        for unit in processed_units:
+        total_processed_units = len(processed_units)
+        stats_emit_step = max(1, total_processed_units // 20) if total_processed_units > 0 else 1
+        for processed_idx, unit in enumerate(processed_units, start=1):
             unit_instance_df = unit["Instances"]
             layers_df = unit["Layers"]
             unit_window_rows: list[dict[str, Any]] = []
@@ -579,6 +683,14 @@ def main() -> None:
             for k in args.candidate_k:
                 unit_summary_row[f"OverflowInstances_K{int(k)}"] = int(unit_window_df[f"OverflowInstances_K{int(k)}"].sum())
             unit_summary_rows.append(unit_summary_row)
+            if processed_idx == 1 or processed_idx == total_processed_units or processed_idx % stats_emit_step == 0:
+                emit_window_stats_progress(
+                    "窗口统计进度",
+                    (
+                        f"tag={tag}, unit={processed_idx}/{total_processed_units}, "
+                        f"window_rows={len(window_rows)}, voxel_samples={len(voxel_count_values)}"
+                    ),
+                )
 
         window_df = pd.DataFrame(window_rows) if window_rows else build_empty_window_df([int(v) for v in args.candidate_k])
         write_csv_utf8(window_df, size_dir / "window_stats.csv")
@@ -632,14 +744,17 @@ def main() -> None:
         "window_sizes": [int(v) for v in args.window_sizes],
         "overlap_ratio": float(args.overlap_ratio),
         "candidate_k": [int(v) for v in args.candidate_k],
+        "confidence_rule_version": ALL_TRAIN_CONFIDENCE_RULE_VERSION,
         "processed_unit_count": int(len(inventory_df)),
         "skipped_unit_count": int(len(skipped_units)),
+        "all_train_unit_count": int(inventory_df["RecommendTrain"].sum()) if not inventory_df.empty else 0,
         "phase1_train_unit_count": int(inventory_df["RecommendPhase1Train"].sum()) if not inventory_df.empty else 0,
         "phase2_train_unit_count": int(inventory_df["RecommendPhase2Train"].sum()) if not inventory_df.empty else 0,
         "reliability_counts": reliability_counts,
         "data_mode_counts": data_mode_counts,
         "window_summaries": window_summaries,
         "unit_inventory_csv": str(aggregate_dir / "unit_inventory.csv"),
+        "all_train_units_with_confidence_csv": str(aggregate_dir / "all_train_units_with_confidence.csv"),
         "phase1_train_units_csv": str(aggregate_dir / "phase1_train_units.csv"),
         "phase2_train_units_csv": str(aggregate_dir / "phase2_train_units.csv"),
         "window_size_comparison_csv": str(aggregate_dir / "window_size_comparison.csv"),

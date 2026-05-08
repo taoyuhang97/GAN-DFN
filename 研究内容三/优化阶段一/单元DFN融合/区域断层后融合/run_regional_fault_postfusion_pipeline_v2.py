@@ -21,6 +21,14 @@ from merge_unit_dfn_vtks import read_legacy_vtk_polygons
 from scale_merged_dfn_vtk_uniform import format_scale_suffix, scale_cell_data, scale_polygons_uniform
 
 
+def emit_fault_pipeline_progress(step_idx: int, total_steps: int, stage: str, detail: str | None = None) -> None:
+    prefix = f"[fault-pipeline] {step_idx}/{total_steps} {stage}"
+    if detail:
+        print(f"{prefix} | {detail}", flush=True)
+    else:
+        print(prefix, flush=True)
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="One-command fault post-fusion pipeline for an existing regional DFN VTK.",
@@ -101,7 +109,9 @@ def main() -> None:
     panel_dir = run_root / "01_fault_panels"
     surface_dir = run_root / "02_fault_surface"
     fuse_dir = run_root / "03_fault_fused"
+    total_steps = 4 if args.final_scale_factor is not None else 3
 
+    emit_fault_pipeline_progress(1, total_steps, "开始 fault panels", f"output_dir={panel_dir}")
     panel_summary = run_build_regional_fault_panels(
         fault_patches_root=Path(args.fault_patches_root),
         block_x_start=int(args.block_x_start),
@@ -115,6 +125,8 @@ def main() -> None:
         panel_strike_tol=float(args.panel_strike_tol),
         panel_dip_tol=float(args.panel_dip_tol),
     )
+    emit_fault_pipeline_progress(1, total_steps, "完成 fault panels", f"fault_panel_count={panel_summary['fault_panel_count']}")
+    emit_fault_pipeline_progress(2, total_steps, "开始 fault surface", f"output_dir={surface_dir}")
     surface_summary = run_build_fault_surface_fragments(
         fault_patches_root=Path(args.fault_patches_root),
         block_x_start=int(args.block_x_start),
@@ -132,6 +144,8 @@ def main() -> None:
         surface_display_offset_ms=float(args.surface_display_offset_ms),
         surface_max_fragment_area_ratio=float(args.surface_max_fragment_area_ratio),
     )
+    emit_fault_pipeline_progress(2, total_steps, "完成 fault surface", f"fragment_count={surface_summary['fragment_count']}")
+    emit_fault_pipeline_progress(3, total_steps, "开始 fault fused", f"output_dir={fuse_dir}")
     fuse_summary = run_fault_postfusion(
         input_vtk=Path(args.input_vtk),
         fault_panel_csv=Path(panel_summary["panel_csv"]),
@@ -145,16 +159,19 @@ def main() -> None:
         parallel_ratio=float(args.parallel_ratio),
         random_seed=int(args.random_seed),
     )
+    emit_fault_pipeline_progress(3, total_steps, "完成 fault fused", f"final_polygon_count={fuse_summary['final_polygon_count']}")
 
     scale_summary: dict[str, Any] | None = None
     final_vtk = str(fuse_summary["output_vtk"])
     if args.final_scale_factor is not None:
+        emit_fault_pipeline_progress(4, total_steps, "开始 uniform scale", f"scale_factor={float(args.final_scale_factor)}")
         scale_summary = run_uniform_scale_step(
             input_vtk=Path(fuse_summary["output_vtk"]),
             scale_factor=float(args.final_scale_factor),
             output_dir=run_root / "05_scaled",
         )
         final_vtk = str(scale_summary["output_vtk"])
+        emit_fault_pipeline_progress(4, total_steps, "完成 uniform scale", f"output_vtk={final_vtk}")
 
     pipeline_summary = {
         "run_root": str(run_root),

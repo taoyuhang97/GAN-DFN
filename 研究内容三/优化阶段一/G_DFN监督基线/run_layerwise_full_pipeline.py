@@ -15,11 +15,17 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from baseline_common import DEFAULT_LAYER_DENSITY_SOURCE, LAYER_DENSITY_SOURCE_CHOICES
+from baseline_common import (
+    compute_file_sha256,
+    DEFAULT_LAYER_DENSITY_SOURCE,
+    LAYER_DENSITY_SOURCE_CHOICES,
+)
+from layer_training_config import canonicalize_layer_surface_pair_key
 
 
 THIS_DIR = Path(__file__).resolve().parent
 ROOT_DIR = THIS_DIR.parent
+DEFAULT_LAYER_TRAINING_CONFIG_PY = THIS_DIR / "layerwise_training_plan_demo_v1.py"
 
 STATS_SCRIPT = ROOT_DIR / "GAN训练准备" / "窗口级实例统计" / "analyze_instance_window_distribution.py"
 PACKAGE_SCRIPT = ROOT_DIR / "GAN训练准备" / "训练样本打包" / "build_sparse_instance_gan_dataset.py"
@@ -32,7 +38,7 @@ POSTPROCESS_SCRIPT = ROOT_DIR / "单元DFN融合" / "run_regional_postprocess_mu
 FAULT_POSTFUSION_SCRIPT = ROOT_DIR / "单元DFN融合" / "区域断层后融合" / "run_regional_fault_postfusion_pipeline_v2.py"
 
 DEFAULT_PIPELINE_OUTPUT_ROOT = Path(
-    r"/data/shared/project-oil/wx数据/砂砾岩/优化阶段一/研究内容三/G_DFN监督基线/后台全流程"
+    r"/home/tyh/data/project-oil/砂砾岩/优化阶段一/研究内容三/G_DFN监督基线/后台全流程"
 )
 DEFAULT_UNIT_DFN_ROOT = Path(
     r"/data/shared/project-oil/wx数据/砂砾岩/优化阶段一/研究内容二/单元DFN构建/批量生成_新层位重拆分"
@@ -40,7 +46,7 @@ DEFAULT_UNIT_DFN_ROOT = Path(
 DEFAULT_TRACE_HEADER_CSV = Path(r"/data/shared/project-oil/wx数据/砂砾岩/研究内容一/trace_header_xy.csv")
 DEFAULT_SGY_FILE = Path(r"/data/shared/project-oil/wx数据/砂砾岩/psdm_final_time.sgy")
 DEFAULT_SURFACE_DIR = Path(r"/data/shared/project-oil/wx数据/砂砾岩/层位")
-DEFAULT_DOCX_PATH = Path(r"/data/shared/project-oil/wx数据/砂砾岩/优化阶段一/实验记录/实验记录20260328.docx")
+DEFAULT_DOCX_PATH = Path(r"/home/tyh/data/project-oil/砂砾岩/优化阶段一/实验记录/实验记录20260328.docx")
 DEFAULT_FAULT_PATCHES_ROOT = Path(
     r"/data/shared/project-oil/wx数据/砂砾岩/研究内容二/单元实验/fault_patches_out/patches"
 )
@@ -76,8 +82,8 @@ STAGE_DEPENDENCIES = {
     "split": ["package"],
     "train_layerwise": ["split"],
     "eval": ["split", "train_layerwise"],
-    "smoke_infer": ["train_layerwise"],
-    "full_infer": ["train_layerwise"],
+    "smoke_infer": ["train_layerwise", "eval"],
+    "full_infer": ["train_layerwise", "eval"],
     "merge": ["full_infer"],
     "postprocess": ["merge"],
     "fault_postfusion": ["postprocess"],
@@ -161,6 +167,53 @@ def same_path(value: Any, expected: Path) -> bool:
     left = resolve_path_text(value)
     right = str(Path(expected).resolve())
     return bool(left) and left == right
+
+
+def same_sha256(value: Any, expected_path: Path | str | None) -> bool:
+    expected_hash = str(value or "").strip()
+    actual_hash = compute_file_sha256(expected_path)
+    return bool(expected_hash) and bool(actual_hash) and expected_hash == actual_hash
+
+
+def build_expected_train_identity(args: argparse.Namespace) -> dict[str, Any]:
+    raw_layer_surface_pair_keys = getattr(args, "layer_surface_pair_key", None) or []
+    requested_layer_keys: list[str] = []
+    for raw_value in raw_layer_surface_pair_keys:
+        canonical_key = canonicalize_layer_surface_pair_key(raw_value)
+        if canonical_key:
+            requested_layer_keys.append(canonical_key)
+    return {
+        "requested_layer_surface_pair_keys": requested_layer_keys,
+        "layer_training_config_py": str(Path(args.layer_training_config_py).resolve()) if args.layer_training_config_py else "",
+        "layer_training_config_sha256": compute_file_sha256(args.layer_training_config_py),
+        "slots_per_voxel": int(args.slots_per_voxel),
+        "base_channels": int(args.base_channels),
+        "batch_size": int(args.batch_size),
+        "num_workers": int(args.num_workers),
+        "torch_num_threads": int(args.torch_num_threads),
+        "torch_num_interop_threads": int(args.torch_num_interop_threads),
+        "epochs": int(args.epochs),
+        "learning_rate": float(args.learning_rate),
+        "weight_decay": float(args.weight_decay),
+        "seed": int(args.seed),
+        "train_limit_samples": int(args.train_limit_samples) if args.train_limit_samples is not None else None,
+        "val_limit_samples": int(args.val_limit_samples) if args.val_limit_samples is not None else None,
+        "max_train_steps": int(args.max_train_steps) if args.max_train_steps is not None else None,
+        "max_val_steps": int(args.max_val_steps) if args.max_val_steps is not None else None,
+        "disable_amp": bool(args.disable_amp),
+        "no_cache_raw_packages": bool(args.no_cache_raw_packages),
+        "no_progress": bool(args.no_progress),
+        "center_positive_weight": float(args.center_positive_weight),
+        "center_negative_weight": float(args.center_negative_weight),
+        "center_focal_gamma": float(args.center_focal_gamma),
+        "count_positive_weight": float(args.count_positive_weight),
+        "count_negative_weight": float(args.count_negative_weight),
+        "center_loss_weight": float(args.center_loss_weight),
+        "count_loss_weight": float(args.count_loss_weight),
+        "calibration_center_thresholds": [float(value) for value in args.calibration_center_thresholds],
+        "calibration_count_thresholds": [float(value) for value in args.calibration_count_thresholds],
+        "calibration_window_weight": float(args.calibration_window_weight),
+    }
 
 
 def load_state(state_path: Path, run_name: str, args: argparse.Namespace) -> dict[str, Any]:
@@ -270,6 +323,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--val-unit-count", type=int)
     parser.add_argument("--test-unit-count", type=int)
     parser.add_argument("--fixed-unit-split-csv", type=Path)
+    parser.add_argument("--layer-training-config-py", type=Path, default=DEFAULT_LAYER_TRAINING_CONFIG_PY)
     parser.add_argument("--split-seed", type=int, default=20260330)
 
     parser.add_argument("--gpu-ids", nargs="+", type=int, default=[0, 1, 2, 3])
@@ -574,12 +628,32 @@ def validate_split(paths: PipelinePaths, args: argparse.Namespace) -> tuple[bool
     payload = read_json(summary_path)
     if payload is None:
         return False, f"missing_or_invalid_json: {summary_path}"
+    dataset_manifest_csv = paths.dataset_run_dir / "aggregated" / "sample_manifest.csv"
+    dataset_summary_json = paths.dataset_run_dir / "aggregated" / "dataset_summary.json"
     for split_name in ("train", "val", "test"):
         manifest_path = paths.split_run_dir / f"{split_name}_manifest.csv"
         if not manifest_path.exists():
             return False, f"missing_manifest: {manifest_path}"
+        if not same_sha256(payload.get(f"{split_name}_manifest_sha256", ""), manifest_path):
+            return False, f"{split_name}_manifest_sha256_mismatch"
     if not same_path(payload.get("dataset_run_dir", ""), paths.dataset_run_dir):
         return False, "dataset_run_dir_mismatch"
+    if not same_path(payload.get("dataset_manifest_csv", ""), dataset_manifest_csv):
+        return False, "dataset_manifest_csv_mismatch"
+    if not same_sha256(payload.get("dataset_manifest_sha256", ""), dataset_manifest_csv):
+        return False, "dataset_manifest_sha256_mismatch"
+    payload_dataset_summary_json = str(payload.get("dataset_summary_json", "")).strip()
+    if dataset_summary_json.exists():
+        if not same_path(payload_dataset_summary_json, dataset_summary_json):
+            return False, "dataset_summary_json_mismatch"
+        if not same_sha256(payload.get("dataset_summary_sha256", ""), dataset_summary_json):
+            return False, "dataset_summary_sha256_mismatch"
+    expected_layer_training_config_py = str(Path(args.layer_training_config_py).resolve()) if args.layer_training_config_py else None
+    if payload.get("layer_training_config_py") != expected_layer_training_config_py:
+        return False, "layer_training_config_py_mismatch"
+    expected_layer_training_config_sha256 = compute_file_sha256(args.layer_training_config_py) if args.layer_training_config_py else ""
+    if str(payload.get("layer_training_config_sha256", "")).strip() != expected_layer_training_config_sha256:
+        return False, "layer_training_config_sha256_mismatch"
     if int(payload.get("seed", -1)) != int(args.split_seed):
         return False, "seed_mismatch"
     if float(payload.get("train_ratio", -1.0)) != float(args.train_ratio):
@@ -598,6 +672,14 @@ def validate_split(paths: PipelinePaths, args: argparse.Namespace) -> tuple[bool
     expected_fixed_unit_split_csv = str(Path(args.fixed_unit_split_csv).resolve()) if args.fixed_unit_split_csv else None
     if payload.get("fixed_unit_split_csv") != expected_fixed_unit_split_csv:
         return False, "fixed_unit_split_csv_mismatch"
+    expected_fixed_unit_split_sha256 = compute_file_sha256(args.fixed_unit_split_csv) if args.fixed_unit_split_csv else ""
+    if str(payload.get("fixed_unit_split_csv_sha256", "")).strip() != expected_fixed_unit_split_sha256:
+        return False, "fixed_unit_split_csv_sha256_mismatch"
+    unit_split_csv = paths.split_run_dir / "unit_split.csv"
+    if not unit_split_csv.exists():
+        return False, f"missing_unit_split_csv: {unit_split_csv}"
+    if not same_sha256(payload.get("unit_split_csv_sha256", ""), unit_split_csv):
+        return False, "unit_split_csv_sha256_mismatch"
     train_windows = int(payload.get("train_window_count", 0))
     val_windows = int(payload.get("val_window_count", 0))
     test_windows = int(payload.get("test_window_count", 0))
@@ -615,6 +697,19 @@ def validate_train(paths: PipelinePaths, args: argparse.Namespace) -> tuple[bool
         return False, "split_run_dir_mismatch"
     if metadata and not same_path(metadata.get("unit_dfn_root", ""), Path(args.unit_dfn_root)):
         return False, "unit_dfn_root_mismatch"
+    split_summary_json = paths.split_run_dir / "split_summary.json"
+    if not same_path(metadata.get("split_summary_json", ""), split_summary_json):
+        return False, "split_summary_json_mismatch"
+    if not same_sha256(metadata.get("split_summary_sha256", ""), split_summary_json):
+        return False, "split_summary_sha256_mismatch"
+    for split_name in ("train", "val", "test"):
+        manifest_path = paths.split_run_dir / f"{split_name}_manifest.csv"
+        if not same_path(metadata.get(f"{split_name}_manifest_csv", ""), manifest_path):
+            return False, f"{split_name}_manifest_csv_mismatch"
+        if not same_sha256(metadata.get(f"{split_name}_manifest_sha256", ""), manifest_path):
+            return False, f"{split_name}_manifest_sha256_mismatch"
+    if metadata.get("training_identity") != build_expected_train_identity(args):
+        return False, "training_identity_mismatch"
     models = registry_payload.get("models", {}) if isinstance(registry_payload, dict) else {}
     if not isinstance(models, dict) or not models:
         return False, "empty_registry_models"
@@ -642,8 +737,12 @@ def validate_eval(paths: PipelinePaths, args: argparse.Namespace) -> tuple[bool,
     expected_manifest = paths.split_run_dir / f"{args.eval_split_name}_manifest.csv"
     if not same_path(payload.get("layer_model_registry_py", ""), paths.train_registry_py):
         return False, "layer_model_registry_mismatch"
+    if not same_sha256(payload.get("layer_model_registry_sha256", ""), paths.train_registry_py):
+        return False, "layer_model_registry_sha256_mismatch"
     if not same_path(payload.get("split_manifest_csv", ""), expected_manifest):
         return False, "split_manifest_mismatch"
+    if not same_sha256(payload.get("split_manifest_sha256", ""), expected_manifest):
+        return False, "split_manifest_sha256_mismatch"
     if str(payload.get("decode_mode", "")) != str(args.eval_decode_mode):
         return False, "decode_mode_mismatch"
     if int(payload.get("relaxed_min_count", -1)) != int(args.eval_relaxed_min_count):
@@ -662,6 +761,15 @@ def validate_eval(paths: PipelinePaths, args: argparse.Namespace) -> tuple[bool,
         return False, "layer_density_calibration_min_scale_mismatch"
     if float(payload.get("layer_density_calibration_max_scale", -1.0)) != float(args.layer_density_calibration_max_scale):
         return False, "layer_density_calibration_max_scale_mismatch"
+    input_layer_density_calibration_json = getattr(args, "layer_density_calibration_json", None)
+    if input_layer_density_calibration_json is not None:
+        if not same_path(payload.get("input_layer_density_calibration_json", ""), Path(input_layer_density_calibration_json)):
+            return False, "input_layer_density_calibration_json_mismatch"
+        if not same_sha256(
+            payload.get("input_layer_density_calibration_json_sha256", ""),
+            Path(input_layer_density_calibration_json),
+        ):
+            return False, "input_layer_density_calibration_json_sha256_mismatch"
     evaluated = int(payload.get("evaluated_unit_count", 0))
     if evaluated <= 0:
         return False, "evaluated_unit_count<=0"
@@ -689,6 +797,8 @@ def validate_production_run(
         return False, f"missing_selected_units_csv: {selected_units_csv}"
     if not same_path(payload.get("layer_model_registry_py", ""), registry_py):
         return False, "layer_model_registry_mismatch"
+    if not same_sha256(payload.get("layer_model_registry_sha256", ""), registry_py):
+        return False, "layer_model_registry_sha256_mismatch"
     if not same_path(payload.get("unit_dfn_root", ""), Path(args.unit_dfn_root)):
         return False, "unit_dfn_root_mismatch"
     if not same_path(payload.get("surface_dir", ""), Path(args.surface_dir)):
@@ -728,6 +838,10 @@ def validate_production_run(
     if expected_calibration_json.exists():
         if not same_path(payload_calibration_json, expected_calibration_json):
             return False, "layer_density_calibration_json_mismatch"
+        if not same_sha256(payload.get("layer_density_calibration_json_sha256", ""), expected_calibration_json):
+            return False, "layer_density_calibration_json_sha256_mismatch"
+    elif payload_calibration_json:
+        return False, "unexpected_layer_density_calibration_json"
     if float(payload.get("layer_density_calibration_min_scale", -1.0)) != float(args.layer_density_calibration_min_scale):
         return False, "layer_density_calibration_min_scale_mismatch"
     if float(payload.get("layer_density_calibration_max_scale", -1.0)) != float(args.layer_density_calibration_max_scale):
@@ -965,6 +1079,7 @@ def build_split_args(paths: PipelinePaths, args: argparse.Namespace) -> list[str
         "--output-root", str(paths.split_output_root.resolve()),
         "--run-name", "split",
         "--docx-path", str(Path(args.docx_path).resolve()),
+        "--layer-training-config-py", str(Path(args.layer_training_config_py).resolve()),
         "--train-ratio", str(float(args.train_ratio)),
         "--val-ratio", str(float(args.val_ratio)),
         "--seed", str(int(args.split_seed)),
@@ -988,6 +1103,7 @@ def build_train_args(paths: PipelinePaths, args: argparse.Namespace, overwrite_e
         "--run-name-prefix", "layerwise_baseline",
         "--registry-output-py", str(paths.train_registry_py.resolve()),
         "--docx-path", str(Path(args.docx_path).resolve()),
+        "--layer-training-config-py", str(Path(args.layer_training_config_py).resolve()),
         "--gpu-ids", *[str(int(v)) for v in args.gpu_ids],
         "--slots-per-voxel", str(int(args.slots_per_voxel)),
         "--base-channels", str(int(args.base_channels)),

@@ -9,6 +9,7 @@ from typing import Any
 import numpy as np
 import pandas as pd
 import torch
+from tqdm.auto import tqdm
 
 from baseline_common import (
     DEFAULT_LAYER_DENSITY_SOURCE,
@@ -24,8 +25,10 @@ from baseline_common import (
     append_lines_to_docx,
     build_unit_layer_segment_table,
     build_window_grid,
+    compute_file_sha256,
     decode_window_predictions_with_optional_second_pass,
     dedupe_patch_df,
+    load_layer_density_calibration_payload,
     load_sample_manifest,
     prepare_unit_context,
     read_csv_utf8,
@@ -77,6 +80,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--disable-layer-density-control", action="store_true")
     parser.add_argument("--layer-density-source", type=str, default=DEFAULT_LAYER_DENSITY_SOURCE, choices=list(LAYER_DENSITY_SOURCE_CHOICES))
     parser.add_argument("--layer-density-scale", type=float, default=1.0)
+    parser.add_argument("--layer-density-calibration-json", type=Path)
     parser.add_argument("--layer-density-calibration-min-scale", type=float, default=0.25)
     parser.add_argument("--layer-density-calibration-max-scale", type=float, default=4.0)
     parser.add_argument("--device", type=str, default="auto")
@@ -182,6 +186,7 @@ def main() -> None:
         raise ValueError("please provide --checkpoint or --layer-model-registry-py")
     layer_surface_pair_key = str(args.layer_surface_pair_key).strip() if args.layer_surface_pair_key else ""
     registry_payload = load_layer_model_registry(Path(args.layer_model_registry_py)) if args.layer_model_registry_py else None
+    layer_density_calibration_payload = load_layer_density_calibration_payload(args.layer_density_calibration_json)
     model_cache: dict[str, tuple[SparseInstanceBaselineUNet, dict[str, Any]]] = {}
 
     def get_or_load_model(checkpoint_path: Path) -> tuple[SparseInstanceBaselineUNet, dict[str, Any]]:
@@ -193,6 +198,9 @@ def main() -> None:
     split_manifest_csv = Path(args.split_run_dir) / f"{args.split_name}_manifest.csv"
     if not split_manifest_csv.exists():
         raise FileNotFoundError(f"split manifest not found: {split_manifest_csv}")
+    split_manifest_sha256 = compute_file_sha256(split_manifest_csv)
+    layer_model_registry_sha256 = compute_file_sha256(args.layer_model_registry_py) if args.layer_model_registry_py else ""
+    input_layer_density_calibration_json_sha256 = compute_file_sha256(args.layer_density_calibration_json)
     manifest_df = ensure_unit_layer_segment_key_column(
         ensure_layer_surface_pair_key_column(read_csv_utf8(split_manifest_csv), key_col=LAYER_SURFACE_PAIR_KEY_COL),
         key_col=UNIT_LAYER_SEGMENT_KEY_COL,
@@ -208,6 +216,14 @@ def main() -> None:
     manifest_df = manifest_df.reset_index(drop=True)
     if manifest_df.empty:
         raise ValueError("evaluation manifest is empty")
+    print(
+        (
+            "[eval] start window inference | "
+            f"split={args.split_name}, total_windows={len(manifest_df)}, "
+            f"approx_unit_count={manifest_df['UnitID'].astype(str).nunique()}, device={device}"
+        ),
+        flush=True,
+    )
 
     run_dir = Path(args.output_root) / args.run_name
     units_dir = run_dir / "units"
@@ -220,7 +236,13 @@ def main() -> None:
     per_unit_patch_frames: dict[str, list[pd.DataFrame]] = {}
     unit_layer_rows: list[dict[str, Any]] = []
 
-    for _, row in manifest_df.iterrows():
+    window_progress = tqdm(
+        manifest_df.iterrows(),
+        total=len(manifest_df),
+        desc="Eval windows",
+        dynamic_ncols=True,
+    )
+    for _, row in window_progress:
         unit_id = str(row["UnitID"])
         if unit_id not in unit_context_cache:
             unit_context_cache[unit_id] = prepare_unit_context(unit_id=unit_id, unit_dfn_root=args.unit_dfn_root)
@@ -264,7 +286,7 @@ def main() -> None:
             dedupe_azimuth_tol_deg=float(args.dedupe_azimuth_tol_deg),
             dedupe_dip_tol_deg=float(args.dedupe_dip_tol_deg),
             layer_surface_pair_key=layer_key,
-            calibration_payload=None,
+            calibration_payload=layer_density_calibration_payload,
         )
         unit_layer_segment_key = build_unit_layer_segment_key_from_row(row)
         if not window_patch_df.empty:
@@ -322,6 +344,15 @@ def main() -> None:
             window_dir.mkdir(parents=True, exist_ok=True)
             write_csv_utf8(window_patch_df, window_dir / f"W{int(row['WindowIndex']):03d}_predicted_patches.csv")
             write_csv_utf8(decoded_df, window_dir / f"W{int(row['WindowIndex']):03d}_decoded_instances.csv")
+        window_progress.set_postfix(unit=unit_id, pred=int(len(window_patch_df)))
+    window_progress.close()
+    print(
+        (
+            "[eval] window inference completed | "
+            f"processed_windows={len(predicted_window_rows)}, unique_units={len(unit_context_cache)}"
+        ),
+        flush=True,
+    )
 
     write_csv_utf8(pd.DataFrame(predicted_window_rows), aggregated_dir / "window_prediction_summary.csv")
 
@@ -330,7 +361,14 @@ def main() -> None:
         invert_time=not bool(args.vtk_no_invert_time),
     )
     unit_rows: list[dict[str, Any]] = []
-    for unit_id, unit_context in unit_context_cache.items():
+    print(f"[eval] start unit aggregation | total_units={len(unit_context_cache)}", flush=True)
+    unit_progress = tqdm(
+        unit_context_cache.items(),
+        total=len(unit_context_cache),
+        desc="Eval units",
+        dynamic_ncols=True,
+    )
+    for unit_id, unit_context in unit_progress:
         unit_dir = units_dir / unit_id
         unit_dir.mkdir(parents=True, exist_ok=True)
         predicted_all = pd.concat(per_unit_patch_frames.get(unit_id, []), ignore_index=True, sort=False) if per_unit_patch_frames.get(unit_id) else pd.DataFrame()
@@ -348,6 +386,9 @@ def main() -> None:
             registry_payload=registry_payload,
             density_source=str(args.layer_density_source),
             density_scale=float(args.layer_density_scale),
+            calibration_payload=layer_density_calibration_payload,
+            calibration_min_scale=float(args.layer_density_calibration_min_scale),
+            calibration_max_scale=float(args.layer_density_calibration_max_scale),
             enabled=not bool(args.disable_layer_density_control),
         )
         ground_truth = unit_context["patch_df"].copy()
@@ -489,6 +530,15 @@ def main() -> None:
             )
         unit_rows.append(unit_summary)
         write_json(unit_dir / "unit_evaluation_summary.json", unit_summary)
+        unit_progress.set_postfix(unit=unit_id, gt=int(len(ground_truth)), pred=int(len(dedup_pred)))
+    unit_progress.close()
+    print(
+        (
+            "[eval] unit aggregation completed | "
+            f"evaluated_units={len(unit_rows)}, layer_rows={len(unit_layer_rows)}"
+        ),
+        flush=True,
+    )
 
     unit_eval_df = pd.DataFrame(unit_rows)
     write_csv_utf8(unit_eval_df, aggregated_dir / "unit_evaluation.csv")
@@ -669,12 +719,15 @@ def main() -> None:
         }
     )
     write_json(layer_calibration_json, layer_calibration_payload)
+    layer_density_calibration_json_sha256 = compute_file_sha256(layer_calibration_json)
     aggregate_summary = {
         "run_dir": str(run_dir),
         "checkpoint": str(args.checkpoint) if args.checkpoint else "",
         "layer_model_registry_py": str(args.layer_model_registry_py) if args.layer_model_registry_py else "",
+        "layer_model_registry_sha256": layer_model_registry_sha256,
         "layer_surface_pair_key": layer_surface_pair_key,
         "split_manifest_csv": str(split_manifest_csv),
+        "split_manifest_sha256": split_manifest_sha256,
         "device": str(device),
         "evaluated_unit_count": int(unit_eval_df["UnitID"].nunique()) if not unit_eval_df.empty else 0,
         "evaluated_window_count": int(len(manifest_df)),
@@ -695,10 +748,13 @@ def main() -> None:
         "layer_density_control_enabled": bool(not args.disable_layer_density_control),
         "layer_density_source": str(args.layer_density_source),
         "layer_density_scale": float(args.layer_density_scale),
+        "input_layer_density_calibration_json": str(args.layer_density_calibration_json) if args.layer_density_calibration_json else "",
+        "input_layer_density_calibration_json_sha256": input_layer_density_calibration_json_sha256,
         "layer_density_calibration_min_scale": float(args.layer_density_calibration_min_scale),
         "layer_density_calibration_max_scale": float(args.layer_density_calibration_max_scale),
         "layer_density_evaluation_csv": str(layer_eval_csv.resolve()),
         "layer_density_calibration_json": str(layer_calibration_json.resolve()),
+        "layer_density_calibration_json_sha256": layer_density_calibration_json_sha256,
     }
     summary_path = aggregated_dir / "evaluation_summary.json"
     write_json(summary_path, aggregate_summary)
@@ -727,6 +783,7 @@ def main() -> None:
             f"layer_density_control_enabled: {aggregate_summary['layer_density_control_enabled']}",
             f"layer_density_source: {aggregate_summary['layer_density_source']}",
             f"layer_density_scale: {aggregate_summary['layer_density_scale']}",
+            f"input_layer_density_calibration_json: {aggregate_summary['input_layer_density_calibration_json'] if aggregate_summary['input_layer_density_calibration_json'] else 'None'}",
             f"layer_density_calibration_min_scale: {aggregate_summary['layer_density_calibration_min_scale']}",
             f"layer_density_calibration_max_scale: {aggregate_summary['layer_density_calibration_max_scale']}",
             f"mean_ground_truth_patch_count: {aggregate_summary['mean_ground_truth_patch_count']}",

@@ -73,6 +73,16 @@ from layer_model_registry import (
 )
 
 
+def normalize_sample_confidence(value: Any, default: float = 1.0) -> float:
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):
+        numeric = float(default)
+    if not np.isfinite(numeric):
+        numeric = float(default)
+    return float(np.clip(numeric, 0.0, 1.0))
+
+
 class SparseWindowBaselineDataset(Dataset):
     def __init__(
         self,
@@ -130,6 +140,10 @@ class SparseWindowBaselineDataset(Dataset):
         package_path = Path(str(row["PackagePath"]))
         sparse_arrays = self._load_sparse_package(package_path)
         dense = build_dense_targets_from_sparse_arrays(sparse_arrays, slots_per_voxel=self.slots_per_voxel)
+        sample_confidence = normalize_sample_confidence(
+            row.get("SampleConfidence", row.get("UnitConfidence", 1.0)),
+            default=1.0,
+        )
         return {
             "input_features": torch.from_numpy(dense["input_features"]).float(),
             "valid_z_mask": torch.from_numpy(dense["valid_z_mask"]).float(),
@@ -138,6 +152,7 @@ class SparseWindowBaselineDataset(Dataset):
             "weight_target": torch.from_numpy(dense["weight_target"]).float(),
             "count_target": torch.from_numpy(dense["count_target"]).float(),
             "overflow_instance_count": torch.from_numpy(dense["overflow_instance_count"]).long(),
+            "sample_confidence": torch.tensor(sample_confidence, dtype=torch.float32),
             "meta": {
                 "SampleID": str(row["SampleID"]),
                 "UnitID": str(row["UnitID"]),
@@ -158,6 +173,7 @@ def collate_batch(batch: list[dict[str, Any]]) -> dict[str, Any]:
         "weight_target",
         "count_target",
         "overflow_instance_count",
+        "sample_confidence",
     ]
     collated = {key: torch.stack([item[key] for item in batch], dim=0) for key in tensor_keys}
     collated["meta"] = [item["meta"] for item in batch]
@@ -197,6 +213,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--count-negative-weight", type=float, default=0.25)
     parser.add_argument("--center-loss-weight", type=float, default=2.5)
     parser.add_argument("--count-loss-weight", type=float, default=1.0)
+    parser.add_argument("--area-loss-weight", type=float, default=0.10)
     parser.add_argument(
         "--calibration-center-thresholds",
         nargs="+",
@@ -316,6 +333,7 @@ def build_loss_config(args: argparse.Namespace) -> dict[str, float]:
         "count_negative_weight": float(max(args.count_negative_weight, 1e-6)),
         "center_loss_weight": float(max(args.center_loss_weight, 0.0)),
         "count_loss_weight": float(max(args.count_loss_weight, 0.0)),
+        "area_loss_weight": float(max(args.area_loss_weight, 0.0)),
     }
 
 
@@ -334,9 +352,11 @@ def compute_loss_dict(
     weight_target = batch["weight_target"]
     count_target = batch["count_target"]
     valid_z_mask = batch["valid_z_mask"]
+    sample_confidence = batch["sample_confidence"]
 
     batch_size, slots_per_voxel, nx, ny, nz = center_target.shape
     valid_center = valid_z_mask.view(batch_size, 1, 1, 1, nz)
+    sample_confidence_weight = torch.clamp(sample_confidence.view(batch_size, 1, 1, 1, 1), min=0.0, max=1.0)
     center_prob = torch.sigmoid(outputs["center_logits"])
     positive_center_mask = center_target > 0.5
     center_alpha = torch.where(
@@ -347,7 +367,7 @@ def compute_loss_dict(
     center_loss_map = F.binary_cross_entropy_with_logits(outputs["center_logits"], center_target, reduction="none")
     center_pt = torch.where(positive_center_mask, center_prob, 1.0 - center_prob)
     center_focal = torch.pow(1.0 - center_pt, float(loss_config["center_focal_gamma"]))
-    center_loss = weighted_mean(center_loss_map * center_focal, valid_center * center_alpha)
+    center_loss = weighted_mean(center_loss_map * center_focal, valid_center * center_alpha * sample_confidence_weight)
 
     count_pred = outputs["count_pred"]
     count_mask = valid_z_mask.view(batch_size, 1, 1, 1, nz)
@@ -358,10 +378,17 @@ def compute_loss_dict(
         * (1.0 + torch.clamp(count_target, min=0.0, max=4.0) / 4.0),
         torch.full_like(count_target, float(loss_config["count_negative_weight"])),
     )
-    count_loss = weighted_mean(F.smooth_l1_loss(count_pred, count_target, reduction="none"), count_mask * count_alpha)
+    count_loss = weighted_mean(
+        F.smooth_l1_loss(count_pred, count_target, reduction="none"),
+        count_mask * count_alpha * sample_confidence_weight,
+    )
 
     geom_mask_scalar = center_target * valid_center
-    geom_mask_weight = geom_mask_scalar * torch.where(weight_target > 0.0, weight_target, torch.ones_like(weight_target))
+    geom_mask_weight = (
+        geom_mask_scalar
+        * torch.where(weight_target > 0.0, weight_target, torch.ones_like(weight_target))
+        * sample_confidence_weight
+    )
     geom_pred = outputs["geom_pred"]
 
     offset_loss = weighted_mean(
@@ -372,6 +399,12 @@ def compute_loss_dict(
     udir_loss = cosine_loss(geom_pred[:, :, 6:9], geom_target[:, :, 6:9], geom_mask_weight)
     size_loss = weighted_mean(
         F.smooth_l1_loss(geom_pred[:, :, 9:11], geom_target[:, :, 9:11], reduction="none").mean(dim=2),
+        geom_mask_weight,
+    )
+    pred_patch_area = torch.clamp(geom_pred[:, :, 9], min=0.0) * torch.clamp(geom_pred[:, :, 10], min=0.0)
+    target_patch_area = torch.clamp(geom_target[:, :, 9], min=0.0) * torch.clamp(geom_target[:, :, 10], min=0.0)
+    area_loss = weighted_mean(
+        F.smooth_l1_loss(torch.log1p(pred_patch_area), torch.log1p(target_patch_area), reduction="none"),
         geom_mask_weight,
     )
     confidence_loss = weighted_mean(
@@ -386,6 +419,7 @@ def compute_loss_dict(
         + 0.4 * normal_loss
         + 0.4 * udir_loss
         + 0.15 * size_loss
+        + float(loss_config["area_loss_weight"]) * area_loss
         + 0.10 * confidence_loss
     )
 
@@ -408,10 +442,12 @@ def compute_loss_dict(
         "loss_normal": float(normal_loss.detach().cpu()),
         "loss_udir": float(udir_loss.detach().cpu()),
         "loss_size": float(size_loss.detach().cpu()),
+        "loss_area": float(area_loss.detach().cpu()),
         "loss_confidence": float(confidence_loss.detach().cpu()),
         "center_precision": precision,
         "center_recall": recall,
         "count_mae": count_mae,
+        "sample_confidence_mean": float(sample_confidence.mean().detach().cpu()),
     }
     return total_loss, metrics
 

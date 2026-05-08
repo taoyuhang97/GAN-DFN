@@ -29,6 +29,13 @@ SURFACE_FACET_NORMAL_TOL_DEG = 8.0
 SURFACE_FACET_MIN_CELLS = 1
 
 
+def emit_fault_surface_progress(stage: str, detail: str | None = None) -> None:
+    if detail:
+        print(f"[fault-surface] {stage} | {detail}", flush=True)
+    else:
+        print(f"[fault-surface] {stage}", flush=True)
+
+
 def extract_surface_clean_tri(mesh: pv.DataSet) -> pv.PolyData:
     surface = mesh.extract_surface(algorithm="dataset_surface")
     surface = surface.clean().triangulate()
@@ -677,6 +684,10 @@ def run_build_fault_surface_fragments(
 ) -> dict[str, Any]:
     run_dir = Path(output_root) / str(run_name)
     run_dir.mkdir(parents=True, exist_ok=True)
+    emit_fault_surface_progress(
+        "开始构建断层 surface fragments",
+        f"region=BX{min(block_x_start, block_x_end)}-{max(block_x_start, block_x_end)}, BY{min(block_y_start, block_y_end)}-{max(block_y_start, block_y_end)}",
+    )
 
     patch_paths = collect_region_fault_patch_paths(
         fault_patches_root=Path(fault_patches_root),
@@ -685,20 +696,34 @@ def run_build_fault_surface_fragments(
         block_y_start=int(block_y_start),
         block_y_end=int(block_y_end),
     )
+    emit_fault_surface_progress("完成目标断层 patch 收集", f"selected_patch_count={len(patch_paths)}")
     component_bundles: list[dict[str, Any]] = []
     component_areas: list[float] = []
-    for patch_path in patch_paths:
+    total_patch_count = len(patch_paths)
+    patch_emit_step = max(1, total_patch_count // 20) if total_patch_count > 0 else 1
+    for patch_idx, patch_path in enumerate(patch_paths, start=1):
         bundles = extract_patch_component_bundles(Path(patch_path))
         component_bundles.extend(bundles)
         for bundle in bundles:
             component_area = float(bundle["component_local"].area)
             if component_area >= float(surface_min_fragment_area):
                 component_areas.append(component_area)
+        if patch_idx == 1 or patch_idx == total_patch_count or patch_idx % patch_emit_step == 0:
+            emit_fault_surface_progress(
+                "断层 patch 拆面进度",
+                f"{patch_idx}/{total_patch_count}, component_bundle_count={len(component_bundles)}",
+            )
     surface_area_cap_base = float(min(component_areas)) if component_areas else float(surface_min_fragment_area)
     surface_area_cap = max(float(surface_area_cap_base) * float(surface_max_fragment_area_ratio), float(surface_min_fragment_area))
+    emit_fault_surface_progress(
+        "fragment 面积上限确定完成",
+        f"surface_area_cap_base={surface_area_cap_base:.4f}, surface_area_cap={surface_area_cap:.4f}",
+    )
 
     fragment_records: list[dict[str, Any]] = []
-    for bundle in component_bundles:
+    total_bundle_count = len(component_bundles)
+    bundle_emit_step = max(1, total_bundle_count // 20) if total_bundle_count > 0 else 1
+    for bundle_idx, bundle in enumerate(component_bundles, start=1):
         fragment_records.extend(
             build_fragment_records_from_bundle(
                 bundle=bundle,
@@ -707,6 +732,11 @@ def run_build_fault_surface_fragments(
                 surface_area_cap=float(surface_area_cap),
             )
         )
+        if bundle_idx == 1 or bundle_idx == total_bundle_count or bundle_idx % bundle_emit_step == 0:
+            emit_fault_surface_progress(
+                "fragment 生成进度",
+                f"{bundle_idx}/{total_bundle_count}, fragment_count={len(fragment_records)}",
+            )
     for global_idx, record in enumerate(fragment_records, start=1):
         record["meta"]["FaultSurfaceFragmentID"] = int(global_idx)
 
@@ -717,6 +747,10 @@ def run_build_fault_surface_fragments(
     write_csv_utf8(summary_df, output_csv)
 
     payload = build_surface_vtk_payload(fragment_records)
+    emit_fault_surface_progress(
+        "surface VTK payload 构建完成",
+        f"fragment_count={len(fragment_records)}, polygon_count={len(payload['polygons'])}",
+    )
     write_legacy_vtk_polygons_preserve_patch_area(
         path=output_vtk,
         title="regional_fault_surface_fragments",
@@ -756,6 +790,7 @@ def run_build_fault_surface_fragments(
     summary_path = run_dir / "fault_surface_fragments_summary.json"
     write_json(summary_path, summary)
     summary["summary_json"] = str(summary_path)
+    emit_fault_surface_progress("surface fragments 导出完成", f"surface_vtk={output_vtk}")
     return summary
 
 

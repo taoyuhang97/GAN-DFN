@@ -14,6 +14,7 @@ from typing import Any
 import pandas as pd
 
 from baseline_common import (
+    compute_file_sha256,
     DEFAULT_DOCX_PATH,
     DEFAULT_OUTPUT_ROOT,
     append_lines_to_docx,
@@ -29,10 +30,24 @@ from layer_model_registry import (
     summarize_manifest_by_layer_surface_pair,
     write_layer_model_registry_py,
 )
+from layer_training_config import canonicalize_layer_surface_pair_key, load_layer_training_config
 
 
 THIS_DIR = Path(__file__).resolve().parent
 TRAIN_SCRIPT = THIS_DIR / "train_supervised_baseline.py"
+DEFAULT_LAYER_TRAINING_CONFIG_PY = THIS_DIR / "layerwise_training_plan_demo_v1.py"
+
+
+def format_running_jobs(running_jobs: list[dict[str, Any]], limit: int = 6) -> str:
+    if not running_jobs:
+        return "none"
+    items = [
+        f"{job['layer_surface_pair_key']}@gpu{job['gpu_id']}"
+        for job in running_jobs[:limit]
+    ]
+    if len(running_jobs) > limit:
+        items.append(f"...(+{len(running_jobs) - limit})")
+    return ", ".join(items)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -43,6 +58,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--run-name-prefix", type=str, default="layerwise_baseline")
     parser.add_argument("--registry-output-py", type=Path)
     parser.add_argument("--docx-path", type=Path, default=DEFAULT_DOCX_PATH)
+    parser.add_argument("--layer-training-config-py", type=Path, default=DEFAULT_LAYER_TRAINING_CONFIG_PY)
     parser.add_argument("--gpu-ids", nargs="+", type=int, default=[0, 1, 2, 3])
     parser.add_argument("--max-concurrent-jobs", type=int)
     parser.add_argument("--layer-surface-pair-key", nargs="+")
@@ -72,6 +88,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--count-negative-weight", type=float, default=0.25)
     parser.add_argument("--center-loss-weight", type=float, default=2.5)
     parser.add_argument("--count-loss-weight", type=float, default=1.0)
+    parser.add_argument("--area-loss-weight", type=float, default=0.10)
     parser.add_argument(
         "--calibration-center-thresholds",
         nargs="+",
@@ -95,7 +112,75 @@ def load_split_manifest(split_run_dir: Path, split_name: str) -> pd.DataFrame:
     return ensure_layer_surface_pair_key_column(pd.read_csv(manifest_path, encoding="utf-8-sig"), key_col=LAYER_SURFACE_PAIR_KEY_COL)
 
 
-def build_layer_jobs(args: argparse.Namespace) -> tuple[list[dict[str, Any]], pd.DataFrame]:
+def build_base_training_config(args: argparse.Namespace) -> dict[str, Any]:
+    return {
+        "slots_per_voxel": int(args.slots_per_voxel),
+        "base_channels": int(args.base_channels),
+        "batch_size": int(args.batch_size),
+        "num_workers": int(args.num_workers),
+        "torch_num_threads": int(args.torch_num_threads),
+        "torch_num_interop_threads": int(args.torch_num_interop_threads),
+        "epochs": int(args.epochs),
+        "learning_rate": float(args.learning_rate),
+        "weight_decay": float(args.weight_decay),
+        "seed": int(args.seed),
+        "train_limit_samples": int(args.train_limit_samples) if args.train_limit_samples is not None else None,
+        "val_limit_samples": int(args.val_limit_samples) if args.val_limit_samples is not None else None,
+        "max_train_steps": int(args.max_train_steps) if args.max_train_steps is not None else None,
+        "max_val_steps": int(args.max_val_steps) if args.max_val_steps is not None else None,
+        "disable_amp": bool(args.disable_amp),
+        "no_cache_raw_packages": bool(args.no_cache_raw_packages),
+        "no_progress": bool(args.no_progress),
+        "center_positive_weight": float(args.center_positive_weight),
+        "center_negative_weight": float(args.center_negative_weight),
+        "center_focal_gamma": float(args.center_focal_gamma),
+        "count_positive_weight": float(args.count_positive_weight),
+        "count_negative_weight": float(args.count_negative_weight),
+        "center_loss_weight": float(args.center_loss_weight),
+        "count_loss_weight": float(args.count_loss_weight),
+        "area_loss_weight": float(args.area_loss_weight),
+        "calibration_center_thresholds": [float(value) for value in args.calibration_center_thresholds],
+        "calibration_count_thresholds": [float(value) for value in args.calibration_count_thresholds],
+        "calibration_window_weight": float(args.calibration_window_weight),
+    }
+
+
+def build_training_identity_payload(
+    args: argparse.Namespace,
+    layer_training_config: dict[str, Any],
+) -> dict[str, Any]:
+    requested_layer_keys: list[str] = []
+    if args.layer_surface_pair_key:
+        for raw_value in args.layer_surface_pair_key:
+            canonical_key = canonicalize_layer_surface_pair_key(raw_value)
+            if canonical_key:
+                requested_layer_keys.append(canonical_key)
+    return {
+        "requested_layer_surface_pair_keys": requested_layer_keys,
+        "layer_training_config_py": layer_training_config["config_py"],
+        "layer_training_config_sha256": layer_training_config["config_sha256"],
+        **build_base_training_config(args),
+    }
+
+
+def build_unit_confidence_map_from_manifest(manifest_df: pd.DataFrame) -> dict[str, float]:
+    if manifest_df.empty or "UnitID" not in manifest_df.columns:
+        return {}
+    confidence_col = "UnitConfidence" if "UnitConfidence" in manifest_df.columns else "SampleConfidence" if "SampleConfidence" in manifest_df.columns else ""
+    if not confidence_col:
+        return {}
+    work_df = manifest_df[["UnitID", confidence_col]].copy()
+    work_df["UnitID"] = work_df["UnitID"].astype(str).str.strip()
+    work_df[confidence_col] = pd.to_numeric(work_df[confidence_col], errors="coerce").fillna(1.0).clip(lower=0.0, upper=1.0)
+    grouped = work_df.groupby("UnitID", dropna=False)[confidence_col].max()
+    return {str(unit_id): float(value) for unit_id, value in grouped.items() if str(unit_id).strip()}
+
+
+def build_layer_jobs(
+    args: argparse.Namespace,
+    layer_training_config: dict[str, Any],
+    base_training_config: dict[str, Any],
+) -> tuple[list[dict[str, Any]], pd.DataFrame]:
     train_df = load_split_manifest(Path(args.split_run_dir), "train")
     val_df = load_split_manifest(Path(args.split_run_dir), "val")
     train_summary = summarize_manifest_by_layer_surface_pair(train_df)
@@ -116,18 +201,27 @@ def build_layer_jobs(args: argparse.Namespace) -> tuple[list[dict[str, Any]], pd
         raise ValueError("no layer pair windows found in split manifests")
 
     if args.layer_surface_pair_key:
-        selected_keys = [str(value).strip() for value in args.layer_surface_pair_key if str(value).strip()]
+        selected_keys = []
+        seen_keys: set[str] = set()
+        for raw_value in args.layer_surface_pair_key:
+            canonical_key = canonicalize_layer_surface_pair_key(raw_value)
+            if not canonical_key or canonical_key in seen_keys:
+                continue
+            seen_keys.add(canonical_key)
+            selected_keys.append(canonical_key)
     else:
-        selected_keys = (
-            merged.sort_values(
-                [f"Train_WindowCount", LAYER_SURFACE_PAIR_KEY_COL],
-                ascending=[False, True],
-                na_position="last",
-            )[LAYER_SURFACE_PAIR_KEY_COL]
-            .drop_duplicates()
-            .astype(str)
-            .tolist()
-        )
+        selected_keys = [str(layer_key) for layer_key in layer_training_config["allowed_layer_surface_pair_keys"]]
+        if not selected_keys:
+            selected_keys = (
+                merged.sort_values(
+                    [f"Train_WindowCount", LAYER_SURFACE_PAIR_KEY_COL],
+                    ascending=[False, True],
+                    na_position="last",
+                )[LAYER_SURFACE_PAIR_KEY_COL]
+                .drop_duplicates()
+                .astype(str)
+                .tolist()
+            )
 
     jobs: list[dict[str, Any]] = []
     summary_rows: list[dict[str, Any]] = []
@@ -143,6 +237,9 @@ def build_layer_jobs(args: argparse.Namespace) -> tuple[list[dict[str, Any]], pd
         best_checkpoint = run_dir / "checkpoints" / "best_model.pt"
         log_path = output_root / "launcher_logs" / f"{sanitized_key}.log"
         job_docx_path = output_root / "layer_train_docs" / f"{sanitized_key}.docx"
+        train_config_override = dict(layer_training_config["layer_training_overrides"].get(layer_key, {}))
+        effective_training_config = dict(base_training_config)
+        effective_training_config.update(train_config_override)
         status = "pending"
         reason = ""
         if train_window_count <= 0 or val_window_count <= 0:
@@ -163,6 +260,8 @@ def build_layer_jobs(args: argparse.Namespace) -> tuple[list[dict[str, Any]], pd
                     "job_docx_path": job_docx_path,
                     "train_window_count": train_window_count,
                     "val_window_count": val_window_count,
+                    "train_config_override": train_config_override,
+                    "effective_training_config": effective_training_config,
                 }
             )
         summary_rows.append(
@@ -178,12 +277,15 @@ def build_layer_jobs(args: argparse.Namespace) -> tuple[list[dict[str, Any]], pd
                 "Reason": reason,
                 "LogPath": str(log_path),
                 "JobDocxPath": str(job_docx_path),
+                "TrainConfigOverrideJSON": json.dumps(train_config_override, ensure_ascii=False, sort_keys=True),
+                "EffectiveTrainConfigJSON": json.dumps(effective_training_config, ensure_ascii=False, sort_keys=True),
             }
         )
     return jobs, pd.DataFrame(summary_rows)
 
 
 def build_train_command(args: argparse.Namespace, layer_job: dict[str, Any]) -> list[str]:
+    effective_training_config = dict(layer_job["effective_training_config"])
     cmd = [
         sys.executable,
         str(TRAIN_SCRIPT),
@@ -198,61 +300,63 @@ def build_train_command(args: argparse.Namespace, layer_job: dict[str, Any]) -> 
         "--docx-path",
         str(Path(layer_job["job_docx_path"]).resolve()),
         "--slots-per-voxel",
-        str(int(args.slots_per_voxel)),
+        str(int(effective_training_config["slots_per_voxel"])),
         "--base-channels",
-        str(int(args.base_channels)),
+        str(int(effective_training_config["base_channels"])),
         "--batch-size",
-        str(int(args.batch_size)),
+        str(int(effective_training_config["batch_size"])),
         "--num-workers",
-        str(int(args.num_workers)),
+        str(int(effective_training_config["num_workers"])),
         "--torch-num-threads",
-        str(int(args.torch_num_threads)),
+        str(int(effective_training_config["torch_num_threads"])),
         "--torch-num-interop-threads",
-        str(int(args.torch_num_interop_threads)),
+        str(int(effective_training_config["torch_num_interop_threads"])),
         "--epochs",
-        str(int(args.epochs)),
+        str(int(effective_training_config["epochs"])),
         "--learning-rate",
-        str(float(args.learning_rate)),
+        str(float(effective_training_config["learning_rate"])),
         "--weight-decay",
-        str(float(args.weight_decay)),
+        str(float(effective_training_config["weight_decay"])),
         "--center-positive-weight",
-        str(float(args.center_positive_weight)),
+        str(float(effective_training_config["center_positive_weight"])),
         "--center-negative-weight",
-        str(float(args.center_negative_weight)),
+        str(float(effective_training_config["center_negative_weight"])),
         "--center-focal-gamma",
-        str(float(args.center_focal_gamma)),
+        str(float(effective_training_config["center_focal_gamma"])),
         "--count-positive-weight",
-        str(float(args.count_positive_weight)),
+        str(float(effective_training_config["count_positive_weight"])),
         "--count-negative-weight",
-        str(float(args.count_negative_weight)),
+        str(float(effective_training_config["count_negative_weight"])),
         "--center-loss-weight",
-        str(float(args.center_loss_weight)),
+        str(float(effective_training_config["center_loss_weight"])),
         "--count-loss-weight",
-        str(float(args.count_loss_weight)),
+        str(float(effective_training_config["count_loss_weight"])),
+        "--area-loss-weight",
+        str(float(effective_training_config["area_loss_weight"])),
         "--calibration-center-thresholds",
-        *[str(float(value)) for value in args.calibration_center_thresholds],
+        *[str(float(value)) for value in effective_training_config["calibration_center_thresholds"]],
         "--calibration-count-thresholds",
-        *[str(float(value)) for value in args.calibration_count_thresholds],
+        *[str(float(value)) for value in effective_training_config["calibration_count_thresholds"]],
         "--calibration-window-weight",
-        str(float(args.calibration_window_weight)),
+        str(float(effective_training_config["calibration_window_weight"])),
         "--device",
         "cuda",
         "--seed",
-        str(int(args.seed)),
+        str(int(effective_training_config["seed"])),
     ]
-    if args.train_limit_samples is not None:
-        cmd.extend(["--train-limit-samples", str(int(args.train_limit_samples))])
-    if args.val_limit_samples is not None:
-        cmd.extend(["--val-limit-samples", str(int(args.val_limit_samples))])
-    if args.max_train_steps is not None:
-        cmd.extend(["--max-train-steps", str(int(args.max_train_steps))])
-    if args.max_val_steps is not None:
-        cmd.extend(["--max-val-steps", str(int(args.max_val_steps))])
-    if bool(args.disable_amp):
+    if effective_training_config["train_limit_samples"] is not None:
+        cmd.extend(["--train-limit-samples", str(int(effective_training_config["train_limit_samples"]))])
+    if effective_training_config["val_limit_samples"] is not None:
+        cmd.extend(["--val-limit-samples", str(int(effective_training_config["val_limit_samples"]))])
+    if effective_training_config["max_train_steps"] is not None:
+        cmd.extend(["--max-train-steps", str(int(effective_training_config["max_train_steps"]))])
+    if effective_training_config["max_val_steps"] is not None:
+        cmd.extend(["--max-val-steps", str(int(effective_training_config["max_val_steps"]))])
+    if bool(effective_training_config["disable_amp"]):
         cmd.append("--disable-amp")
-    if bool(args.no_cache_raw_packages):
+    if bool(effective_training_config["no_cache_raw_packages"]):
         cmd.append("--no-cache-raw-packages")
-    if bool(args.no_progress):
+    if bool(effective_training_config["no_progress"]):
         cmd.append("--no-progress")
     return cmd
 
@@ -262,12 +366,36 @@ def main() -> None:
     output_root = Path(args.output_root)
     output_root.mkdir(parents=True, exist_ok=True)
     (output_root / "launcher_logs").mkdir(parents=True, exist_ok=True)
-    jobs, summary_df = build_layer_jobs(args)
+    layer_training_config = load_layer_training_config(args.layer_training_config_py)
+    base_training_config = build_base_training_config(args)
+    jobs, summary_df = build_layer_jobs(
+        args,
+        layer_training_config=layer_training_config,
+        base_training_config=base_training_config,
+    )
+    initial_status_counts = (
+        summary_df.get("Status", pd.Series(dtype="object")).astype(str).value_counts().to_dict()
+        if not summary_df.empty
+        else {}
+    )
+    total_layer_count = int(len(summary_df))
+    precompleted_count = int(sum(count for status, count in initial_status_counts.items() if status != "pending"))
+    print(
+        (
+            "[train-layerwise] training plan prepared | "
+            f"requested_layers={total_layer_count}, pending_train={len(jobs)}, "
+            f"skipped_existing={int(initial_status_counts.get('skipped_existing', 0))}, "
+            f"skipped_no_split_data={int(initial_status_counts.get('skipped_no_split_data', 0))}"
+        ),
+        flush=True,
+    )
     train_df = load_split_manifest(Path(args.split_run_dir), "train")
     train_unit_ids = train_df["UnitID"].astype(str).drop_duplicates().tolist()
+    train_unit_confidence_map = build_unit_confidence_map_from_manifest(train_df)
     density_prior_summary_df, _ = summarize_layer_density_priors(
         unit_dfn_root=Path(args.unit_dfn_root),
         unit_ids=train_unit_ids,
+        unit_confidence_map=train_unit_confidence_map,
     )
     density_prior_summary_csv = output_root / f"{args.run_name_prefix}_layer_density_prior_summary.csv"
     write_csv_utf8(density_prior_summary_df, density_prior_summary_csv)
@@ -282,7 +410,10 @@ def main() -> None:
     pending_jobs = list(jobs)
     running_jobs: list[dict[str, Any]] = []
     completed_rows: list[dict[str, Any]] = []
+    last_status_signature: tuple[int, int, int] | None = None
+    last_status_emit_ts = 0.0
     while pending_jobs or running_jobs:
+        launched_count = 0
         while pending_jobs and available_gpus and len(running_jobs) < max_concurrent_jobs:
             layer_job = pending_jobs.pop(0)
             gpu_id = available_gpus.pop(0)
@@ -308,9 +439,21 @@ def main() -> None:
                     "started_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                 }
             )
+            launched_count += 1
+            print(
+                (
+                    "[train-layerwise] launch | "
+                    f"layer={layer_job['layer_surface_pair_key']}, gpu={gpu_id}, "
+                    f"train_windows={int(layer_job['train_window_count'])}, "
+                    f"val_windows={int(layer_job['val_window_count'])}, "
+                    f"log={layer_job['log_path']}"
+                ),
+                flush=True,
+            )
 
         time.sleep(max(float(args.poll_seconds), 0.5))
         still_running: list[dict[str, Any]] = []
+        completed_in_cycle = 0
         for item in running_jobs:
             process: subprocess.Popen = item["process"]
             return_code = process.poll()
@@ -338,7 +481,39 @@ def main() -> None:
                     "Command": " ".join(item["cmd"]),
                 }
             )
+            completed_in_cycle += 1
+            print(
+                (
+                    "[train-layerwise] finish | "
+                    f"layer={item['layer_surface_pair_key']}, gpu={item['gpu_id']}, "
+                    f"status={'completed' if return_code == 0 and best_checkpoint.exists() else 'failed'}, "
+                    f"return_code={return_code}, checkpoint_exists={best_checkpoint.exists()}, "
+                    f"log={item['log_path']}"
+                ),
+                flush=True,
+            )
         running_jobs = still_running
+        available_gpus.sort()
+        status_signature = (len(pending_jobs), len(running_jobs), len(completed_rows))
+        now_ts = time.time()
+        if (
+            launched_count > 0
+            or completed_in_cycle > 0
+            or status_signature != last_status_signature
+            or (now_ts - last_status_emit_ts) >= 30.0
+        ):
+            failed_count = int(sum(1 for row in completed_rows if str(row.get("Status", "")) == "failed"))
+            print(
+                (
+                    "[train-layerwise] progress | "
+                    f"done={precompleted_count + len(completed_rows)}/{total_layer_count}, "
+                    f"pending={len(pending_jobs)}, running={len(running_jobs)}, failed={failed_count}, "
+                    f"available_gpus={available_gpus}, running_jobs={format_running_jobs(running_jobs)}"
+                ),
+                flush=True,
+            )
+            last_status_signature = status_signature
+            last_status_emit_ts = now_ts
 
     merged_summary_df = summary_df.copy()
     if completed_rows:
@@ -389,15 +564,42 @@ def main() -> None:
         if args.registry_output_py
         else output_root / f"{args.run_name_prefix}_layer_model_registry.py"
     )
+    split_run_dir = Path(args.split_run_dir).resolve()
+    split_summary_json = split_run_dir / "split_summary.json"
+    train_manifest_csv = split_run_dir / "train_manifest.csv"
+    val_manifest_csv = split_run_dir / "val_manifest.csv"
+    test_manifest_csv = split_run_dir / "test_manifest.csv"
+    training_identity = build_training_identity_payload(args, layer_training_config=layer_training_config)
     write_layer_model_registry_py(
         output_path=registry_output_py,
         models=registry_models,
         metadata={
             "generated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            "split_run_dir": str(Path(args.split_run_dir).resolve()),
+            "split_run_dir": str(split_run_dir),
             "unit_dfn_root": str(Path(args.unit_dfn_root).resolve()),
             "output_root": str(output_root.resolve()),
+            "layer_training_config_py": layer_training_config["config_py"],
+            "layer_training_config_sha256": layer_training_config["config_sha256"],
+            "allowed_layer_surface_pair_keys": layer_training_config["allowed_layer_surface_pair_keys"],
+            "layer_training_config_metadata": layer_training_config["metadata"],
+            "layer_training_overrides": layer_training_config["layer_training_overrides"],
             "layer_density_prior_summary_csv": str(density_prior_summary_csv.resolve()),
+            "density_prior_confidence_weighted": bool(train_unit_confidence_map),
+            "train_unit_confidence_count": int(len(train_unit_confidence_map)),
+            "train_unit_confidence_mean": (
+                float(sum(train_unit_confidence_map.values()) / len(train_unit_confidence_map))
+                if train_unit_confidence_map
+                else 0.0
+            ),
+            "split_summary_json": str(split_summary_json.resolve()),
+            "split_summary_sha256": compute_file_sha256(split_summary_json),
+            "train_manifest_csv": str(train_manifest_csv.resolve()),
+            "train_manifest_sha256": compute_file_sha256(train_manifest_csv),
+            "val_manifest_csv": str(val_manifest_csv.resolve()),
+            "val_manifest_sha256": compute_file_sha256(val_manifest_csv),
+            "test_manifest_csv": str(test_manifest_csv.resolve()),
+            "test_manifest_sha256": compute_file_sha256(test_manifest_csv),
+            "training_identity": training_identity,
         },
         layer_decode_settings=layer_decode_settings,
         layer_density_priors=layer_density_priors,
@@ -407,17 +609,38 @@ def main() -> None:
     summary_json = output_root / f"{args.run_name_prefix}_layer_training_summary.json"
     write_csv_utf8(merged_summary_df, summary_csv)
     payload = {
-        "split_run_dir": str(Path(args.split_run_dir).resolve()),
+        "split_run_dir": str(split_run_dir),
         "output_root": str(output_root.resolve()),
         "registry_output_py": str(registry_output_py.resolve()),
         "gpu_ids": [int(gpu_id) for gpu_id in args.gpu_ids],
         "max_concurrent_jobs": int(max_concurrent_jobs),
         "requested_layer_count": int(len(summary_df)),
         "trained_or_reused_layer_count": int(len(registry_models)),
+        "layer_training_config_py": layer_training_config["config_py"],
+        "layer_training_config_sha256": layer_training_config["config_sha256"],
+        "allowed_layer_surface_pair_keys": layer_training_config["allowed_layer_surface_pair_keys"],
+        "layer_training_config_metadata": layer_training_config["metadata"],
+        "layer_training_overrides": layer_training_config["layer_training_overrides"],
         "layer_decode_settings_count": int(len(layer_decode_settings)),
         "layer_density_prior_count": int(len(layer_density_priors)),
         "layer_density_prior_summary_csv": str(density_prior_summary_csv.resolve()),
+        "density_prior_confidence_weighted": bool(train_unit_confidence_map),
+        "train_unit_confidence_count": int(len(train_unit_confidence_map)),
+        "train_unit_confidence_mean": (
+            float(sum(train_unit_confidence_map.values()) / len(train_unit_confidence_map))
+            if train_unit_confidence_map
+            else 0.0
+        ),
         "summary_csv": str(summary_csv.resolve()),
+        "split_summary_json": str(split_summary_json.resolve()),
+        "split_summary_sha256": compute_file_sha256(split_summary_json),
+        "train_manifest_csv": str(train_manifest_csv.resolve()),
+        "train_manifest_sha256": compute_file_sha256(train_manifest_csv),
+        "val_manifest_csv": str(val_manifest_csv.resolve()),
+        "val_manifest_sha256": compute_file_sha256(val_manifest_csv),
+        "test_manifest_csv": str(test_manifest_csv.resolve()),
+        "test_manifest_sha256": compute_file_sha256(test_manifest_csv),
+        "training_identity": training_identity,
     }
     write_json(summary_json, payload)
 
@@ -429,11 +652,14 @@ def main() -> None:
             f"output_root: {output_root.resolve()}",
             f"registry_output_py: {registry_output_py.resolve()}",
             f"unit_dfn_root: {Path(args.unit_dfn_root).resolve()}",
+            f"layer_training_config_py: {layer_training_config['config_py'] or 'None'}",
             f"gpu_ids: {args.gpu_ids}",
             f"max_concurrent_jobs: {max_concurrent_jobs}",
             f"trained_or_reused_layer_count: {len(registry_models)}",
             f"layer_density_prior_count: {len(layer_density_priors)}",
             f"layer_density_prior_summary_csv: {density_prior_summary_csv.resolve()}",
+            f"density_prior_confidence_weighted: {bool(train_unit_confidence_map)}",
+            f"train_unit_confidence_count: {len(train_unit_confidence_map)}",
             f"summary_csv: {summary_csv.resolve()}",
             f"summary_json: {summary_json.resolve()}",
         ],

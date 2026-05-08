@@ -28,6 +28,7 @@ if str(PACK_DIR) not in sys.path:
 from baseline_common import (
     DEFAULT_LAYER_DENSITY_SOURCE,
     LAYER_DENSITY_SOURCE_CHOICES,
+    compute_file_sha256,
     DEFAULT_DOCX_PATH,
     DEFAULT_OUTPUT_ROOT,
     DEFAULT_SLOTS_PER_VOXEL,
@@ -766,6 +767,34 @@ def scale_decoded_patch_sizes(decoded_df: pd.DataFrame, scale_factor: float) -> 
     return work
 
 
+def ensure_patch_area_column(patch_df: pd.DataFrame) -> pd.DataFrame:
+    if patch_df.empty:
+        work = patch_df.copy()
+        if "PatchArea" not in work.columns:
+            work["PatchArea"] = pd.Series(dtype=float)
+        return work
+
+    work = patch_df.copy()
+    vertex_cols = [f"V{vertex_idx}{axis}" for vertex_idx in range(1, 5) for axis in ("X", "Y", "Z")]
+    has_vertices = all(column in work.columns for column in vertex_cols)
+    if has_vertices:
+        v1 = work[[f"V1{axis}" for axis in ("X", "Y", "Z")]].apply(pd.to_numeric, errors="coerce").to_numpy(dtype=float)
+        v2 = work[[f"V2{axis}" for axis in ("X", "Y", "Z")]].apply(pd.to_numeric, errors="coerce").to_numpy(dtype=float)
+        v3 = work[[f"V3{axis}" for axis in ("X", "Y", "Z")]].apply(pd.to_numeric, errors="coerce").to_numpy(dtype=float)
+        v4 = work[[f"V4{axis}" for axis in ("X", "Y", "Z")]].apply(pd.to_numeric, errors="coerce").to_numpy(dtype=float)
+        tri1 = 0.5 * np.linalg.norm(np.cross(v2 - v1, v3 - v1), axis=1)
+        tri2 = 0.5 * np.linalg.norm(np.cross(v3 - v1, v4 - v1), axis=1)
+        areas = np.nan_to_num(tri1 + tri2, nan=0.0, posinf=0.0, neginf=0.0)
+        work["PatchArea"] = areas
+        return work
+
+    work["PatchArea"] = (
+        pd.to_numeric(work.get("PatchLength"), errors="coerce").fillna(0.0)
+        * pd.to_numeric(work.get("PatchHeight"), errors="coerce").fillna(0.0)
+    )
+    return work
+
+
 def run_single_window(
     model: SparseInstanceBaselineUNet,
     input_features: np.ndarray,
@@ -916,6 +945,7 @@ def write_partial_unit_outputs(
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     unit_output_dir.mkdir(parents=True, exist_ok=True)
     predicted_all = pd.concat(per_unit_frames, ignore_index=True, sort=False) if per_unit_frames else pd.DataFrame()
+    predicted_all = ensure_patch_area_column(predicted_all)
     dedup_pred = dedupe_patch_df(
         predicted_all,
         xy_tol_m=float(dedupe_xy_tol_m),
@@ -923,6 +953,7 @@ def write_partial_unit_outputs(
         azimuth_tol_deg=float(dedupe_azimuth_tol_deg),
         dip_tol_deg=float(dedupe_dip_tol_deg),
     )
+    dedup_pred = ensure_patch_area_column(dedup_pred)
     write_csv_utf8(layers_df, unit_output_dir / "unit_layers_input.csv")
     if artifact_flags.get("save_source_metadata", False):
         write_json(unit_output_dir / "source_unit_summary.json", unit_summary)
@@ -1521,6 +1552,7 @@ def main() -> None:
             window_bar.close()
 
             predicted_all = pd.concat(per_unit_frames, ignore_index=True, sort=False) if per_unit_frames else pd.DataFrame()
+            predicted_all = ensure_patch_area_column(predicted_all)
             dedup_pred = dedupe_patch_df(
                 predicted_all,
                 xy_tol_m=float(args.dedupe_xy_tol_m),
@@ -1528,6 +1560,7 @@ def main() -> None:
                 azimuth_tol_deg=float(args.dedupe_azimuth_tol_deg),
                 dip_tol_deg=float(args.dedupe_dip_tol_deg),
             )
+            dedup_pred = ensure_patch_area_column(dedup_pred)
             predicted_dedup_before_density_count = int(len(dedup_pred))
             dedup_pred, density_control_summary_df = apply_layer_density_budget(
                 patch_df=dedup_pred,
@@ -1540,6 +1573,7 @@ def main() -> None:
                 calibration_max_scale=float(args.layer_density_calibration_max_scale),
                 enabled=not bool(args.disable_layer_density_control),
             )
+            dedup_pred = ensure_patch_area_column(dedup_pred)
             write_csv_utf8(layers_df, unit_output_dir / "unit_layers_input.csv")
             if artifact_flags.get("save_window_concat_csv", False):
                 write_csv_utf8(predicted_all, unit_output_dir / "predicted_window_concat_patches.csv")
@@ -1641,6 +1675,7 @@ def main() -> None:
         "run_dir": str(run_dir),
         "checkpoint": str(args.checkpoint) if args.checkpoint else "",
         "layer_model_registry_py": str(args.layer_model_registry_py) if args.layer_model_registry_py else "",
+        "layer_model_registry_sha256": compute_file_sha256(args.layer_model_registry_py),
         "unit_dfn_root": str(args.unit_dfn_root),
         "surface_dir": str(args.surface_dir),
         "trace_header_csv": str(args.trace_header_csv),
@@ -1672,6 +1707,7 @@ def main() -> None:
         "layer_density_source": str(args.layer_density_source),
         "layer_density_scale": float(args.layer_density_scale),
         "layer_density_calibration_json": str(Path(args.layer_density_calibration_json).resolve()) if args.layer_density_calibration_json else "",
+        "layer_density_calibration_json_sha256": compute_file_sha256(args.layer_density_calibration_json),
         "layer_density_calibration_min_scale": float(args.layer_density_calibration_min_scale),
         "layer_density_calibration_max_scale": float(args.layer_density_calibration_max_scale),
         "no_layer_constraint": bool(args.no_layer_constraint),

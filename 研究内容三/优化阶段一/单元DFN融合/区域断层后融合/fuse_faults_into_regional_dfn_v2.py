@@ -4,7 +4,7 @@ from __future__ import annotations
 import argparse
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import numpy as np
 import pandas as pd
@@ -28,6 +28,13 @@ from fault_postfusion_common import (
 
 
 SIZE_LABELS = ["small", "medium", "large"]
+
+
+def emit_fault_postfusion_progress(stage: str, detail: str | None = None) -> None:
+    if detail:
+        print(f"[fault-fuse] {stage} | {detail}", flush=True)
+    else:
+        print(f"[fault-fuse] {stage}", flush=True)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -130,6 +137,7 @@ def assign_fault_influence(
     fault_remove_ms: float,
     fault_transition_ms: float,
     panel_xy_buffer: float,
+    progress_hook: Callable[[str, str | None], None] | None = None,
 ) -> pd.DataFrame:
     result = df.copy()
     result["PatchOriginCode"] = pd.to_numeric(result.get("PatchOriginCode", 0), errors="coerce").fillna(0).astype(int)
@@ -160,7 +168,10 @@ def assign_fault_influence(
     }
     valid_nz = np.abs(panel_arrays["nz"]) > 1e-8
 
-    for idx, row in result.iterrows():
+    total_rows = int(len(result))
+    emit_step = max(1, total_rows // 20) if total_rows > 0 else 1
+    affected_count = 0
+    for row_idx, (idx, row) in enumerate(result.iterrows(), start=1):
         x = float(row["CenterX"])
         y = float(row["CenterY"])
         z = float(row["CenterTIME"])
@@ -171,7 +182,12 @@ def assign_fault_influence(
             & (y <= panel_arrays["ymax"])
         )
         if not np.any(candidate_mask):
+            if progress_hook is not None and (
+                row_idx == 1 or row_idx == total_rows or row_idx % emit_step == 0
+            ):
+                progress_hook("断层影响赋值进度", f"{row_idx}/{total_rows}, affected={affected_count}")
             continue
+        affected_count += 1
         fault_z = panel_arrays["cz"][candidate_mask].copy()
         cand_valid_nz = valid_nz[candidate_mask]
         if np.any(cand_valid_nz):
@@ -199,6 +215,10 @@ def assign_fault_influence(
         elif min_dist <= float(fault_transition_ms):
             result.at[idx, "FaultActionText"] = "shrink"
             result.at[idx, "FaultActionCode"] = FAULT_ACTION_TEXT_TO_CODE["shrink"]
+        if progress_hook is not None and (
+            row_idx == 1 or row_idx == total_rows or row_idx % emit_step == 0
+        ):
+            progress_hook("断层影响赋值进度", f"{row_idx}/{total_rows}, affected={affected_count}")
     return result
 
 
@@ -206,14 +226,24 @@ def apply_fault_filter_and_shrink(
     influenced_df: pd.DataFrame,
     fault_remove_ms: float,
     fault_transition_ms: float,
+    progress_hook: Callable[[str, str | None], None] | None = None,
 ) -> tuple[pd.DataFrame, dict[str, Any]]:
     kept_rows: list[pd.Series] = []
     removed_count = 0
     shrunk_count = 0
-    for _, row in influenced_df.iterrows():
+    total_rows = int(len(influenced_df))
+    emit_step = max(1, total_rows // 20) if total_rows > 0 else 1
+    for row_idx, (_, row) in enumerate(influenced_df.iterrows(), start=1):
         action = str(row.get("FaultActionText", "keep"))
         if action == "remove":
             removed_count += 1
+            if progress_hook is not None and (
+                row_idx == 1 or row_idx == total_rows or row_idx % emit_step == 0
+            ):
+                progress_hook(
+                    "断层控制区过滤进度",
+                    f"{row_idx}/{total_rows}, kept={len(kept_rows)}, removed={removed_count}, shrunk={shrunk_count}",
+                )
             continue
         updated = row.copy()
         if action == "shrink":
@@ -226,6 +256,13 @@ def apply_fault_filter_and_shrink(
         else:
             updated["FaultShrinkAreaRatio"] = 1.0
         kept_rows.append(updated)
+        if progress_hook is not None and (
+            row_idx == 1 or row_idx == total_rows or row_idx % emit_step == 0
+        ):
+            progress_hook(
+                "断层控制区过滤进度",
+                f"{row_idx}/{total_rows}, kept={len(kept_rows)}, removed={removed_count}, shrunk={shrunk_count}",
+            )
     kept_df = pd.DataFrame(kept_rows).reset_index(drop=True) if kept_rows else influenced_df.iloc[0:0].copy()
     stats = {
         "input_patch_count": int(len(influenced_df)),
@@ -344,6 +381,7 @@ def build_generated_patch_rows(
     parallel_ratio: float,
     random_seed: int,
     fault_half_band_ms: float,
+    progress_hook: Callable[[str, str | None], None] | None = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     rng = np.random.default_rng(int(random_seed))
     parallel_rows: list[dict[str, Any]] = []
@@ -351,7 +389,9 @@ def build_generated_patch_rows(
     parallel_ratio = float(np.clip(parallel_ratio, 0.0, 1.0))
     zone_specs = build_zone_specs(float(fault_half_band_ms))
 
-    for _, panel_row in panel_df.iterrows():
+    total_panel_count = int(len(panel_df))
+    emit_step = max(1, total_panel_count // 10) if total_panel_count > 0 else 1
+    for panel_idx, (_, panel_row) in enumerate(panel_df.iterrows(), start=1):
         panel_id = int(panel_row["FaultPanelID"])
         fault_name = str(panel_row["FaultName"])
         center = np.array([float(panel_row["CenterX"]), float(panel_row["CenterY"]), float(panel_row["CenterTIME"])], dtype=float)
@@ -529,6 +569,16 @@ def build_generated_patch_rows(
                         },
                     )
                 )
+        if progress_hook is not None and (
+            panel_idx == 1 or panel_idx == total_panel_count or panel_idx % emit_step == 0
+        ):
+            progress_hook(
+                "断层诱导裂缝生成进度",
+                (
+                    f"{panel_idx}/{total_panel_count}, fault_panel_id={panel_id}, "
+                    f"parallel_count={len(parallel_rows)}, perpendicular_count={len(perpendicular_rows)}"
+                ),
+            )
     return pd.DataFrame(parallel_rows), pd.DataFrame(perpendicular_rows)
 
 
@@ -636,8 +686,11 @@ def run_fault_postfusion(
     run_dir = Path(output_root) / str(run_name)
     run_dir.mkdir(parents=True, exist_ok=True)
 
+    emit_fault_postfusion_progress("开始断层后融合", f"input_vtk={input_vtk}")
     regional_df, scalar_types, title = read_regional_vtk_to_df(Path(input_vtk))
+    emit_fault_postfusion_progress("区域 DFN 读取完成", f"input_patch_count={len(regional_df)}")
     panel_df = load_fault_panels(Path(fault_panel_csv))
+    emit_fault_postfusion_progress("断层 panel 读取完成", f"fault_panel_count={len(panel_df)}")
     influenced_df = assign_fault_influence(
         df=regional_df,
         panel_df=panel_df,
@@ -645,30 +698,54 @@ def run_fault_postfusion(
         fault_remove_ms=float(fault_remove_ms),
         fault_transition_ms=float(fault_transition_ms),
         panel_xy_buffer=float(panel_xy_buffer),
+        progress_hook=emit_fault_postfusion_progress,
     )
+    emit_fault_postfusion_progress("断层影响赋值完成", f"influenced_patch_count={len(influenced_df)}")
     kept_df, filter_stats = apply_fault_filter_and_shrink(
         influenced_df=influenced_df,
         fault_remove_ms=float(fault_remove_ms),
         fault_transition_ms=float(fault_transition_ms),
+        progress_hook=emit_fault_postfusion_progress,
+    )
+    emit_fault_postfusion_progress(
+        "断层控制区过滤完成",
+        (
+            f"kept_patch_count={len(kept_df)}, removed_patch_count={filter_stats['removed_patch_count']}, "
+            f"shrunk_patch_count={filter_stats['shrunk_patch_count']}"
+        ),
     )
     parallel_df, perpendicular_df = build_generated_patch_rows(
         panel_df=panel_df,
         parallel_ratio=float(parallel_ratio),
         random_seed=int(random_seed),
         fault_half_band_ms=float(fault_half_band_ms),
+        progress_hook=emit_fault_postfusion_progress,
+    )
+    emit_fault_postfusion_progress(
+        "断层诱导裂缝生成完成",
+        f"parallel_count={len(parallel_df)}, perpendicular_count={len(perpendicular_df)}",
     )
     final_df = finalize_output_dataframe(kept_df, parallel_df, perpendicular_df)
+    emit_fault_postfusion_progress("断层后融合结果拼接完成", f"fracture_patch_count={len(final_df)}")
 
     output_csv = run_dir / "regional_dfn_fault_embedded_fractures.csv"
     fractures_vtk = run_dir / "regional_dfn_fault_embedded_fractures_raw.vtk"
     output_vtk = run_dir / "regional_dfn_fault_embedded_raw.vtk"
     write_csv_utf8(final_df, output_csv)
     write_df_to_regional_vtk(final_df, f"{title}_fault_embedded_fractures", fractures_vtk, scalar_types)
+    emit_fault_postfusion_progress("断层裂缝 VTK 写出完成", f"fractures_vtk={fractures_vtk}")
     vtk_merge_stats = combine_with_fault_surface_vtk(
         fracture_vtk=fractures_vtk,
         fault_surface_vtk=Path(fault_surface_vtk) if fault_surface_vtk else None,
         output_vtk=output_vtk,
         title=f"{title}_fault_embedded",
+    )
+    emit_fault_postfusion_progress(
+        "断层 surface 融合完成",
+        (
+            f"fault_surface_polygon_count={vtk_merge_stats['surface_polygon_count']}, "
+            f"final_polygon_count={vtk_merge_stats['final_polygon_count']}"
+        ),
     )
 
     parallel_csv = run_dir / "fault_parallel_patches.csv"
@@ -717,6 +794,7 @@ def run_fault_postfusion(
     summary_path = run_dir / "regional_dfn_fault_embedded_summary.json"
     write_json(summary_path, summary)
     summary["summary_json"] = str(summary_path)
+    emit_fault_postfusion_progress("断层后融合结果导出完成", f"summary_json={summary_path}")
     return summary
 
 

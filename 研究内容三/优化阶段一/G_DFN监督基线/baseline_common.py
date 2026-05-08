@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from collections import defaultdict
+import hashlib
 import json
 import random
 import sys
@@ -28,7 +29,7 @@ if str(INSTANCE_DIR) not in sys.path:
     sys.path.append(str(INSTANCE_DIR))
 
 from instance_roundtrip_common import (  # type: ignore
-    DEFAULT_DOCX_PATH,
+    DEFAULT_DOCX_PATH as LEGACY_DEFAULT_DOCX_PATH,
     DEFAULT_UNIT_DFN_ROOT,
     GridSpec,
     VtkPatchExportConfig,
@@ -49,11 +50,14 @@ from instance_roundtrip_common import (  # type: ignore
 )
 
 
+DEFAULT_SHARED_DATA_ROOT = Path(r"/data/shared/project-oil/wx数据/砂砾岩")
+DEFAULT_PRIVATE_DATA_ROOT = Path(r"/home/tyh/data/project-oil/砂砾岩")
+DEFAULT_DOCX_PATH = DEFAULT_PRIVATE_DATA_ROOT / "优化阶段一" / "实验记录" / LEGACY_DEFAULT_DOCX_PATH.name
 DEFAULT_DATASET_RUN_DIR = Path(
-    r"/data/shared/project-oil/wx数据/砂砾岩/优化阶段一/研究内容三/GAN训练准备/训练样本打包/phase1_t128_sparse_v1_full_fix1_20260330"
+    DEFAULT_SHARED_DATA_ROOT / "优化阶段一" / "研究内容三" / "GAN训练准备" / "训练样本打包" / "phase1_t128_sparse_v1_full_fix1_20260330"
 )
 DEFAULT_OUTPUT_ROOT = Path(
-    r"/data/shared/project-oil/wx数据/砂砾岩/优化阶段一/研究内容三/G_DFN监督基线"
+    DEFAULT_PRIVATE_DATA_ROOT / "优化阶段一" / "研究内容三" / "G_DFN监督基线"
 )
 DEFAULT_SLOTS_PER_VOXEL = 16
 DEFAULT_XY_RESOLUTION = 24
@@ -119,9 +123,41 @@ def scalar_int(value: Any, default: int = 0) -> int:
     return int(round(value_float))
 
 
-def build_unit_layer_segment_table(layers_df: pd.DataFrame) -> pd.DataFrame:
+def compute_file_sha256(
+    path: Path | str | None,
+    chunk_size: int = 1024 * 1024,
+) -> str:
+    if path is None:
+        return ""
+    file_path = Path(path)
+    if not file_path.exists() or not file_path.is_file():
+        return ""
+    digest = hashlib.sha256()
+    with file_path.open("rb") as fp:
+        while True:
+            chunk = fp.read(int(chunk_size))
+            if not chunk:
+                break
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def build_unit_layer_segment_table(
+    layers_df: pd.DataFrame,
+    fallback_unit_id: str | None = None,
+) -> pd.DataFrame:
+    work = layers_df.copy()
+    fallback_text = str(fallback_unit_id or "").strip()
+    if fallback_text:
+        if "UnitID" not in work.columns:
+            work["UnitID"] = fallback_text
+        else:
+            unit_id_series = work["UnitID"].fillna("").astype(str).str.strip()
+            fill_mask = unit_id_series.eq("") | unit_id_series.str.lower().eq("nan")
+            if fill_mask.any():
+                work.loc[fill_mask, "UnitID"] = fallback_text
     work = ensure_unit_layer_segment_key_column(
-        ensure_layer_surface_pair_key_column(layers_df.copy(), key_col=LAYER_SURFACE_PAIR_KEY_COL),
+        ensure_layer_surface_pair_key_column(work, key_col=LAYER_SURFACE_PAIR_KEY_COL),
         key_col=UNIT_LAYER_SEGMENT_KEY_COL,
         pair_key_col=LAYER_SURFACE_PAIR_KEY_COL,
     )
@@ -159,7 +195,7 @@ def build_unit_layer_density_rows(
         unit_id_series = raw_layers_df["UnitID"].fillna("").astype(str).str.strip()
         if unit_id_series.eq("").all():
             raw_layers_df["UnitID"] = str(unit_dir.name)
-    layers_df = build_unit_layer_segment_table(raw_layers_df)
+    layers_df = build_unit_layer_segment_table(raw_layers_df, fallback_unit_id=str(unit_dir.name))
     patch_path = unit_dir / patch_filename
     if patch_path.exists():
         patch_df = ensure_unit_layer_segment_key_column(
@@ -208,10 +244,46 @@ def build_unit_layer_density_rows(
     return pd.DataFrame(rows)
 
 
+def normalize_unit_confidence(value: Any, default: float = 1.0) -> float:
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):
+        numeric = float(default)
+    if not np.isfinite(numeric):
+        numeric = float(default)
+    return float(np.clip(numeric, 0.0, 1.0))
+
+
+def weighted_average_or_default(values: np.ndarray, weights: np.ndarray, default: float = 0.0) -> float:
+    if values.size <= 0 or weights.size <= 0:
+        return float(default)
+    mask = np.isfinite(values) & np.isfinite(weights) & (weights > 0.0)
+    if not np.any(mask):
+        return float(default)
+    return float(np.average(values[mask], weights=weights[mask]))
+
+
+def weighted_quantile_or_default(values: np.ndarray, weights: np.ndarray, quantile: float, default: float = 0.0) -> float:
+    if values.size <= 0 or weights.size <= 0:
+        return float(default)
+    mask = np.isfinite(values) & np.isfinite(weights) & (weights > 0.0)
+    if not np.any(mask):
+        return float(default)
+    sort_order = np.argsort(values[mask])
+    sorted_values = values[mask][sort_order]
+    sorted_weights = weights[mask][sort_order]
+    cumulative = np.cumsum(sorted_weights)
+    threshold = float(np.clip(quantile, 0.0, 1.0)) * float(cumulative[-1])
+    index = int(np.searchsorted(cumulative, threshold, side="left"))
+    index = int(np.clip(index, 0, len(sorted_values) - 1))
+    return float(sorted_values[index])
+
+
 def summarize_layer_density_priors(
     unit_dfn_root: Path,
     unit_ids: list[str],
     patch_filename: str = "unit_dfn_patches.csv",
+    unit_confidence_map: dict[str, float] | None = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     unit_dfn_root = Path(unit_dfn_root)
     density_rows: list[pd.DataFrame] = []
@@ -236,66 +308,105 @@ def summarize_layer_density_priors(
                     "TotalPatchCount",
                     "TotalThicknessMs",
                     "AggregateDensity",
+                    "WeightedAggregateDensity",
                     "UnitMeanDensity",
                     "UnitMedianDensity",
                     "UnitP25Density",
                     "UnitP10Density",
                     "UnitP75Density",
                     "UnitMaxDensity",
+                    "WeightedUnitMeanDensity",
+                    "WeightedUnitMedianDensity",
+                    "WeightedUnitP25Density",
+                    "WeightedUnitP10Density",
+                    "WeightedUnitP75Density",
+                    "ConfidenceMean",
+                    "ConfidenceMin",
+                    "ConfidenceMax",
                     "NonZeroSegmentCount",
                     "NonZeroSegmentFraction",
+                    "WeightedNonZeroSegmentFraction",
                     "RobustDensity",
                 ]
             ),
             detail_df,
         )
-    summary_df = (
-        detail_df.groupby(LAYER_SURFACE_PAIR_KEY_COL, dropna=False)
-        .agg(
-            UnitCount=("UnitID", lambda values: int(pd.Series(values).astype(str).nunique())),
-            SegmentCount=("UnitID", "count"),
-            TotalPatchCount=("PatchCount", "sum"),
-            TotalThicknessMs=("LayerThicknessMs", "sum"),
-            AggregateDensity=("PatchDensity", lambda values: float("nan")),
-            UnitMeanDensity=("PatchDensity", "mean"),
-            UnitMedianDensity=("PatchDensity", "median"),
-            UnitP25Density=("PatchDensity", lambda values: float(pd.Series(values).quantile(0.25))),
-            UnitP10Density=("PatchDensity", lambda values: float(pd.Series(values).quantile(0.10))),
-            UnitP75Density=("PatchDensity", lambda values: float(pd.Series(values).quantile(0.75))),
-            UnitMaxDensity=("PatchDensity", "max"),
-            NonZeroSegmentCount=("PatchCount", lambda values: int((pd.to_numeric(pd.Series(values), errors="coerce").fillna(0.0) > 0.0).sum())),
-        )
-        .reset_index()
-    )
-    total_patch_counts = detail_df.groupby(LAYER_SURFACE_PAIR_KEY_COL, dropna=False)["PatchCount"].sum()
-    total_thickness = detail_df.groupby(LAYER_SURFACE_PAIR_KEY_COL, dropna=False)["LayerThicknessMs"].sum()
-    summary_df["AggregateDensity"] = [
-        float(total_patch_counts.get(key, 0) / total_thickness.get(key, 1.0))
-        if float(total_thickness.get(key, 0.0)) > 0.0
-        else 0.0
-        for key in summary_df[LAYER_SURFACE_PAIR_KEY_COL].astype(str)
+    confidence_lookup = {
+        str(unit_id).strip(): normalize_unit_confidence(value, default=1.0)
+        for unit_id, value in (unit_confidence_map or {}).items()
+        if str(unit_id).strip()
+    }
+    detail_df = detail_df.copy()
+    detail_df["UnitConfidence"] = [
+        confidence_lookup.get(str(unit_id).strip(), 1.0)
+        for unit_id in detail_df["UnitID"].astype(str).tolist()
     ]
-    summary_df["NonZeroSegmentFraction"] = [
-        float(nonzero_count / segment_count) if int(segment_count) > 0 else 0.0
-        for nonzero_count, segment_count in zip(
-            summary_df["NonZeroSegmentCount"],
-            summary_df["SegmentCount"],
+
+    summary_rows: list[dict[str, Any]] = []
+    for layer_key, group_df in detail_df.groupby(LAYER_SURFACE_PAIR_KEY_COL, dropna=False):
+        patch_density = pd.to_numeric(group_df["PatchDensity"], errors="coerce").fillna(0.0).to_numpy(dtype=float)
+        patch_count = pd.to_numeric(group_df["PatchCount"], errors="coerce").fillna(0.0).to_numpy(dtype=float)
+        thickness = pd.to_numeric(group_df["LayerThicknessMs"], errors="coerce").fillna(0.0).to_numpy(dtype=float)
+        weights = pd.to_numeric(group_df["UnitConfidence"], errors="coerce").fillna(1.0).to_numpy(dtype=float)
+        weights = np.clip(weights, 0.0, 1.0)
+        nonzero_mask = patch_count > 0.0
+
+        total_patch_count = float(patch_count.sum())
+        total_thickness_ms = float(thickness.sum())
+        weighted_total_patch_count = float((patch_count * weights).sum())
+        weighted_total_thickness_ms = float((thickness * weights).sum())
+        aggregate_density = float(total_patch_count / total_thickness_ms) if total_thickness_ms > 0.0 else 0.0
+        weighted_aggregate_density = (
+            float(weighted_total_patch_count / weighted_total_thickness_ms)
+            if weighted_total_thickness_ms > 0.0
+            else 0.0
         )
-    ]
-    robust_density_rows: list[float] = []
-    for _, row in summary_df.iterrows():
-        unit_median_density = scalar_float(row.get("UnitMedianDensity"), default=0.0)
-        unit_mean_density = scalar_float(row.get("UnitMeanDensity"), default=0.0)
-        aggregate_density = scalar_float(row.get("AggregateDensity"), default=0.0)
-        unit_p10_density = scalar_float(row.get("UnitP10Density"), default=0.0)
+
+        row = {
+            LAYER_SURFACE_PAIR_KEY_COL: str(layer_key),
+            "UnitCount": int(group_df["UnitID"].astype(str).nunique()),
+            "SegmentCount": int(len(group_df)),
+            "TotalPatchCount": int(round(total_patch_count)),
+            "TotalThicknessMs": float(total_thickness_ms),
+            "AggregateDensity": float(aggregate_density),
+            "WeightedAggregateDensity": float(weighted_aggregate_density),
+            "UnitMeanDensity": float(np.mean(patch_density)) if patch_density.size > 0 else 0.0,
+            "UnitMedianDensity": float(np.median(patch_density)) if patch_density.size > 0 else 0.0,
+            "UnitP25Density": float(np.quantile(patch_density, 0.25)) if patch_density.size > 0 else 0.0,
+            "UnitP10Density": float(np.quantile(patch_density, 0.10)) if patch_density.size > 0 else 0.0,
+            "UnitP75Density": float(np.quantile(patch_density, 0.75)) if patch_density.size > 0 else 0.0,
+            "UnitMaxDensity": float(np.max(patch_density)) if patch_density.size > 0 else 0.0,
+            "WeightedUnitMeanDensity": weighted_average_or_default(patch_density, weights, default=0.0),
+            "WeightedUnitMedianDensity": weighted_quantile_or_default(patch_density, weights, 0.50, default=0.0),
+            "WeightedUnitP25Density": weighted_quantile_or_default(patch_density, weights, 0.25, default=0.0),
+            "WeightedUnitP10Density": weighted_quantile_or_default(patch_density, weights, 0.10, default=0.0),
+            "WeightedUnitP75Density": weighted_quantile_or_default(patch_density, weights, 0.75, default=0.0),
+            "ConfidenceMean": float(np.mean(weights)) if weights.size > 0 else 1.0,
+            "ConfidenceMin": float(np.min(weights)) if weights.size > 0 else 1.0,
+            "ConfidenceMax": float(np.max(weights)) if weights.size > 0 else 1.0,
+            "NonZeroSegmentCount": int(nonzero_mask.sum()),
+            "NonZeroSegmentFraction": float(nonzero_mask.sum() / len(group_df)) if len(group_df) > 0 else 0.0,
+            "WeightedNonZeroSegmentFraction": (
+                float(weights[nonzero_mask].sum() / weights.sum())
+                if weights.size > 0 and float(weights.sum()) > 0.0
+                else 0.0
+            ),
+        }
+
+        unit_median_density = scalar_float(row.get("WeightedUnitMedianDensity"), default=0.0)
+        unit_mean_density = scalar_float(row.get("WeightedUnitMeanDensity"), default=0.0)
+        aggregate_density = scalar_float(row.get("WeightedAggregateDensity"), default=0.0)
+        unit_p10_density = scalar_float(row.get("WeightedUnitP10Density"), default=0.0)
         if unit_median_density > 0.0:
             robust_density = unit_median_density
         elif unit_mean_density > 0.0:
             robust_density = min(unit_mean_density, aggregate_density) if aggregate_density > 0.0 else unit_mean_density
         else:
             robust_density = max(unit_p10_density, aggregate_density)
-        robust_density_rows.append(float(max(robust_density, 0.0)))
-    summary_df["RobustDensity"] = robust_density_rows
+        row["RobustDensity"] = float(max(robust_density, 0.0))
+        summary_rows.append(row)
+
+    summary_df = pd.DataFrame(summary_rows)
     summary_df = summary_df.sort_values(LAYER_SURFACE_PAIR_KEY_COL).reset_index(drop=True)
     return summary_df, detail_df
 
@@ -309,12 +420,30 @@ def build_layer_density_prior_payload(summary_df: pd.DataFrame) -> dict[str, dic
         if not layer_key:
             continue
         payload[layer_key] = {
-            "aggregate_density": scalar_float(row.get("AggregateDensity"), default=0.0),
-            "unit_mean_density": scalar_float(row.get("UnitMeanDensity"), default=0.0),
-            "unit_median_density": scalar_float(row.get("UnitMedianDensity"), default=0.0),
-            "unit_p25_density": scalar_float(row.get("UnitP25Density"), default=0.0),
-            "unit_p10_density": scalar_float(row.get("UnitP10Density"), default=0.0),
-            "unit_p75_density": scalar_float(row.get("UnitP75Density"), default=0.0),
+            "aggregate_density": scalar_float(
+                row.get("WeightedAggregateDensity", row.get("AggregateDensity")),
+                default=0.0,
+            ),
+            "unit_mean_density": scalar_float(
+                row.get("WeightedUnitMeanDensity", row.get("UnitMeanDensity")),
+                default=0.0,
+            ),
+            "unit_median_density": scalar_float(
+                row.get("WeightedUnitMedianDensity", row.get("UnitMedianDensity")),
+                default=0.0,
+            ),
+            "unit_p25_density": scalar_float(
+                row.get("WeightedUnitP25Density", row.get("UnitP25Density")),
+                default=0.0,
+            ),
+            "unit_p10_density": scalar_float(
+                row.get("WeightedUnitP10Density", row.get("UnitP10Density")),
+                default=0.0,
+            ),
+            "unit_p75_density": scalar_float(
+                row.get("WeightedUnitP75Density", row.get("UnitP75Density")),
+                default=0.0,
+            ),
             "unit_max_density": scalar_float(row.get("UnitMaxDensity"), default=0.0),
             "robust_density": scalar_float(row.get("RobustDensity"), default=0.0),
             "unit_count": scalar_int(row.get("UnitCount"), default=0),
@@ -323,6 +452,13 @@ def build_layer_density_prior_payload(summary_df: pd.DataFrame) -> dict[str, dic
             "total_patch_count": scalar_int(row.get("TotalPatchCount"), default=0),
             "total_thickness_ms": scalar_float(row.get("TotalThicknessMs"), default=0.0),
             "nonzero_segment_fraction": scalar_float(row.get("NonZeroSegmentFraction"), default=0.0),
+            "weighted_nonzero_segment_fraction": scalar_float(row.get("WeightedNonZeroSegmentFraction"), default=0.0),
+            "confidence_mean": scalar_float(row.get("ConfidenceMean"), default=1.0),
+            "confidence_min": scalar_float(row.get("ConfidenceMin"), default=1.0),
+            "confidence_max": scalar_float(row.get("ConfidenceMax"), default=1.0),
+            "raw_aggregate_density": scalar_float(row.get("AggregateDensity"), default=0.0),
+            "raw_unit_mean_density": scalar_float(row.get("UnitMeanDensity"), default=0.0),
+            "raw_unit_median_density": scalar_float(row.get("UnitMedianDensity"), default=0.0),
         }
     return payload
 
@@ -623,12 +759,24 @@ def apply_layer_density_budget(
     calibration_max_scale: float = 4.0,
     enabled: bool = True,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
-    normalized_layers_df = build_unit_layer_segment_table(layers_df)
     normalized_source = normalize_layer_density_source(density_source)
     patch_work = ensure_unit_layer_segment_key_column(
         ensure_layer_surface_pair_key_column(patch_df.copy(), key_col=LAYER_SURFACE_PAIR_KEY_COL),
         key_col=UNIT_LAYER_SEGMENT_KEY_COL,
         pair_key_col=LAYER_SURFACE_PAIR_KEY_COL,
+    )
+    fallback_unit_id = ""
+    if not patch_work.empty and "UnitID" in patch_work.columns:
+        patch_unit_ids = (
+            patch_work["UnitID"].fillna("").astype(str).str.strip()
+        )
+        patch_unit_ids = patch_unit_ids[patch_unit_ids.ne("") & patch_unit_ids.str.lower().ne("nan")]
+        unique_patch_unit_ids = patch_unit_ids.drop_duplicates().tolist()
+        if len(unique_patch_unit_ids) == 1:
+            fallback_unit_id = str(unique_patch_unit_ids[0])
+    normalized_layers_df = build_unit_layer_segment_table(
+        layers_df,
+        fallback_unit_id=fallback_unit_id,
     )
 
     if patch_work.empty:
@@ -1138,7 +1286,22 @@ def prepare_unit_context(
     unit_dir = Path(unit_dfn_root) / str(unit_id)
     patch_csv = unit_dir / "unit_dfn_patches.csv"
     patch_df = load_patch_table(patch_csv)
-    layers_df = load_layer_table(unit_dir)
+    if "UnitID" not in patch_df.columns:
+        patch_df["UnitID"] = str(unit_id)
+    else:
+        patch_unit_id_series = patch_df["UnitID"].fillna("").astype(str).str.strip()
+        patch_fill_mask = patch_unit_id_series.eq("") | patch_unit_id_series.str.lower().eq("nan")
+        if patch_fill_mask.any():
+            patch_df.loc[patch_fill_mask, "UnitID"] = str(unit_id)
+    patch_df = ensure_unit_layer_segment_key_column(
+        ensure_layer_surface_pair_key_column(patch_df, key_col=LAYER_SURFACE_PAIR_KEY_COL),
+        key_col=UNIT_LAYER_SEGMENT_KEY_COL,
+        pair_key_col=LAYER_SURFACE_PAIR_KEY_COL,
+    )
+    layers_df = build_unit_layer_segment_table(
+        load_layer_table(unit_dir),
+        fallback_unit_id=str(unit_id),
+    )
     unit_summary = load_unit_summary(unit_dir)
     if patch_df.empty:
         raise ValueError(f"empty patch table: {patch_csv}")

@@ -18,6 +18,13 @@ UNIT_ID_PATTERN = re.compile(r"^BX(?P<block_x>\d+)_BY(?P<block_y>\d+)$", flags=r
 SCALARS_PATTERN = re.compile(r"^SCALARS\s+(?P<name>\S+)\s+(?P<dtype>\S+)\s+1$", flags=re.IGNORECASE)
 
 
+def emit_merge_progress(stage: str, detail: str | None = None) -> None:
+    if detail:
+        print(f"[merge] {stage} | {detail}", flush=True)
+    else:
+        print(f"[merge] {stage}", flush=True)
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Merge rectangle-selected unit DFN VTK files into one regional VTK.")
     parser.add_argument("--units-root", type=Path, required=True, help="Path to the run's units directory.")
@@ -266,14 +273,21 @@ def main() -> None:
 
     target_unit_ids = build_target_unit_ids(args)
     vtk_paths = validate_required_unit_vtks(units_root=units_root, unit_ids=target_unit_ids, vtk_name=str(args.vtk_name))
+    emit_merge_progress(
+        "开始区域单元 VTK 合并",
+        f"selected_unit_count={len(target_unit_ids)}, vtk_name={args.vtk_name}",
+    )
 
     payloads: list[dict[str, Any]] = []
     source_rows: list[dict[str, Any]] = []
-    for unit_id, vtk_path in zip(target_unit_ids, vtk_paths):
+    cumulative_polygon_count = 0
+    total_units = len(target_unit_ids)
+    for unit_idx, (unit_id, vtk_path) in enumerate(zip(target_unit_ids, vtk_paths), start=1):
         block_x, block_y = parse_unit_id(unit_id)
         payload = read_legacy_vtk_polygons(vtk_path)
         payloads.append(payload)
         points = np.asarray(payload["points"], dtype=float)
+        cumulative_polygon_count += int(len(payload["polygons"]))
         source_rows.append(
             {
                 "UnitID": str(unit_id),
@@ -290,7 +304,16 @@ def main() -> None:
                 "ZMax": float(points[:, 2].max()) if len(points) else None,
             }
         )
+        if unit_idx == 1 or unit_idx == total_units or unit_idx % 50 == 0:
+            emit_merge_progress(
+                "读取单元 VTK 进度",
+                (
+                    f"{unit_idx}/{total_units}, unit={unit_id}, "
+                    f"cumulative_polygon_count={cumulative_polygon_count}"
+                ),
+            )
 
+    emit_merge_progress("开始合并 VTK payload", f"payload_count={len(payloads)}")
     merged = merge_vtk_payloads(payloads)
     output_vtk_name = (
         str(args.output_vtk_name)
@@ -301,6 +324,10 @@ def main() -> None:
     )
     output_vtk_path = run_dir / output_vtk_name
     title = f"merged_{Path(args.vtk_name).stem}"
+    emit_merge_progress(
+        "开始写出合并后 VTK",
+        f"merged_polygon_count={len(merged['polygons'])}, output={output_vtk_path}",
+    )
     write_legacy_vtk_polygons(
         path=output_vtk_path,
         title=title,

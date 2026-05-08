@@ -4,6 +4,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DEFAULT_RUN_NAME="demo_bx6_13_by28_35_$(date +%Y%m%d_%H%M%S)"
 FIXED_SPLIT_CSV="${SCRIPT_DIR}/fixed_unit_splits/demo_bx6_13_by28_35_fixed_split.csv"
+LAYER_TRAINING_CONFIG_PY="${SCRIPT_DIR}/layerwise_training_plan_demo_v1.py"
 
 has_run_name="0"
 for arg in "$@"; do
@@ -18,6 +19,7 @@ forward_args=(
   --val-unit-count 9
   --test-unit-count 5
   --fixed-unit-split-csv "$FIXED_SPLIT_CSV"
+  --layer-training-config-py "$LAYER_TRAINING_CONFIG_PY"
   --center-positive-weight 24.0
   --center-negative-weight 0.25
   --center-focal-gamma 2.0

@@ -55,7 +55,8 @@ import sys
 from datetime import datetime
 from itertools import product
 from pathlib import Path
-from typing import Any
+from time import perf_counter
+from typing import Any, Callable
 
 import numpy as np
 import pandas as pd
@@ -176,6 +177,12 @@ def _same_physical_layer(row_i: pd.Series | dict[str, Any], row_j: pd.Series | d
     return _normalize_layer_key_text(row_i.get("GeoIntervalKey", "")) == _normalize_layer_key_text(row_j.get("GeoIntervalKey", ""))
 
 
+def _numeric_series_or_default(df: pd.DataFrame, column: str, default: float) -> pd.Series:
+    if column in df.columns:
+        return pd.to_numeric(df[column], errors="coerce").fillna(default)
+    return pd.Series(np.full(len(df), float(default), dtype=float), index=df.index, dtype=float)
+
+
 def _normalize_compute_backend(compute_backend: str | None) -> str:
     backend = str(compute_backend or DEFAULT_POSTPROCESS_COMPUTE_BACKEND).strip().lower()
     if backend not in {"auto", "cpu", "gpu"}:
@@ -216,6 +223,104 @@ def _thread_limit_context(max_cpu_threads: int | None):
                         pass
         else:
             yield
+
+
+class _StageProgressPrinter:
+    def __init__(self, total_steps: int, prefix: str = "postprocess", bar_width: int = 24):
+        self.total_steps = max(int(total_steps), 1)
+        self.prefix = str(prefix)
+        self.bar_width = max(int(bar_width), 10)
+        self.current_step = 0
+        self.started_at = perf_counter()
+        self._emit("start", detail=f"total_steps={self.total_steps}")
+
+    def _render_bar(self) -> str:
+        ratio = min(max(self.current_step / self.total_steps, 0.0), 1.0)
+        filled = int(round(self.bar_width * ratio))
+        filled = min(max(filled, 0), self.bar_width)
+        return "#" * filled + "." * (self.bar_width - filled)
+
+    def _emit(self, label: str, detail: str | None = None) -> None:
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        elapsed_seconds = perf_counter() - self.started_at
+        line = (
+            f"[{timestamp}] [{self.prefix}] "
+            f"[{self._render_bar()}] {self.current_step}/{self.total_steps} {label}"
+        )
+        line += f" | elapsed={elapsed_seconds:.1f}s"
+        if detail:
+            line += f" | {detail}"
+        print(line, flush=True)
+
+    def advance(self, label: str, detail: str | None = None) -> None:
+        self.current_step = min(self.current_step + 1, self.total_steps)
+        self._emit(label, detail=detail)
+
+    def log(self, label: str, detail: str | None = None) -> None:
+        self._emit(label, detail=detail)
+
+
+def _format_seconds(seconds: float) -> str:
+    return f"{float(seconds):.2f}s"
+
+
+def _should_emit_loop_progress(current: int, total: int, segments: int = 10) -> bool:
+    total_value = max(int(total), 1)
+    current_value = int(current)
+    emit_step = max(1, total_value // max(int(segments), 1))
+    return current_value == 1 or current_value == total_value or current_value % emit_step == 0
+
+
+def _emit_loop_progress(
+    progress_hook: Callable[[str, str | None], None] | None,
+    label: str,
+    current: int,
+    total: int,
+    detail: str | None = None,
+) -> None:
+    if progress_hook is None or not _should_emit_loop_progress(current, total):
+        return
+    suffix = f"{int(current)}/{max(int(total), 1)}"
+    message = suffix if not detail else f"{suffix}, {detail}"
+    progress_hook(label, message)
+
+
+def _subsample_row_indices(row_count: int, sample_cap: int | None, seed: int) -> np.ndarray:
+    total_rows = int(max(row_count, 0))
+    if total_rows <= 0:
+        return np.zeros(0, dtype=np.int64)
+    if sample_cap is None or int(sample_cap) <= 0 or total_rows <= int(sample_cap):
+        return np.arange(total_rows, dtype=np.int64)
+    rng = np.random.default_rng(int(seed))
+    return np.sort(rng.choice(total_rows, size=int(sample_cap), replace=False).astype(np.int64))
+
+
+def _prepare_group_indices(
+    df: pd.DataFrame,
+    *,
+    include_layer: bool = True,
+) -> tuple[pd.DataFrame, list[tuple[Any, np.ndarray]]]:
+    work_df = df
+    group_cols: list[str] = []
+    has_layer_info = any(
+        column in work_df.columns
+        for column in (LAYER_SURFACE_PAIR_KEY_COL, "TopSurfaceCode", "BaseSurfaceCode", "GeoIntervalKey")
+    )
+    if include_layer and has_layer_info:
+        if work_df is df:
+            work_df = df.copy()
+        work_df[LAYER_SURFACE_PAIR_KEY_COL] = _preferred_layer_series(work_df, prefer_unit_segment=False)
+        group_cols.append(LAYER_SURFACE_PAIR_KEY_COL)
+    if "FractureSet" in work_df.columns:
+        group_cols.append("FractureSet")
+    if not group_cols:
+        return work_df, []
+    grouped_indices = work_df.groupby(group_cols, dropna=False, sort=False).indices
+    group_items = [
+        (group_key, np.asarray(position_idx, dtype=np.int64))
+        for group_key, position_idx in grouped_indices.items()
+    ]
+    return work_df, group_items
 
 
 def _build_spatial_bucket_index(
@@ -438,6 +543,9 @@ def fracture_set_clustering(
     max_sets: int = 6,
     min_sets: int = 2,
     n_sets: int | None = None,
+    bic_sample_cap: int = 250000,
+    fit_sample_cap: int = 400000,
+    progress_hook: Callable[[str, str | None], None] | None = None,
 ) -> pd.DataFrame:
     """用 GMM 在 (Azimuth, Dip) 空间做候选裂缝组识别。
 
@@ -455,16 +563,27 @@ def fracture_set_clustering(
     # 走向 180° 对称 → sin/cos 嵌入
     rad = np.deg2rad(2.0 * az)
     features = np.column_stack([np.cos(rad), np.sin(rad), dip / 90.0])
+    if progress_hook is not None:
+        progress_hook(
+            "裂缝组识别数据规模",
+            f"rows={len(features)}, bic_rows={len(features)}, fit_rows={len(features)}",
+        )
 
     if n_sets is None:
         best_bic, best_k = np.inf, min_sets
-        for k in range(min_sets, max_sets + 1):
+        k_values = list(range(min_sets, max_sets + 1))
+        for k_idx, k in enumerate(k_values, start=1):
             gmm = GaussianMixture(n_components=k, covariance_type="full",
                                   n_init=3, random_state=42, max_iter=200)
             gmm.fit(features)
             bic = gmm.bic(features)
             if bic < best_bic:
                 best_bic, best_k = bic, k
+            if progress_hook is not None:
+                progress_hook(
+                    "裂缝组识别 BIC 进度",
+                    f"{k_idx}/{len(k_values)}, k={k}, best_k={best_k}",
+                )
         n_sets = best_k
 
     gmm = GaussianMixture(n_components=n_sets, covariance_type="full",
@@ -476,6 +595,8 @@ def fracture_set_clustering(
 
     df["FractureSet"] = labels.astype(int)
     df["SetProbability"] = max_probs.astype(float)
+    df.attrs["fracture_set_bic_sample_size"] = int(len(features))
+    df.attrs["fracture_set_fit_sample_size"] = int(len(features))
     return df
 
 
@@ -488,6 +609,8 @@ def regional_orientation_smoothing(
     bandwidth_xy: float = 150.0,
     bandwidth_z: float = 20.0,
     blend_alpha: float = 0.4,
+    local_radius_factor: float = 3.0,
+    progress_hook: Callable[[str, str | None], None] | None = None,
 ) -> pd.DataFrame:
     """Nadaraya-Watson 核回归, 仅在同组内做局部产状趋势估计。
 
@@ -510,17 +633,25 @@ def regional_orientation_smoothing(
     cz = df["CenterTIME"].values.astype(float)
     conf = df["Confidence"].values.astype(float) if "Confidence" in df.columns else np.ones(len(df))
 
-    for set_id in df["FractureSet"].unique():
+    set_ids = list(df["FractureSet"].unique())
+    total_groups = len(set_ids)
+    for group_idx, set_id in enumerate(set_ids, start=1):
         mask = df["FractureSet"].values == set_id
         idx = np.where(mask)[0]
         if len(idx) < 3:
+            _emit_loop_progress(
+                progress_hook,
+                "产状平滑组进度",
+                group_idx,
+                total_groups,
+                f"group_size={len(idx)}, skipped_small_group=1",
+            )
             continue
 
         coords = np.column_stack([cx[idx], cy[idx], cz[idx]])
         az_vals = df["Azimuth"].values[idx].astype(float)
         dip_vals = df["Dip"].values[idx].astype(float)
         w_conf = conf[idx].copy()
-
         az_rad = np.deg2rad(2.0 * az_vals)
         az_cos = np.cos(az_rad)
         az_sin = np.sin(az_rad)
@@ -534,7 +665,7 @@ def regional_orientation_smoothing(
             dz = coords[:, 2] - coords[i, 2]
             dist_sq = (dx / bandwidth_xy) ** 2 + (dy / bandwidth_xy) ** 2 + (dz / bandwidth_z) ** 2
             kernel = np.exp(-0.5 * dist_sq) * w_conf
-            kernel[i] = 0.0  # leave-one-out
+            kernel[i] = 0.0
             w_sum = kernel.sum()
             if w_sum < 1e-12:
                 smoothed_az[i] = az_vals[i]
@@ -546,7 +677,6 @@ def regional_orientation_smoothing(
             trend_az = (np.rad2deg(np.arctan2(mean_sin, mean_cos)) / 2.0) % 180.0
             trend_dip = np.dot(kernel, dip_vals) / w_sum
 
-            # 混合: 差异过大则不平滑 (可能是局部真实异常)
             az_diff = _azimuth_diff(np.array([az_vals[i]]), np.array([trend_az]))[0]
             if az_diff < 90.0:
                 blended_az = _azimuth_mean_weighted(
@@ -562,8 +692,13 @@ def regional_orientation_smoothing(
 
         df.loc[df.index[idx], "SmoothedAzimuth"] = smoothed_az
         df.loc[df.index[idx], "SmoothedDip"] = smoothed_dip
-        # 注意: 不覆盖 Azimuth / Dip
-
+        _emit_loop_progress(
+            progress_hook,
+            "产状平滑组进度",
+            group_idx,
+            total_groups,
+            f"group_size={len(idx)}",
+        )
     return df
 
 
@@ -576,6 +711,7 @@ def fracture_corridor_detection(
     corridor_search_radius: float = 200.0,
     corridor_min_patches: int = 5,
     along_strike_weight: float = 2.0,
+    progress_hook: Callable[[str, str | None], None] | None = None,
 ) -> pd.DataFrame:
     """检测裂缝走廊 — 沿走向排列的裂缝密集带。
 
@@ -585,16 +721,25 @@ def fracture_corridor_detection(
     - 走廊作为"候选走廊识别" → CorridorSupport 证据字段
     - 走廊增强可靠性评分权重
     - 走廊为跨界补接提供优先约束
-    - 不直接等于"必须连接"的许可
+     - 不直接等于"必须连接"的许可
     """
     df = df.copy()
     df["CorridorID"] = -1
 
     corridor_counter = 0
-    for set_id in df["FractureSet"].unique():
+    set_ids = list(df["FractureSet"].unique())
+    total_groups = len(set_ids)
+    for group_idx, set_id in enumerate(set_ids, start=1):
         mask = df["FractureSet"].values == set_id
         idx = np.where(mask)[0]
         if len(idx) < corridor_min_patches:
+            _emit_loop_progress(
+                progress_hook,
+                "走廊识别组进度",
+                group_idx,
+                total_groups,
+                f"group_size={len(idx)}, skipped_small_group=1",
+            )
             continue
 
         az_vals = df["Azimuth"].values[idx].astype(float)
@@ -609,15 +754,20 @@ def fracture_corridor_detection(
         proj_coords = np.column_stack([p, s / along_strike_weight])
         clustering = DBSCAN(eps=corridor_search_radius, min_samples=corridor_min_patches).fit(proj_coords)
         labels = clustering.labels_
-
         for c_label in set(labels):
             if c_label == -1:
                 continue
             c_idx = idx[labels == c_label]
             df.loc[df.index[c_idx], "CorridorID"] = corridor_counter
             corridor_counter += 1
+        _emit_loop_progress(
+            progress_hook,
+            "走廊识别组进度",
+            group_idx,
+            total_groups,
+            f"group_size={len(idx)}, corridor_counter={corridor_counter}",
+        )
 
-    # CorridorSupport 作为证据字段 (bool → int)
     df["CorridorSupport"] = (df["CorridorID"] >= 0).astype(int)
     return df
 
@@ -686,6 +836,7 @@ def assign_scale_classes(
     meso_min_span: float = 30.0,
     macro_min_neighbors: int = 6,
     meso_min_neighbors: int = 3,
+    progress_hook: Callable[[str, str | None], None] | None = None,
 ) -> pd.DataFrame:
     """按同层位、同裂缝组内的连通潜力给裂缝片分配尺度类别。
 
@@ -719,7 +870,9 @@ def assign_scale_classes(
         df[LAYER_SURFACE_PAIR_KEY_COL] = _preferred_layer_series(df, prefer_unit_segment=False)
         group_cols.insert(0, LAYER_SURFACE_PAIR_KEY_COL)
 
-    for _, group in df.groupby(group_cols, dropna=False):
+    groups = list(df.groupby(group_cols, dropna=False))
+    total_groups = len(groups)
+    for group_idx, (_, group) in enumerate(groups, start=1):
         idx = group.index
         if len(idx) == 0:
             continue
@@ -819,6 +972,13 @@ def assign_scale_classes(
         df.loc[idx, "AreaRankInSet"] = q_area
         df.loc[idx, "ScaleClass"] = scale_class
 
+        _emit_loop_progress(
+            progress_hook,
+            "尺度分类组进度",
+            group_idx,
+            total_groups,
+            f"group_size={len(group)}",
+        )
     return df
 
 
@@ -1185,6 +1345,7 @@ def aggregate_patches(
     meso_min_span: float = 30.0,
     macro_min_neighbors: int = 6,
     meso_min_neighbors: int = 3,
+    progress_hook: Callable[[str, str | None], None] | None = None,
 ) -> pd.DataFrame:
     """按裂缝层级做多尺度聚合。
 
@@ -1232,9 +1393,18 @@ def aggregate_patches(
         if subset.empty:
             return
 
-        for _, group in subset.groupby(group_cols, dropna=False):
+        group_items = list(subset.groupby(group_cols, dropna=False))
+        total_groups = len(group_items)
+        for group_idx, (_, group) in enumerate(group_items, start=1):
             idx_labels = group.index.to_numpy()
             if len(idx_labels) < cluster_min_patches:
+                _emit_loop_progress(
+                    progress_hook,
+                    f"裂缝片聚合组进度[{scale_class}]",
+                    group_idx,
+                    total_groups,
+                    f"group_size={len(idx_labels)}, skipped_small_group=1",
+                )
                 continue
 
             c_cx = pd.to_numeric(group["CenterX"], errors="coerce").to_numpy(dtype=float)
@@ -1347,6 +1517,13 @@ def aggregate_patches(
                 })
                 new_patches.append(new_patch)
                 keep_mask[df.index.get_indexer(cluster_idx)] = False
+            _emit_loop_progress(
+                progress_hook,
+                f"裂缝片聚合组进度[{scale_class}]",
+                group_idx,
+                total_groups,
+                f"group_size={len(idx_labels)}",
+            )
 
     _aggregate_scale(
         "macro_core",
@@ -1385,6 +1562,7 @@ def corridor_elongation(
     max_neighbor_dist: float = 120.0,
     macro_stretch_factor: float = 4.0,
     macro_neighbor_dist: float = 220.0,
+    progress_hook: Callable[[str, str | None], None] | None = None,
 ) -> pd.DataFrame:
     """在同组内沿走向拉伸裂缝片, 使相邻片在视觉上重叠形成连续带。
 
@@ -1401,12 +1579,20 @@ def corridor_elongation(
     - 重新计算 V1-V4 顶点 (中心不变, 仅沿走向拉伸)
     """
     df = df.copy()
-
     n_elongated = 0
-    for set_id in df["FractureSet"].unique():
+    set_ids = list(df["FractureSet"].unique())
+    total_groups = len(set_ids)
+    for group_idx, set_id in enumerate(set_ids, start=1):
         mask = df["FractureSet"].values == set_id
         idx = np.where(mask)[0]
         if len(idx) < 2:
+            _emit_loop_progress(
+                progress_hook,
+                "沿走向拉伸组进度",
+                group_idx,
+                total_groups,
+                f"group_size={len(idx)}, skipped_small_group=1",
+            )
             continue
 
         az_vals = df["Azimuth"].values[idx].astype(float)
@@ -1417,11 +1603,8 @@ def corridor_elongation(
         cx = df["CenterX"].values[idx].astype(float)
         cy = df["CenterY"].values[idx].astype(float)
 
-        # 沿走向 / 垂直走向投影
         s_proj = cx * strike_x + cy * strike_y
         p_proj = -cx * np.sin(mean_az_rad) + cy * np.cos(mean_az_rad)
-
-        # 用 KDTree 在组内找邻居
         coords_sp = np.column_stack([s_proj, p_proj])
         tree = cKDTree(coords_sp)
 
@@ -1434,23 +1617,18 @@ def corridor_elongation(
             class_neighbor_dist = macro_neighbor_dist if scale_class == "macro_core" else max_neighbor_dist
             orig_length = float(df.loc[df.index[i], "PatchLength"])
             half_len_i = orig_length / 2.0
-
-            # 搜索同组邻居 (沿走向+垂直走向)
             nbs = tree.query_ball_point(coords_sp[k], r=class_neighbor_dist)
             if len(nbs) <= 1:
                 continue
 
-            # 找沿走向最近的邻居 (排除自身, 垂直走向距离需小于合理阈值)
             best_along_gap = float('inf')
             for nb in nbs:
                 if nb == k:
                     continue
                 ds = abs(s_proj[nb] - s_proj[k])
                 dp = abs(p_proj[nb] - p_proj[k])
-                # 垂直走向距离不能太大 (否则不是沿走向邻居)
                 if dp > class_neighbor_dist * (0.25 if scale_class == "macro_core" else 0.4):
                     continue
-                # 计算真实间隙
                 half_len_nb = float(df.loc[df.index[idx[nb]], "PatchLength"]) / 2.0
                 gap = ds - half_len_i - half_len_nb
                 if gap > 0 and gap < best_along_gap:
@@ -1459,15 +1637,12 @@ def corridor_elongation(
             if best_along_gap == float('inf') or best_along_gap <= 0:
                 continue
 
-            # 拉伸量
             stretch = best_along_gap * gap_fill_fraction
             new_length = orig_length + stretch
             new_length = min(new_length, orig_length * class_max_stretch)
-
             if new_length <= orig_length * 1.05:
                 continue
 
-            # 从顶点恢复 u/v 方向
             v1 = np.array([float(df.iloc[i][f"V1{c}"]) for c in "XYZ"])
             v2 = np.array([float(df.iloc[i][f"V2{c}"]) for c in "XYZ"])
             v4 = np.array([float(df.iloc[i][f"V4{c}"]) for c in "XYZ"])
@@ -1485,7 +1660,6 @@ def corridor_elongation(
 
             u_hat = u_vec / u_len
             v_hat = v_vec / v_len
-
             new_half_u = new_length / 2.0
             half_v = v_len / 2.0
 
@@ -1502,6 +1676,13 @@ def corridor_elongation(
             df.loc[df.index[i], "PatchLength"] = new_length
             n_elongated += 1
 
+        _emit_loop_progress(
+            progress_hook,
+            "沿走向拉伸组进度",
+            group_idx,
+            total_groups,
+            f"group_size={len(idx)}",
+        )
     return df
 
 
@@ -2419,6 +2600,8 @@ def run_phase1(
     height_range: tuple[float, float] = (0.5, 100.0),
     compute_backend: str = DEFAULT_POSTPROCESS_COMPUTE_BACKEND,
     gpu_tile_points: int = DEFAULT_POSTPROCESS_GPU_TILE_POINTS,
+    progress_hook: Callable[[str, str | None], None] | None = None,
+    heartbeat_hook: Callable[[str, str | None], None] | None = None,
 ) -> tuple[pd.DataFrame, dict[str, Any]]:
     """第一轮: 裂缝组识别 + 可靠性评分 + 边界匹配 (不补片)。
 
@@ -2426,18 +2609,36 @@ def run_phase1(
     """
     stats: dict[str, Any] = {"phase": 1, "input_count": len(df)}
 
-    # Step 1: 裂缝组识别
-    df = fracture_set_clustering(df, max_sets=max_fracture_sets, n_sets=n_fracture_sets)
+    stats["step_seconds"] = {}
+
+    step_started = perf_counter()
+    df = fracture_set_clustering(
+        df,
+        max_sets=max_fracture_sets,
+        n_sets=n_fracture_sets,
+        progress_hook=heartbeat_hook,
+    )
+    stats["step_seconds"]["fracture_set_clustering"] = float(perf_counter() - step_started)
     n_sets_found = int(df["FractureSet"].nunique())
     set_sizes = df.groupby("FractureSet").size().to_dict()
     stats["fracture_sets"] = n_sets_found
     stats["set_sizes"] = {str(k): int(v) for k, v in set_sizes.items()}
+    stats["fracture_set_bic_sample_size"] = int(df.attrs.get("fracture_set_bic_sample_size", len(df)))
+    stats["fracture_set_fit_sample_size"] = int(df.attrs.get("fracture_set_fit_sample_size", len(df)))
+    if progress_hook is not None:
+        progress_hook(
+            "Phase1 裂缝组识别完成",
+            (
+                f"fracture_sets={n_sets_found}, "
+                f"elapsed={_format_seconds(stats['step_seconds']['fracture_set_clustering'])}"
+            ),
+        )
 
     # OrigAzimuth/OrigDip 必须在 Phase 1 就保留
     df["OrigAzimuth"] = df["Azimuth"].values.copy()
     df["OrigDip"] = df["Dip"].values.copy()
 
-    # Step 4: 多维度可靠性评分
+    step_started = perf_counter()
     df = multi_dimensional_reliability_scoring(
         df,
         neighbor_radius_xy=neighbor_radius_xy,
@@ -2449,20 +2650,44 @@ def run_phase1(
         compute_backend=compute_backend,
         gpu_tile_points=gpu_tile_points,
     )
+    stats["step_seconds"]["reliability_scoring"] = float(perf_counter() - step_started)
     stats["compute_backend"] = str(df.attrs.get("compute_backend", _resolve_compute_backend(compute_backend)))
     stats["reliability_distribution"] = df["ReliabilityLevel"].value_counts().to_dict()
     stats["mean_geophysics_score"] = float(df["GeophysicsScore"].mean())
     stats["mean_geometry_score"] = float(df["GeometryScore"].mean())
+    if progress_hook is not None:
+        reliability_dist = df["ReliabilityLevel"].value_counts().to_dict()
+        progress_hook(
+            "Phase1 可靠性评分完成",
+            (
+                f"backend={stats['compute_backend']}, "
+                f"high={int(reliability_dist.get('high', 0))}, "
+                f"medium={int(reliability_dist.get('medium', 0))}, "
+                f"low={int(reliability_dist.get('low', 0))}, "
+                f"elapsed={_format_seconds(stats['step_seconds']['reliability_scoring'])}"
+            ),
+        )
 
-    # Step 5a: 边界匹配 (仅标记)
+    step_started = perf_counter()
     df, matched_pairs = boundary_match_only(
         df,
         boundary_tol_xy=boundary_tol_xy,
         compute_backend=compute_backend,
         gpu_tile_points=gpu_tile_points,
     )
+    stats["step_seconds"]["boundary_match_only"] = float(perf_counter() - step_started)
+    df.attrs["_boundary_matched_pairs"] = matched_pairs
     stats["boundary_matched_pairs"] = len(matched_pairs)
     stats["boundary_matched_patches"] = int((df["ConnectionType"] == "boundary_matched").sum())
+    if progress_hook is not None:
+        progress_hook(
+            "Phase1 边界匹配完成",
+            (
+                f"matched_pairs={len(matched_pairs)}, "
+                f"matched_patches={int((df['ConnectionType'] == 'boundary_matched').sum())}, "
+                f"elapsed={_format_seconds(stats['step_seconds']['boundary_match_only'])}"
+            ),
+        )
 
     stats["output_count"] = len(df)
     return df, stats
@@ -2500,6 +2725,7 @@ def run_phase2(
     jitter_seed: int = 42,
     compute_backend: str = DEFAULT_POSTPROCESS_COMPUTE_BACKEND,
     gpu_tile_points: int = DEFAULT_POSTPROCESS_GPU_TILE_POINTS,
+    progress_hook: Callable[[str, str | None], None] | None = None,
 ) -> tuple[pd.DataFrame, dict[str, Any]]:
     """第二轮: 组内平滑 + 走廊检测 + 聚合 + 沿走向拉伸 + 有限补接 + 空间扰动。
 
@@ -2516,12 +2742,25 @@ def run_phase2(
         "mean_dip_shift_deg": float(np.nanmean(dip_shift)),
         "max_azimuth_shift_deg": float(np.nanmax(az_shift)),
     }
+    if progress_hook is not None:
+        progress_hook(
+            "Phase2 产状平滑完成",
+            (
+                f"mean_az_shift={stats['orientation_smoothing']['mean_azimuth_shift_deg']:.2f}deg, "
+                f"mean_dip_shift={stats['orientation_smoothing']['mean_dip_shift_deg']:.2f}deg"
+            ),
+        )
 
     # Step 3: 走廊检测 (CorridorSupport 证据)
     df = fracture_corridor_detection(df, corridor_search_radius, corridor_min_patches)
     n_in_corridors = int(df["CorridorSupport"].sum())
     stats["corridors_detected"] = int(df["CorridorID"].max() + 1) if n_in_corridors > 0 else 0
     stats["patches_in_corridors"] = n_in_corridors
+    if progress_hook is not None:
+        progress_hook(
+            "Phase2 走廊识别完成",
+            f"corridors={int(stats['corridors_detected'])}, patches_in_corridor={n_in_corridors}",
+        )
 
     # Step 5b: 保守补接
     if enable_supplement:
@@ -3222,10 +3461,7 @@ def boundary_connect_postprocess(
     if "ConnectionID" not in df.columns:
         df["ConnectionID"] = -1
     if "PatchArea" not in df.columns:
-        df["PatchArea"] = (
-            pd.to_numeric(df.get("PatchLength"), errors="coerce").fillna(0.0)
-            * pd.to_numeric(df.get("PatchHeight"), errors="coerce").fillna(0.0)
-        )
+        df["PatchArea"] = _numeric_series_or_default(df, "PatchLength", 0.0) * _numeric_series_or_default(df, "PatchHeight", 0.0)
 
     work_az_arr, work_dip_arr = _get_work_orientation(df)
     scale_class_arr = (
@@ -4048,11 +4284,22 @@ def run_phase2(
     jitter_seed: int = 42,
     compute_backend: str = DEFAULT_POSTPROCESS_COMPUTE_BACKEND,
     gpu_tile_points: int = DEFAULT_POSTPROCESS_GPU_TILE_POINTS,
+    progress_hook: Callable[[str, str | None], None] | None = None,
+    heartbeat_hook: Callable[[str, str | None], None] | None = None,
 ) -> tuple[pd.DataFrame, dict[str, Any]]:
     """Phase 2 override with multiscale expert postprocess."""
     stats: dict[str, Any] = {"phase": 2, "input_count": len(df)}
+    stats["step_seconds"] = {}
 
-    df = regional_orientation_smoothing(df, smooth_bandwidth_xy, smooth_bandwidth_z, smooth_blend_alpha)
+    step_started = perf_counter()
+    df = regional_orientation_smoothing(
+        df,
+        smooth_bandwidth_xy,
+        smooth_bandwidth_z,
+        smooth_blend_alpha,
+        progress_hook=heartbeat_hook,
+    )
+    stats["step_seconds"]["orientation_smoothing"] = float(perf_counter() - step_started)
     az_shift = _azimuth_diff(df["OrigAzimuth"].values, df["SmoothedAzimuth"].values)
     dip_shift = np.abs(df["OrigDip"].values - df["SmoothedDip"].values)
     stats["orientation_smoothing"] = {
@@ -4060,12 +4307,38 @@ def run_phase2(
         "mean_dip_shift_deg": float(np.nanmean(dip_shift)),
         "max_azimuth_shift_deg": float(np.nanmax(az_shift)),
     }
+    if progress_hook is not None:
+        progress_hook(
+            "Phase2 产状平滑完成",
+            (
+                f"mean_az_shift={stats['orientation_smoothing']['mean_azimuth_shift_deg']:.2f}deg, "
+                f"mean_dip_shift={stats['orientation_smoothing']['mean_dip_shift_deg']:.2f}deg, "
+                f"elapsed={_format_seconds(stats['step_seconds']['orientation_smoothing'])}"
+            ),
+        )
 
-    df = fracture_corridor_detection(df, corridor_search_radius, corridor_min_patches)
+    step_started = perf_counter()
+    df = fracture_corridor_detection(
+        df,
+        corridor_search_radius,
+        corridor_min_patches,
+        progress_hook=heartbeat_hook,
+    )
+    stats["step_seconds"]["corridor_detection"] = float(perf_counter() - step_started)
     n_in_corridors = int(df["CorridorSupport"].sum())
     stats["corridors_detected"] = int(df["CorridorID"].max() + 1) if n_in_corridors > 0 else 0
     stats["patches_in_corridors"] = n_in_corridors
+    if progress_hook is not None:
+        progress_hook(
+            "Phase2 走廊识别完成",
+            (
+                f"corridors={int(stats['corridors_detected'])}, "
+                f"patches_in_corridor={n_in_corridors}, "
+                f"elapsed={_format_seconds(stats['step_seconds']['corridor_detection'])}"
+            ),
+        )
 
+    step_started = perf_counter()
     df = assign_scale_classes(
         df,
         scale_major_radius=scale_major_radius,
@@ -4078,15 +4351,28 @@ def run_phase2(
         meso_min_span=meso_min_span,
         macro_min_neighbors=macro_min_neighbors,
         meso_min_neighbors=meso_min_neighbors,
+        progress_hook=heartbeat_hook,
     )
+    stats["step_seconds"]["scale_classification"] = float(perf_counter() - step_started)
     scale_counts = df["ScaleClass"].value_counts().to_dict()
     total_scale = max(len(df), 1)
     stats["scale_class_counts"] = {str(key): int(value) for key, value in scale_counts.items()}
     stats["macro_fraction"] = float(scale_counts.get("macro_core", 0) / total_scale)
     stats["meso_fraction"] = float(scale_counts.get("meso_link", 0) / total_scale)
     stats["micro_fraction"] = float(scale_counts.get("micro_bg", 0) / total_scale)
+    if progress_hook is not None:
+        progress_hook(
+            "Phase2 尺度分类完成",
+            (
+                f"macro={int(scale_counts.get('macro_core', 0))}, "
+                f"meso={int(scale_counts.get('meso_link', 0))}, "
+                f"micro={int(scale_counts.get('micro_bg', 0))}, "
+                f"elapsed={_format_seconds(stats['step_seconds']['scale_classification'])}"
+            ),
+        )
 
     if enable_supplement:
+        step_started = perf_counter()
         _, matched_pairs = boundary_match_only(
             df,
             boundary_tol_xy=boundary_tol_xy,
@@ -4100,11 +4386,23 @@ def run_phase2(
             min_pair_confidence=min_pair_confidence,
             max_supplement_length=max_supplement_length,
         )
+        stats["step_seconds"]["conservative_supplement"] = float(perf_counter() - step_started)
         stats["supplemented_patches"] = len(df) - count_before
+        if progress_hook is not None:
+            progress_hook(
+                "Phase2 保守补接完成",
+                (
+                    f"matched_pairs={len(matched_pairs)}, supplemented={int(stats['supplemented_patches'])}, "
+                    f"elapsed={_format_seconds(stats['step_seconds']['conservative_supplement'])}"
+                ),
+            )
     else:
         stats["supplemented_patches"] = 0
+        if progress_hook is not None:
+            progress_hook("Phase2 保守补接跳过", "enable_supplement=False")
 
     if enable_aggregation:
+        step_started = perf_counter()
         count_before_agg = len(df)
         df = aggregate_patches(
             df,
@@ -4128,17 +4426,31 @@ def run_phase2(
             meso_min_span=meso_min_span,
             macro_min_neighbors=macro_min_neighbors,
             meso_min_neighbors=meso_min_neighbors,
+            progress_hook=heartbeat_hook,
         )
+        stats["step_seconds"]["aggregate_patches"] = float(perf_counter() - step_started)
         stats["aggregation"] = {
             "input_patches": count_before_agg,
             "output_patches": len(df),
             "merged_away": count_before_agg - len(df),
             "post_scale_class_counts": {str(k): int(v) for k, v in df["ScaleClass"].value_counts().to_dict().items()} if "ScaleClass" in df.columns else {},
         }
+        if progress_hook is not None:
+            progress_hook(
+                "Phase2 裂缝片聚合完成",
+                (
+                    f"input={count_before_agg}, output={len(df)}, "
+                    f"merged_away={count_before_agg - len(df)}, "
+                    f"elapsed={_format_seconds(stats['step_seconds']['aggregate_patches'])}"
+                ),
+            )
     else:
         stats["aggregation"] = None
+        if progress_hook is not None:
+            progress_hook("Phase2 裂缝片聚合跳过", "enable_aggregation=False")
 
     if enable_elongation:
+        step_started = perf_counter()
         orig_lengths = df["PatchLength"].to_numpy(dtype=float).copy()
         df = corridor_elongation(
             df,
@@ -4147,7 +4459,9 @@ def run_phase2(
             max_neighbor_dist=elongation_max_neighbor_dist,
             macro_stretch_factor=macro_elongation_stretch,
             macro_neighbor_dist=macro_elongation_range,
+            progress_hook=heartbeat_hook,
         )
+        stats["step_seconds"]["corridor_elongation"] = float(perf_counter() - step_started)
         if "PatchArea" in df.columns:
             df["PatchArea"] = (
                 pd.to_numeric(df["PatchLength"], errors="coerce").fillna(0.0)
@@ -4161,13 +4475,36 @@ def run_phase2(
             "max_stretch_factor": elongation_max_stretch,
             "macro_stretch_factor": macro_elongation_stretch,
         }
+        if progress_hook is not None:
+            progress_hook(
+                "Phase2 沿走向拉伸完成",
+                (
+                    f"stretched={int(stretched_mask.sum())}, "
+                    f"mean_ratio={stats['elongation']['mean_stretch_ratio']:.3f}, "
+                    f"elapsed={_format_seconds(stats['step_seconds']['corridor_elongation'])}"
+                ),
+            )
+    elif progress_hook is not None:
+        progress_hook("Phase2 沿走向拉伸跳过", "enable_elongation=False")
 
     if jitter_sigma_xy > 0:
+        step_started = perf_counter()
         df = spatial_perturbation(df, jitter_sigma_xy, jitter_along_strike_factor, jitter_seed)
+        stats["step_seconds"]["spatial_perturbation"] = float(perf_counter() - step_started)
         stats["spatial_perturbation"] = {
             "jitter_sigma_xy": jitter_sigma_xy,
             "along_strike_factor": jitter_along_strike_factor,
         }
+        if progress_hook is not None:
+            progress_hook(
+                "Phase2 空间扰动完成",
+                (
+                    f"jitter_sigma_xy={jitter_sigma_xy}, along_strike_factor={jitter_along_strike_factor}, "
+                    f"elapsed={_format_seconds(stats['step_seconds']['spatial_perturbation'])}"
+                ),
+            )
+    elif progress_hook is not None:
+        progress_hook("Phase2 空间扰动跳过", "jitter_sigma_xy<=0")
 
     stats["compute_backend"] = _resolve_compute_backend(compute_backend)
     stats["output_count"] = len(df)
@@ -4198,28 +4535,40 @@ def _df_from_vtk(payload: dict[str, Any]) -> pd.DataFrame:
         if numeric.notna().all():
             df[col] = numeric.astype(int).map(mapping).fillna(df[col])
 
-    centers = np.zeros((n_cells, 3))
-    for i, poly in enumerate(polygons):
-        centers[i] = points[poly].mean(axis=0)
-    df["CenterX"] = centers[:, 0]
-    df["CenterY"] = centers[:, 1]
-    df["CenterTIME"] = centers[:, 2]
-
-    for vi in range(1, 5):
-        vx, vy, vz = [], [], []
+    if n_cells > 0 and all(len(poly) == 4 for poly in polygons):
+        polygon_idx = np.asarray(polygons, dtype=np.int64)
+        polygon_points = points[polygon_idx]
+        centers = polygon_points.mean(axis=1)
+        df["CenterX"] = centers[:, 0]
+        df["CenterY"] = centers[:, 1]
+        df["CenterTIME"] = centers[:, 2]
+        for vi in range(4):
+            df[f"V{vi + 1}X"] = polygon_points[:, vi, 0]
+            df[f"V{vi + 1}Y"] = polygon_points[:, vi, 1]
+            df[f"V{vi + 1}Z"] = polygon_points[:, vi, 2]
+    else:
+        centers = np.zeros((n_cells, 3))
         for i, poly in enumerate(polygons):
-            if vi - 1 < len(poly):
-                point = points[poly[vi - 1]]
-                vx.append(point[0])
-                vy.append(point[1])
-                vz.append(point[2])
-            else:
-                vx.append(centers[i, 0])
-                vy.append(centers[i, 1])
-                vz.append(centers[i, 2])
-        df[f"V{vi}X"] = vx
-        df[f"V{vi}Y"] = vy
-        df[f"V{vi}Z"] = vz
+            centers[i] = points[poly].mean(axis=0)
+        df["CenterX"] = centers[:, 0]
+        df["CenterY"] = centers[:, 1]
+        df["CenterTIME"] = centers[:, 2]
+
+        for vi in range(1, 5):
+            vx, vy, vz = [], [], []
+            for i, poly in enumerate(polygons):
+                if vi - 1 < len(poly):
+                    point = points[poly[vi - 1]]
+                    vx.append(point[0])
+                    vy.append(point[1])
+                    vz.append(point[2])
+                else:
+                    vx.append(centers[i, 0])
+                    vy.append(centers[i, 1])
+                    vz.append(centers[i, 2])
+            df[f"V{vi}X"] = vx
+            df[f"V{vi}Y"] = vy
+            df[f"V{vi}Z"] = vz
 
     for col, default in [("Azimuth", 0.0), ("Dip", 45.0), ("Confidence", 0.5), ("PatchLength", 10.0), ("PatchHeight", 10.0)]:
         if col not in df.columns:
@@ -4235,22 +4584,22 @@ def _df_from_vtk(payload: dict[str, Any]) -> pd.DataFrame:
 
 def _df_to_vtk(df: pd.DataFrame, title: str, output_vtk: Path, scalar_types: dict[str, str] | None = None) -> None:
     """Write DataFrame back to legacy VTK."""
-    new_points: list[list[float]] = []
-    new_polygons: list[list[int]] = []
+    row_count = int(len(df))
     skip_cols = {"CenterX", "CenterY", "CenterTIME"}
     skip_cols |= {f"V{vi}{c}" for vi in range(1, 5) for c in ("X", "Y", "Z")}
     data_cols = [col for col in df.columns if col not in skip_cols]
-    cell_data_lists: dict[str, list[Any]] = {col: [] for col in data_cols}
-
-    for _, row in df.iterrows():
-        start_idx = len(new_points)
-        for vi in range(1, 5):
-            new_points.append([float(row[f"V{vi}X"]), float(row[f"V{vi}Y"]), float(row[f"V{vi}Z"])])
-        new_polygons.append(list(range(start_idx, start_idx + 4)))
-        for col in data_cols:
-            cell_data_lists[col].append(row[col])
-
-    out_points = np.array(new_points, dtype=float)
+    vertex_blocks = [
+        np.column_stack(
+            [
+                pd.to_numeric(df[f"V{vi}X"], errors="coerce").fillna(0.0).to_numpy(dtype=float),
+                pd.to_numeric(df[f"V{vi}Y"], errors="coerce").fillna(0.0).to_numpy(dtype=float),
+                pd.to_numeric(df[f"V{vi}Z"], errors="coerce").fillna(0.0).to_numpy(dtype=float),
+            ]
+        )
+        for vi in range(1, 5)
+    ]
+    out_points = np.stack(vertex_blocks, axis=1).reshape(row_count * 4, 3) if row_count > 0 else np.zeros((0, 3), dtype=float)
+    new_polygons = np.arange(row_count * 4, dtype=int).reshape(row_count, 4).tolist() if row_count > 0 else []
     out_cell_data: dict[str, np.ndarray] = {}
     out_scalar_types: dict[str, str] = dict(scalar_types) if scalar_types else {}
     int_cols = {
@@ -4270,8 +4619,10 @@ def _df_to_vtk(df: pd.DataFrame, title: str, output_vtk: Path, scalar_types: dic
         "AggregationMode": {"original": 0, "macro_agg": 1, "meso_agg": 2, "boundary_bridge": 3, "seam_fill": 4},
     }
 
-    for col, vals_list in cell_data_lists.items():
-        arr = np.array(vals_list)
+    for col in data_cols:
+        vals_series = df[col]
+        vals_list = vals_series.to_numpy()
+        arr = np.asarray(vals_list)
         if col in str_maps:
             mapping = str_maps[col]
             out_cell_data[col] = np.array([mapping.get(str(value), -1) for value in vals_list], dtype=int)
@@ -4296,7 +4647,13 @@ def _df_to_vtk(df: pd.DataFrame, title: str, output_vtk: Path, scalar_types: dic
     )
 
 
-def _run_pipeline_on_dataframe(df: pd.DataFrame, phase: int, **kwargs: Any) -> tuple[pd.DataFrame, dict[str, Any]]:
+def _run_pipeline_on_dataframe(
+    df: pd.DataFrame,
+    phase: int,
+    progress_hook: Callable[[str, str | None], None] | None = None,
+    heartbeat_hook: Callable[[str, str | None], None] | None = None,
+    **kwargs: Any,
+) -> tuple[pd.DataFrame, dict[str, Any]]:
     """Run pipeline on a dataframe so VTK and CSV share the same logic."""
     runtime_keys = {
         "compute_backend",
@@ -4345,7 +4702,7 @@ def _run_pipeline_on_dataframe(df: pd.DataFrame, phase: int, **kwargs: Any) -> t
         if phase == 1:
             p1_kwargs = dict(core_kwargs)
             p1_kwargs.update(phase_runtime_kwargs)
-            df, stats = run_phase1(df, **p1_kwargs)
+            df, stats = run_phase1(df, progress_hook=progress_hook, heartbeat_hook=heartbeat_hook, **p1_kwargs)
         elif phase == 2:
             p1_keys = {
                 "max_fracture_sets",
@@ -4364,8 +4721,8 @@ def _run_pipeline_on_dataframe(df: pd.DataFrame, phase: int, **kwargs: Any) -> t
             p2_kwargs = {k: v for k, v in core_kwargs.items() if k not in p1_keys}
             p1_kwargs.update(phase_runtime_kwargs)
             p2_kwargs.update(phase_runtime_kwargs)
-            df, stats1 = run_phase1(df, **p1_kwargs)
-            df, stats2 = run_phase2(df, **p2_kwargs)
+            df, stats1 = run_phase1(df, progress_hook=progress_hook, heartbeat_hook=heartbeat_hook, **p1_kwargs)
+            df, stats2 = run_phase2(df, progress_hook=progress_hook, heartbeat_hook=heartbeat_hook, **p2_kwargs)
             stats = {
                 **stats1,
                 "phase1_output_count": stats1.get("output_count"),
@@ -4395,6 +4752,15 @@ def _run_pipeline_on_dataframe(df: pd.DataFrame, phase: int, **kwargs: Any) -> t
             bc_args.update({k: v for k, v in runtime_kwargs.items() if k in {"compute_backend", "gpu_tile_points"}})
             df, bc_stats = boundary_connect_postprocess(df, **bc_args)
             stats["boundary_connect"] = bc_stats
+            if progress_hook is not None:
+                progress_hook(
+                    "边界跨单元补接完成",
+                    (
+                        f"connections={int(bc_stats.get('connections_made', 0))}, "
+                        f"supplements={int(bc_stats.get('supplements_added', 0))}, "
+                        f"backend={bc_stats.get('compute_backend', 'unknown')}"
+                    ),
+                )
 
         if enable_seam_fill:
             sf_map = {
@@ -4411,6 +4777,14 @@ def _run_pipeline_on_dataframe(df: pd.DataFrame, phase: int, **kwargs: Any) -> t
             sf_args = {sf_map[k]: v for k, v in boundary_kwargs.items() if k in sf_map}
             df, sf_stats = boundary_seam_fill(df, **sf_args)
             stats["seam_fill"] = sf_stats
+            if progress_hook is not None:
+                progress_hook(
+                    "边界缝带填充完成",
+                    (
+                        f"seam_fills={int(sf_stats.get('seam_fills', 0))}, "
+                        f"blended={int(sf_stats.get('blended_patches', 0))}"
+                    ),
+                )
 
     stats["max_cpu_threads"] = int(max_cpu_threads)
     stats["compute_backend"] = str(stats.get("compute_backend", runtime_kwargs.get("compute_backend", DEFAULT_POSTPROCESS_COMPUTE_BACKEND)))
@@ -4419,11 +4793,32 @@ def _run_pipeline_on_dataframe(df: pd.DataFrame, phase: int, **kwargs: Any) -> t
 
 def postprocess_vtk(input_vtk: Path, output_vtk: Path, phase: int = 1, **kwargs: Any) -> dict[str, Any]:
     """Read VTK, postprocess, write VTK."""
+    total_started = perf_counter()
+    enable_boundary_connect = bool(kwargs.get("enable_boundary_connect", False))
+    enable_seam_fill = bool(kwargs.get("enable_seam_fill", False))
+    pipeline_stage_count = 3 + (7 if int(phase) == 2 else 0) + (1 if enable_boundary_connect else 0) + (1 if enable_seam_fill else 0)
+    progress = _StageProgressPrinter(
+        total_steps=2 + pipeline_stage_count + 1,
+        prefix=f"postprocess phase{int(phase)}",
+    )
     payload = read_legacy_vtk_polygons(input_vtk)
+    progress.advance("读取VTK完成", f"polygons={len(payload.get('polygons', []))}")
     df = _df_from_vtk(payload)
-    df, stats = _run_pipeline_on_dataframe(df, phase, **kwargs)
+    progress.advance("VTK转DataFrame完成", f"rows={len(df)}")
+    df, stats = _run_pipeline_on_dataframe(
+        df,
+        phase,
+        progress_hook=progress.advance,
+        heartbeat_hook=progress.log,
+        **kwargs,
+    )
     title = f"{payload.get('title', 'DFN')}_postprocessed_phase{phase}"
     _df_to_vtk(df, title, output_vtk, payload.get("scalar_types"))
+    stats["total_seconds"] = float(perf_counter() - total_started)
+    progress.advance(
+        "写出VTK完成",
+        f"rows={len(df)}, output={output_vtk}, total_elapsed={_format_seconds(stats['total_seconds'])}",
+    )
     return stats
 
 
