@@ -275,43 +275,79 @@ def extract_local_submesh(tri_local_poly: pv.PolyData, cell_ids: np.ndarray) -> 
     return submesh
 
 
-def split_local_component_by_area_cap(component_local: pv.PolyData, area_cap: float) -> list[pv.PolyData]:
-    tri_local_poly = extract_surface_clean_tri(component_local)
-    if not isinstance(tri_local_poly, pv.PolyData) or tri_local_poly.n_cells <= 0:
-        return []
-    if float(area_cap) <= 0.0 or float(tri_local_poly.area) <= float(area_cap):
-        return [tri_local_poly]
-
+def prepare_area_cap_split_arrays(
+    tri_local_poly: pv.PolyData,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     cell_centers = tri_local_poly.cell_centers().points
     if cell_centers is None or len(cell_centers) != tri_local_poly.n_cells:
-        return [tri_local_poly]
+        raise ValueError("failed to compute fault surface cell centers")
     cell_centers = np.asarray(cell_centers, dtype=float)
 
-    pending: list[np.ndarray] = [np.arange(tri_local_poly.n_cells, dtype=int)]
-    leaves: list[pv.PolyData] = []
+    sized_poly = tri_local_poly.compute_cell_sizes(length=False, area=True, volume=False)
+    cell_areas = np.asarray(sized_poly.cell_data.get("Area", np.zeros(tri_local_poly.n_cells)), dtype=float)
+    if len(cell_areas) != tri_local_poly.n_cells:
+        cell_areas = np.full(
+            tri_local_poly.n_cells,
+            float(tri_local_poly.area) / max(int(tri_local_poly.n_cells), 1),
+            dtype=float,
+        )
+
+    cell_xmin = cell_centers[:, 0].copy()
+    cell_xmax = cell_centers[:, 0].copy()
+    cell_ymin = cell_centers[:, 1].copy()
+    cell_ymax = cell_centers[:, 1].copy()
+    polygons = parse_faces_to_polygons(np.asarray(tri_local_poly.faces, dtype=int))
+    if len(polygons) == tri_local_poly.n_cells:
+        points = np.asarray(tri_local_poly.points, dtype=float)
+        for cell_idx, polygon in enumerate(polygons):
+            polygon_points = points[np.asarray(polygon, dtype=int)]
+            cell_xmin[cell_idx] = float(polygon_points[:, 0].min())
+            cell_xmax[cell_idx] = float(polygon_points[:, 0].max())
+            cell_ymin[cell_idx] = float(polygon_points[:, 1].min())
+            cell_ymax[cell_idx] = float(polygon_points[:, 1].max())
+    return cell_centers, cell_areas, cell_xmin, cell_xmax, cell_ymin, cell_ymax
+
+
+def split_component_cell_ids_by_area_cap(
+    cell_centers: np.ndarray,
+    cell_areas: np.ndarray,
+    cell_xmin: np.ndarray,
+    cell_xmax: np.ndarray,
+    cell_ymin: np.ndarray,
+    cell_ymax: np.ndarray,
+    area_cap: float,
+) -> list[np.ndarray]:
+    pending: list[np.ndarray] = [np.arange(len(cell_centers), dtype=int)]
+    leaf_ids: list[np.ndarray] = []
+    safe_area_cap = max(float(area_cap), 0.0)
+
     while pending:
         current_ids = pending.pop()
-        current_mesh = extract_local_submesh(tri_local_poly, current_ids)
-        if current_mesh is None:
+        if len(current_ids) <= 0:
             continue
-        current_area = float(current_mesh.area)
-        if current_area <= float(area_cap) or len(current_ids) <= 1:
-            leaves.append(current_mesh)
+        current_area = float(cell_areas[current_ids].sum())
+        if current_area <= safe_area_cap or len(current_ids) <= 1:
+            leaf_ids.append(np.asarray(current_ids, dtype=int))
             continue
 
-        current_points = np.asarray(current_mesh.points, dtype=float)
-        if len(current_points) == 0:
-            leaves.append(current_mesh)
-            continue
-        span_x = float(current_points[:, 0].max() - current_points[:, 0].min())
-        span_y = float(current_points[:, 1].max() - current_points[:, 1].min())
+        span_x = float(cell_xmax[current_ids].max() - cell_xmin[current_ids].min())
+        span_y = float(cell_ymax[current_ids].max() - cell_ymin[current_ids].min())
         axis_candidates = [0, 1] if span_x >= span_y else [1, 0]
         split_done = False
+
         for axis in axis_candidates:
             axis_values = cell_centers[current_ids, axis]
             if len(axis_values) <= 1:
                 continue
-            for split_value in (float(np.median(axis_values)), float(0.5 * (axis_values.min() + axis_values.max()))):
+            unique_values = np.unique(axis_values)
+            if len(unique_values) <= 1:
+                continue
+
+            split_values = [
+                float(np.median(axis_values)),
+                float(0.5 * (axis_values.min() + axis_values.max())),
+            ]
+            for split_value in split_values:
                 left_ids = current_ids[axis_values <= split_value]
                 right_ids = current_ids[axis_values > split_value]
                 if len(left_ids) == 0 or len(right_ids) == 0:
@@ -324,9 +360,59 @@ def split_local_component_by_area_cap(component_local: pv.PolyData, area_cap: fl
                 break
             if split_done:
                 break
+
+            order = np.argsort(axis_values, kind="mergesort")
+            sorted_ids = current_ids[order]
+            if len(sorted_ids) <= 1:
+                continue
+            cumulative_area = np.cumsum(cell_areas[sorted_ids])
+            split_idx = int(np.searchsorted(cumulative_area, current_area * 0.5, side="left"))
+            split_idx = min(max(split_idx, 1), len(sorted_ids) - 1)
+            left_ids = sorted_ids[:split_idx]
+            right_ids = sorted_ids[split_idx:]
+            if len(left_ids) == 0 or len(right_ids) == 0:
+                continue
+            pending.append(np.asarray(left_ids, dtype=int))
+            pending.append(np.asarray(right_ids, dtype=int))
+            split_done = True
+            break
+
         if not split_done:
-            leaves.append(current_mesh)
-    return leaves
+            leaf_ids.append(np.asarray(current_ids, dtype=int))
+
+    leaf_ids.sort(key=lambda ids: int(ids.min()) if len(ids) > 0 else -1)
+    return leaf_ids
+
+
+def split_local_component_by_area_cap(component_local: pv.PolyData, area_cap: float) -> list[pv.PolyData]:
+    tri_local_poly = extract_surface_clean_tri(component_local)
+    if not isinstance(tri_local_poly, pv.PolyData) or tri_local_poly.n_cells <= 0:
+        return []
+    if float(area_cap) <= 0.0 or float(tri_local_poly.area) <= float(area_cap):
+        return [tri_local_poly]
+
+    try:
+        cell_centers, cell_areas, cell_xmin, cell_xmax, cell_ymin, cell_ymax = prepare_area_cap_split_arrays(tri_local_poly)
+    except ValueError:
+        return [tri_local_poly]
+
+    leaf_ids = split_component_cell_ids_by_area_cap(
+        cell_centers=cell_centers,
+        cell_areas=cell_areas,
+        cell_xmin=cell_xmin,
+        cell_xmax=cell_xmax,
+        cell_ymin=cell_ymin,
+        cell_ymax=cell_ymax,
+        area_cap=float(area_cap),
+    )
+
+    leaves: list[pv.PolyData] = []
+    for current_ids in leaf_ids:
+        current_mesh = extract_local_submesh(tri_local_poly, current_ids)
+        if current_mesh is None:
+            continue
+        leaves.append(current_mesh)
+    return leaves if leaves else [tri_local_poly]
 
 
 def build_planar_patch_row_from_mesh(

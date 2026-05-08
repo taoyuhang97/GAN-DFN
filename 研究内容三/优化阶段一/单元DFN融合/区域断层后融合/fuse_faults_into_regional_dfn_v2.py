@@ -19,7 +19,6 @@ from fault_postfusion_common import (
     normalize_vector,
     predict_fault_time_at_xy,
     read_regional_vtk_to_df,
-    scale_patch_row_geometry,
     write_legacy_vtk_polygons_preserve_patch_area,
     write_csv_utf8,
     write_df_to_regional_vtk,
@@ -130,6 +129,50 @@ def build_zone_specs(fault_half_band_ms: float) -> list[dict[str, Any]]:
     ]
 
 
+def build_panel_spatial_index(
+    panel_arrays: dict[str, np.ndarray],
+    grid_size_xy: float,
+) -> dict[tuple[int, int], np.ndarray]:
+    safe_grid_size = max(float(grid_size_xy), 1.0)
+    grid_lookup: dict[tuple[int, int], list[int]] = {}
+    grid_x_min = np.floor(panel_arrays["xmin"] / safe_grid_size).astype(int)
+    grid_x_max = np.floor(panel_arrays["xmax"] / safe_grid_size).astype(int)
+    grid_y_min = np.floor(panel_arrays["ymin"] / safe_grid_size).astype(int)
+    grid_y_max = np.floor(panel_arrays["ymax"] / safe_grid_size).astype(int)
+    for panel_pos in range(len(panel_arrays["id"])):
+        for grid_x in range(int(grid_x_min[panel_pos]), int(grid_x_max[panel_pos]) + 1):
+            for grid_y in range(int(grid_y_min[panel_pos]), int(grid_y_max[panel_pos]) + 1):
+                grid_lookup.setdefault((grid_x, grid_y), []).append(int(panel_pos))
+    return {
+        key: np.asarray(value, dtype=np.int32)
+        for key, value in grid_lookup.items()
+    }
+
+
+def iter_grouped_xy_row_positions(
+    x_values: np.ndarray,
+    y_values: np.ndarray,
+    grid_size_xy: float,
+) -> list[tuple[tuple[int, int], np.ndarray]]:
+    if len(x_values) <= 0:
+        return []
+    safe_grid_size = max(float(grid_size_xy), 1.0)
+    grid_x = np.floor(np.asarray(x_values, dtype=float) / safe_grid_size).astype(np.int32)
+    grid_y = np.floor(np.asarray(y_values, dtype=float) / safe_grid_size).astype(np.int32)
+    order = np.lexsort((grid_y, grid_x))
+    sorted_grid_x = grid_x[order]
+    sorted_grid_y = grid_y[order]
+    change_positions = np.flatnonzero(
+        (sorted_grid_x[1:] != sorted_grid_x[:-1]) | (sorted_grid_y[1:] != sorted_grid_y[:-1])
+    ) + 1
+    starts = np.concatenate([[0], change_positions])
+    ends = np.concatenate([change_positions, [len(order)]])
+    return [
+        ((int(sorted_grid_x[start]), int(sorted_grid_y[start])), order[start:end])
+        for start, end in zip(starts, ends)
+    ]
+
+
 def assign_fault_influence(
     df: pd.DataFrame,
     panel_df: pd.DataFrame,
@@ -140,16 +183,28 @@ def assign_fault_influence(
     progress_hook: Callable[[str, str | None], None] | None = None,
 ) -> pd.DataFrame:
     result = df.copy()
-    result["PatchOriginCode"] = pd.to_numeric(result.get("PatchOriginCode", 0), errors="coerce").fillna(0).astype(int)
-    result["PatchOriginText"] = result.get("PatchOriginText", "original")
-    result["FaultActionCode"] = 0
-    result["FaultActionText"] = "keep"
-    result["FaultDistanceMs"] = np.nan
-    result["FaultInfluenceWeight"] = 0.0
-    result["NearestFaultPanelID"] = -1
-    result["NearestFaultName"] = ""
+    if "PatchOriginCode" in result.columns:
+        result["PatchOriginCode"] = pd.to_numeric(result["PatchOriginCode"], errors="coerce").fillna(0).astype(int)
+    else:
+        result["PatchOriginCode"] = 0
+    if "PatchOriginText" not in result.columns:
+        result["PatchOriginText"] = "original"
+    total_rows = int(len(result))
+
+    fault_action_codes = np.zeros(total_rows, dtype=int)
+    fault_action_texts = np.full(total_rows, "keep", dtype=object)
+    fault_distance_ms = np.full(total_rows, np.nan, dtype=float)
+    fault_influence_weight = np.zeros(total_rows, dtype=float)
+    nearest_fault_panel_id = np.full(total_rows, -1, dtype=int)
+    nearest_fault_name = np.full(total_rows, "", dtype=object)
 
     if panel_df.empty or result.empty:
+        result["FaultActionCode"] = fault_action_codes
+        result["FaultActionText"] = fault_action_texts
+        result["FaultDistanceMs"] = fault_distance_ms
+        result["FaultInfluenceWeight"] = fault_influence_weight
+        result["NearestFaultPanelID"] = nearest_fault_panel_id
+        result["NearestFaultName"] = nearest_fault_name
         return result
 
     panel_arrays = {
@@ -167,58 +222,102 @@ def assign_fault_influence(
         "nz": panel_df["NormalZ"].to_numpy(dtype=float),
     }
     valid_nz = np.abs(panel_arrays["nz"]) > 1e-8
+    grid_size_xy = max(float(panel_xy_buffer), 1.0)
+    panel_spatial_index = build_panel_spatial_index(panel_arrays, grid_size_xy)
 
-    total_rows = int(len(result))
-    emit_step = max(1, total_rows // 20) if total_rows > 0 else 1
+    center_x = result["CenterX"].to_numpy(dtype=float)
+    center_y = result["CenterY"].to_numpy(dtype=float)
+    center_z = result["CenterTIME"].to_numpy(dtype=float)
+    grouped_positions = iter_grouped_xy_row_positions(center_x, center_y, grid_size_xy)
     affected_count = 0
-    for row_idx, (idx, row) in enumerate(result.iterrows(), start=1):
-        x = float(row["CenterX"])
-        y = float(row["CenterY"])
-        z = float(row["CenterTIME"])
-        candidate_mask = (
-            (panel_arrays["xmin"] <= x)
-            & (x <= panel_arrays["xmax"])
-            & (panel_arrays["ymin"] <= y)
-            & (y <= panel_arrays["ymax"])
-        )
-        if not np.any(candidate_mask):
-            if progress_hook is not None and (
-                row_idx == 1 or row_idx == total_rows or row_idx % emit_step == 0
-            ):
-                progress_hook("断层影响赋值进度", f"{row_idx}/{total_rows}, affected={affected_count}")
+    processed_rows = 0
+    emit_step = max(1, total_rows // 20) if total_rows > 0 else 1
+    next_emit_row = 1
+
+    def maybe_emit_progress() -> None:
+        nonlocal next_emit_row
+        if progress_hook is None:
+            return
+        if processed_rows < next_emit_row and processed_rows != total_rows:
+            return
+        progress_hook("断层影响赋值进度", f"{processed_rows}/{total_rows}, affected={affected_count}")
+        while next_emit_row <= processed_rows:
+            next_emit_row += emit_step
+
+    for grid_key, row_positions in grouped_positions:
+        processed_rows += int(len(row_positions))
+        candidate_positions = panel_spatial_index.get(grid_key)
+        if candidate_positions is None or len(candidate_positions) <= 0:
+            maybe_emit_progress()
             continue
-        affected_count += 1
-        fault_z = panel_arrays["cz"][candidate_mask].copy()
-        cand_valid_nz = valid_nz[candidate_mask]
-        if np.any(cand_valid_nz):
-            fault_z[cand_valid_nz] = (
-                panel_arrays["cz"][candidate_mask][cand_valid_nz]
-                - (
-                    panel_arrays["nx"][candidate_mask][cand_valid_nz] * (x - panel_arrays["cx"][candidate_mask][cand_valid_nz])
-                    + panel_arrays["ny"][candidate_mask][cand_valid_nz] * (y - panel_arrays["cy"][candidate_mask][cand_valid_nz])
-                )
-                / panel_arrays["nz"][candidate_mask][cand_valid_nz]
+
+        group_x = center_x[row_positions][:, None]
+        group_y = center_y[row_positions][:, None]
+        group_z = center_z[row_positions][:, None]
+        candidate_xmin = panel_arrays["xmin"][candidate_positions][None, :]
+        candidate_xmax = panel_arrays["xmax"][candidate_positions][None, :]
+        candidate_ymin = panel_arrays["ymin"][candidate_positions][None, :]
+        candidate_ymax = panel_arrays["ymax"][candidate_positions][None, :]
+
+        inside_mask = (
+            (candidate_xmin <= group_x)
+            & (group_x <= candidate_xmax)
+            & (candidate_ymin <= group_y)
+            & (group_y <= candidate_ymax)
+        )
+        if not np.any(inside_mask):
+            maybe_emit_progress()
+            continue
+
+        candidate_cz = panel_arrays["cz"][candidate_positions]
+        fault_z = np.broadcast_to(candidate_cz[None, :], inside_mask.shape).astype(float, copy=True)
+        candidate_valid_nz = valid_nz[candidate_positions]
+        if np.any(candidate_valid_nz):
+            candidate_cx = panel_arrays["cx"][candidate_positions][candidate_valid_nz][None, :]
+            candidate_cy = panel_arrays["cy"][candidate_positions][candidate_valid_nz][None, :]
+            candidate_nx = panel_arrays["nx"][candidate_positions][candidate_valid_nz][None, :]
+            candidate_ny = panel_arrays["ny"][candidate_positions][candidate_valid_nz][None, :]
+            candidate_nz = panel_arrays["nz"][candidate_positions][candidate_valid_nz][None, :]
+            fault_z[:, candidate_valid_nz] = candidate_cz[candidate_valid_nz][None, :] - (
+                candidate_nx * (group_x - candidate_cx) + candidate_ny * (group_y - candidate_cy)
+            ) / candidate_nz
+
+        distances = np.abs(group_z - fault_z)
+        distances[~inside_mask] = np.inf
+        min_pos = np.argmin(distances, axis=1)
+        row_pos = np.arange(len(row_positions))
+        min_dist = distances[row_pos, min_pos]
+        valid_rows = np.isfinite(min_dist)
+        if np.any(valid_rows):
+            valid_row_positions = row_positions[valid_rows]
+            chosen_candidate_positions = candidate_positions[min_pos[valid_rows]]
+            valid_dist = min_dist[valid_rows]
+            affected_count += int(valid_rows.sum())
+            nearest_fault_panel_id[valid_row_positions] = panel_arrays["id"][chosen_candidate_positions]
+            nearest_fault_name[valid_row_positions] = panel_arrays["name"][chosen_candidate_positions]
+            fault_distance_ms[valid_row_positions] = valid_dist
+            fault_influence_weight[valid_row_positions] = np.maximum(
+                0.0,
+                1.0 - valid_dist / max(float(fault_half_band_ms), 1e-6),
             )
-        distances = np.abs(z - fault_z)
-        min_pos = int(np.argmin(distances))
-        min_dist = float(distances[min_pos])
-        chosen_panel_id = int(panel_arrays["id"][candidate_mask][min_pos])
-        chosen_fault_name = str(panel_arrays["name"][candidate_mask][min_pos])
-        result.at[idx, "NearestFaultPanelID"] = chosen_panel_id
-        result.at[idx, "NearestFaultName"] = chosen_fault_name
-        result.at[idx, "FaultDistanceMs"] = min_dist
-        influence_weight = max(0.0, 1.0 - min_dist / max(float(fault_half_band_ms), 1e-6))
-        result.at[idx, "FaultInfluenceWeight"] = influence_weight
-        if min_dist <= float(fault_remove_ms):
-            result.at[idx, "FaultActionText"] = "remove"
-            result.at[idx, "FaultActionCode"] = FAULT_ACTION_TEXT_TO_CODE["remove"]
-        elif min_dist <= float(fault_transition_ms):
-            result.at[idx, "FaultActionText"] = "shrink"
-            result.at[idx, "FaultActionCode"] = FAULT_ACTION_TEXT_TO_CODE["shrink"]
-        if progress_hook is not None and (
-            row_idx == 1 or row_idx == total_rows or row_idx % emit_step == 0
-        ):
-            progress_hook("断层影响赋值进度", f"{row_idx}/{total_rows}, affected={affected_count}")
+            remove_mask = valid_dist <= float(fault_remove_ms)
+            shrink_mask = (valid_dist > float(fault_remove_ms)) & (valid_dist <= float(fault_transition_ms))
+            if np.any(remove_mask):
+                remove_positions = valid_row_positions[remove_mask]
+                fault_action_texts[remove_positions] = "remove"
+                fault_action_codes[remove_positions] = FAULT_ACTION_TEXT_TO_CODE["remove"]
+            if np.any(shrink_mask):
+                shrink_positions = valid_row_positions[shrink_mask]
+                fault_action_texts[shrink_positions] = "shrink"
+                fault_action_codes[shrink_positions] = FAULT_ACTION_TEXT_TO_CODE["shrink"]
+        maybe_emit_progress()
+
+    result["FaultActionCode"] = fault_action_codes
+    result["FaultActionText"] = fault_action_texts
+    result["FaultDistanceMs"] = fault_distance_ms
+    result["FaultInfluenceWeight"] = fault_influence_weight
+    result["NearestFaultPanelID"] = nearest_fault_panel_id
+    result["NearestFaultName"] = nearest_fault_name
     return result
 
 
@@ -228,42 +327,76 @@ def apply_fault_filter_and_shrink(
     fault_transition_ms: float,
     progress_hook: Callable[[str, str | None], None] | None = None,
 ) -> tuple[pd.DataFrame, dict[str, Any]]:
-    kept_rows: list[pd.Series] = []
-    removed_count = 0
-    shrunk_count = 0
     total_rows = int(len(influenced_df))
-    emit_step = max(1, total_rows // 20) if total_rows > 0 else 1
-    for row_idx, (_, row) in enumerate(influenced_df.iterrows(), start=1):
-        action = str(row.get("FaultActionText", "keep"))
-        if action == "remove":
-            removed_count += 1
-            if progress_hook is not None and (
-                row_idx == 1 or row_idx == total_rows or row_idx % emit_step == 0
+    if "FaultActionText" in influenced_df.columns:
+        action_text = influenced_df["FaultActionText"].astype(str).to_numpy()
+    else:
+        action_text = np.full(total_rows, "keep", dtype=object)
+    remove_mask = action_text == "remove"
+    shrink_mask = action_text == "shrink"
+    removed_count = int(remove_mask.sum())
+    shrunk_count = int(shrink_mask.sum())
+
+    if progress_hook is not None:
+        progress_hook(
+            "断层控制区过滤进度",
+            f"0/{total_rows}, kept=0, removed=0, shrunk=0",
+        )
+
+    kept_df = influenced_df.loc[~remove_mask].copy().reset_index(drop=True)
+    kept_df["FaultShrinkAreaRatio"] = 1.0
+    if not kept_df.empty and "FaultActionText" in kept_df.columns and np.any(kept_df["FaultActionText"].astype(str).to_numpy() == "shrink"):
+        kept_shrink_mask = kept_df["FaultActionText"].astype(str).to_numpy() == "shrink"
+        shrink_idx = np.flatnonzero(kept_shrink_mask)
+        denom = max(float(fault_transition_ms) - float(fault_remove_ms), 1e-6)
+        distance_ms = kept_df.loc[shrink_idx, "FaultDistanceMs"].to_numpy(dtype=float)
+        area_ratio = np.clip((distance_ms - float(fault_remove_ms)) / denom, 0.0, 1.0)
+        scale = np.sqrt(area_ratio)
+        kept_df.loc[shrink_idx, "FaultShrinkAreaRatio"] = area_ratio
+        kept_df.loc[shrink_idx, "PatchLength"] = kept_df.loc[shrink_idx, "PatchLength"].to_numpy(dtype=float) * scale
+        kept_df.loc[shrink_idx, "PatchHeight"] = kept_df.loc[shrink_idx, "PatchHeight"].to_numpy(dtype=float) * scale
+        if "PatchArea" in kept_df.columns:
+            kept_df.loc[shrink_idx, "PatchArea"] = kept_df.loc[shrink_idx, "PatchArea"].to_numpy(dtype=float) * area_ratio
+        if "PatchArea3D" in kept_df.columns:
+            kept_df.loc[shrink_idx, "PatchArea3D"] = kept_df.loc[shrink_idx, "PatchArea3D"].to_numpy(dtype=float) * area_ratio
+
+        for vertex_idx in range(1, 5):
+            center_x = kept_df.loc[shrink_idx, "CenterX"].to_numpy(dtype=float)
+            center_y = kept_df.loc[shrink_idx, "CenterY"].to_numpy(dtype=float)
+            center_z = kept_df.loc[shrink_idx, "CenterTIME"].to_numpy(dtype=float)
+            for axis, center_values in zip(
+                ("X", "Y", "Z"),
+                (center_x, center_y, center_z),
             ):
-                progress_hook(
-                    "断层控制区过滤进度",
-                    f"{row_idx}/{total_rows}, kept={len(kept_rows)}, removed={removed_count}, shrunk={shrunk_count}",
-                )
-            continue
-        updated = row.copy()
-        if action == "shrink":
-            distance_ms = float(row.get("FaultDistanceMs", np.nan))
-            denom = max(float(fault_transition_ms) - float(fault_remove_ms), 1e-6)
-            area_ratio = np.clip((distance_ms - float(fault_remove_ms)) / denom, 0.0, 1.0)
-            updated = scale_patch_row_geometry(updated, float(area_ratio))
-            updated["FaultShrinkAreaRatio"] = float(area_ratio)
-            shrunk_count += 1
-        else:
-            updated["FaultShrinkAreaRatio"] = 1.0
-        kept_rows.append(updated)
-        if progress_hook is not None and (
-            row_idx == 1 or row_idx == total_rows or row_idx % emit_step == 0
-        ):
-            progress_hook(
-                "断层控制区过滤进度",
-                f"{row_idx}/{total_rows}, kept={len(kept_rows)}, removed={removed_count}, shrunk={shrunk_count}",
-            )
-    kept_df = pd.DataFrame(kept_rows).reset_index(drop=True) if kept_rows else influenced_df.iloc[0:0].copy()
+                col = f"V{vertex_idx}{axis}"
+                vertex_values = kept_df.loc[shrink_idx, col].to_numpy(dtype=float)
+                kept_df.loc[shrink_idx, col] = center_values + scale * (vertex_values - center_values)
+
+        vertex_x = np.column_stack([
+            kept_df.loc[shrink_idx, f"V{vertex_idx}X"].to_numpy(dtype=float)
+            for vertex_idx in range(1, 5)
+        ])
+        vertex_y = np.column_stack([
+            kept_df.loc[shrink_idx, f"V{vertex_idx}Y"].to_numpy(dtype=float)
+            for vertex_idx in range(1, 5)
+        ])
+        vertex_z = np.column_stack([
+            kept_df.loc[shrink_idx, f"V{vertex_idx}Z"].to_numpy(dtype=float)
+            for vertex_idx in range(1, 5)
+        ])
+        kept_df.loc[shrink_idx, "BBoxXMin"] = vertex_x.min(axis=1)
+        kept_df.loc[shrink_idx, "BBoxXMax"] = vertex_x.max(axis=1)
+        kept_df.loc[shrink_idx, "BBoxYMin"] = vertex_y.min(axis=1)
+        kept_df.loc[shrink_idx, "BBoxYMax"] = vertex_y.max(axis=1)
+        kept_df.loc[shrink_idx, "BBoxZMin"] = vertex_z.min(axis=1)
+        kept_df.loc[shrink_idx, "BBoxZMax"] = vertex_z.max(axis=1)
+
+    if progress_hook is not None:
+        progress_hook(
+            "断层控制区过滤进度",
+            f"{total_rows}/{total_rows}, kept={len(kept_df)}, removed={removed_count}, shrunk={shrunk_count}",
+        )
+
     stats = {
         "input_patch_count": int(len(influenced_df)),
         "kept_patch_count": int(len(kept_df)),
