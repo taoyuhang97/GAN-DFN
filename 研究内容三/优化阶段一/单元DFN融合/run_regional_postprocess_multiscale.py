@@ -54,6 +54,13 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=DEFAULT_POSTPROCESS_GPU_TILE_POINTS,
     )
+    parser.add_argument("--gmm-bic-sample-cap", type=int, default=250000)
+    parser.add_argument("--gmm-fit-sample-cap", type=int, default=400000)
+    parser.add_argument("--phase2-chunk-row-threshold", type=int, default=250000)
+    parser.add_argument("--phase2-chunk-unit-width", type=int, default=12)
+    parser.add_argument("--phase2-chunk-unit-height", type=int, default=12)
+    parser.add_argument("--phase2-chunk-overlap-units", type=int, default=1)
+    parser.add_argument("--disable-phase2-chunking", action="store_true")
     parser.add_argument("--docx-path", type=Path, default=DEFAULT_DOCX_PATH)
     return parser
 
@@ -74,6 +81,13 @@ def main() -> None:
     pipeline_kwargs["compute_backend"] = str(args.compute_backend)
     pipeline_kwargs["max_cpu_threads"] = int(args.max_cpu_threads)
     pipeline_kwargs["gpu_tile_points"] = int(args.gpu_tile_points)
+    pipeline_kwargs["fracture_set_bic_sample_cap"] = int(args.gmm_bic_sample_cap)
+    pipeline_kwargs["fracture_set_fit_sample_cap"] = int(args.gmm_fit_sample_cap)
+    pipeline_kwargs["phase2_chunk_row_threshold"] = int(args.phase2_chunk_row_threshold)
+    pipeline_kwargs["phase2_chunk_unit_width"] = int(args.phase2_chunk_unit_width)
+    pipeline_kwargs["phase2_chunk_unit_height"] = int(args.phase2_chunk_unit_height)
+    pipeline_kwargs["phase2_chunk_overlap_units"] = int(args.phase2_chunk_overlap_units)
+    pipeline_kwargs["disable_phase2_chunking"] = bool(args.disable_phase2_chunking)
     if bool(args.boundary_connect):
         pipeline_kwargs["enable_boundary_connect"] = True
     if bool(args.bc_seam_fill):
@@ -96,6 +110,13 @@ def main() -> None:
         "compute_backend": str(args.compute_backend),
         "max_cpu_threads": int(args.max_cpu_threads),
         "gpu_tile_points": int(args.gpu_tile_points),
+        "gmm_bic_sample_cap": int(args.gmm_bic_sample_cap),
+        "gmm_fit_sample_cap": int(args.gmm_fit_sample_cap),
+        "phase2_chunk_row_threshold": int(args.phase2_chunk_row_threshold),
+        "phase2_chunk_unit_width": int(args.phase2_chunk_unit_width),
+        "phase2_chunk_unit_height": int(args.phase2_chunk_unit_height),
+        "phase2_chunk_overlap_units": int(args.phase2_chunk_overlap_units),
+        "disable_phase2_chunking": bool(args.disable_phase2_chunking),
         "stats": stats,
     }
     summary_path = run_dir / "regional_postprocess_summary.json"
@@ -113,6 +134,13 @@ def main() -> None:
             f"compute_backend: {args.compute_backend}",
             f"max_cpu_threads: {args.max_cpu_threads}",
             f"gpu_tile_points: {args.gpu_tile_points}",
+            f"gmm_bic_sample_cap: {args.gmm_bic_sample_cap}",
+            f"gmm_fit_sample_cap: {args.gmm_fit_sample_cap}",
+            f"phase2_chunk_row_threshold: {args.phase2_chunk_row_threshold}",
+            f"phase2_chunk_unit_width: {args.phase2_chunk_unit_width}",
+            f"phase2_chunk_unit_height: {args.phase2_chunk_unit_height}",
+            f"phase2_chunk_overlap_units: {args.phase2_chunk_overlap_units}",
+            f"disable_phase2_chunking: {bool(args.disable_phase2_chunking)}",
             f"input_count: {stats.get('input_count', '?')}",
             f"output_count: {stats.get('output_count', '?')}",
             f"summary_json: {summary_path}",

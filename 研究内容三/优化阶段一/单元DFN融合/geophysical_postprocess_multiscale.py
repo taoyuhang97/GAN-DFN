@@ -51,6 +51,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import math
 import sys
 from datetime import datetime
 from itertools import product
@@ -63,6 +64,7 @@ import pandas as pd
 from scipy.spatial import cKDTree
 from sklearn.mixture import GaussianMixture
 from sklearn.cluster import DBSCAN
+from tqdm.auto import tqdm
 
 try:
     import torch
@@ -95,6 +97,7 @@ from merge_unit_dfn_vtks import read_legacy_vtk_polygons, write_legacy_vtk_polyg
 DEFAULT_POSTPROCESS_COMPUTE_BACKEND = "auto"
 DEFAULT_POSTPROCESS_MAX_CPU_THREADS = 24
 DEFAULT_POSTPROCESS_GPU_TILE_POINTS = 2048
+DEFAULT_POSTPROCESS_CPU_QUERY_CHUNK_POINTS = 20000
 
 
 # ---------------------------------------------------------------------------
@@ -226,38 +229,131 @@ def _thread_limit_context(max_cpu_threads: int | None):
 
 
 class _StageProgressPrinter:
-    def __init__(self, total_steps: int, prefix: str = "postprocess", bar_width: int = 24):
+    def __init__(
+        self,
+        total_steps: int,
+        prefix: str = "postprocess",
+        bar_width: int = 24,
+        stage_weights: dict[str, float] | None = None,
+        stage_aliases: dict[str, str] | None = None,
+        heartbeat_aliases: dict[str, str] | None = None,
+    ):
         self.total_steps = max(int(total_steps), 1)
         self.prefix = str(prefix)
-        self.bar_width = max(int(bar_width), 10)
         self.current_step = 0
         self.started_at = perf_counter()
-        self._emit("start", detail=f"total_steps={self.total_steps}")
+        self.stage_weights = {
+            str(key): float(value)
+            for key, value in (stage_weights or {}).items()
+            if float(value) > 0.0
+        }
+        self.stage_aliases = {str(key): str(value) for key, value in (stage_aliases or {}).items()}
+        self.heartbeat_aliases = {str(key): str(value) for key, value in (heartbeat_aliases or {}).items()}
+        self.stage_fraction = {key: 0.0 for key in self.stage_weights}
+        self.completed_steps: set[str] = set()
+        self._bar = tqdm(
+            total=100.0,
+            desc=self.prefix,
+            unit="%",
+            ascii=True,
+            dynamic_ncols=True,
+            leave=True,
+            file=sys.stdout,
+        )
+        self._refresh_bar("start", f"weighted_stages={len(self.stage_weights)}")
 
-    def _render_bar(self) -> str:
-        ratio = min(max(self.current_step / self.total_steps, 0.0), 1.0)
-        filled = int(round(self.bar_width * ratio))
-        filled = min(max(filled, 0), self.bar_width)
-        return "#" * filled + "." * (self.bar_width - filled)
+    def _extract_fraction(self, detail: str | None) -> float | None:
+        if not detail:
+            return None
+        text = str(detail).strip()
+        head = text.split(",", 1)[0].strip()
+        if "/" not in head:
+            return None
+        left, right = head.split("/", 1)
+        try:
+            numerator = float(left.strip())
+            denominator = float(right.strip())
+        except ValueError:
+            return None
+        if denominator <= 0.0:
+            return None
+        return min(max(numerator / denominator, 0.0), 1.0)
+
+    def _resolve_stage(self, label: str, heartbeat: bool = False) -> str | None:
+        alias_map = self.heartbeat_aliases if heartbeat else self.stage_aliases
+        stage_key = alias_map.get(str(label))
+        if stage_key in self.stage_weights:
+            return stage_key
+        if str(label) in self.stage_weights:
+            return str(label)
+        return None
+
+    def _overall_percent(self) -> float:
+        total_weight = sum(self.stage_weights.values())
+        if total_weight <= 0.0:
+            return 0.0
+        completed_weight = sum(
+            self.stage_weights[key] * min(max(self.stage_fraction.get(key, 0.0), 0.0), 1.0)
+            for key in self.stage_weights
+        )
+        return float(np.clip(completed_weight / total_weight * 100.0, 0.0, 100.0))
+
+    def _refresh_bar(self, label: str, detail: str | None = None) -> None:
+        overall_percent = self._overall_percent()
+        self._bar.n = overall_percent
+        elapsed_seconds = perf_counter() - self.started_at
+        postfix = f"{label} | total={overall_percent:.1f}% | elapsed={elapsed_seconds:.1f}s"
+        if detail:
+            postfix += f" | {detail}"
+        self._bar.set_postfix_str(postfix)
+        self._bar.refresh()
 
     def _emit(self, label: str, detail: str | None = None) -> None:
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         elapsed_seconds = perf_counter() - self.started_at
+        overall_percent = self._overall_percent()
         line = (
             f"[{timestamp}] [{self.prefix}] "
-            f"[{self._render_bar()}] {self.current_step}/{self.total_steps} {label}"
+            f"weighted_total={overall_percent:.1f}% {label}"
         )
         line += f" | elapsed={elapsed_seconds:.1f}s"
         if detail:
             line += f" | {detail}"
-        print(line, flush=True)
+        self._refresh_bar(label, detail=detail)
+        tqdm.write(line, file=sys.stdout)
+
+    def update_stage_fraction(self, stage_key: str, fraction: float, detail: str | None = None) -> None:
+        stage_name = str(stage_key)
+        if stage_name not in self.stage_weights:
+            return
+        clipped = float(np.clip(fraction, 0.0, 1.0))
+        if clipped < self.stage_fraction.get(stage_name, 0.0):
+            clipped = self.stage_fraction.get(stage_name, 0.0)
+        self.stage_fraction[stage_name] = clipped
+        if clipped >= 1.0:
+            self.completed_steps.add(stage_name)
+        self._refresh_bar(stage_name, detail=detail)
 
     def advance(self, label: str, detail: str | None = None) -> None:
-        self.current_step = min(self.current_step + 1, self.total_steps)
+        stage_key = self._resolve_stage(label, heartbeat=False)
+        if stage_key is not None:
+            if stage_key not in self.completed_steps:
+                self.current_step = min(self.current_step + 1, self.total_steps)
+            self.update_stage_fraction(stage_key, 1.0, detail=detail)
+        else:
+            self._refresh_bar(label, detail=detail)
         self._emit(label, detail=detail)
 
     def log(self, label: str, detail: str | None = None) -> None:
+        stage_key = self._resolve_stage(label, heartbeat=True)
+        if stage_key is not None:
+            fraction = self._extract_fraction(detail)
+            if fraction is not None:
+                self.update_stage_fraction(stage_key, fraction, detail=f"{label} | {detail}")
         self._emit(label, detail=detail)
+
+    def close(self) -> None:
+        self._bar.close()
 
 
 def _format_seconds(seconds: float) -> str:
@@ -277,8 +373,9 @@ def _emit_loop_progress(
     current: int,
     total: int,
     detail: str | None = None,
+    segments: int = 10,
 ) -> None:
-    if progress_hook is None or not _should_emit_loop_progress(current, total):
+    if progress_hook is None or not _should_emit_loop_progress(current, total, segments=segments):
         return
     suffix = f"{int(current)}/{max(int(total), 1)}"
     message = suffix if not detail else f"{suffix}, {detail}"
@@ -293,6 +390,23 @@ def _subsample_row_indices(row_count: int, sample_cap: int | None, seed: int) ->
         return np.arange(total_rows, dtype=np.int64)
     rng = np.random.default_rng(int(seed))
     return np.sort(rng.choice(total_rows, size=int(sample_cap), replace=False).astype(np.int64))
+
+
+def _build_scaled_spatial_tree(
+    x: np.ndarray,
+    y: np.ndarray,
+    z: np.ndarray,
+    *,
+    scale_x: float,
+    scale_y: float,
+    scale_z: float,
+) -> tuple[np.ndarray, cKDTree]:
+    scaled = np.column_stack([
+        np.asarray(x, dtype=float) / max(float(scale_x), 1e-6),
+        np.asarray(y, dtype=float) / max(float(scale_y), 1e-6),
+        np.asarray(z, dtype=float) / max(float(scale_z), 1e-6),
+    ])
+    return scaled, cKDTree(scaled)
 
 
 def _prepare_group_indices(
@@ -368,6 +482,27 @@ def _iter_bucket_pair_ids(
     return pairs
 
 
+def _estimate_bucket_pair_tile_count(
+    bucket_pairs: list[tuple[int, int]],
+    bucket_points: list[np.ndarray],
+    tile_points: int,
+) -> int:
+    safe_tile_points = max(int(tile_points), 1)
+    total_tiles = 0
+    for bucket_id_a, bucket_id_b in bucket_pairs:
+        points_a = bucket_points[bucket_id_a]
+        points_b = bucket_points[bucket_id_b]
+        if len(points_a) == 0 or len(points_b) == 0:
+            continue
+        tiles_a = max(int(math.ceil(len(points_a) / safe_tile_points)), 1)
+        tiles_b = max(int(math.ceil(len(points_b) / safe_tile_points)), 1)
+        if bucket_id_a == bucket_id_b:
+            total_tiles += tiles_a * (tiles_a + 1) // 2
+        else:
+            total_tiles += tiles_a * tiles_b
+    return max(int(total_tiles), 1)
+
+
 def _pairwise_radius_mask_torch(
     left_points: np.ndarray,
     right_points: np.ndarray,
@@ -385,6 +520,8 @@ def _radius_neighbor_counts_gpu(
     coords: np.ndarray,
     radius: float,
     gpu_tile_points: int,
+    progress_hook: Callable[[str, str | None], None] | None = None,
+    progress_label: str = "可靠性评分邻域统计GPU进度",
 ) -> np.ndarray:
     row_count = int(len(coords))
     if row_count <= 0:
@@ -394,8 +531,20 @@ def _radius_neighbor_counts_gpu(
     tile_points = max(int(gpu_tile_points), 256)
     counts = np.zeros(row_count, dtype=np.int64)
     bucket_lookup, bucket_cells, bucket_points = _build_spatial_bucket_index(coords, cell_size=radius)
+    bucket_pairs = _iter_bucket_pair_ids(bucket_lookup, bucket_cells)
+    total_tile_pairs = _estimate_bucket_pair_tile_count(bucket_pairs, bucket_points, tile_points)
+    processed_tile_pairs = 0
 
-    for bucket_id_a, bucket_id_b in _iter_bucket_pair_ids(bucket_lookup, bucket_cells):
+    if progress_hook is not None:
+        progress_hook(
+            progress_label,
+            (
+                f"0/{total_tile_pairs}, backend=gpu, rows={row_count}, "
+                f"buckets={len(bucket_cells)}, bucket_pairs={len(bucket_pairs)}, tile_points={tile_points}"
+            ),
+        )
+
+    for bucket_id_a, bucket_id_b in bucket_pairs:
         point_idx_a = bucket_points[bucket_id_a]
         point_idx_b = bucket_points[bucket_id_b]
         same_bucket = bucket_id_a == bucket_id_b
@@ -423,14 +572,50 @@ def _radius_neighbor_counts_gpu(
                 else:
                     counts[block_idx_a] += mask.sum(dim=1).detach().cpu().numpy().astype(np.int64)
                     counts[block_idx_b] += mask.sum(dim=0).detach().cpu().numpy().astype(np.int64)
+                processed_tile_pairs += 1
+                _emit_loop_progress(
+                    progress_hook,
+                    progress_label,
+                    processed_tile_pairs,
+                    total_tile_pairs,
+                    detail=f"backend=gpu, rows={row_count}, buckets={len(bucket_cells)}",
+                    segments=50,
+                )
     return counts.astype(np.int32)
 
 
-def _radius_neighbor_counts_cpu(coords: np.ndarray, radius: float) -> np.ndarray:
+def _radius_neighbor_counts_cpu(
+    coords: np.ndarray,
+    radius: float,
+    progress_hook: Callable[[str, str | None], None] | None = None,
+    progress_label: str = "可靠性评分邻域统计CPU进度",
+    query_chunk_points: int = DEFAULT_POSTPROCESS_CPU_QUERY_CHUNK_POINTS,
+) -> np.ndarray:
     if len(coords) <= 0:
         return np.zeros(0, dtype=np.int32)
     tree = cKDTree(np.asarray(coords, dtype=float))
-    return np.asarray(tree.query_ball_point(coords, r=float(radius), return_length=True), dtype=np.int32) - 1
+    counts = np.zeros(len(coords), dtype=np.int32)
+    chunk_points = max(int(query_chunk_points), 1)
+    total_chunks = max(int(math.ceil(len(coords) / chunk_points)), 1)
+    if progress_hook is not None:
+        progress_hook(
+            progress_label,
+            f"0/{total_chunks}, backend=cpu, rows={len(coords)}, chunk_points={chunk_points}",
+        )
+    for chunk_idx, start in enumerate(range(0, len(coords), chunk_points), start=1):
+        end = min(start + chunk_points, len(coords))
+        counts[start:end] = (
+            np.asarray(tree.query_ball_point(coords[start:end], r=float(radius), return_length=True), dtype=np.int32) - 1
+        )
+        _emit_loop_progress(
+            progress_hook,
+            progress_label,
+            chunk_idx,
+            total_chunks,
+            detail=f"backend=cpu, rows={len(coords)}, chunk_points={chunk_points}",
+            segments=50,
+        )
+    return counts
 
 
 def _radius_neighbor_counts(
@@ -438,11 +623,27 @@ def _radius_neighbor_counts(
     radius: float,
     compute_backend: str = DEFAULT_POSTPROCESS_COMPUTE_BACKEND,
     gpu_tile_points: int = DEFAULT_POSTPROCESS_GPU_TILE_POINTS,
+    progress_hook: Callable[[str, str | None], None] | None = None,
 ) -> tuple[np.ndarray, str]:
     resolved_backend = _resolve_compute_backend(compute_backend)
     if resolved_backend == "gpu":
-        return _radius_neighbor_counts_gpu(coords, radius=float(radius), gpu_tile_points=int(gpu_tile_points)), resolved_backend
-    return _radius_neighbor_counts_cpu(coords, radius=float(radius)), resolved_backend
+        return (
+            _radius_neighbor_counts_gpu(
+                coords,
+                radius=float(radius),
+                gpu_tile_points=int(gpu_tile_points),
+                progress_hook=progress_hook,
+            ),
+            resolved_backend,
+        )
+    return (
+        _radius_neighbor_counts_cpu(
+            coords,
+            radius=float(radius),
+            progress_hook=progress_hook,
+        ),
+        resolved_backend,
+    )
 
 
 def _radius_candidate_pairs_cpu(coords: np.ndarray, radius: float) -> tuple[np.ndarray, np.ndarray]:
@@ -563,10 +764,14 @@ def fracture_set_clustering(
     # 走向 180° 对称 → sin/cos 嵌入
     rad = np.deg2rad(2.0 * az)
     features = np.column_stack([np.cos(rad), np.sin(rad), dip / 90.0])
+    bic_indices = _subsample_row_indices(len(features), bic_sample_cap, seed=42)
+    fit_indices = _subsample_row_indices(len(features), fit_sample_cap, seed=43)
+    bic_features = features[bic_indices]
+    fit_features = features[fit_indices]
     if progress_hook is not None:
         progress_hook(
             "裂缝组识别数据规模",
-            f"rows={len(features)}, bic_rows={len(features)}, fit_rows={len(features)}",
+            f"rows={len(features)}, bic_rows={len(bic_features)}, fit_rows={len(fit_features)}",
         )
 
     if n_sets is None:
@@ -575,8 +780,8 @@ def fracture_set_clustering(
         for k_idx, k in enumerate(k_values, start=1):
             gmm = GaussianMixture(n_components=k, covariance_type="full",
                                   n_init=3, random_state=42, max_iter=200)
-            gmm.fit(features)
-            bic = gmm.bic(features)
+            gmm.fit(fit_features)
+            bic = gmm.bic(bic_features)
             if bic < best_bic:
                 best_bic, best_k = bic, k
             if progress_hook is not None:
@@ -588,15 +793,15 @@ def fracture_set_clustering(
 
     gmm = GaussianMixture(n_components=n_sets, covariance_type="full",
                           n_init=5, random_state=42, max_iter=300)
-    gmm.fit(features)
+    gmm.fit(fit_features)
     labels = gmm.predict(features)
     probs = gmm.predict_proba(features)
     max_probs = probs[np.arange(len(labels)), labels]
 
     df["FractureSet"] = labels.astype(int)
     df["SetProbability"] = max_probs.astype(float)
-    df.attrs["fracture_set_bic_sample_size"] = int(len(features))
-    df.attrs["fracture_set_fit_sample_size"] = int(len(features))
+    df.attrs["fracture_set_bic_sample_size"] = int(len(bic_features))
+    df.attrs["fracture_set_fit_sample_size"] = int(len(fit_features))
     return df
 
 
@@ -628,16 +833,17 @@ def regional_orientation_smoothing(
     df["SmoothedAzimuth"] = df["Azimuth"].values.copy().astype(float)
     df["SmoothedDip"] = df["Dip"].values.copy().astype(float)
 
-    cx = df["CenterX"].values.astype(float)
-    cy = df["CenterY"].values.astype(float)
-    cz = df["CenterTIME"].values.astype(float)
-    conf = df["Confidence"].values.astype(float) if "Confidence" in df.columns else np.ones(len(df))
+    cx = df["CenterX"].to_numpy(dtype=float)
+    cy = df["CenterY"].to_numpy(dtype=float)
+    cz = df["CenterTIME"].to_numpy(dtype=float)
+    conf = pd.to_numeric(df.get("Confidence"), errors="coerce").fillna(1.0).to_numpy(dtype=float) if "Confidence" in df.columns else np.ones(len(df), dtype=float)
 
-    set_ids = list(df["FractureSet"].unique())
-    total_groups = len(set_ids)
-    for group_idx, set_id in enumerate(set_ids, start=1):
-        mask = df["FractureSet"].values == set_id
-        idx = np.where(mask)[0]
+    work_df, group_items = _prepare_group_indices(df, include_layer=True)
+    if work_df is not df:
+        df = work_df
+    total_groups = len(group_items)
+    query_radius = max(float(local_radius_factor), 1.0)
+    for group_idx, (_, idx) in enumerate(group_items, start=1):
         if len(idx) < 3:
             _emit_loop_progress(
                 progress_hook,
@@ -652,6 +858,14 @@ def regional_orientation_smoothing(
         az_vals = df["Azimuth"].values[idx].astype(float)
         dip_vals = df["Dip"].values[idx].astype(float)
         w_conf = conf[idx].copy()
+        scaled_coords, tree = _build_scaled_spatial_tree(
+            coords[:, 0],
+            coords[:, 1],
+            coords[:, 2],
+            scale_x=bandwidth_xy,
+            scale_y=bandwidth_xy,
+            scale_z=bandwidth_z,
+        )
         az_rad = np.deg2rad(2.0 * az_vals)
         az_cos = np.cos(az_rad)
         az_sin = np.sin(az_rad)
@@ -660,22 +874,32 @@ def regional_orientation_smoothing(
         smoothed_dip = np.empty(len(idx))
 
         for i in range(len(idx)):
-            dx = coords[:, 0] - coords[i, 0]
-            dy = coords[:, 1] - coords[i, 1]
-            dz = coords[:, 2] - coords[i, 2]
+            neighbor_pos = np.asarray(tree.query_ball_point(scaled_coords[i], r=query_radius), dtype=np.int64)
+            if len(neighbor_pos) <= 1:
+                smoothed_az[i] = az_vals[i]
+                smoothed_dip[i] = dip_vals[i]
+                continue
+            neighbor_pos = neighbor_pos[neighbor_pos != i]
+            if len(neighbor_pos) <= 0:
+                smoothed_az[i] = az_vals[i]
+                smoothed_dip[i] = dip_vals[i]
+                continue
+
+            dx = coords[neighbor_pos, 0] - coords[i, 0]
+            dy = coords[neighbor_pos, 1] - coords[i, 1]
+            dz = coords[neighbor_pos, 2] - coords[i, 2]
             dist_sq = (dx / bandwidth_xy) ** 2 + (dy / bandwidth_xy) ** 2 + (dz / bandwidth_z) ** 2
-            kernel = np.exp(-0.5 * dist_sq) * w_conf
-            kernel[i] = 0.0
+            kernel = np.exp(-0.5 * dist_sq) * w_conf[neighbor_pos]
             w_sum = kernel.sum()
             if w_sum < 1e-12:
                 smoothed_az[i] = az_vals[i]
                 smoothed_dip[i] = dip_vals[i]
                 continue
 
-            mean_cos = np.dot(kernel, az_cos) / w_sum
-            mean_sin = np.dot(kernel, az_sin) / w_sum
+            mean_cos = np.dot(kernel, az_cos[neighbor_pos]) / w_sum
+            mean_sin = np.dot(kernel, az_sin[neighbor_pos]) / w_sum
             trend_az = (np.rad2deg(np.arctan2(mean_sin, mean_cos)) / 2.0) % 180.0
-            trend_dip = np.dot(kernel, dip_vals) / w_sum
+            trend_dip = np.dot(kernel, dip_vals[neighbor_pos]) / w_sum
 
             az_diff = _azimuth_diff(np.array([az_vals[i]]), np.array([trend_az]))[0]
             if az_diff < 90.0:
@@ -727,11 +951,11 @@ def fracture_corridor_detection(
     df["CorridorID"] = -1
 
     corridor_counter = 0
-    set_ids = list(df["FractureSet"].unique())
-    total_groups = len(set_ids)
-    for group_idx, set_id in enumerate(set_ids, start=1):
-        mask = df["FractureSet"].values == set_id
-        idx = np.where(mask)[0]
+    work_df, group_items = _prepare_group_indices(df, include_layer=True)
+    if work_df is not df:
+        df = work_df
+    total_groups = len(group_items)
+    for group_idx, (_, idx) in enumerate(group_items, start=1):
         if len(idx) < corridor_min_patches:
             _emit_loop_progress(
                 progress_hook,
@@ -881,13 +1105,13 @@ def assign_scale_classes(
         cy = pd.to_numeric(group["CenterY"], errors="coerce").to_numpy(dtype=float)
         cz = pd.to_numeric(group["CenterTIME"], errors="coerce").to_numpy(dtype=float)
         gaz = pd.to_numeric(group["WorkAzimuth"], errors="coerce").to_numpy(dtype=float)
-        gconf = pd.to_numeric(group.get("Confidence"), errors="coerce").fillna(0.5).to_numpy(dtype=float)
-        ggeo = pd.to_numeric(group.get("GeophysicsScore"), errors="coerce").fillna(0.0).to_numpy(dtype=float)
-        gset = pd.to_numeric(group.get("SetProbability"), errors="coerce").fillna(0.5).to_numpy(dtype=float)
-        grel = _reliability_to_numeric(group.get("ReliabilityLevel", pd.Series(["medium"] * len(group), index=group.index)))
-        gcorr = pd.to_numeric(group.get("CorridorSupport"), errors="coerce").fillna(0).to_numpy(dtype=float)
+        gconf = _numeric_series_or_default(group, "Confidence", 0.5).to_numpy(dtype=float)
+        ggeo = _numeric_series_or_default(group, "GeophysicsScore", 0.0).to_numpy(dtype=float)
+        gset = _numeric_series_or_default(group, "SetProbability", 0.5).to_numpy(dtype=float)
+        grel = _reliability_to_numeric(group["ReliabilityLevel"] if "ReliabilityLevel" in group.columns else pd.Series(["medium"] * len(group), index=group.index))
+        gcorr = _numeric_series_or_default(group, "CorridorSupport", 0.0).to_numpy(dtype=float)
         garea = pd.to_numeric(group["PatchArea"], errors="coerce").fillna(0.0).to_numpy(dtype=float)
-        glen = pd.to_numeric(group.get("PatchLength"), errors="coerce").fillna(10.0).to_numpy(dtype=float)
+        glen = _numeric_series_or_default(group, "PatchLength", 10.0).to_numpy(dtype=float)
 
         mean_az = _azimuth_mean_weighted(gaz, np.maximum(gconf, 1e-6)) if len(group) > 1 else float(gaz[0])
         s_proj, p_proj = _project_to_strike_frame(cx, cy, mean_az)
@@ -895,21 +1119,34 @@ def assign_scale_classes(
         along_neighbor = np.zeros(len(group), dtype=int)
         along_span = np.zeros(len(group), dtype=float)
         across_spread = np.zeros(len(group), dtype=float)
+        scaled_coords, tree = _build_scaled_spatial_tree(
+            s_proj,
+            p_proj,
+            cz,
+            scale_x=scale_major_radius,
+            scale_y=scale_minor_radius,
+            scale_z=scale_z_radius,
+        )
+        local_radius = math.sqrt(3.0) + 1e-6
         for i in range(len(group)):
-            ds = np.abs(s_proj - s_proj[i])
-            dp = np.abs(p_proj - p_proj[i])
-            dz = np.abs(cz - cz[i])
+            candidate_pos = np.asarray(tree.query_ball_point(scaled_coords[i], r=local_radius), dtype=np.int64)
+            if len(candidate_pos) <= 0:
+                candidate_pos = np.array([i], dtype=np.int64)
+            ds = np.abs(s_proj[candidate_pos] - s_proj[i])
+            dp = np.abs(p_proj[candidate_pos] - p_proj[i])
+            dz = np.abs(cz[candidate_pos] - cz[i])
             local_mask = (
                 (ds <= scale_major_radius)
                 & (dp <= scale_minor_radius)
                 & (dz <= scale_z_radius)
             )
-            local_mask[i] = True
-            neighbor_mask = local_mask.copy()
-            neighbor_mask[i] = False
-            along_neighbor[i] = int(neighbor_mask.sum())
-            local_s = s_proj[local_mask]
-            local_p = p_proj[local_mask]
+            local_pos = candidate_pos[local_mask]
+            if len(local_pos) <= 0:
+                local_pos = np.array([i], dtype=np.int64)
+            neighbor_pos = local_pos[local_pos != i]
+            along_neighbor[i] = int(len(neighbor_pos))
+            local_s = s_proj[local_pos]
+            local_p = p_proj[local_pos]
             if len(local_s) > 0:
                 along_span[i] = float(local_s.max() - local_s.min() + glen[i])
                 across_spread[i] = float(np.std(local_p)) if len(local_p) > 1 else 0.0
@@ -999,6 +1236,7 @@ def multi_dimensional_reliability_scoring(
     known_fracture_layers: list[str] | None = None,
     compute_backend: str = DEFAULT_POSTPROCESS_COMPUTE_BACKEND,
     gpu_tile_points: int = DEFAULT_POSTPROCESS_GPU_TILE_POINTS,
+    progress_hook: Callable[[str, str | None], None] | None = None,
 ) -> pd.DataFrame:
     """多维度证据评分 + 综合结论判定。
 
@@ -1038,6 +1276,7 @@ def multi_dimensional_reliability_scoring(
         radius=float(neighbor_radius_xy),
         compute_backend=compute_backend,
         gpu_tile_points=int(gpu_tile_points),
+        progress_hook=progress_hook,
     )
     max_count = max(int(neighbor_counts.max()), 1)
     df["NeighborCount"] = neighbor_counts.astype(int)
@@ -1580,11 +1819,11 @@ def corridor_elongation(
     """
     df = df.copy()
     n_elongated = 0
-    set_ids = list(df["FractureSet"].unique())
-    total_groups = len(set_ids)
-    for group_idx, set_id in enumerate(set_ids, start=1):
-        mask = df["FractureSet"].values == set_id
-        idx = np.where(mask)[0]
+    work_df, group_items = _prepare_group_indices(df, include_layer=True)
+    if work_df is not df:
+        df = work_df
+    total_groups = len(group_items)
+    for group_idx, (_, idx) in enumerate(group_items, start=1):
         if len(idx) < 2:
             _emit_loop_progress(
                 progress_hook,
@@ -2591,6 +2830,8 @@ def run_phase1(
     *,
     max_fracture_sets: int = 6,
     n_fracture_sets: int | None = None,
+    fracture_set_bic_sample_cap: int = 250000,
+    fracture_set_fit_sample_cap: int = 400000,
     neighbor_radius_xy: float = 100.0,
     neighbor_radius_z: float = 15.0,
     isolation_min_neighbors: int = 2,
@@ -2616,6 +2857,8 @@ def run_phase1(
         df,
         max_sets=max_fracture_sets,
         n_sets=n_fracture_sets,
+        bic_sample_cap=fracture_set_bic_sample_cap,
+        fit_sample_cap=fracture_set_fit_sample_cap,
         progress_hook=heartbeat_hook,
     )
     stats["step_seconds"]["fracture_set_clustering"] = float(perf_counter() - step_started)
@@ -2649,6 +2892,7 @@ def run_phase1(
         height_range=height_range,
         compute_backend=compute_backend,
         gpu_tile_points=gpu_tile_points,
+        progress_hook=heartbeat_hook,
     )
     stats["step_seconds"]["reliability_scoring"] = float(perf_counter() - step_started)
     stats["compute_backend"] = str(df.attrs.get("compute_backend", _resolve_compute_backend(compute_backend)))
@@ -4240,6 +4484,655 @@ def _make_fill_patch(
     out_list.append(new_patch)
 
 
+def _sum_chunk_step_seconds(stats_list: list[dict[str, Any]], key: str) -> float:
+    total = 0.0
+    for item in stats_list:
+        step_seconds = item.get("step_seconds")
+        if isinstance(step_seconds, dict):
+            total += float(step_seconds.get(key, 0.0) or 0.0)
+    return float(total)
+
+
+def _build_phase2_chunk_plan(
+    df: pd.DataFrame,
+    *,
+    chunk_unit_width: int,
+    chunk_unit_height: int,
+    chunk_overlap_units: int,
+) -> list[dict[str, Any]]:
+    if "BlockX" not in df.columns or "BlockY" not in df.columns or df.empty:
+        return []
+    block_x = pd.to_numeric(df["BlockX"], errors="coerce").fillna(-1).astype(int).to_numpy()
+    block_y = pd.to_numeric(df["BlockY"], errors="coerce").fillna(-1).astype(int).to_numpy()
+    center_x = pd.to_numeric(df["CenterX"], errors="coerce").to_numpy(dtype=float)
+    center_y = pd.to_numeric(df["CenterY"], errors="coerce").to_numpy(dtype=float)
+
+    min_block_x = int(block_x.min())
+    max_block_x = int(block_x.max())
+    min_block_y = int(block_y.min())
+    max_block_y = int(block_y.max())
+    width = max(int(chunk_unit_width), 1)
+    height = max(int(chunk_unit_height), 1)
+    overlap = max(int(chunk_overlap_units), 0)
+
+    plans: list[dict[str, Any]] = []
+    for core_x0 in range(min_block_x, max_block_x + 1, width):
+        core_x1 = min(core_x0 + width - 1, max_block_x)
+        for core_y0 in range(min_block_y, max_block_y + 1, height):
+            core_y1 = min(core_y0 + height - 1, max_block_y)
+            core_mask = (
+                (block_x >= core_x0)
+                & (block_x <= core_x1)
+                & (block_y >= core_y0)
+                & (block_y <= core_y1)
+            )
+            if not core_mask.any():
+                continue
+            core_center_x = center_x[core_mask]
+            core_center_y = center_y[core_mask]
+            valid_core = np.isfinite(core_center_x) & np.isfinite(core_center_y)
+            if not valid_core.any():
+                continue
+            plans.append({
+                "core_block_x0": int(core_x0),
+                "core_block_x1": int(core_x1),
+                "core_block_y0": int(core_y0),
+                "core_block_y1": int(core_y1),
+                "ext_block_x0": int(max(min_block_x, core_x0 - overlap)),
+                "ext_block_x1": int(min(max_block_x, core_x1 + overlap)),
+                "ext_block_y0": int(max(min_block_y, core_y0 - overlap)),
+                "ext_block_y1": int(min(max_block_y, core_y1 + overlap)),
+                "core_bounds": {
+                    "x_min": float(np.nanmin(core_center_x[valid_core])),
+                    "x_max": float(np.nanmax(core_center_x[valid_core])),
+                    "y_min": float(np.nanmin(core_center_y[valid_core])),
+                    "y_max": float(np.nanmax(core_center_y[valid_core])),
+                },
+                "core_row_count": int(core_mask.sum()),
+            })
+    return plans
+
+
+def _extract_phase2_chunk(
+    df: pd.DataFrame,
+    plan: dict[str, Any],
+) -> pd.DataFrame:
+    block_x = pd.to_numeric(df["BlockX"], errors="coerce").fillna(-1).astype(int).to_numpy()
+    block_y = pd.to_numeric(df["BlockY"], errors="coerce").fillna(-1).astype(int).to_numpy()
+    ext_mask = (
+        (block_x >= int(plan["ext_block_x0"]))
+        & (block_x <= int(plan["ext_block_x1"]))
+        & (block_y >= int(plan["ext_block_y0"]))
+        & (block_y <= int(plan["ext_block_y1"]))
+    )
+    return df.loc[ext_mask].copy()
+
+
+def _keep_phase2_chunk_core_rows(
+    df: pd.DataFrame,
+    core_bounds: dict[str, float],
+) -> pd.DataFrame:
+    if df.empty:
+        return df.copy()
+    center_x = pd.to_numeric(df["CenterX"], errors="coerce").to_numpy(dtype=float)
+    center_y = pd.to_numeric(df["CenterY"], errors="coerce").to_numpy(dtype=float)
+    eps = 1e-6
+    keep_mask = (
+        np.isfinite(center_x)
+        & np.isfinite(center_y)
+        & (center_x >= float(core_bounds["x_min"]) - eps)
+        & (center_x <= float(core_bounds["x_max"]) + eps)
+        & (center_y >= float(core_bounds["y_min"]) - eps)
+        & (center_y <= float(core_bounds["y_max"]) + eps)
+    )
+    return df.loc[keep_mask].copy()
+
+
+def _run_phase2_pre_agg_steps(
+    df: pd.DataFrame,
+    *,
+    smooth_bandwidth_xy: float,
+    smooth_bandwidth_z: float,
+    smooth_blend_alpha: float,
+    corridor_search_radius: float,
+    corridor_min_patches: int,
+    scale_major_radius: float,
+    scale_minor_radius: float,
+    scale_z_radius: float,
+    macro_score_quantile: float,
+    macro_max_fraction: float,
+    meso_score_quantile: float,
+    macro_min_span: float,
+    meso_min_span: float,
+    macro_min_neighbors: int,
+    meso_min_neighbors: int,
+    heartbeat_hook: Callable[[str, str | None], None] | None = None,
+) -> tuple[pd.DataFrame, dict[str, Any]]:
+    stats: dict[str, Any] = {"input_count": len(df), "step_seconds": {}}
+
+    step_started = perf_counter()
+    df = regional_orientation_smoothing(
+        df,
+        smooth_bandwidth_xy,
+        smooth_bandwidth_z,
+        smooth_blend_alpha,
+        progress_hook=heartbeat_hook,
+    )
+    stats["step_seconds"]["orientation_smoothing"] = float(perf_counter() - step_started)
+
+    step_started = perf_counter()
+    df = fracture_corridor_detection(
+        df,
+        corridor_search_radius,
+        corridor_min_patches,
+        progress_hook=heartbeat_hook,
+    )
+    stats["step_seconds"]["corridor_detection"] = float(perf_counter() - step_started)
+
+    step_started = perf_counter()
+    df = assign_scale_classes(
+        df,
+        scale_major_radius=scale_major_radius,
+        scale_minor_radius=scale_minor_radius,
+        scale_z_radius=scale_z_radius,
+        macro_score_quantile=macro_score_quantile,
+        macro_max_fraction=macro_max_fraction,
+        meso_score_quantile=meso_score_quantile,
+        macro_min_span=macro_min_span,
+        meso_min_span=meso_min_span,
+        macro_min_neighbors=macro_min_neighbors,
+        meso_min_neighbors=meso_min_neighbors,
+        progress_hook=heartbeat_hook,
+    )
+    stats["step_seconds"]["scale_classification"] = float(perf_counter() - step_started)
+    stats["output_count"] = int(len(df))
+    return df, stats
+
+
+def _run_phase2_post_agg_steps(
+    df: pd.DataFrame,
+    *,
+    enable_aggregation: bool,
+    agg_cluster_radius: float,
+    agg_min_patches: int,
+    agg_azimuth_tol: float,
+    agg_dip_tol: float,
+    agg_max_length: float,
+    agg_max_height: float,
+    scale_major_radius: float,
+    scale_minor_radius: float,
+    scale_z_radius: float,
+    macro_score_quantile: float,
+    macro_max_fraction: float,
+    meso_score_quantile: float,
+    macro_min_span: float,
+    meso_min_span: float,
+    macro_min_neighbors: int,
+    meso_min_neighbors: int,
+    macro_agg_major: float,
+    macro_agg_minor: float,
+    macro_agg_max_length: float,
+    macro_agg_max_height: float,
+    enable_elongation: bool,
+    elongation_max_stretch: float,
+    elongation_gap_fill: float,
+    elongation_max_neighbor_dist: float,
+    macro_elongation_stretch: float,
+    macro_elongation_range: float,
+    heartbeat_hook: Callable[[str, str | None], None] | None = None,
+) -> tuple[pd.DataFrame, dict[str, Any]]:
+    stats: dict[str, Any] = {"input_count": len(df), "step_seconds": {}}
+
+    if enable_aggregation:
+        step_started = perf_counter()
+        count_before_agg = len(df)
+        df = aggregate_patches(
+            df,
+            cluster_radius=agg_cluster_radius,
+            cluster_min_patches=agg_min_patches,
+            azimuth_tol_deg=agg_azimuth_tol,
+            dip_tol_deg=agg_dip_tol,
+            max_merged_length=agg_max_length,
+            max_merged_height=agg_max_height,
+            macro_major_radius=macro_agg_major,
+            macro_minor_radius=macro_agg_minor,
+            macro_max_merged_length=macro_agg_max_length,
+            macro_max_merged_height=macro_agg_max_height,
+            scale_major_radius=scale_major_radius,
+            scale_minor_radius=scale_minor_radius,
+            scale_z_radius=scale_z_radius,
+            macro_score_quantile=macro_score_quantile,
+            macro_max_fraction=macro_max_fraction,
+            meso_score_quantile=meso_score_quantile,
+            macro_min_span=macro_min_span,
+            meso_min_span=meso_min_span,
+            macro_min_neighbors=macro_min_neighbors,
+            meso_min_neighbors=meso_min_neighbors,
+            progress_hook=heartbeat_hook,
+        )
+        stats["step_seconds"]["aggregate_patches"] = float(perf_counter() - step_started)
+        stats["aggregation"] = {
+            "input_patches": int(count_before_agg),
+            "output_patches": int(len(df)),
+            "merged_away": int(count_before_agg - len(df)),
+        }
+    else:
+        stats["aggregation"] = None
+
+    if enable_elongation:
+        step_started = perf_counter()
+        orig_lengths = pd.to_numeric(df["PatchLength"], errors="coerce").fillna(0.0).to_numpy(dtype=float).copy()
+        df = corridor_elongation(
+            df,
+            max_stretch_factor=elongation_max_stretch,
+            gap_fill_fraction=elongation_gap_fill,
+            max_neighbor_dist=elongation_max_neighbor_dist,
+            macro_stretch_factor=macro_elongation_stretch,
+            macro_neighbor_dist=macro_elongation_range,
+            progress_hook=heartbeat_hook,
+        )
+        stats["step_seconds"]["corridor_elongation"] = float(perf_counter() - step_started)
+        if "PatchArea" in df.columns:
+            df["PatchArea"] = (
+                pd.to_numeric(df["PatchLength"], errors="coerce").fillna(0.0)
+                * pd.to_numeric(df["PatchHeight"], errors="coerce").fillna(0.0)
+            )
+        new_lengths = pd.to_numeric(df["PatchLength"], errors="coerce").fillna(0.0).to_numpy(dtype=float)
+        comparable = min(len(orig_lengths), len(new_lengths))
+        stretched_mask = new_lengths[:comparable] > orig_lengths[:comparable] * 1.05
+        stats["elongation"] = {
+            "patches_stretched": int(stretched_mask.sum()),
+            "mean_stretch_ratio": float(np.mean(new_lengths[:comparable][stretched_mask] / np.maximum(orig_lengths[:comparable][stretched_mask], 1e-6))) if stretched_mask.any() else 1.0,
+        }
+    else:
+        stats["elongation"] = None
+
+    stats["output_count"] = int(len(df))
+    return df, stats
+
+
+def _run_phase2_chunked(
+    df: pd.DataFrame,
+    *,
+    smooth_bandwidth_xy: float,
+    smooth_bandwidth_z: float,
+    smooth_blend_alpha: float,
+    corridor_search_radius: float,
+    corridor_min_patches: int,
+    enable_supplement: bool,
+    min_pair_confidence: float,
+    max_supplement_length: float,
+    boundary_tol_xy: float,
+    enable_aggregation: bool,
+    agg_cluster_radius: float,
+    agg_min_patches: int,
+    agg_azimuth_tol: float,
+    agg_dip_tol: float,
+    agg_max_length: float,
+    agg_max_height: float,
+    scale_major_radius: float,
+    scale_minor_radius: float,
+    scale_z_radius: float,
+    macro_score_quantile: float,
+    macro_max_fraction: float,
+    meso_score_quantile: float,
+    macro_min_span: float,
+    meso_min_span: float,
+    macro_min_neighbors: int,
+    meso_min_neighbors: int,
+    macro_agg_major: float,
+    macro_agg_minor: float,
+    macro_agg_max_length: float,
+    macro_agg_max_height: float,
+    enable_elongation: bool,
+    elongation_max_stretch: float,
+    elongation_gap_fill: float,
+    elongation_max_neighbor_dist: float,
+    macro_elongation_stretch: float,
+    macro_elongation_range: float,
+    jitter_sigma_xy: float,
+    jitter_along_strike_factor: float,
+    jitter_seed: int,
+    compute_backend: str,
+    gpu_tile_points: int,
+    phase2_chunk_unit_width: int,
+    phase2_chunk_unit_height: int,
+    phase2_chunk_overlap_units: int,
+    progress_hook: Callable[[str, str | None], None] | None = None,
+    heartbeat_hook: Callable[[str, str | None], None] | None = None,
+    overall_progress: _StageProgressPrinter | None = None,
+) -> tuple[pd.DataFrame, dict[str, Any]]:
+    stats: dict[str, Any] = {"phase": 2, "input_count": len(df), "step_seconds": {}}
+    chunk_plan = _build_phase2_chunk_plan(
+        df,
+        chunk_unit_width=phase2_chunk_unit_width,
+        chunk_unit_height=phase2_chunk_unit_height,
+        chunk_overlap_units=phase2_chunk_overlap_units,
+    )
+    if len(chunk_plan) <= 1:
+        return run_phase2(
+            df,
+            smooth_bandwidth_xy=smooth_bandwidth_xy,
+            smooth_bandwidth_z=smooth_bandwidth_z,
+            smooth_blend_alpha=smooth_blend_alpha,
+            corridor_search_radius=corridor_search_radius,
+            corridor_min_patches=corridor_min_patches,
+            enable_supplement=enable_supplement,
+            min_pair_confidence=min_pair_confidence,
+            max_supplement_length=max_supplement_length,
+            boundary_tol_xy=boundary_tol_xy,
+            enable_aggregation=enable_aggregation,
+            agg_cluster_radius=agg_cluster_radius,
+            agg_min_patches=agg_min_patches,
+            agg_azimuth_tol=agg_azimuth_tol,
+            agg_dip_tol=agg_dip_tol,
+            agg_max_length=agg_max_length,
+            agg_max_height=agg_max_height,
+            scale_major_radius=scale_major_radius,
+            scale_minor_radius=scale_minor_radius,
+            scale_z_radius=scale_z_radius,
+            macro_score_quantile=macro_score_quantile,
+            macro_max_fraction=macro_max_fraction,
+            meso_score_quantile=meso_score_quantile,
+            macro_min_span=macro_min_span,
+            meso_min_span=meso_min_span,
+            macro_min_neighbors=macro_min_neighbors,
+            meso_min_neighbors=meso_min_neighbors,
+            macro_agg_major=macro_agg_major,
+            macro_agg_minor=macro_agg_minor,
+            macro_agg_max_length=macro_agg_max_length,
+            macro_agg_max_height=macro_agg_max_height,
+            enable_elongation=enable_elongation,
+            elongation_max_stretch=elongation_max_stretch,
+            elongation_gap_fill=elongation_gap_fill,
+            elongation_max_neighbor_dist=elongation_max_neighbor_dist,
+            macro_elongation_stretch=macro_elongation_stretch,
+            macro_elongation_range=macro_elongation_range,
+            jitter_sigma_xy=jitter_sigma_xy,
+            jitter_along_strike_factor=jitter_along_strike_factor,
+            jitter_seed=jitter_seed,
+            compute_backend=compute_backend,
+            gpu_tile_points=gpu_tile_points,
+            disable_phase2_chunking=True,
+            progress_hook=progress_hook,
+            heartbeat_hook=heartbeat_hook,
+            overall_progress=overall_progress,
+        )
+
+    stats["chunking"] = {
+        "enabled": True,
+        "chunk_count": int(len(chunk_plan)),
+        "chunk_unit_width": int(phase2_chunk_unit_width),
+        "chunk_unit_height": int(phase2_chunk_unit_height),
+        "chunk_overlap_units": int(phase2_chunk_overlap_units),
+    }
+    if progress_hook is not None:
+        progress_hook(
+            "Phase2 分块执行开始",
+            (
+                f"chunks={len(chunk_plan)}, "
+                f"chunk_size={int(phase2_chunk_unit_width)}x{int(phase2_chunk_unit_height)}, "
+                f"overlap={int(phase2_chunk_overlap_units)}"
+            ),
+        )
+
+    preagg_started = perf_counter()
+    preagg_frames: list[pd.DataFrame] = []
+    preagg_stats: list[dict[str, Any]] = []
+    corridor_offset = 0
+    chunk_bar = tqdm(
+        total=len(chunk_plan),
+        desc="phase2_preagg_chunks",
+        unit="chunk",
+        ascii=True,
+        dynamic_ncols=True,
+        leave=True,
+        file=sys.stdout,
+    )
+    for chunk_idx, plan in enumerate(chunk_plan, start=1):
+        chunk_input = _extract_phase2_chunk(df, plan)
+        chunk_output, chunk_stats = _run_phase2_pre_agg_steps(
+            chunk_input,
+            smooth_bandwidth_xy=smooth_bandwidth_xy,
+            smooth_bandwidth_z=smooth_bandwidth_z,
+            smooth_blend_alpha=smooth_blend_alpha,
+            corridor_search_radius=corridor_search_radius,
+            corridor_min_patches=corridor_min_patches,
+            scale_major_radius=scale_major_radius,
+            scale_minor_radius=scale_minor_radius,
+            scale_z_radius=scale_z_radius,
+            macro_score_quantile=macro_score_quantile,
+            macro_max_fraction=macro_max_fraction,
+            meso_score_quantile=meso_score_quantile,
+            macro_min_span=macro_min_span,
+            meso_min_span=meso_min_span,
+            macro_min_neighbors=macro_min_neighbors,
+            meso_min_neighbors=meso_min_neighbors,
+            heartbeat_hook=None,
+        )
+        if "CorridorID" in chunk_output.columns:
+            corridor_mask = pd.to_numeric(chunk_output["CorridorID"], errors="coerce").fillna(-1).to_numpy(dtype=int) >= 0
+            if corridor_mask.any():
+                chunk_output.loc[corridor_mask, "CorridorID"] = (
+                    pd.to_numeric(chunk_output.loc[corridor_mask, "CorridorID"], errors="coerce").fillna(-1).astype(int)
+                    + corridor_offset
+                )
+                corridor_offset = int(pd.to_numeric(chunk_output["CorridorID"], errors="coerce").fillna(-1).max()) + 1
+        chunk_core = _keep_phase2_chunk_core_rows(chunk_output, plan["core_bounds"])
+        preagg_frames.append(chunk_core)
+        preagg_stats.append(chunk_stats)
+        if overall_progress is not None and len(chunk_plan) > 0:
+            chunk_fraction = float(chunk_idx / len(chunk_plan))
+            chunk_detail = (
+                f"preagg_chunk={chunk_idx}/{len(chunk_plan)}, "
+                f"core_rows={len(chunk_core)}, "
+                f"block_x={plan['core_block_x0']}-{plan['core_block_x1']}, "
+                f"block_y={plan['core_block_y0']}-{plan['core_block_y1']}"
+            )
+            for stage_key in ("phase2_orientation", "phase2_corridor", "phase2_scale"):
+                overall_progress.update_stage_fraction(stage_key, chunk_fraction, detail=chunk_detail)
+        chunk_bar.set_postfix_str(f"{chunk_idx}/{len(chunk_plan)} core_rows={len(chunk_core)}")
+        chunk_bar.update(1)
+    chunk_bar.close()
+    df = pd.concat(preagg_frames, ignore_index=True, sort=False) if preagg_frames else df.head(0).copy()
+    stats["step_seconds"]["orientation_smoothing"] = _sum_chunk_step_seconds(preagg_stats, "orientation_smoothing")
+    stats["step_seconds"]["corridor_detection"] = _sum_chunk_step_seconds(preagg_stats, "corridor_detection")
+    stats["step_seconds"]["scale_classification"] = _sum_chunk_step_seconds(preagg_stats, "scale_classification")
+    stats["step_seconds"]["phase2_preagg_chunked"] = float(perf_counter() - preagg_started)
+
+    az_shift = _azimuth_diff(df["OrigAzimuth"].to_numpy(dtype=float), df["SmoothedAzimuth"].to_numpy(dtype=float))
+    dip_shift = np.abs(df["OrigDip"].to_numpy(dtype=float) - df["SmoothedDip"].to_numpy(dtype=float))
+    stats["orientation_smoothing"] = {
+        "mean_azimuth_shift_deg": float(np.nanmean(az_shift)) if len(az_shift) > 0 else 0.0,
+        "mean_dip_shift_deg": float(np.nanmean(dip_shift)) if len(dip_shift) > 0 else 0.0,
+        "max_azimuth_shift_deg": float(np.nanmax(az_shift)) if len(az_shift) > 0 else 0.0,
+    }
+    stats["corridors_detected"] = int(pd.to_numeric(df.get("CorridorID", pd.Series([], dtype=float)), errors="coerce").fillna(-1).max()) + 1 if len(df) > 0 and "CorridorID" in df.columns and (pd.to_numeric(df["CorridorID"], errors="coerce").fillna(-1) >= 0).any() else 0
+    stats["patches_in_corridors"] = int(pd.to_numeric(df.get("CorridorSupport", pd.Series([], dtype=float)), errors="coerce").fillna(0).sum()) if "CorridorSupport" in df.columns else 0
+    scale_counts = df["ScaleClass"].value_counts().to_dict() if "ScaleClass" in df.columns else {}
+    total_scale = max(len(df), 1)
+    stats["scale_class_counts"] = {str(key): int(value) for key, value in scale_counts.items()}
+    stats["macro_fraction"] = float(scale_counts.get("macro_core", 0) / total_scale)
+    stats["meso_fraction"] = float(scale_counts.get("meso_link", 0) / total_scale)
+    stats["micro_fraction"] = float(scale_counts.get("micro_bg", 0) / total_scale)
+    if progress_hook is not None:
+        progress_hook(
+            "Phase2 分块预处理完成",
+            (
+                f"rows={len(df)}, corridors={int(stats['corridors_detected'])}, "
+                f"macro={int(scale_counts.get('macro_core', 0))}, "
+                f"meso={int(scale_counts.get('meso_link', 0))}, "
+                f"micro={int(scale_counts.get('micro_bg', 0))}, "
+                f"elapsed={_format_seconds(stats['step_seconds']['phase2_preagg_chunked'])}"
+            ),
+        )
+
+    if enable_supplement:
+        step_started = perf_counter()
+        _, matched_pairs = boundary_match_only(
+            df,
+            boundary_tol_xy=boundary_tol_xy,
+            compute_backend=compute_backend,
+            gpu_tile_points=gpu_tile_points,
+        )
+        count_before = len(df)
+        df = conservative_boundary_supplement(
+            df,
+            matched_pairs,
+            min_pair_confidence=min_pair_confidence,
+            max_supplement_length=max_supplement_length,
+        )
+        stats["step_seconds"]["conservative_supplement"] = float(perf_counter() - step_started)
+        stats["supplemented_patches"] = int(len(df) - count_before)
+        if progress_hook is not None:
+            progress_hook(
+                "Phase2 全局保守补接完成",
+                (
+                    f"matched_pairs={len(matched_pairs)}, supplemented={int(stats['supplemented_patches'])}, "
+                    f"elapsed={_format_seconds(stats['step_seconds']['conservative_supplement'])}"
+                ),
+            )
+    else:
+        stats["supplemented_patches"] = 0
+        if progress_hook is not None:
+            progress_hook("Phase2 全局保守补接跳过", "enable_supplement=False")
+
+    postagg_started = perf_counter()
+    postagg_frames: list[pd.DataFrame] = []
+    postagg_stats: list[dict[str, Any]] = []
+    post_chunk_plan = _build_phase2_chunk_plan(
+        df,
+        chunk_unit_width=phase2_chunk_unit_width,
+        chunk_unit_height=phase2_chunk_unit_height,
+        chunk_overlap_units=phase2_chunk_overlap_units,
+    )
+    chunk_bar = tqdm(
+        total=len(post_chunk_plan),
+        desc="phase2_postagg_chunks",
+        unit="chunk",
+        ascii=True,
+        dynamic_ncols=True,
+        leave=True,
+        file=sys.stdout,
+    )
+    count_before_postagg = len(df)
+    for chunk_idx, plan in enumerate(post_chunk_plan, start=1):
+        chunk_input = _extract_phase2_chunk(df, plan)
+        chunk_output, chunk_stats = _run_phase2_post_agg_steps(
+            chunk_input,
+            enable_aggregation=enable_aggregation,
+            agg_cluster_radius=agg_cluster_radius,
+            agg_min_patches=agg_min_patches,
+            agg_azimuth_tol=agg_azimuth_tol,
+            agg_dip_tol=agg_dip_tol,
+            agg_max_length=agg_max_length,
+            agg_max_height=agg_max_height,
+            scale_major_radius=scale_major_radius,
+            scale_minor_radius=scale_minor_radius,
+            scale_z_radius=scale_z_radius,
+            macro_score_quantile=macro_score_quantile,
+            macro_max_fraction=macro_max_fraction,
+            meso_score_quantile=meso_score_quantile,
+            macro_min_span=macro_min_span,
+            meso_min_span=meso_min_span,
+            macro_min_neighbors=macro_min_neighbors,
+            meso_min_neighbors=meso_min_neighbors,
+            macro_agg_major=macro_agg_major,
+            macro_agg_minor=macro_agg_minor,
+            macro_agg_max_length=macro_agg_max_length,
+            macro_agg_max_height=macro_agg_max_height,
+            enable_elongation=enable_elongation,
+            elongation_max_stretch=elongation_max_stretch,
+            elongation_gap_fill=elongation_gap_fill,
+            elongation_max_neighbor_dist=elongation_max_neighbor_dist,
+            macro_elongation_stretch=macro_elongation_stretch,
+            macro_elongation_range=macro_elongation_range,
+            heartbeat_hook=None,
+        )
+        chunk_core = _keep_phase2_chunk_core_rows(chunk_output, plan["core_bounds"])
+        postagg_frames.append(chunk_core)
+        postagg_stats.append(chunk_stats)
+        if overall_progress is not None and len(post_chunk_plan) > 0:
+            chunk_fraction = float(chunk_idx / len(post_chunk_plan))
+            chunk_detail = (
+                f"postagg_chunk={chunk_idx}/{len(post_chunk_plan)}, "
+                f"core_rows={len(chunk_core)}, "
+                f"block_x={plan['core_block_x0']}-{plan['core_block_x1']}, "
+                f"block_y={plan['core_block_y0']}-{plan['core_block_y1']}"
+            )
+            if enable_aggregation:
+                overall_progress.update_stage_fraction("phase2_aggregate", chunk_fraction, detail=chunk_detail)
+            if enable_elongation:
+                overall_progress.update_stage_fraction("phase2_elongation", chunk_fraction, detail=chunk_detail)
+        chunk_bar.set_postfix_str(f"{chunk_idx}/{len(post_chunk_plan)} core_rows={len(chunk_core)}")
+        chunk_bar.update(1)
+    chunk_bar.close()
+    df = pd.concat(postagg_frames, ignore_index=True, sort=False) if postagg_frames else df.head(0).copy()
+    stats["step_seconds"]["aggregate_patches"] = _sum_chunk_step_seconds(postagg_stats, "aggregate_patches")
+    stats["step_seconds"]["corridor_elongation"] = _sum_chunk_step_seconds(postagg_stats, "corridor_elongation")
+    stats["step_seconds"]["phase2_postagg_chunked"] = float(perf_counter() - postagg_started)
+    stats["aggregation"] = {
+        "input_patches": int(count_before_postagg),
+        "output_patches": int(len(df)),
+        "merged_away": int(count_before_postagg - len(df)),
+        "post_scale_class_counts": {str(k): int(v) for k, v in df["ScaleClass"].value_counts().to_dict().items()} if "ScaleClass" in df.columns else {},
+    } if enable_aggregation else None
+
+    elongated_total = 0
+    elongation_ratios: list[float] = []
+    for item in postagg_stats:
+        elongation = item.get("elongation")
+        if not isinstance(elongation, dict):
+            continue
+        elongated_total += int(elongation.get("patches_stretched", 0) or 0)
+        ratio = float(elongation.get("mean_stretch_ratio", 1.0) or 1.0)
+        if ratio > 0:
+            elongation_ratios.append(ratio)
+    if enable_elongation:
+        stats["elongation"] = {
+            "patches_stretched": int(elongated_total),
+            "mean_stretch_ratio": float(np.mean(elongation_ratios)) if elongation_ratios else 1.0,
+            "max_stretch_factor": elongation_max_stretch,
+            "macro_stretch_factor": macro_elongation_stretch,
+        }
+    else:
+        stats["elongation"] = None
+    if progress_hook is not None:
+        progress_hook(
+            "Phase2 分块聚合完成",
+            (
+                f"input={count_before_postagg}, output={len(df)}, "
+                f"merged_away={count_before_postagg - len(df)}, "
+                f"elapsed={_format_seconds(stats['step_seconds']['phase2_postagg_chunked'])}"
+            ),
+        )
+
+    if jitter_sigma_xy > 0:
+        step_started = perf_counter()
+        df = spatial_perturbation(df, jitter_sigma_xy, jitter_along_strike_factor, jitter_seed)
+        stats["step_seconds"]["spatial_perturbation"] = float(perf_counter() - step_started)
+        stats["spatial_perturbation"] = {
+            "jitter_sigma_xy": jitter_sigma_xy,
+            "along_strike_factor": jitter_along_strike_factor,
+        }
+        if progress_hook is not None:
+            progress_hook(
+                "Phase2 全局空间扰动完成",
+                (
+                    f"jitter_sigma_xy={jitter_sigma_xy}, along_strike_factor={jitter_along_strike_factor}, "
+                    f"elapsed={_format_seconds(stats['step_seconds']['spatial_perturbation'])}"
+                ),
+            )
+    else:
+        stats["spatial_perturbation"] = None
+        if progress_hook is not None:
+            progress_hook("Phase2 全局空间扰动跳过", "jitter_sigma_xy<=0")
+
+    stats["compute_backend"] = _resolve_compute_backend(compute_backend)
+    stats["output_count"] = int(len(df))
+    return df, stats
+
+
 def run_phase2(
     df: pd.DataFrame,
     *,
@@ -4284,10 +5177,74 @@ def run_phase2(
     jitter_seed: int = 42,
     compute_backend: str = DEFAULT_POSTPROCESS_COMPUTE_BACKEND,
     gpu_tile_points: int = DEFAULT_POSTPROCESS_GPU_TILE_POINTS,
+    phase2_chunk_row_threshold: int = 250000,
+    phase2_chunk_unit_width: int = 12,
+    phase2_chunk_unit_height: int = 12,
+    phase2_chunk_overlap_units: int = 1,
+    disable_phase2_chunking: bool = False,
     progress_hook: Callable[[str, str | None], None] | None = None,
     heartbeat_hook: Callable[[str, str | None], None] | None = None,
+    overall_progress: _StageProgressPrinter | None = None,
 ) -> tuple[pd.DataFrame, dict[str, Any]]:
     """Phase 2 override with multiscale expert postprocess."""
+    use_chunking = (
+        not bool(disable_phase2_chunking)
+        and len(df) >= int(max(phase2_chunk_row_threshold, 1))
+        and "BlockX" in df.columns
+        and "BlockY" in df.columns
+    )
+    if use_chunking:
+        return _run_phase2_chunked(
+            df,
+            smooth_bandwidth_xy=smooth_bandwidth_xy,
+            smooth_bandwidth_z=smooth_bandwidth_z,
+            smooth_blend_alpha=smooth_blend_alpha,
+            corridor_search_radius=corridor_search_radius,
+            corridor_min_patches=corridor_min_patches,
+            enable_supplement=enable_supplement,
+            min_pair_confidence=min_pair_confidence,
+            max_supplement_length=max_supplement_length,
+            boundary_tol_xy=boundary_tol_xy,
+            enable_aggregation=enable_aggregation,
+            agg_cluster_radius=agg_cluster_radius,
+            agg_min_patches=agg_min_patches,
+            agg_azimuth_tol=agg_azimuth_tol,
+            agg_dip_tol=agg_dip_tol,
+            agg_max_length=agg_max_length,
+            agg_max_height=agg_max_height,
+            scale_major_radius=scale_major_radius,
+            scale_minor_radius=scale_minor_radius,
+            scale_z_radius=scale_z_radius,
+            macro_score_quantile=macro_score_quantile,
+            macro_max_fraction=macro_max_fraction,
+            meso_score_quantile=meso_score_quantile,
+            macro_min_span=macro_min_span,
+            meso_min_span=meso_min_span,
+            macro_min_neighbors=macro_min_neighbors,
+            meso_min_neighbors=meso_min_neighbors,
+            macro_agg_major=macro_agg_major,
+            macro_agg_minor=macro_agg_minor,
+            macro_agg_max_length=macro_agg_max_length,
+            macro_agg_max_height=macro_agg_max_height,
+            enable_elongation=enable_elongation,
+            elongation_max_stretch=elongation_max_stretch,
+            elongation_gap_fill=elongation_gap_fill,
+            elongation_max_neighbor_dist=elongation_max_neighbor_dist,
+            macro_elongation_stretch=macro_elongation_stretch,
+            macro_elongation_range=macro_elongation_range,
+            jitter_sigma_xy=jitter_sigma_xy,
+            jitter_along_strike_factor=jitter_along_strike_factor,
+            jitter_seed=jitter_seed,
+            compute_backend=compute_backend,
+            gpu_tile_points=gpu_tile_points,
+            phase2_chunk_unit_width=phase2_chunk_unit_width,
+            phase2_chunk_unit_height=phase2_chunk_unit_height,
+            phase2_chunk_overlap_units=phase2_chunk_overlap_units,
+            progress_hook=progress_hook,
+            heartbeat_hook=heartbeat_hook,
+            overall_progress=overall_progress,
+        )
+
     stats: dict[str, Any] = {"phase": 2, "input_count": len(df)}
     stats["step_seconds"] = {}
 
@@ -4652,6 +5609,7 @@ def _run_pipeline_on_dataframe(
     phase: int,
     progress_hook: Callable[[str, str | None], None] | None = None,
     heartbeat_hook: Callable[[str, str | None], None] | None = None,
+    overall_progress: _StageProgressPrinter | None = None,
     **kwargs: Any,
 ) -> tuple[pd.DataFrame, dict[str, Any]]:
     """Run pipeline on a dataframe so VTK and CSV share the same logic."""
@@ -4707,6 +5665,8 @@ def _run_pipeline_on_dataframe(
             p1_keys = {
                 "max_fracture_sets",
                 "n_fracture_sets",
+                "fracture_set_bic_sample_cap",
+                "fracture_set_fit_sample_cap",
                 "neighbor_radius_xy",
                 "neighbor_radius_z",
                 "isolation_min_neighbors",
@@ -4722,7 +5682,13 @@ def _run_pipeline_on_dataframe(
             p1_kwargs.update(phase_runtime_kwargs)
             p2_kwargs.update(phase_runtime_kwargs)
             df, stats1 = run_phase1(df, progress_hook=progress_hook, heartbeat_hook=heartbeat_hook, **p1_kwargs)
-            df, stats2 = run_phase2(df, progress_hook=progress_hook, heartbeat_hook=heartbeat_hook, **p2_kwargs)
+            df, stats2 = run_phase2(
+                df,
+                progress_hook=progress_hook,
+                heartbeat_hook=heartbeat_hook,
+                overall_progress=overall_progress,
+                **p2_kwargs,
+            )
             stats = {
                 **stats1,
                 "phase1_output_count": stats1.get("output_count"),
@@ -4796,30 +5762,123 @@ def postprocess_vtk(input_vtk: Path, output_vtk: Path, phase: int = 1, **kwargs:
     total_started = perf_counter()
     enable_boundary_connect = bool(kwargs.get("enable_boundary_connect", False))
     enable_seam_fill = bool(kwargs.get("enable_seam_fill", False))
-    pipeline_stage_count = 3 + (7 if int(phase) == 2 else 0) + (1 if enable_boundary_connect else 0) + (1 if enable_seam_fill else 0)
+    enable_supplement = bool(kwargs.get("enable_supplement", True))
+    enable_aggregation = bool(kwargs.get("enable_aggregation", True))
+    enable_elongation = bool(kwargs.get("enable_elongation", True))
+    enable_jitter = float(kwargs.get("jitter_sigma_xy", 8.0) or 0.0) > 0.0
+    stage_weights: dict[str, float] = {
+        "read_vtk": 0.02 if int(phase) == 2 else 0.05,
+        "vtk_to_df": 0.02 if int(phase) == 2 else 0.05,
+        "phase1_cluster": 0.08 if int(phase) == 2 else 0.35,
+        "phase1_score": 0.08 if int(phase) == 2 else 0.35,
+        "phase1_boundary": 0.04 if int(phase) == 2 else 0.10,
+        "write_vtk": 0.02 if int(phase) == 2 else 0.10,
+    }
+    if int(phase) == 2:
+        stage_weights.update({
+            "phase2_orientation": 0.10,
+            "phase2_corridor": 0.06,
+            "phase2_scale": 0.16,
+        })
+        if enable_supplement:
+            stage_weights["phase2_supplement"] = 0.04
+        if enable_aggregation:
+            stage_weights["phase2_aggregate"] = 0.18
+        if enable_elongation:
+            stage_weights["phase2_elongation"] = 0.10
+        if enable_jitter:
+            stage_weights["phase2_jitter"] = 0.02
+        if enable_boundary_connect:
+            stage_weights["boundary_connect"] = 0.04
+        if enable_seam_fill:
+            stage_weights["seam_fill"] = 0.04
+    stage_aliases = {
+        "读取VTK完成": "read_vtk",
+        "VTK转DataFrame完成": "vtk_to_df",
+        "Phase1 裂缝组识别完成": "phase1_cluster",
+        "Phase1 可靠性评分完成": "phase1_score",
+        "Phase1 边界匹配完成": "phase1_boundary",
+        "Phase2 产状平滑完成": "phase2_orientation",
+        "Phase2 走廊识别完成": "phase2_corridor",
+        "Phase2 尺度分类完成": "phase2_scale",
+        "Phase2 保守补接完成": "phase2_supplement",
+        "Phase2 全局保守补接完成": "phase2_supplement",
+        "Phase2 裂缝片聚合完成": "phase2_aggregate",
+        "Phase2 沿走向拉伸完成": "phase2_elongation",
+        "Phase2 空间扰动完成": "phase2_jitter",
+        "Phase2 全局空间扰动完成": "phase2_jitter",
+        "边界跨单元补接完成": "boundary_connect",
+        "边界缝带填充完成": "seam_fill",
+        "写出VTK完成": "write_vtk",
+    }
+    heartbeat_aliases = {
+        "裂缝组识别 BIC 进度": "phase1_cluster",
+        "可靠性评分邻域统计GPU进度": "phase1_score",
+        "可靠性评分邻域统计CPU进度": "phase1_score",
+        "产状平滑组进度": "phase2_orientation",
+        "走廊识别组进度": "phase2_corridor",
+        "尺度分类组进度": "phase2_scale",
+        "裂缝片聚合组进度[macro_core]": "phase2_aggregate",
+        "裂缝片聚合组进度[meso_link]": "phase2_aggregate",
+        "沿走向拉伸组进度": "phase2_elongation",
+    }
+    stage_labels = [
+        f"读取VTK[{stage_weights.get('read_vtk', 0.0) * 100:.0f}%]",
+        f"VTK转DataFrame[{stage_weights.get('vtk_to_df', 0.0) * 100:.0f}%]",
+        f"Phase1裂缝组识别[{stage_weights.get('phase1_cluster', 0.0) * 100:.0f}%]",
+        f"Phase1可靠性评分[{stage_weights.get('phase1_score', 0.0) * 100:.0f}%]",
+        f"Phase1边界匹配[{stage_weights.get('phase1_boundary', 0.0) * 100:.0f}%]",
+    ]
+    if int(phase) == 2:
+        stage_labels.extend([
+            f"Phase2产状平滑[{stage_weights.get('phase2_orientation', 0.0) * 100:.0f}%]",
+            f"Phase2走廊识别[{stage_weights.get('phase2_corridor', 0.0) * 100:.0f}%]",
+            f"Phase2尺度分类[{stage_weights.get('phase2_scale', 0.0) * 100:.0f}%]",
+        ])
+        if enable_supplement:
+            stage_labels.append(f"Phase2保守补接[{stage_weights.get('phase2_supplement', 0.0) * 100:.0f}%]")
+        if enable_aggregation:
+            stage_labels.append(f"Phase2裂缝片聚合[{stage_weights.get('phase2_aggregate', 0.0) * 100:.0f}%]")
+        if enable_elongation:
+            stage_labels.append(f"Phase2沿走向拉伸[{stage_weights.get('phase2_elongation', 0.0) * 100:.0f}%]")
+        if enable_jitter:
+            stage_labels.append(f"Phase2空间扰动[{stage_weights.get('phase2_jitter', 0.0) * 100:.0f}%]")
+    if enable_boundary_connect:
+        stage_labels.append(f"边界跨单元补接[{stage_weights.get('boundary_connect', 0.0) * 100:.0f}%]")
+    if enable_seam_fill:
+        stage_labels.append(f"边界缝带填充[{stage_weights.get('seam_fill', 0.0) * 100:.0f}%]")
+    stage_labels.append(f"写出VTK[{stage_weights.get('write_vtk', 0.0) * 100:.0f}%]")
     progress = _StageProgressPrinter(
-        total_steps=2 + pipeline_stage_count + 1,
+        total_steps=max(len(stage_labels), 1),
         prefix=f"postprocess phase{int(phase)}",
+        stage_weights=stage_weights,
+        stage_aliases=stage_aliases,
+        heartbeat_aliases=heartbeat_aliases,
     )
-    payload = read_legacy_vtk_polygons(input_vtk)
-    progress.advance("读取VTK完成", f"polygons={len(payload.get('polygons', []))}")
-    df = _df_from_vtk(payload)
-    progress.advance("VTK转DataFrame完成", f"rows={len(df)}")
-    df, stats = _run_pipeline_on_dataframe(
-        df,
-        phase,
-        progress_hook=progress.advance,
-        heartbeat_hook=progress.log,
-        **kwargs,
-    )
-    title = f"{payload.get('title', 'DFN')}_postprocessed_phase{phase}"
-    _df_to_vtk(df, title, output_vtk, payload.get("scalar_types"))
-    stats["total_seconds"] = float(perf_counter() - total_started)
-    progress.advance(
-        "写出VTK完成",
-        f"rows={len(df)}, output={output_vtk}, total_elapsed={_format_seconds(stats['total_seconds'])}",
-    )
-    return stats
+    progress.log("stage_plan", " | ".join(stage_labels))
+    try:
+        payload = read_legacy_vtk_polygons(input_vtk)
+        progress.advance("读取VTK完成", f"polygons={len(payload.get('polygons', []))}")
+        df = _df_from_vtk(payload)
+        progress.advance("VTK转DataFrame完成", f"rows={len(df)}")
+        df, stats = _run_pipeline_on_dataframe(
+            df,
+            phase,
+            progress_hook=progress.advance,
+            heartbeat_hook=progress.log,
+            overall_progress=progress,
+            **kwargs,
+        )
+        title = f"{payload.get('title', 'DFN')}_postprocessed_phase{phase}"
+        _df_to_vtk(df, title, output_vtk, payload.get("scalar_types"))
+        stats["total_seconds"] = float(perf_counter() - total_started)
+        progress.advance(
+            "写出VTK完成",
+            f"rows={len(df)}, output={output_vtk}, total_elapsed={_format_seconds(stats['total_seconds'])}",
+        )
+        return stats
+    finally:
+        progress.close()
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -4841,6 +5900,8 @@ def build_parser() -> argparse.ArgumentParser:
     g1 = parser.add_argument_group("Step 1")
     g1.add_argument("--max-sets", type=int, default=6)
     g1.add_argument("--n-sets", type=int, default=None)
+    g1.add_argument("--gmm-bic-sample-cap", type=int, default=250000)
+    g1.add_argument("--gmm-fit-sample-cap", type=int, default=400000)
 
     g2 = parser.add_argument_group("Step 2")
     g2.add_argument("--smooth-bw-xy", type=float, default=150.0)
@@ -4926,6 +5987,13 @@ def build_parser() -> argparse.ArgumentParser:
     g10.add_argument("--bc-min-shared-ratio", type=float, default=0.15)
     g10.add_argument("--bc-high-rel-boost", type=float, default=1.5)
 
+    g11 = parser.add_argument_group("Runtime")
+    g11.add_argument("--phase2-chunk-row-threshold", type=int, default=250000)
+    g11.add_argument("--phase2-chunk-unit-width", type=int, default=12)
+    g11.add_argument("--phase2-chunk-unit-height", type=int, default=12)
+    g11.add_argument("--phase2-chunk-overlap-units", type=int, default=1)
+    g11.add_argument("--disable-phase2-chunking", action="store_true")
+
     parser.add_argument("--docx-path", type=Path, default=DEFAULT_DOCX_PATH)
     return parser
 
@@ -4935,6 +6003,8 @@ def _collect_pipeline_kwargs(args: argparse.Namespace) -> dict[str, Any]:
     kwargs: dict[str, Any] = {
         "max_fracture_sets": args.max_sets,
         "n_fracture_sets": args.n_sets,
+        "fracture_set_bic_sample_cap": args.gmm_bic_sample_cap,
+        "fracture_set_fit_sample_cap": args.gmm_fit_sample_cap,
         "neighbor_radius_xy": args.neighbor_radius_xy,
         "neighbor_radius_z": args.neighbor_radius_z,
         "isolation_min_neighbors": args.min_neighbors,
@@ -4981,6 +6051,11 @@ def _collect_pipeline_kwargs(args: argparse.Namespace) -> dict[str, Any]:
             "jitter_sigma_xy": 0.0 if args.no_jitter else args.jitter_xy,
             "jitter_along_strike_factor": args.jitter_strike_factor,
             "jitter_seed": args.jitter_seed,
+            "phase2_chunk_row_threshold": args.phase2_chunk_row_threshold,
+            "phase2_chunk_unit_width": args.phase2_chunk_unit_width,
+            "phase2_chunk_unit_height": args.phase2_chunk_unit_height,
+            "phase2_chunk_overlap_units": args.phase2_chunk_overlap_units,
+            "disable_phase2_chunking": args.disable_phase2_chunking,
         })
     if args.boundary_connect:
         kwargs.update({

@@ -426,6 +426,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--postprocess-compute-backend", choices=["auto", "cpu", "gpu"], default="auto")
     parser.add_argument("--postprocess-max-cpu-threads", type=int, default=24)
     parser.add_argument("--postprocess-gpu-tile-points", type=int, default=2048)
+    parser.add_argument("--postprocess-gmm-bic-sample-cap", type=int, default=250000)
+    parser.add_argument("--postprocess-gmm-fit-sample-cap", type=int, default=400000)
+    parser.add_argument("--postprocess-phase2-chunk-row-threshold", type=int, default=250000)
+    parser.add_argument("--postprocess-phase2-chunk-unit-width", type=int, default=12)
+    parser.add_argument("--postprocess-phase2-chunk-unit-height", type=int, default=12)
+    parser.add_argument("--postprocess-phase2-chunk-overlap-units", type=int, default=1)
+    parser.add_argument("--postprocess-disable-phase2-chunking", action="store_true")
     parser.add_argument("--fault-patches-root", type=Path, default=DEFAULT_FAULT_PATCHES_ROOT)
     parser.add_argument("--fault-half-band-ms", type=float, default=100.0)
     parser.add_argument("--fault-remove-ms", type=float, default=50.0)
@@ -1310,9 +1317,17 @@ def build_postprocess_args(paths: PipelinePaths, args: argparse.Namespace) -> li
         "--compute-backend", str(args.postprocess_compute_backend),
         "--max-cpu-threads", str(int(args.postprocess_max_cpu_threads)),
         "--gpu-tile-points", str(int(args.postprocess_gpu_tile_points)),
+        "--gmm-bic-sample-cap", str(int(args.postprocess_gmm_bic_sample_cap)),
+        "--gmm-fit-sample-cap", str(int(args.postprocess_gmm_fit_sample_cap)),
+        "--phase2-chunk-row-threshold", str(int(args.postprocess_phase2_chunk_row_threshold)),
+        "--phase2-chunk-unit-width", str(int(args.postprocess_phase2_chunk_unit_width)),
+        "--phase2-chunk-unit-height", str(int(args.postprocess_phase2_chunk_unit_height)),
+        "--phase2-chunk-overlap-units", str(int(args.postprocess_phase2_chunk_overlap_units)),
         "--docx-path", str(Path(args.docx_path).resolve()),
         "--overwrite",
     ]
+    if bool(args.postprocess_disable_phase2_chunking):
+        extra.append("--disable-phase2-chunking")
     if bool(args.postprocess_boundary_connect):
         extra.append("--boundary-connect")
     if bool(args.postprocess_bc_seam_fill):
