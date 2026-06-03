@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 from datetime import datetime
 from pathlib import Path
+from time import perf_counter
 from typing import Any
 
 import numpy as np
@@ -265,16 +266,6 @@ def build_fragment_display_offset(
     return np.array([0.0, 0.0, float(display_sign) * local_normal_shift], dtype=float)
 
 
-def extract_local_submesh(tri_local_poly: pv.PolyData, cell_ids: np.ndarray) -> pv.PolyData | None:
-    if len(cell_ids) <= 0:
-        return None
-    submesh = tri_local_poly.extract_cells(np.asarray(cell_ids, dtype=int))
-    submesh = extract_surface_clean_tri(submesh)
-    if not isinstance(submesh, pv.PolyData) or submesh.n_cells <= 0:
-        return None
-    return submesh
-
-
 def prepare_area_cap_split_arrays(
     tri_local_poly: pv.PolyData,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
@@ -384,19 +375,19 @@ def split_component_cell_ids_by_area_cap(
     return leaf_ids
 
 
-def split_local_component_by_area_cap(component_local: pv.PolyData, area_cap: float) -> list[pv.PolyData]:
+def split_local_component_by_area_cap(component_local: pv.PolyData, area_cap: float) -> list[np.ndarray]:
     tri_local_poly = extract_surface_clean_tri(component_local)
     if not isinstance(tri_local_poly, pv.PolyData) or tri_local_poly.n_cells <= 0:
         return []
     if float(area_cap) <= 0.0 or float(tri_local_poly.area) <= float(area_cap):
-        return [tri_local_poly]
+        return [np.arange(tri_local_poly.n_cells, dtype=int)]
 
     try:
         cell_centers, cell_areas, cell_xmin, cell_xmax, cell_ymin, cell_ymax = prepare_area_cap_split_arrays(tri_local_poly)
     except ValueError:
-        return [tri_local_poly]
+        return [np.arange(tri_local_poly.n_cells, dtype=int)]
 
-    leaf_ids = split_component_cell_ids_by_area_cap(
+    return split_component_cell_ids_by_area_cap(
         cell_centers=cell_centers,
         cell_areas=cell_areas,
         cell_xmin=cell_xmin,
@@ -406,47 +397,33 @@ def split_local_component_by_area_cap(component_local: pv.PolyData, area_cap: fl
         area_cap=float(area_cap),
     )
 
-    leaves: list[pv.PolyData] = []
-    for current_ids in leaf_ids:
-        current_mesh = extract_local_submesh(tri_local_poly, current_ids)
-        if current_mesh is None:
-            continue
-        leaves.append(current_mesh)
-    return leaves if leaves else [tri_local_poly]
 
-
-def build_planar_patch_row_from_mesh(
-    world_mesh: pv.PolyData,
+def build_planar_patch_row_from_local_bounds(
+    local_strike_min: float,
+    local_strike_max: float,
+    local_dip_min: float,
+    local_dip_max: float,
+    target_area: float,
+    center: np.ndarray,
+    strike_vec: np.ndarray,
+    dip_vec: np.ndarray,
+    normal_vec: np.ndarray,
     display_offset_ms: float,
     fragment_seed: int,
 ) -> dict[str, Any] | None:
-    world_points = np.asarray(world_mesh.points, dtype=float)
-    if len(world_points) < 3:
-        return None
-    plane = fit_plane_from_points(world_points)
-    center = np.asarray(plane["center"], dtype=float)
-    strike_vec = normalize_vector(np.asarray(plane["strike_vec"], dtype=float), fallback=np.array([1.0, 0.0, 0.0], dtype=float))
-    dip_vec = normalize_vector(np.asarray(plane["dip_vec"], dtype=float), fallback=np.array([0.0, 0.0, 1.0], dtype=float))
-    normal_vec = normalize_vector(np.asarray(plane["normal"], dtype=float), fallback=np.array([0.0, 0.0, 1.0], dtype=float))
-    local_points = world_to_local_points(world_points, center, strike_vec, dip_vec, normal_vec)
-    if len(local_points) == 0:
-        return None
-
-    strike_min = float(local_points[:, 0].min())
-    strike_max = float(local_points[:, 0].max())
-    dip_min = float(local_points[:, 1].min())
-    dip_max = float(local_points[:, 1].max())
-    bbox_length = max(float(strike_max - strike_min), 1e-6)
-    bbox_height = max(float(dip_max - dip_min), 1e-6)
+    bbox_length = max(float(local_strike_max - local_strike_min), 1e-6)
+    bbox_height = max(float(local_dip_max - local_dip_min), 1e-6)
     bbox_area = max(bbox_length * bbox_height, 1e-6)
-    target_area = max(float(world_mesh.area), 1e-6)
+    target_area = max(float(target_area), 1e-6)
+    if bbox_area <= 0.0 or target_area <= 0.0:
+        return None
     scale_ratio = float(np.sqrt(np.clip(target_area / bbox_area, 1e-6, 1.0)))
     patch_length = max(bbox_length * scale_ratio, 1e-6)
     patch_height = max(bbox_height * scale_ratio, 1e-6)
     local_center = np.array(
         [
-            0.5 * (strike_min + strike_max),
-            0.5 * (dip_min + dip_max),
+            0.5 * (local_strike_min + local_strike_max),
+            0.5 * (local_dip_min + local_dip_max),
             0.0,
         ],
         dtype=float,
@@ -504,13 +481,44 @@ def extract_patch_component_bundles(patch_path: Path) -> list[dict[str, Any]]:
         component = extract_surface_clean_tri(component)
         if not isinstance(component, pv.PolyData) or component.n_cells <= 0:
             continue
+        component_world_points = local_to_world_points(
+            np.asarray(component.points, dtype=float),
+            center,
+            strike_vec,
+            dip_vec,
+            normal_vec,
+        )
+        component_plane = fit_plane_from_points(component_world_points)
+        component_center = np.asarray(component_plane["center"], dtype=float)
+        component_strike_vec = normalize_vector(
+            np.asarray(component_plane["strike_vec"], dtype=float),
+            fallback=np.asarray(strike_vec, dtype=float),
+        )
+        component_dip_vec = normalize_vector(
+            np.asarray(component_plane["dip_vec"], dtype=float),
+            fallback=np.asarray(dip_vec, dtype=float),
+        )
+        component_normal_vec = normalize_vector(
+            np.asarray(component_plane["normal"], dtype=float),
+            fallback=np.asarray(normal_vec, dtype=float),
+        )
+        component_local = component.copy(deep=True)
+        component_local.points = world_to_local_points(
+            component_world_points,
+            component_center,
+            component_strike_vec,
+            component_dip_vec,
+            component_normal_vec,
+        )
         bundles.append(
             {
-                "component_local": component,
-                "center": center,
-                "strike_vec": strike_vec,
-                "dip_vec": dip_vec,
-                "normal_vec": normal_vec,
+                "component_local": component_local,
+                "center": component_center,
+                "strike_vec": component_strike_vec,
+                "dip_vec": component_dip_vec,
+                "normal_vec": component_normal_vec,
+                "strike_deg": float(component_plane["strike_deg"]),
+                "dip_deg": float(component_plane["dip_deg"]),
                 "patch_info": patch_info,
                 "patch_path": str(Path(patch_path)),
                 "facet_component_count": facet_component_count,
@@ -533,33 +541,50 @@ def build_fragment_records_from_bundle(
     strike_vec = np.asarray(bundle["strike_vec"], dtype=float)
     dip_vec = np.asarray(bundle["dip_vec"], dtype=float)
     normal_vec = np.asarray(bundle["normal_vec"], dtype=float)
+    strike_deg = float(bundle["strike_deg"])
+    dip_deg = float(bundle["dip_deg"])
     patch_info = dict(bundle["patch_info"])
     patch_path = str(bundle["patch_path"])
     facet_component_count = int(bundle["facet_component_count"])
     facet_component_idx = int(bundle["facet_component_idx"])
     facet_split_applied = int(bundle["facet_split_applied"])
     area_split_applied = int(float(component_local.area) > float(surface_area_cap) > 0.0)
+    try:
+        cell_centers, cell_areas, cell_xmin, cell_xmax, cell_ymin, cell_ymax = prepare_area_cap_split_arrays(component_local)
+    except ValueError:
+        return fragment_records
 
-    for split_idx, submesh_local in enumerate(split_local_component_by_area_cap(component_local, float(surface_area_cap))):
-        if not isinstance(submesh_local, pv.PolyData) or submesh_local.n_cells <= 0:
+    leaf_ids = split_component_cell_ids_by_area_cap(
+        cell_centers=cell_centers,
+        cell_areas=cell_areas,
+        cell_xmin=cell_xmin,
+        cell_xmax=cell_xmax,
+        cell_ymin=cell_ymin,
+        cell_ymax=cell_ymax,
+        area_cap=float(surface_area_cap),
+    )
+
+    for split_idx, leaf_cell_ids in enumerate(leaf_ids):
+        if len(leaf_cell_ids) <= 0:
             continue
-        fragment_area = float(submesh_local.area)
+        fragment_area = float(cell_areas[leaf_cell_ids].sum())
         if fragment_area < float(surface_min_fragment_area):
             continue
-        submesh_world = transform_mesh_to_world(submesh_local, center, strike_vec, dip_vec, normal_vec)
-        if not isinstance(submesh_world, pv.PolyData) or submesh_world.n_cells <= 0:
-            continue
-        fragment_points = np.asarray(submesh_world.points, dtype=float)
-        if len(fragment_points) < 3:
-            continue
-        fragment_plane = fit_plane_from_points(fragment_points)
         fragment_seed = build_fault_surface_group_seed(
             fault_name=str(patch_info["fault_name"]),
-            azimuth_deg=float(fragment_plane["strike_deg"]),
-            dip_deg=float(fragment_plane["dip_deg"]),
+            azimuth_deg=float(strike_deg),
+            dip_deg=float(dip_deg),
         ) + int(split_idx)
-        planar_row = build_planar_patch_row_from_mesh(
-            world_mesh=submesh_world,
+        planar_row = build_planar_patch_row_from_local_bounds(
+            local_strike_min=float(cell_xmin[leaf_cell_ids].min()),
+            local_strike_max=float(cell_xmax[leaf_cell_ids].max()),
+            local_dip_min=float(cell_ymin[leaf_cell_ids].min()),
+            local_dip_max=float(cell_ymax[leaf_cell_ids].max()),
+            target_area=float(fragment_area),
+            center=center,
+            strike_vec=strike_vec,
+            dip_vec=dip_vec,
+            normal_vec=normal_vec,
             display_offset_ms=float(surface_display_offset_ms),
             fragment_seed=int(fragment_seed),
         )
@@ -592,11 +617,11 @@ def build_fragment_records_from_bundle(
                     "CenterX": float(planar_row["CenterX"]),
                     "CenterY": float(planar_row["CenterY"]),
                     "CenterTIME": float(planar_row["CenterTIME"]),
-                    "Azimuth": float(fragment_plane["strike_deg"]),
-                    "Dip": float(fragment_plane["dip_deg"]),
+                    "Azimuth": float(strike_deg),
+                    "Dip": float(dip_deg),
                     "PatchArea": float(fragment_area),
                     "PatchArea3D": float(fragment_area),
-                    "PolygonCellCount": int(submesh_world.n_cells),
+                    "PolygonCellCount": int(len(leaf_cell_ids)),
                     "PlanarVertexCount": 4,
                     "DisplayGapRatio": 1.0,
                     "DisplayOffsetMs": float(surface_display_offset_ms),
@@ -809,6 +834,8 @@ def run_build_fault_surface_fragments(
     fragment_records: list[dict[str, Any]] = []
     total_bundle_count = len(component_bundles)
     bundle_emit_step = max(1, total_bundle_count // 20) if total_bundle_count > 0 else 1
+    fragment_started_at = perf_counter()
+    last_emit_at = fragment_started_at
     for bundle_idx, bundle in enumerate(component_bundles, start=1):
         fragment_records.extend(
             build_fragment_records_from_bundle(
@@ -818,11 +845,22 @@ def run_build_fault_surface_fragments(
                 surface_area_cap=float(surface_area_cap),
             )
         )
-        if bundle_idx == 1 or bundle_idx == total_bundle_count or bundle_idx % bundle_emit_step == 0:
+        now = perf_counter()
+        if (
+            bundle_idx == 1
+            or bundle_idx == total_bundle_count
+            or bundle_idx % bundle_emit_step == 0
+            or now - last_emit_at >= 30.0
+        ):
+            elapsed = max(now - fragment_started_at, 1e-6)
             emit_fault_surface_progress(
                 "fragment 生成进度",
-                f"{bundle_idx}/{total_bundle_count}, fragment_count={len(fragment_records)}",
+                (
+                    f"{bundle_idx}/{total_bundle_count}, fragment_count={len(fragment_records)}, "
+                    f"elapsed={elapsed:.1f}s, bundle_rate={bundle_idx / elapsed:.2f}/s"
+                ),
             )
+            last_emit_at = now
     for global_idx, record in enumerate(fragment_records, start=1):
         record["meta"]["FaultSurfaceFragmentID"] = int(global_idx)
 
@@ -852,7 +890,7 @@ def run_build_fault_surface_fragments(
         "component_bundle_count": int(len(component_bundles)),
         "fragment_count": int(len(fragment_records)),
         "surface_polygon_count": int(len(payload["polygons"])),
-        "surface_fragment_mode": "facet_components_area_capped_planar_patches",
+        "surface_fragment_mode": "direct_local_bounds_area_capped_planar_patches",
         "surface_internal_facet_split_enabled": 1,
         "surface_internal_area_cap_split_enabled": 1,
         "surface_facet_normal_tol_deg": float(SURFACE_FACET_NORMAL_TOL_DEG),

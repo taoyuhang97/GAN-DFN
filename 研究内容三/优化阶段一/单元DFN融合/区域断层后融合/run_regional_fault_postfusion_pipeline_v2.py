@@ -57,6 +57,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--fault-half-band-ms", type=float, default=100.0)
     parser.add_argument("--fault-remove-ms", type=float, default=50.0)
     parser.add_argument("--fault-transition-ms", type=float, default=100.0)
+    parser.add_argument("--fault-induced-count-scale", type=float, default=5.5)
     parser.add_argument("--panel-xy-buffer", type=float, default=180.0)
     parser.add_argument("--parallel-ratio", type=float, default=0.65)
     parser.add_argument("--random-seed", type=int, default=42)
@@ -155,6 +156,7 @@ def main() -> None:
         fault_half_band_ms=float(args.fault_half_band_ms),
         fault_remove_ms=float(args.fault_remove_ms),
         fault_transition_ms=float(args.fault_transition_ms),
+        fault_induced_count_scale=float(args.fault_induced_count_scale),
         panel_xy_buffer=float(args.panel_xy_buffer),
         parallel_ratio=float(args.parallel_ratio),
         random_seed=int(args.random_seed),
@@ -180,6 +182,7 @@ def main() -> None:
         "fault_half_band_ms": float(args.fault_half_band_ms),
         "fault_remove_ms": float(args.fault_remove_ms),
         "fault_transition_ms": float(args.fault_transition_ms),
+        "fault_induced_count_scale": float(args.fault_induced_count_scale),
         "surface_max_fragment_area_ratio": float(args.surface_max_fragment_area_ratio),
         "fault_panels": panel_summary,
         "fault_surface": surface_summary,

@@ -15,10 +15,13 @@ from fault_postfusion_common import (
     FAULT_ACTION_TEXT_TO_CODE,
     PATCH_ORIGIN_TEXT_TO_CODE,
     append_lines_to_docx,
+    azimuth_diff_deg,
+    build_plane_axes_from_normal,
     make_patch_row_from_axes,
     normalize_vector,
     predict_fault_time_at_xy,
     read_regional_vtk_to_df,
+    strike_dip_from_normal,
     write_legacy_vtk_polygons_preserve_patch_area,
     write_csv_utf8,
     write_df_to_regional_vtk,
@@ -27,6 +30,25 @@ from fault_postfusion_common import (
 
 
 SIZE_LABELS = ["small", "medium", "large"]
+PATCH_GEOMETRY_COLUMNS = [
+    "CenterX",
+    "CenterY",
+    "CenterTIME",
+    "PatchLength",
+    "PatchHeight",
+    "PatchArea",
+    "Azimuth",
+    "Dip",
+    "NormalX",
+    "NormalY",
+    "NormalZ",
+    "BBoxXMin",
+    "BBoxXMax",
+    "BBoxYMin",
+    "BBoxYMax",
+    "BBoxZMin",
+    "BBoxZMax",
+] + [f"V{vertex_idx}{axis}" for vertex_idx in range(1, 5) for axis in ("X", "Y", "Z")]
 
 
 def emit_fault_postfusion_progress(stage: str, detail: str | None = None) -> None:
@@ -49,6 +71,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--fault-half-band-ms", type=float, default=100.0)
     parser.add_argument("--fault-remove-ms", type=float, default=50.0)
     parser.add_argument("--fault-transition-ms", type=float, default=100.0)
+    parser.add_argument("--fault-induced-count-scale", type=float, default=5.5)
     parser.add_argument("--panel-xy-buffer", type=float, default=180.0)
     parser.add_argument("--parallel-ratio", type=float, default=0.65)
     parser.add_argument("--random-seed", type=int, default=42)
@@ -95,38 +118,248 @@ def load_fault_panels(panel_csv: Path) -> pd.DataFrame:
     return panel_df
 
 
-def build_zone_specs(fault_half_band_ms: float) -> list[dict[str, Any]]:
-    half_band = max(float(fault_half_band_ms), 12.0)
-    edges = np.linspace(0.0, half_band, 4)
+def build_zone_specs(
+    fault_remove_ms: float,
+    fault_transition_ms: float,
+) -> list[dict[str, Any]]:
+    remove_ms = max(float(fault_remove_ms), 1.0)
+    transition_ms = max(float(fault_transition_ms), remove_ms + 1.0)
+    transition_mid = remove_ms + 0.5 * (transition_ms - remove_ms)
     return [
         {
-            "name": "near",
-            "d_min": float(edges[0]),
-            "d_max": float(edges[1]),
+            "name": "core",
+            "d_min": 0.0,
+            "d_max": float(remove_ms),
             "count_weight": 1.50,
             "size_probs": [0.64, 0.27, 0.09],
             "confidence": 0.92,
             "size_scale": 1.55,
+            "transition_blend": 0,
         },
         {
-            "name": "mid",
-            "d_min": float(edges[1]),
-            "d_max": float(edges[2]),
+            "name": "transition_inner",
+            "d_min": float(remove_ms),
+            "d_max": float(transition_mid),
             "count_weight": 0.95,
             "size_probs": [0.78, 0.18, 0.04],
             "confidence": 0.82,
             "size_scale": 1.12,
+            "transition_blend": 1,
         },
         {
-            "name": "far",
-            "d_min": float(edges[2]),
-            "d_max": float(edges[3]),
+            "name": "transition_outer",
+            "d_min": float(transition_mid),
+            "d_max": float(transition_ms),
             "count_weight": 0.60,
             "size_probs": [0.88, 0.10, 0.02],
             "confidence": 0.72,
             "size_scale": 0.86,
+            "transition_blend": 1,
         },
     ]
+
+
+def compute_transition_fault_weight(
+    distance_ms: float,
+    fault_remove_ms: float,
+    fault_transition_ms: float,
+) -> float:
+    span = max(float(fault_transition_ms) - float(fault_remove_ms), 1e-6)
+    ratio = (float(distance_ms) - float(fault_remove_ms)) / span
+    return float(np.clip(1.0 - ratio, 0.0, 1.0))
+
+
+def blend_axial_angles_deg(fault_angle_deg: float, ref_angle_deg: float, fault_weight: float) -> float:
+    blend_weight = float(np.clip(fault_weight, 0.0, 1.0))
+    ref_weight = 1.0 - blend_weight
+    fault_rad = np.deg2rad(2.0 * (float(fault_angle_deg) % 180.0))
+    ref_rad = np.deg2rad(2.0 * (float(ref_angle_deg) % 180.0))
+    vec = (
+        blend_weight * np.array([np.cos(fault_rad), np.sin(fault_rad)], dtype=float)
+        + ref_weight * np.array([np.cos(ref_rad), np.sin(ref_rad)], dtype=float)
+    )
+    if float(np.linalg.norm(vec)) <= 1e-8:
+        return float(fault_angle_deg if blend_weight >= ref_weight else ref_angle_deg) % 180.0
+    return float(0.5 * np.degrees(np.arctan2(vec[1], vec[0]))) % 180.0
+
+
+def normal_from_azimuth_dip_deg(azimuth_deg: float, dip_deg: float) -> np.ndarray:
+    azimuth_rad = np.deg2rad(float(azimuth_deg) % 180.0)
+    dip_rad = np.deg2rad(float(np.clip(dip_deg, 0.0, 89.999)))
+    horizontal_norm = float(np.cos(dip_rad))
+    normal = np.array(
+        [
+            np.sin(azimuth_rad) * horizontal_norm,
+            np.cos(azimuth_rad) * horizontal_norm,
+            np.sin(dip_rad),
+        ],
+        dtype=float,
+    )
+    return normalize_vector(normal, fallback=np.array([0.0, 0.0, 1.0], dtype=float))
+
+
+def build_axes_from_azimuth_dip_deg(azimuth_deg: float, dip_deg: float) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    plane_normal = normal_from_azimuth_dip_deg(azimuth_deg, dip_deg)
+    return build_plane_axes_from_normal(plane_normal)
+
+
+def orientation_from_axes(u_vec: np.ndarray, v_vec: np.ndarray) -> tuple[float, float]:
+    plane_normal = normalize_vector(np.cross(np.asarray(u_vec, dtype=float), np.asarray(v_vec, dtype=float)))
+    return strike_dip_from_normal(plane_normal)
+
+
+def build_patch_geometry_from_orientation(
+    center: np.ndarray,
+    azimuth_deg: float,
+    dip_deg: float,
+    patch_length: float,
+    patch_height: float,
+) -> dict[str, Any]:
+    _, strike_vec, dip_vec = build_axes_from_azimuth_dip_deg(azimuth_deg, dip_deg)
+    return make_patch_row_from_axes(
+        center=np.asarray(center, dtype=float),
+        u_vec=strike_vec,
+        v_vec=dip_vec,
+        length=float(patch_length),
+        height=float(patch_height),
+    )
+
+
+def build_transition_reference_lookup(
+    influenced_df: pd.DataFrame,
+    panel_df: pd.DataFrame,
+    fault_remove_ms: float,
+    fault_transition_ms: float,
+) -> dict[int, dict[str, np.ndarray]]:
+    if influenced_df.empty or panel_df.empty:
+        return {}
+    if "NearestFaultPanelID" not in influenced_df.columns or "FaultDistanceMs" not in influenced_df.columns:
+        return {}
+    distance = pd.to_numeric(influenced_df["FaultDistanceMs"], errors="coerce")
+    panel_id = pd.to_numeric(influenced_df["NearestFaultPanelID"], errors="coerce")
+    valid_mask = (
+        panel_id.notna()
+        & (panel_id.astype(int) >= 0)
+        & distance.notna()
+        & (distance > float(fault_remove_ms))
+        & (distance <= float(fault_transition_ms))
+    )
+    if not bool(valid_mask.any()):
+        return {}
+    cols = [
+        "NearestFaultPanelID",
+        "CenterX",
+        "CenterY",
+        "CenterTIME",
+        "Azimuth",
+        "Dip",
+        "PatchLength",
+        "PatchHeight",
+        "PatchArea",
+        "FaultDistanceMs",
+    ]
+    work = influenced_df.loc[valid_mask, cols].copy()
+    if "PatchArea" not in work.columns:
+        work["PatchArea"] = (
+            pd.to_numeric(work.get("PatchLength"), errors="coerce").fillna(0.0)
+            * pd.to_numeric(work.get("PatchHeight"), errors="coerce").fillna(0.0)
+        )
+    panel_lookup = {
+        int(row["FaultPanelID"]): row
+        for _, row in panel_df.iterrows()
+    }
+    ref_lookup: dict[int, dict[str, np.ndarray]] = {}
+    for panel_key, group in work.groupby("NearestFaultPanelID", sort=False):
+        panel_id_int = int(panel_key)
+        panel_row = panel_lookup.get(panel_id_int)
+        if panel_row is None:
+            continue
+        center_x = pd.to_numeric(group["CenterX"], errors="coerce").to_numpy(dtype=float)
+        center_y = pd.to_numeric(group["CenterY"], errors="coerce").to_numpy(dtype=float)
+        center_z = pd.to_numeric(group["CenterTIME"], errors="coerce").to_numpy(dtype=float)
+        azimuth = pd.to_numeric(group["Azimuth"], errors="coerce").to_numpy(dtype=float)
+        dip = pd.to_numeric(group["Dip"], errors="coerce").to_numpy(dtype=float)
+        patch_length = pd.to_numeric(group["PatchLength"], errors="coerce").to_numpy(dtype=float)
+        patch_height = pd.to_numeric(group["PatchHeight"], errors="coerce").to_numpy(dtype=float)
+        patch_area = pd.to_numeric(group["PatchArea"], errors="coerce").to_numpy(dtype=float)
+        distance_ms = pd.to_numeric(group["FaultDistanceMs"], errors="coerce").to_numpy(dtype=float)
+        nx = float(panel_row.get("NormalX", 0.0))
+        ny = float(panel_row.get("NormalY", 0.0))
+        nz = float(panel_row.get("NormalZ", 1.0))
+        cx = float(panel_row.get("CenterX", 0.0))
+        cy = float(panel_row.get("CenterY", 0.0))
+        cz = float(panel_row.get("CenterTIME", 0.0))
+        if abs(nz) > 1e-8:
+            fault_time = cz - (nx * (center_x - cx) + ny * (center_y - cy)) / nz
+        else:
+            fault_time = np.full(len(group), cz, dtype=float)
+        side_sign = np.where(center_z >= fault_time, 1.0, -1.0)
+        valid = (
+            np.isfinite(center_x)
+            & np.isfinite(center_y)
+            & np.isfinite(center_z)
+            & np.isfinite(azimuth)
+            & np.isfinite(dip)
+            & np.isfinite(patch_length)
+            & np.isfinite(patch_height)
+            & np.isfinite(patch_area)
+            & np.isfinite(distance_ms)
+        )
+        if not np.any(valid):
+            continue
+        ref_lookup[panel_id_int] = {
+            "CenterX": center_x[valid],
+            "CenterY": center_y[valid],
+            "CenterTIME": center_z[valid],
+            "Azimuth": azimuth[valid],
+            "Dip": dip[valid],
+            "PatchLength": np.clip(patch_length[valid], 1e-6, None),
+            "PatchHeight": np.clip(patch_height[valid], 1e-6, None),
+            "PatchArea": np.clip(patch_area[valid], 1e-6, None),
+            "FaultDistanceMs": distance_ms[valid],
+            "SideSign": side_sign[valid],
+        }
+    return ref_lookup
+
+
+def sample_transition_reference(
+    ref_lookup: dict[int, dict[str, np.ndarray]],
+    panel_id: int,
+    side_sign: float,
+    target_distance_ms: float,
+    rng: np.random.Generator,
+) -> dict[str, float] | None:
+    refs = ref_lookup.get(int(panel_id))
+    if not refs:
+        return None
+    base_mask = np.isfinite(refs["FaultDistanceMs"])
+    if not np.any(base_mask):
+        return None
+    same_side_mask = base_mask & (refs["SideSign"] == (1.0 if float(side_sign) >= 0.0 else -1.0))
+    use_mask = same_side_mask if np.any(same_side_mask) else base_mask
+    candidate_positions = np.flatnonzero(use_mask)
+    if len(candidate_positions) <= 0:
+        return None
+    distance_delta = np.abs(refs["FaultDistanceMs"][candidate_positions] - float(target_distance_ms))
+    area_weights = np.sqrt(np.clip(refs["PatchArea"][candidate_positions], 1e-6, None))
+    weights = area_weights / np.clip(distance_delta + 5.0, 1.0, None)
+    if not np.all(np.isfinite(weights)) or float(weights.sum()) <= 0.0:
+        chosen_pos = int(rng.choice(candidate_positions))
+    else:
+        probs = weights / weights.sum()
+        chosen_pos = int(rng.choice(candidate_positions, p=probs))
+    return {
+        "CenterX": float(refs["CenterX"][chosen_pos]),
+        "CenterY": float(refs["CenterY"][chosen_pos]),
+        "CenterTIME": float(refs["CenterTIME"][chosen_pos]),
+        "Azimuth": float(refs["Azimuth"][chosen_pos]),
+        "Dip": float(refs["Dip"][chosen_pos]),
+        "PatchLength": float(refs["PatchLength"][chosen_pos]),
+        "PatchHeight": float(refs["PatchHeight"][chosen_pos]),
+        "PatchArea": float(refs["PatchArea"][chosen_pos]),
+        "FaultDistanceMs": float(refs["FaultDistanceMs"][chosen_pos]),
+        "SourceCount": int(len(candidate_positions)),
+    }
 
 
 def build_panel_spatial_index(
@@ -406,6 +639,147 @@ def apply_fault_filter_and_shrink(
     return kept_df, stats
 
 
+def apply_fault_transition_blend_to_existing_patches(
+    kept_df: pd.DataFrame,
+    panel_df: pd.DataFrame,
+    fault_remove_ms: float,
+    fault_transition_ms: float,
+    progress_hook: Callable[[str, str | None], None] | None = None,
+) -> tuple[pd.DataFrame, dict[str, Any]]:
+    if kept_df.empty or panel_df.empty or "FaultActionText" not in kept_df.columns:
+        return kept_df, {"transition_blended_original_count": 0}
+    transition_mask = kept_df["FaultActionText"].astype(str).to_numpy() == "shrink"
+    transition_positions = np.flatnonzero(transition_mask)
+    if len(transition_positions) <= 0:
+        kept_df["FaultTransitionBlendWeight"] = 0.0
+        kept_df["FaultTransitionBlendApplied"] = 0
+        return kept_df, {"transition_blended_original_count": 0}
+
+    panel_lookup = {int(row["FaultPanelID"]): row for _, row in panel_df.iterrows()}
+    kept_df["FaultTransitionBlendWeight"] = 0.0
+    kept_df["FaultTransitionBlendApplied"] = 0
+
+    updated_cols: dict[str, list[Any]] = {col: [] for col in PATCH_GEOMETRY_COLUMNS}
+    updated_row_positions: list[int] = []
+    updated_blend_weights: list[float] = []
+    total_count = int(len(transition_positions))
+    emit_step = max(1, total_count // 10)
+
+    if progress_hook is not None:
+        progress_hook("断层过渡带原裂缝混合进度", f"0/{total_count}, blended=0")
+
+    for seq_idx, row_pos in enumerate(transition_positions, start=1):
+        row = kept_df.iloc[int(row_pos)]
+        panel_id = int(pd.to_numeric(row.get("NearestFaultPanelID"), errors="coerce") if pd.notna(row.get("NearestFaultPanelID")) else -1)
+        panel_row = panel_lookup.get(panel_id)
+        if panel_row is None:
+            if progress_hook is not None and (seq_idx == total_count or seq_idx % emit_step == 0):
+                progress_hook("断层过渡带原裂缝混合进度", f"{seq_idx}/{total_count}, blended={len(updated_row_positions)}")
+            continue
+        distance_ms = float(pd.to_numeric(row.get("FaultDistanceMs"), errors="coerce"))
+        if not np.isfinite(distance_ms):
+            if progress_hook is not None and (seq_idx == total_count or seq_idx % emit_step == 0):
+                progress_hook("断层过渡带原裂缝混合进度", f"{seq_idx}/{total_count}, blended={len(updated_row_positions)}")
+            continue
+        fault_weight = compute_transition_fault_weight(distance_ms, fault_remove_ms, fault_transition_ms)
+        if fault_weight <= 0.0:
+            if progress_hook is not None and (seq_idx == total_count or seq_idx % emit_step == 0):
+                progress_hook("断层过渡带原裂缝混合进度", f"{seq_idx}/{total_count}, blended={len(updated_row_positions)}")
+            continue
+
+        strike_vec = np.array(
+            [
+                float(panel_row.get("StrikeVecX", 1.0)),
+                float(panel_row.get("StrikeVecY", 0.0)),
+                float(panel_row.get("StrikeVecZ", 0.0)),
+            ],
+            dtype=float,
+        )
+        dip_vec = np.array(
+            [
+                float(panel_row.get("DipVecX", 0.0)),
+                float(panel_row.get("DipVecY", 0.0)),
+                float(panel_row.get("DipVecZ", 1.0)),
+            ],
+            dtype=float,
+        )
+        horizontal_normal = build_fault_horizontal_normal(panel_row, strike_vec)
+        parallel_azimuth, parallel_dip = orientation_from_axes(strike_vec, dip_vec)
+        perpendicular_u_vec, perpendicular_v_vec = build_vertical_perpendicular_axes(panel_row, strike_vec)
+        perpendicular_azimuth, perpendicular_dip = orientation_from_axes(perpendicular_u_vec, perpendicular_v_vec)
+
+        current_azimuth = float(pd.to_numeric(row.get("Azimuth"), errors="coerce"))
+        current_dip = float(pd.to_numeric(row.get("Dip"), errors="coerce"))
+        parallel_score = azimuth_diff_deg(current_azimuth, parallel_azimuth) + 0.35 * abs(current_dip - parallel_dip)
+        perpendicular_score = azimuth_diff_deg(current_azimuth, perpendicular_azimuth) + 0.35 * abs(current_dip - perpendicular_dip)
+        if parallel_score <= perpendicular_score:
+            target_azimuth = parallel_azimuth
+            target_dip = parallel_dip
+        else:
+            target_azimuth = perpendicular_azimuth
+            target_dip = perpendicular_dip
+
+        orientation_weight = float(np.clip(0.25 + 0.55 * fault_weight, 0.0, 0.85))
+        blended_azimuth = blend_axial_angles_deg(target_azimuth, current_azimuth, orientation_weight)
+        blended_dip = float(np.clip(
+            orientation_weight * target_dip + (1.0 - orientation_weight) * current_dip,
+            0.0,
+            89.999,
+        ))
+
+        original_center = np.array(
+            [
+                float(pd.to_numeric(row.get("CenterX"), errors="coerce")),
+                float(pd.to_numeric(row.get("CenterY"), errors="coerce")),
+                float(pd.to_numeric(row.get("CenterTIME"), errors="coerce")),
+            ],
+            dtype=float,
+        )
+        fault_time = predict_fault_time_at_xy(panel_row, float(original_center[0]), float(original_center[1]))
+        side_sign = -1.0 if float(original_center[2]) < float(fault_time) else 1.0
+        panel_length = max(float(panel_row.get("PanelLength", 10.0)), 10.0)
+        target_distance_ms = float(fault_remove_ms + 0.35 * max(distance_ms - float(fault_remove_ms), 0.0))
+        target_center = build_fault_offset_center(
+            panel_row=panel_row,
+            base_point=original_center,
+            fault_time=float(fault_time),
+            distance_ms=target_distance_ms,
+            fault_half_band_ms=float(fault_transition_ms),
+            side_sign=side_sign,
+            horizontal_normal=horizontal_normal,
+            panel_length=panel_length,
+        )
+        position_weight = float(np.clip(0.12 + 0.38 * fault_weight, 0.0, 0.50))
+        blended_center = (1.0 - position_weight) * original_center + position_weight * target_center
+        patch_length = max(float(pd.to_numeric(row.get("PatchLength"), errors="coerce")), 1e-6)
+        patch_height = max(float(pd.to_numeric(row.get("PatchHeight"), errors="coerce")), 1e-6)
+        geometry = build_patch_geometry_from_orientation(
+            center=blended_center,
+            azimuth_deg=blended_azimuth,
+            dip_deg=blended_dip,
+            patch_length=patch_length,
+            patch_height=patch_height,
+        )
+        updated_row_positions.append(int(row_pos))
+        updated_blend_weights.append(float(fault_weight))
+        for col in PATCH_GEOMETRY_COLUMNS:
+            updated_cols[col].append(geometry[col])
+        if progress_hook is not None and (seq_idx == total_count or seq_idx % emit_step == 0):
+            progress_hook("断层过渡带原裂缝混合进度", f"{seq_idx}/{total_count}, blended={len(updated_row_positions)}")
+
+    if updated_row_positions:
+        for col, values in updated_cols.items():
+            kept_df.loc[updated_row_positions, col] = values
+        kept_df.loc[updated_row_positions, "FaultTransitionBlendWeight"] = updated_blend_weights
+        kept_df.loc[updated_row_positions, "FaultTransitionBlendApplied"] = 1
+        if "PatchArea3D" in kept_df.columns:
+            kept_df.loc[updated_row_positions, "PatchArea3D"] = kept_df.loc[updated_row_positions, "PatchArea"].to_numpy(dtype=float)
+    stats = {
+        "transition_blended_original_count": int(len(updated_row_positions)),
+    }
+    return kept_df, stats
+
+
 def sample_patch_dimensions(panel_row: pd.Series, zone_spec: dict[str, Any], rng: np.random.Generator) -> tuple[float, float, str]:
     panel_length = max(float(panel_row.get("PanelLength", 20.0)), 20.0)
     panel_height = max(float(panel_row.get("PanelHeight", 8.0)), 8.0)
@@ -514,13 +888,22 @@ def build_generated_patch_rows(
     parallel_ratio: float,
     random_seed: int,
     fault_half_band_ms: float,
+    fault_remove_ms: float,
+    fault_transition_ms: float,
+    fault_induced_count_scale: float,
+    transition_ref_lookup: dict[int, dict[str, np.ndarray]] | None = None,
     progress_hook: Callable[[str, str | None], None] | None = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     rng = np.random.default_rng(int(random_seed))
     parallel_rows: list[dict[str, Any]] = []
     perpendicular_rows: list[dict[str, Any]] = []
     parallel_ratio = float(np.clip(parallel_ratio, 0.0, 1.0))
-    zone_specs = build_zone_specs(float(fault_half_band_ms))
+    induced_count_scale = max(float(fault_induced_count_scale), 0.0)
+    transition_ref_lookup = transition_ref_lookup or {}
+    zone_specs = build_zone_specs(
+        fault_remove_ms=float(fault_remove_ms),
+        fault_transition_ms=float(fault_transition_ms),
+    )
 
     total_panel_count = int(len(panel_df))
     emit_step = max(1, total_panel_count // 10) if total_panel_count > 0 else 1
@@ -530,32 +913,34 @@ def build_generated_patch_rows(
         center = np.array([float(panel_row["CenterX"]), float(panel_row["CenterY"]), float(panel_row["CenterTIME"])], dtype=float)
         strike_vec = np.array([float(panel_row["StrikeVecX"]), float(panel_row["StrikeVecY"]), float(panel_row["StrikeVecZ"])], dtype=float)
         dip_vec = np.array([float(panel_row["DipVecX"]), float(panel_row["DipVecY"]), float(panel_row["DipVecZ"])], dtype=float)
-        normal = np.array([float(panel_row["NormalX"]), float(panel_row["NormalY"]), float(panel_row["NormalZ"])], dtype=float)
         panel_length = max(float(panel_row["PanelLength"]), 10.0)
         panel_height = max(float(panel_row["PanelHeight"]), 6.0)
         source_patch_count = max(int(panel_row.get("SourcePatchCount", 1)), 1)
         source_unit_count = max(int(panel_row.get("SourceUnitCount", 1)), 1)
         horizontal_normal = build_fault_horizontal_normal(panel_row, strike_vec)
         perpendicular_u_vec, perpendicular_v_vec = build_vertical_perpendicular_axes(panel_row, strike_vec)
+        parallel_azimuth, parallel_dip = orientation_from_axes(strike_vec, dip_vec)
+        perpendicular_azimuth, perpendicular_dip = orientation_from_axes(perpendicular_u_vec, perpendicular_v_vec)
         accepted_parallel_centers: list[np.ndarray] = []
         accepted_perpendicular_centers: list[np.ndarray] = []
 
         for zone_spec in zone_specs:
-            total_count = max(1, int(round(source_patch_count * float(zone_spec["count_weight"]))))
+            total_count = max(1, int(round(source_patch_count * float(zone_spec["count_weight"]) * induced_count_scale)))
             parallel_count = max(1, int(round(total_count * parallel_ratio)))
             perpendicular_count = max(0, total_count - parallel_count)
             if perpendicular_count == 0:
                 perpendicular_count = 1
 
             for _ in range(parallel_count):
-                patch_length, patch_height, size_label = sample_patch_dimensions(panel_row, zone_spec, rng)
-                min_xy_distance = max(12.0, 0.45 * patch_length)
-                min_time_distance = max(1.0, 0.35 * patch_height)
+                template_length, template_height, size_label = sample_patch_dimensions(panel_row, zone_spec, rng)
+                min_xy_distance = max(12.0, 0.45 * template_length)
+                min_time_distance = max(1.0, 0.35 * template_height)
                 patch_center = None
                 zone_center_distance = 0.0
                 zone_weight = 0.0
+                time_sign = 1.0
                 for _attempt in range(16):
-                    strike_offset, dip_offset = sample_panel_offsets(panel_length, panel_height, patch_length, patch_height, rng)
+                    strike_offset, dip_offset = sample_panel_offsets(panel_length, panel_height, template_length, template_height, rng)
                     base_point = center + strike_offset * strike_vec + dip_offset * dip_vec
                     fault_time = predict_fault_time_at_xy(panel_row, float(base_point[0]), float(base_point[1]))
                     zone_center_distance = max(float(rng.uniform(zone_spec["d_min"], zone_spec["d_max"])), 1.0)
@@ -573,10 +958,9 @@ def build_generated_patch_rows(
                     )
                     if center_is_far_enough(candidate_center, accepted_parallel_centers, min_xy_distance, min_time_distance):
                         patch_center = candidate_center
-                        accepted_parallel_centers.append(candidate_center)
                         break
                 if patch_center is None:
-                    strike_offset, dip_offset = sample_panel_offsets(panel_length, panel_height, patch_length, patch_height, rng)
+                    strike_offset, dip_offset = sample_panel_offsets(panel_length, panel_height, template_length, template_height, rng)
                     base_point = center + strike_offset * strike_vec + dip_offset * dip_vec
                     fault_time = predict_fault_time_at_xy(panel_row, float(base_point[0]), float(base_point[1]))
                     zone_center_distance = max(float(rng.uniform(zone_spec["d_min"], zone_spec["d_max"])), 1.0)
@@ -592,15 +976,60 @@ def build_generated_patch_rows(
                         horizontal_normal=horizontal_normal,
                         panel_length=panel_length,
                     )
+                patch_length = float(template_length)
+                patch_height = float(template_height)
+                patch_u_vec = strike_vec
+                patch_v_vec = dip_vec
+                patch_azimuth = parallel_azimuth
+                patch_dip = parallel_dip
+                transition_blend_weight = 0.0
+                transition_blend_applied = 0
+                transition_blend_source_count = 0
+                confidence = float(zone_spec["confidence"])
+                if int(zone_spec.get("transition_blend", 0)) == 1:
+                    fault_weight = compute_transition_fault_weight(
+                        zone_center_distance,
+                        fault_remove_ms=fault_remove_ms,
+                        fault_transition_ms=fault_transition_ms,
+                    )
+                    ref = sample_transition_reference(
+                        ref_lookup=transition_ref_lookup,
+                        panel_id=panel_id,
+                        side_sign=time_sign,
+                        target_distance_ms=zone_center_distance,
+                        rng=rng,
+                    )
+                    if ref is not None:
+                        patch_length = max(1e-6, float(fault_weight * template_length + (1.0 - fault_weight) * ref["PatchLength"]))
+                        patch_height = max(1e-6, float(fault_weight * template_height + (1.0 - fault_weight) * ref["PatchHeight"]))
+                        patch_center = (
+                            fault_weight * patch_center
+                            + (1.0 - fault_weight) * np.array(
+                                [ref["CenterX"], ref["CenterY"], ref["CenterTIME"]],
+                                dtype=float,
+                            )
+                        )
+                        patch_azimuth = blend_axial_angles_deg(parallel_azimuth, ref["Azimuth"], fault_weight)
+                        patch_dip = float(np.clip(
+                            fault_weight * parallel_dip + (1.0 - fault_weight) * ref["Dip"],
+                            0.0,
+                            89.999,
+                        ))
+                        _, patch_u_vec, patch_v_vec = build_axes_from_azimuth_dip_deg(patch_azimuth, patch_dip)
+                        confidence = float(fault_weight * float(zone_spec["confidence"]) + (1.0 - fault_weight) * 0.68)
+                        transition_blend_weight = float(fault_weight)
+                        transition_blend_applied = 1
+                        transition_blend_source_count = int(ref["SourceCount"])
+                accepted_parallel_centers.append(np.asarray(patch_center, dtype=float))
                 parallel_rows.append(
                     make_patch_row_from_axes(
                         center=patch_center,
-                        u_vec=strike_vec,
-                        v_vec=dip_vec,
+                        u_vec=patch_u_vec,
+                        v_vec=patch_v_vec,
                         length=patch_length,
                         height=patch_height,
                         extra={
-                            "Confidence": float(zone_spec["confidence"]),
+                            "Confidence": float(confidence),
                             "PatchOriginCode": PATCH_ORIGIN_TEXT_TO_CODE["fault_parallel"],
                             "PatchOriginText": "fault_parallel",
                             "FaultActionCode": FAULT_ACTION_TEXT_TO_CODE["induced"],
@@ -621,19 +1050,23 @@ def build_generated_patch_rows(
                             "CorridorSupport": 1,
                             "IsSupplemented": 0,
                             "FractureSet": -1,
+                            "FaultTransitionBlendWeight": float(transition_blend_weight),
+                            "FaultTransitionBlendApplied": int(transition_blend_applied),
+                            "FaultTransitionBlendSourceCount": int(transition_blend_source_count),
                         },
                     )
                 )
             for _ in range(perpendicular_count):
-                patch_length, patch_height, size_label = sample_patch_dimensions(panel_row, zone_spec, rng)
-                patch_height = max(patch_height, zone_spec["size_scale"] * 10.0)
-                min_xy_distance = max(12.0, 0.40 * patch_length)
-                min_time_distance = max(1.0, 0.30 * patch_height)
+                template_length, template_height, size_label = sample_patch_dimensions(panel_row, zone_spec, rng)
+                template_height = max(template_height, zone_spec["size_scale"] * 10.0)
+                min_xy_distance = max(12.0, 0.40 * template_length)
+                min_time_distance = max(1.0, 0.30 * template_height)
                 patch_center = None
                 zone_center_distance = 0.0
                 zone_weight = 0.0
+                time_sign = 1.0
                 for _attempt in range(16):
-                    strike_offset, dip_offset = sample_panel_offsets(panel_length, panel_height, patch_length, patch_height, rng)
+                    strike_offset, dip_offset = sample_panel_offsets(panel_length, panel_height, template_length, template_height, rng)
                     base_point = center + strike_offset * strike_vec + dip_offset * dip_vec
                     fault_time = predict_fault_time_at_xy(panel_row, float(base_point[0]), float(base_point[1]))
                     zone_center_distance = max(float(rng.uniform(zone_spec["d_min"], zone_spec["d_max"])), 1.0)
@@ -651,10 +1084,9 @@ def build_generated_patch_rows(
                     )
                     if center_is_far_enough(candidate_center, accepted_perpendicular_centers, min_xy_distance, min_time_distance):
                         patch_center = candidate_center
-                        accepted_perpendicular_centers.append(candidate_center)
                         break
                 if patch_center is None:
-                    strike_offset, dip_offset = sample_panel_offsets(panel_length, panel_height, patch_length, patch_height, rng)
+                    strike_offset, dip_offset = sample_panel_offsets(panel_length, panel_height, template_length, template_height, rng)
                     base_point = center + strike_offset * strike_vec + dip_offset * dip_vec
                     fault_time = predict_fault_time_at_xy(panel_row, float(base_point[0]), float(base_point[1]))
                     zone_center_distance = max(float(rng.uniform(zone_spec["d_min"], zone_spec["d_max"])), 1.0)
@@ -670,15 +1102,60 @@ def build_generated_patch_rows(
                         horizontal_normal=horizontal_normal,
                         panel_length=panel_length,
                     )
+                patch_length = float(template_length)
+                patch_height = float(template_height)
+                patch_u_vec = perpendicular_u_vec
+                patch_v_vec = perpendicular_v_vec
+                patch_azimuth = perpendicular_azimuth
+                patch_dip = perpendicular_dip
+                transition_blend_weight = 0.0
+                transition_blend_applied = 0
+                transition_blend_source_count = 0
+                confidence = float(zone_spec["confidence"]) * 0.95
+                if int(zone_spec.get("transition_blend", 0)) == 1:
+                    fault_weight = compute_transition_fault_weight(
+                        zone_center_distance,
+                        fault_remove_ms=fault_remove_ms,
+                        fault_transition_ms=fault_transition_ms,
+                    )
+                    ref = sample_transition_reference(
+                        ref_lookup=transition_ref_lookup,
+                        panel_id=panel_id,
+                        side_sign=time_sign,
+                        target_distance_ms=zone_center_distance,
+                        rng=rng,
+                    )
+                    if ref is not None:
+                        patch_length = max(1e-6, float(fault_weight * template_length + (1.0 - fault_weight) * ref["PatchLength"]))
+                        patch_height = max(1e-6, float(fault_weight * template_height + (1.0 - fault_weight) * ref["PatchHeight"]))
+                        patch_center = (
+                            fault_weight * patch_center
+                            + (1.0 - fault_weight) * np.array(
+                                [ref["CenterX"], ref["CenterY"], ref["CenterTIME"]],
+                                dtype=float,
+                            )
+                        )
+                        patch_azimuth = blend_axial_angles_deg(perpendicular_azimuth, ref["Azimuth"], fault_weight)
+                        patch_dip = float(np.clip(
+                            fault_weight * perpendicular_dip + (1.0 - fault_weight) * ref["Dip"],
+                            0.0,
+                            89.999,
+                        ))
+                        _, patch_u_vec, patch_v_vec = build_axes_from_azimuth_dip_deg(patch_azimuth, patch_dip)
+                        confidence = float(fault_weight * (float(zone_spec["confidence"]) * 0.95) + (1.0 - fault_weight) * 0.68)
+                        transition_blend_weight = float(fault_weight)
+                        transition_blend_applied = 1
+                        transition_blend_source_count = int(ref["SourceCount"])
+                accepted_perpendicular_centers.append(np.asarray(patch_center, dtype=float))
                 perpendicular_rows.append(
                     make_patch_row_from_axes(
                         center=patch_center,
-                        u_vec=perpendicular_u_vec,
-                        v_vec=perpendicular_v_vec,
+                        u_vec=patch_u_vec,
+                        v_vec=patch_v_vec,
                         length=patch_length,
                         height=patch_height,
                         extra={
-                            "Confidence": float(zone_spec["confidence"]) * 0.95,
+                            "Confidence": float(confidence),
                             "PatchOriginCode": PATCH_ORIGIN_TEXT_TO_CODE["fault_perpendicular"],
                             "PatchOriginText": "fault_perpendicular",
                             "FaultActionCode": FAULT_ACTION_TEXT_TO_CODE["induced"],
@@ -699,6 +1176,9 @@ def build_generated_patch_rows(
                             "CorridorSupport": 1,
                             "IsSupplemented": 0,
                             "FractureSet": -1,
+                            "FaultTransitionBlendWeight": float(transition_blend_weight),
+                            "FaultTransitionBlendApplied": int(transition_blend_applied),
+                            "FaultTransitionBlendSourceCount": int(transition_blend_source_count),
                         },
                     )
                 )
@@ -745,6 +1225,9 @@ def finalize_output_dataframe(
         "CorridorSupport": 0,
         "IsSupplemented": 0,
         "FractureSet": -1,
+        "FaultTransitionBlendWeight": 0.0,
+        "FaultTransitionBlendApplied": 0,
+        "FaultTransitionBlendSourceCount": 0,
     }
     for col, default in defaults.items():
         if col not in merged_df.columns:
@@ -812,6 +1295,7 @@ def run_fault_postfusion(
     fault_half_band_ms: float,
     fault_remove_ms: float,
     fault_transition_ms: float,
+    fault_induced_count_scale: float,
     panel_xy_buffer: float,
     parallel_ratio: float,
     random_seed: int,
@@ -847,11 +1331,31 @@ def run_fault_postfusion(
             f"shrunk_patch_count={filter_stats['shrunk_patch_count']}"
         ),
     )
+    kept_df, transition_blend_stats = apply_fault_transition_blend_to_existing_patches(
+        kept_df=kept_df,
+        panel_df=panel_df,
+        fault_remove_ms=float(fault_remove_ms),
+        fault_transition_ms=float(fault_transition_ms),
+        progress_hook=emit_fault_postfusion_progress,
+    )
+    emit_fault_postfusion_progress(
+        "断层过渡带原裂缝混合完成",
+        f"transition_blended_original_count={transition_blend_stats['transition_blended_original_count']}",
+    )
     parallel_df, perpendicular_df = build_generated_patch_rows(
         panel_df=panel_df,
         parallel_ratio=float(parallel_ratio),
         random_seed=int(random_seed),
         fault_half_band_ms=float(fault_half_band_ms),
+        fault_remove_ms=float(fault_remove_ms),
+        fault_transition_ms=float(fault_transition_ms),
+        fault_induced_count_scale=float(fault_induced_count_scale),
+        transition_ref_lookup=build_transition_reference_lookup(
+            influenced_df=influenced_df,
+            panel_df=panel_df,
+            fault_remove_ms=float(fault_remove_ms),
+            fault_transition_ms=float(fault_transition_ms),
+        ),
         progress_hook=emit_fault_postfusion_progress,
     )
     emit_fault_postfusion_progress(
@@ -904,6 +1408,7 @@ def run_fault_postfusion(
         "fault_half_band_ms": float(fault_half_band_ms),
         "fault_remove_ms": float(fault_remove_ms),
         "fault_transition_ms": float(fault_transition_ms),
+        "fault_induced_count_scale": float(fault_induced_count_scale),
         "panel_xy_buffer": float(panel_xy_buffer),
         "parallel_ratio": float(parallel_ratio),
         "input_patch_count": int(len(regional_df)),
@@ -921,6 +1426,21 @@ def run_fault_postfusion(
         "fault_perpendicular_csv": str(perpendicular_csv) if not perpendicular_df.empty else "",
         "fault_perpendicular_vtk": str(perpendicular_vtk) if not perpendicular_df.empty else "",
         "filter_stats": filter_stats,
+        "transition_blend_stats": {
+            **transition_blend_stats,
+            "transition_blended_generated_count": int(
+                pd.to_numeric(
+                    pd.concat(
+                        [
+                            parallel_df.get("FaultTransitionBlendApplied", pd.Series(dtype=float)),
+                            perpendicular_df.get("FaultTransitionBlendApplied", pd.Series(dtype=float)),
+                        ],
+                        ignore_index=True,
+                    ),
+                    errors="coerce",
+                ).fillna(0).astype(int).sum()
+            ),
+        },
         "origin_counts": origin_counts,
         "action_counts": action_counts,
     }
@@ -945,6 +1465,7 @@ def main() -> None:
         fault_half_band_ms=float(args.fault_half_band_ms),
         fault_remove_ms=float(args.fault_remove_ms),
         fault_transition_ms=float(args.fault_transition_ms),
+        fault_induced_count_scale=float(args.fault_induced_count_scale),
         panel_xy_buffer=float(args.panel_xy_buffer),
         parallel_ratio=float(args.parallel_ratio),
         random_seed=int(args.random_seed),

@@ -437,6 +437,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--fault-half-band-ms", type=float, default=100.0)
     parser.add_argument("--fault-remove-ms", type=float, default=50.0)
     parser.add_argument("--fault-transition-ms", type=float, default=100.0)
+    parser.add_argument("--fault-induced-count-scale", type=float, default=5.5)
     parser.add_argument("--fault-surface-max-fragment-area-ratio", type=float, default=1500.0)
     return parser
 
@@ -1011,6 +1012,8 @@ def validate_fault_postfusion(paths: PipelinePaths, args: argparse.Namespace) ->
         return False, "fault_remove_ms_mismatch"
     if float(payload.get("fault_transition_ms", -1.0)) != float(args.fault_transition_ms):
         return False, "fault_transition_ms_mismatch"
+    if float(payload.get("fault_induced_count_scale", -1.0)) != float(args.fault_induced_count_scale):
+        return False, "fault_induced_count_scale_mismatch"
     if float(payload.get("surface_max_fragment_area_ratio", -1.0)) != float(args.fault_surface_max_fragment_area_ratio):
         return False, "surface_max_fragment_area_ratio_mismatch"
     final_vtk_text = str(payload.get("final_vtk", "")).strip()
@@ -1348,6 +1351,7 @@ def build_fault_postfusion_args(paths: PipelinePaths, args: argparse.Namespace) 
         "--fault-half-band-ms", str(float(args.fault_half_band_ms)),
         "--fault-remove-ms", str(float(args.fault_remove_ms)),
         "--fault-transition-ms", str(float(args.fault_transition_ms)),
+        "--fault-induced-count-scale", str(float(args.fault_induced_count_scale)),
         "--surface-max-fragment-area-ratio", str(float(args.fault_surface_max_fragment_area_ratio)),
         "--docx-path", str(Path(args.docx_path).resolve()),
         "--overwrite",
