@@ -1,0 +1,28 @@
+{
+  "input_vtk": "/home/tyh/projects/petroleum/code/GAN-DFN/优化阶段二/正式主线/step8_dfn_well_correction/output/well_corrected_dfn_raw_time.vtk",
+  "real_well_samples_root": "/home/tyh/projects/petroleum/code/GAN-DFN/优化阶段二/正式主线/step2_real_well_t4_t7_samples/output/formal_all_wells",
+  "surface_dir": "/data/shared/project-oil/wx数据/砂砾岩/层位",
+  "output_dir": "/home/tyh/projects/petroleum/code/GAN-DFN/优化阶段二/正式主线/step9_section_visualize/output/all",
+  "well_name": null,
+  "exclude_wells": ["车页1导眼"],
+  "target_block": {
+    "name": "candidate_a",
+    "x_min": 568567.32,
+    "x_max": 571567.32,
+    "y_min": 4199778.5,
+    "y_max": 4202778.5
+  },
+  "half_width": 50.0,
+  "max_polygons": 0,
+  "max_selected": 0,
+  "min_patch_area": 0.0,
+  "max_patch_area": 0.0,
+  "surface_samples": 650,
+  "title_prefix": "candidate A demo 全矿区横坐标过井 DFN 剖面",
+  "z_label": "TWT / ms",
+  "dpi": 240,
+  "fig_width": 18.0,
+  "fig_height": 8.2,
+  "progress_interval": 100000,
+  "no_svg": false
+}

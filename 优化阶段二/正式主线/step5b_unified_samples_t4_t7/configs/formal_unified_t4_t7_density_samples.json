@@ -1,0 +1,8 @@
+{
+  "real_well_prediction_csv": "/home/tyh/projects/petroleum/code/GAN-DFN/优化阶段二/正式主线/step4_expert_real_well_prediction/output/formal_well_expert_library/all_wells_t4_t7_density_prediction.csv",
+  "real_fracture_points_csv": "/home/tyh/projects/petroleum/code/GAN-DFN/优化阶段二/正式主线/step4_expert_real_well_prediction/output/formal_well_expert_library/all_wells_t4_t7_fracture_points.csv",
+  "virtual_well_training_samples_csv": "/home/tyh/projects/petroleum/code/GAN-DFN/优化阶段二/正式主线/step5a_single_source_virtual_wells/output/formal_single_source_virtual_wells/virtual_well_training_samples.csv",
+  "virtual_well_training_summary_csv": "/home/tyh/projects/petroleum/code/GAN-DFN/优化阶段二/正式主线/step5a_single_source_virtual_wells/output/formal_single_source_virtual_wells/virtual_well_training_summary.csv",
+  "output_dir": "/home/tyh/projects/petroleum/code/GAN-DFN/优化阶段二/正式主线/step5b_unified_samples_t4_t7/output",
+  "chunksize": 250000
+}

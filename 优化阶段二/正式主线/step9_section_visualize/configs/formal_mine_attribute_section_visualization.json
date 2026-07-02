@@ -1,0 +1,25 @@
+{
+  "trace_header_csv": "/home/tyh/projects/petroleum/code/GAN-DFN/数据精简/trace_header_xy.csv",
+  "real_well_samples_root": "/home/tyh/projects/petroleum/code/GAN-DFN/优化阶段二/正式主线/step2_real_well_t4_t7_samples/output/formal_all_wells",
+  "surface_dir": "/data/shared/project-oil/wx数据/砂砾岩/层位",
+  "output_root": "/home/tyh/projects/petroleum/code/GAN-DFN/优化阶段二/正式主线/step9_section_visualize/output/mine_attribute_sections",
+  "well_name": "车58",
+  "exclude_wells": ["车页1导眼"],
+  "section_tag": "anttrack_coherence_t4_t7_mine_extent",
+  "target_block": {},
+  "volume_paths": {
+    "Coherence": "/data/shared/project-oil/wx数据/砂砾岩/补充材料-20260623/车西_T4-T7/车西-相干体T4-T7.sgy",
+    "AntTrack": "/data/shared/project-oil/wx数据/砂砾岩/补充材料-20260623/车西_T4-T7/车西-蚂蚁体T4-T7.sgy"
+  },
+  "attribute_names": ["Coherence", "AntTrack"],
+  "title_prefix": "全矿区尺度过车58属性体剖面",
+  "z_label": "TWT / ms",
+  "time_padding_ms": 20.0,
+  "axis_sample_count": 720,
+  "surface_samples": 720,
+  "progress_interval": 60,
+  "fig_width": 18.0,
+  "fig_height": 8.2,
+  "dpi": 240,
+  "no_svg": false
+}

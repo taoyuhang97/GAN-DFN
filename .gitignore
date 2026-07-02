@@ -9,3 +9,6 @@ record/
 tmp_eval_smoke/
 揭榜挂帅调研/
 reference/
+
+# 正式主线生成产物体积很大，不纳入 Git 版本管理。
+优化阶段二/正式主线/**/output/
