@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -12,6 +14,12 @@ from scipy.spatial import cKDTree
 
 CURRENT_DIR = Path(__file__).resolve().parent
 DEFAULT_CONFIG = CURRENT_DIR / "configs/formal_well_control_correction.json"
+SURFACE_TOOL_DIR = CURRENT_DIR.parent / "step1_surface_framework"
+if str(SURFACE_TOOL_DIR) not in sys.path:
+    sys.path.insert(0, str(SURFACE_TOOL_DIR))
+
+from surface_tools import load_surface_tables  # noqa: E402
+
 ALLOWED_LAYERS = ["沙三段", "沙四段"]
 LAYER_CODE = {"沙三段": 3, "沙四段": 4}
 CSV_ENCODINGS = ("utf-8-sig", "utf-8", "gb18030", "gbk")
@@ -63,7 +71,6 @@ def output_paths(output_dir: Path) -> dict[str, Path]:
     return {
         "corrected_csv": output_dir / "well_corrected_dfn_fracture_patches.csv",
         "raw_vtk": output_dir / "well_corrected_dfn_raw_time.vtk",
-        "display_vtk": output_dir / "well_corrected_dfn_display.vtk",
         "summary_json": output_dir / "well_corrected_dfn_summary.json",
         "audit_csv": output_dir / "well_control_correction_audit.csv",
     }
@@ -128,6 +135,125 @@ def load_control_points(path: Path, target_block: dict[str, Any]) -> pd.DataFram
     ].copy()
     out = out.sort_values(["WellName", "LayerGroup", "TIME", "WellControlSampleID"]).reset_index(drop=True)
     out["ControlPointID"] = ["ctrl_%06d" % (idx + 1) for idx in range(len(out))]
+    out["ControlSource"] = "step4_predicted"
+    out["IsImagingGroundTruth"] = 0
+    return out
+
+
+def load_step3_imaging_controls(paths: list[Path], well_name: str, target_block: dict[str, Any]) -> pd.DataFrame:
+    parts: list[pd.DataFrame] = []
+    for path in paths:
+        df = read_csv_flexible(path, low_memory=False)
+        required = {"X", "Y", "TIME", "GT_POINT_FLAG"}
+        missing = sorted(required - set(df.columns))
+        if missing:
+            raise ValueError(f"Step3 imaging group csv missing columns {missing}: {path}")
+        work = df[pd.to_numeric(df["GT_POINT_FLAG"], errors="coerce").fillna(0).astype(int).eq(1)].copy()
+        work["WellName"] = well_name
+        work["Step3GroupCSV"] = str(path)
+        parts.append(work)
+    if not parts:
+        return pd.DataFrame()
+    work = pd.concat(parts, ignore_index=True)
+    for column in ["X", "Y", "TIME", "TVD", "DEPT", "Density", "Frac_Azimuth", "Frac_Dip"]:
+        if column in work.columns:
+            work[column] = safe_numeric(work[column])
+    work = work.dropna(subset=["X", "Y", "TIME"]).copy()
+    x_min = float(target_block["x_min"])
+    x_max = float(target_block["x_max"])
+    y_min = float(target_block["y_min"])
+    y_max = float(target_block["y_max"])
+    work = work[work["X"].between(x_min, x_max) & work["Y"].between(y_min, y_max)].copy()
+    layer_col = "StrataName" if "StrataName" in work.columns else "LayerGroup" if "LayerGroup" in work.columns else None
+    if layer_col is None:
+        raise ValueError("Step3 imaging group csv missing StrataName/LayerGroup")
+    work["LayerGroup"] = work[layer_col].astype(str)
+    work = work[work["LayerGroup"].isin(ALLOWED_LAYERS)].copy()
+    if work.empty:
+        return pd.DataFrame()
+    if "SampleID" in work.columns:
+        sample_id = work["SampleID"].astype(str)
+    else:
+        sample_id = pd.Series(["step3_gt_%06d" % (idx + 1) for idx in range(len(work))], index=work.index)
+    work["WellControlSampleID"] = "step3_gt_" + sample_id
+    work["ControlSource"] = "step3_imaging_gt"
+    work["IsImagingGroundTruth"] = 1
+    keep = [
+        "WellName",
+        "X",
+        "Y",
+        "TIME",
+        "TVD",
+        "DEPT",
+        "LayerGroup",
+        "Density",
+        "WellControlSampleID",
+        "ControlSource",
+        "IsImagingGroundTruth",
+        "Frac_Azimuth",
+        "Frac_Dip",
+        "Step3GroupCSV",
+    ]
+    keep = [column for column in keep if column in work.columns]
+    return work[keep].sort_values(["WellName", "LayerGroup", "TIME", "WellControlSampleID"]).reset_index(drop=True)
+
+
+def load_step3_imaging_time_windows(paths: list[Path], well_name: str, target_block: dict[str, Any]) -> pd.DataFrame:
+    rows: list[dict[str, Any]] = []
+    for path in paths:
+        df = read_csv_flexible(path, low_memory=False)
+        required = {"X", "Y", "TIME"}
+        missing = sorted(required - set(df.columns))
+        if missing:
+            raise ValueError(f"Step3 imaging group csv missing columns {missing}: {path}")
+        layer_col = "StrataName" if "StrataName" in df.columns else "LayerGroup" if "LayerGroup" in df.columns else None
+        if layer_col is None:
+            raise ValueError("Step3 imaging group csv missing StrataName/LayerGroup")
+        work = df.copy()
+        for column in ["X", "Y", "TIME"]:
+            work[column] = safe_numeric(work[column])
+        work = work.dropna(subset=["X", "Y", "TIME"]).copy()
+        work = work[
+            work["X"].between(float(target_block["x_min"]), float(target_block["x_max"]))
+            & work["Y"].between(float(target_block["y_min"]), float(target_block["y_max"]))
+        ].copy()
+        if work.empty:
+            continue
+        layer = str(work[layer_col].dropna().astype(str).mode().iloc[0]) if work[layer_col].notna().any() else ""
+        if layer not in ALLOWED_LAYERS:
+            continue
+        rows.append(
+            {
+                "WellName": well_name,
+                "LayerGroup": layer,
+                "TimeMin": float(work["TIME"].min()),
+                "TimeMax": float(work["TIME"].max()),
+                "Step3GroupCSV": str(path),
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def merge_step3_imaging_controls(step4_df: pd.DataFrame, step3_df: pd.DataFrame, windows: pd.DataFrame, config: dict[str, Any]) -> pd.DataFrame:
+    if step3_df.empty:
+        out = step4_df.copy()
+        out["ControlPointID"] = ["ctrl_%06d" % (idx + 1) for idx in range(len(out))]
+        return out
+    filtered = step4_df.copy()
+    if bool(config.get("replace_step4_inside_step3_imaging_windows", True)) and not windows.empty:
+        padding = float(config.get("step3_imaging_window_time_padding_ms", 1.0))
+        keep = pd.Series(True, index=filtered.index)
+        for _, window in windows.iterrows():
+            mask = (
+                filtered["WellName"].astype(str).eq(str(window["WellName"]))
+                & filtered["LayerGroup"].astype(str).eq(str(window["LayerGroup"]))
+                & filtered["TIME"].between(float(window["TimeMin"]) - padding, float(window["TimeMax"]) + padding)
+            )
+            keep.loc[mask] = False
+        filtered = filtered.loc[keep].copy()
+    out = pd.concat([filtered, step3_df], ignore_index=True, sort=False)
+    out = out.sort_values(["WellName", "LayerGroup", "TIME", "WellControlSampleID"]).reset_index(drop=True)
+    out["ControlPointID"] = ["ctrl_%06d" % (idx + 1) for idx in range(len(out))]
     return out
 
 
@@ -171,6 +297,48 @@ def nearest_track_distances(control_df: pd.DataFrame, tracks: dict[str, pd.DataF
         dist, _ = tree.query(query, k=1)
         values.append(float(dist[0]))
     return pd.Series(values, index=control_df.index)
+
+
+def load_surface_time_lookup(surface_dir: Path | None) -> dict[str, Any] | None:
+    if surface_dir is None or not surface_dir.exists():
+        return None
+    payload: dict[str, Any] = {}
+    surfaces = load_surface_tables(surface_dir)
+    for code in ["T4", "T6", "T7"]:
+        table = surfaces[code]["table"]
+        xy = table[["X", "Y"]].to_numpy(dtype=float)
+        time = table["Z"].to_numpy(dtype=float)
+        payload[code] = {"tree": cKDTree(xy), "time": time}
+    return payload
+
+
+def query_surface_time(surface_lookup: dict[str, Any], code: str, x: float, y: float) -> float:
+    item = surface_lookup[code]
+    _, idx = item["tree"].query(np.asarray([[float(x), float(y)]]), k=1, p=1)
+    return float(item["time"][int(idx[0])])
+
+
+def update_layer_window_from_surfaces(row: pd.Series | dict[str, Any], surface_lookup: dict[str, Any] | None) -> dict[str, float]:
+    if surface_lookup is None:
+        return {}
+    layer = str(row["LayerGroup"])
+    x = float(row["CenterX"])
+    y = float(row["CenterY"])
+    if layer == "沙三段":
+        top = query_surface_time(surface_lookup, "T4", x, y)
+        base = query_surface_time(surface_lookup, "T6", x, y)
+    elif layer == "沙四段":
+        top = query_surface_time(surface_lookup, "T6", x, y)
+        base = query_surface_time(surface_lookup, "T7", x, y)
+    else:
+        return {}
+    if not np.isfinite(top) or not np.isfinite(base) or base <= top:
+        return {}
+    center_time = float(row["CenterTime"])
+    if np.isfinite(center_time):
+        top = min(top, center_time)
+        base = max(base, center_time)
+    return {"TimeWindowMin": top, "TimeWindowMax": base, "LayerThickness": base - top}
 
 
 def build_patch_tree(df: pd.DataFrame, layer: str, time_scale: float) -> tuple[cKDTree | None, np.ndarray]:
@@ -264,19 +432,156 @@ def correction_columns() -> list[str]:
         "WellControlMatchAfter",
         "NearestTrajectoryDistance",
         "IsWellControlPatch",
+        "ControlSource",
+        "IsImagingGroundTruth",
+        "ControlX",
+        "ControlY",
+        "ControlTime",
+        "ControlInsidePatchEnvelope",
+        "WellControlCenterOffsetM",
+        "WellControlCenterOffsetTimeMs",
     ]
 
 
-def build_added_patch(template: pd.Series, control: pd.Series, add_index: int, before_distance: float, track_distance: float) -> dict[str, Any]:
+def stable_unit_value(key: str) -> float:
+    digest = hashlib.sha1(key.encode("utf-8")).hexdigest()
+    integer = int(digest[:12], 16)
+    return 2.0 * (integer / float(0xFFFFFFFFFFFF)) - 1.0
+
+
+def add_control_size_columns(control_df: pd.DataFrame, config: dict[str, Any]) -> pd.DataFrame:
+    out = control_df.copy()
+    size_config = dict(config.get("well_control_size", {}))
+    min_length = float(size_config.get("min_length_m", 30.0))
+    max_length = float(size_config.get("max_length_m", 120.0))
+    min_height = float(size_config.get("min_height_time_ms", 6.0))
+    max_height = float(size_config.get("max_height_time_ms", 28.0))
+    imaging_multiplier = float(size_config.get("imaging_gt_size_multiplier", 1.0))
+    if "Density" not in out.columns:
+        out["Density"] = np.nan
+    out["Density"] = safe_numeric(out["Density"])
+    out["WellControlSizeFactor"] = 0.5
+    for layer, group in out.groupby("LayerGroup", dropna=False):
+        density = safe_numeric(group["Density"])
+        if density.notna().any():
+            lo = float(density.quantile(0.05))
+            hi = float(density.quantile(0.95))
+            if hi > lo:
+                factor = ((density.fillna(density.median()) - lo) / (hi - lo)).clip(0.0, 1.0)
+            else:
+                factor = pd.Series(0.5, index=group.index)
+        else:
+            factor = pd.Series(0.5, index=group.index)
+        out.loc[group.index, "WellControlSizeFactor"] = factor
+    out["WellControlLengthM"] = min_length + out["WellControlSizeFactor"] * (max_length - min_length)
+    out["WellControlHeightTimeMs"] = min_height + out["WellControlSizeFactor"] * (max_height - min_height)
+    if "IsImagingGroundTruth" in out.columns:
+        gt_mask = safe_numeric(out["IsImagingGroundTruth"]).fillna(0).astype(int).eq(1)
+        out.loc[gt_mask, "WellControlLengthM"] *= imaging_multiplier
+        out.loc[gt_mask, "WellControlHeightTimeMs"] *= imaging_multiplier
+    out["WellControlLengthM"] = out["WellControlLengthM"].clip(lower=min_length, upper=max_length)
+    out["WellControlHeightTimeMs"] = out["WellControlHeightTimeMs"].clip(lower=min_height, upper=max_height)
+    return out
+
+
+def control_orientation(template: pd.Series, control: pd.Series) -> tuple[float, float, str]:
+    is_gt = int(control.get("IsImagingGroundTruth", 0) or 0) == 1
+    azimuth = pd.to_numeric(pd.Series([control.get("Frac_Azimuth")]), errors="coerce").iloc[0]
+    dip = pd.to_numeric(pd.Series([control.get("Frac_Dip")]), errors="coerce").iloc[0]
+    if is_gt and np.isfinite(azimuth) and np.isfinite(dip):
+        return float(azimuth) % 180.0, float(np.clip(dip, 1.0, 89.0)), "step3_imaging_gt_orientation"
+    return float(template["AzimuthDeg"]) % 180.0, float(np.clip(template["DipDeg"], 1.0, 89.0)), "well_control_template_from_nearest_initial_patch"
+
+
+def offset_center_near_control(control: pd.Series, azimuth_deg: float, dip_deg: float, length_m: float, height_time_ms: float, config: dict[str, Any]) -> dict[str, float]:
+    if not bool(config.get("enable_well_control_center_offset", True)):
+        return {
+            "CenterX": float(control["X"]),
+            "CenterY": float(control["Y"]),
+            "CenterTime": float(control["TIME"]),
+            "CenterOffsetM": 0.0,
+            "CenterOffsetTimeMs": 0.0,
+            "ControlInsidePatchEnvelope": 1,
+        }
+    theta = np.deg2rad(float(azimuth_deg))
+    dip = np.deg2rad(float(np.clip(dip_deg, 1.0, 89.0)))
+    strike = np.asarray([np.cos(theta), np.sin(theta)], dtype=float)
+    dip_horizontal = np.asarray([-np.sin(theta), np.cos(theta)], dtype=float)
+    time_scale = float(config.get("geometry_time_scale_m_per_ms", config.get("time_scale_m_per_ms", 2.0)))
+    half_length = 0.5 * float(length_m)
+    half_height = 0.5 * float(height_time_ms)
+    half_dip_xy = half_height * time_scale / max(float(np.tan(dip)), 1.0e-6)
+    max_fraction = float(config.get("well_control_center_offset_max_fraction", 0.35))
+    max_offset_m = float(config.get("well_control_center_offset_max_m", 45.0))
+    min_offset_m = float(config.get("well_control_center_offset_min_m", 6.0))
+    strike_limit = max(0.0, min(max_offset_m, half_length * max_fraction))
+    dip_limit = max(0.0, min(max_offset_m * 0.35, half_dip_xy * max_fraction))
+    key = f"{control.get('WellName', '')}|{control.get('WellControlSampleID', '')}|{control.get('LayerGroup', '')}"
+    strike_raw = stable_unit_value(key + "|strike")
+    dip_raw = stable_unit_value(key + "|dip")
+    strike_offset = strike_raw * strike_limit
+    if abs(strike_offset) < min_offset_m and strike_limit >= min_offset_m:
+        strike_offset = np.sign(strike_raw if strike_raw != 0.0 else 1.0) * min_offset_m
+    dip_offset = dip_raw * dip_limit
+    xy_offset = strike_offset * strike + dip_offset * dip_horizontal
+    time_offset = dip_offset * float(np.tan(dip)) / max(time_scale, 1.0e-6)
+    center_x = float(control["X"]) + float(xy_offset[0])
+    center_y = float(control["Y"]) + float(xy_offset[1])
+    center_time = float(control["TIME"]) + float(time_offset)
+    target = config.get("target_block") or {}
+    if target:
+        center_x = float(np.clip(center_x, float(target["x_min"]), float(target["x_max"])))
+        center_y = float(np.clip(center_y, float(target["y_min"]), float(target["y_max"])))
+    inside = int(abs(strike_offset) <= half_length + 1.0e-6 and abs(dip_offset) <= half_dip_xy + 1.0e-6 and abs(time_offset) <= half_height + 1.0e-6)
+    return {
+        "CenterX": center_x,
+        "CenterY": center_y,
+        "CenterTime": center_time,
+        "CenterOffsetM": float(np.hypot(float(xy_offset[0]), float(xy_offset[1]))),
+        "CenterOffsetTimeMs": float(abs(time_offset)),
+        "ControlInsidePatchEnvelope": inside,
+    }
+
+
+def apply_geometry_from_control(row: pd.Series | dict[str, Any], template: pd.Series, control: pd.Series, config: dict[str, Any]) -> dict[str, Any]:
+    out = dict(row)
+    azimuth, dip, orientation_source = control_orientation(template=template, control=control)
+    length = float(control["WellControlLengthM"]) if "WellControlLengthM" in control and pd.notna(control["WellControlLengthM"]) else float(template["LengthM"])
+    height = float(control["WellControlHeightTimeMs"]) if "WellControlHeightTimeMs" in control and pd.notna(control["WellControlHeightTimeMs"]) else float(template["HeightTimeMs"])
+    center = offset_center_near_control(control=control, azimuth_deg=azimuth, dip_deg=dip, length_m=length, height_time_ms=height, config=config)
+    out.update(center)
+    out["LengthM"] = length
+    out["HeightTimeMs"] = height
+    out["AzimuthDeg"] = azimuth
+    out["DipDeg"] = dip
+    out["OrientationSource"] = orientation_source
+    out["SizeRule"] = "well_control_density_scaled"
+    out["ControlInsidePatchEnvelope"] = int(center["ControlInsidePatchEnvelope"])
+    out["WellControlCenterOffsetM"] = float(center["CenterOffsetM"])
+    out["WellControlCenterOffsetTimeMs"] = float(center["CenterOffsetTimeMs"])
+    out["ControlX"] = float(control["X"])
+    out["ControlY"] = float(control["Y"])
+    out["ControlTime"] = float(control["TIME"])
+    out["ControlSource"] = str(control.get("ControlSource", "step4_predicted"))
+    out["IsImagingGroundTruth"] = int(control.get("IsImagingGroundTruth", 0) or 0)
+    return out
+
+
+def build_added_patch(
+    template: pd.Series,
+    control: pd.Series,
+    add_index: int,
+    before_distance: float,
+    track_distance: float,
+    config: dict[str, Any],
+    surface_lookup: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     row = template.to_dict()
     row["PatchID"] = f"well_ctrl_dfn_{add_index:06d}"
     row["OriginalPatchID"] = ""
     row["OriginalCenterX"] = np.nan
     row["OriginalCenterY"] = np.nan
     row["OriginalCenterTime"] = np.nan
-    row["CenterX"] = float(control["X"])
-    row["CenterY"] = float(control["Y"])
-    row["CenterTime"] = float(control["TIME"])
     row["LayerGroup"] = str(control["LayerGroup"])
     row["LayerCode"] = int(LAYER_CODE[str(control["LayerGroup"])])
     row["SourceDensity"] = float(control["Density"]) if "Density" in control and pd.notna(control["Density"]) else row.get("SourceDensity", np.nan)
@@ -291,8 +596,17 @@ def build_added_patch(template: pd.Series, control: pd.Series, add_index: int, b
     row["NearestTrajectoryDistance"] = float(track_distance) if pd.notna(track_distance) else np.nan
     row["IsWellControlPatch"] = 1
     row["NeedsWellCorrection"] = 0
-    row["OrientationSource"] = "well_control_template_from_nearest_initial_patch"
     row["SamplingRule"] = "hard_well_control_addition"
+    row = apply_geometry_from_control(row=row, template=template, control=control, config=config)
+    time_scale = float(config.get("time_scale_m_per_ms", 2.0))
+    row["WellControlMatchAfter"] = float(
+        np.sqrt(
+            (float(row["CenterX"]) - float(control["X"])) ** 2
+            + (float(row["CenterY"]) - float(control["Y"])) ** 2
+            + ((float(row["CenterTime"]) - float(control["TIME"])) * time_scale) ** 2
+        )
+    )
+    row.update(update_layer_window_from_surfaces(row, surface_lookup))
     return row
 
 
@@ -301,8 +615,10 @@ def apply_well_controls(
     control_df: pd.DataFrame,
     track_distances: pd.Series,
     config: dict[str, Any],
+    surface_lookup: dict[str, Any] | None = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     time_scale = float(config.get("time_scale_m_per_ms", 2.0))
+    control_df = add_control_size_columns(control_df, config=config)
     before_dist = nearest_patch_distances(initial_df, control_df, time_scale=time_scale)
     corrected = initial_df.copy()
     trees = {layer: build_patch_tree(initial_df, layer=layer, time_scale=time_scale) for layer in ALLOWED_LAYERS}
@@ -325,19 +641,38 @@ def apply_well_controls(
         if patch_idx is not None:
             used_patch_indices.add(patch_idx)
             original = corrected.loc[patch_idx].copy()
-            corrected.loc[patch_idx, "CenterX"] = float(control["X"])
-            corrected.loc[patch_idx, "CenterY"] = float(control["Y"])
-            corrected.loc[patch_idx, "CenterTime"] = float(control["TIME"])
+            updated = apply_geometry_from_control(
+                row=corrected.loc[patch_idx],
+                template=original,
+                control=control,
+                config=config,
+            )
+            for update_col, update_value in updated.items():
+                if update_col not in corrected.columns:
+                    corrected[update_col] = pd.Series([pd.NA] * len(corrected), dtype="object") if isinstance(update_value, str) else np.nan
+                elif isinstance(update_value, str) and not pd.api.types.is_object_dtype(corrected[update_col].dtype):
+                    corrected[update_col] = corrected[update_col].astype("object")
+                corrected.loc[patch_idx, update_col] = update_value
             corrected.loc[patch_idx, "CorrectionAction"] = "adjust_to_well_control"
             corrected.loc[patch_idx, "CorrectionReason"] = "unused_initial_patch_within_search_window"
             corrected.loc[patch_idx, "WellControlSampleID"] = str(control["WellControlSampleID"])
             corrected.loc[patch_idx, "WellControlWellName"] = str(control["WellName"])
             corrected.loc[patch_idx, "WellControlDensity"] = float(control["Density"]) if "Density" in control and pd.notna(control["Density"]) else np.nan
             corrected.loc[patch_idx, "WellControlMatchBefore"] = before
-            corrected.loc[patch_idx, "WellControlMatchAfter"] = 0.0
+            after_center_dist = float(
+                np.sqrt(
+                    (float(corrected.loc[patch_idx, "CenterX"]) - float(control["X"])) ** 2
+                    + (float(corrected.loc[patch_idx, "CenterY"]) - float(control["Y"])) ** 2
+                    + ((float(corrected.loc[patch_idx, "CenterTime"]) - float(control["TIME"])) * time_scale) ** 2
+                )
+            )
+            corrected.loc[patch_idx, "WellControlMatchAfter"] = after_center_dist
             corrected.loc[patch_idx, "NearestTrajectoryDistance"] = track_distance
             corrected.loc[patch_idx, "IsWellControlPatch"] = 1
             corrected.loc[patch_idx, "NeedsWellCorrection"] = 0
+            window_update = update_layer_window_from_surfaces(corrected.loc[patch_idx], surface_lookup)
+            for update_col, update_value in window_update.items():
+                corrected.loc[patch_idx, update_col] = update_value
             patch_id = str(corrected.loc[patch_idx, "PatchID"])
             action = "adjust_to_well_control"
             reason = "unused_initial_patch_within_search_window"
@@ -360,6 +695,8 @@ def apply_well_controls(
                 add_index=len(added_rows) + 1,
                 before_distance=before,
                 track_distance=track_distance,
+                config=config,
+                surface_lookup=surface_lookup,
             )
             added_rows.append(added)
             patch_id = str(added["PatchID"])
@@ -370,16 +707,43 @@ def apply_well_controls(
             original_y = float(template["CenterY"])
             original_time = float(template["CenterTime"])
 
+        if patch_idx is not None:
+            corrected_x = float(corrected.loc[patch_idx, "CenterX"])
+            corrected_y = float(corrected.loc[patch_idx, "CenterY"])
+            corrected_time = float(corrected.loc[patch_idx, "CenterTime"])
+            center_offset_m = float(corrected.loc[patch_idx, "WellControlCenterOffsetM"])
+            center_offset_time_ms = float(corrected.loc[patch_idx, "WellControlCenterOffsetTimeMs"])
+            inside_envelope = int(corrected.loc[patch_idx, "ControlInsidePatchEnvelope"])
+        else:
+            corrected_x = float(added["CenterX"])
+            corrected_y = float(added["CenterY"])
+            corrected_time = float(added["CenterTime"])
+            center_offset_m = float(added["WellControlCenterOffsetM"])
+            center_offset_time_ms = float(added["WellControlCenterOffsetTimeMs"])
+            inside_envelope = int(added["ControlInsidePatchEnvelope"])
+        after = float(
+            np.sqrt(
+                (corrected_x - float(control["X"])) ** 2
+                + (corrected_y - float(control["Y"])) ** 2
+                + ((corrected_time - float(control["TIME"])) * time_scale) ** 2
+            )
+        )
+
         audit_rows.append(
             {
                 "ControlPointID": str(control["ControlPointID"]),
                 "WellControlSampleID": str(control["WellControlSampleID"]),
                 "WellName": str(control["WellName"]),
                 "LayerGroup": str(control["LayerGroup"]),
+                "ControlSource": str(control.get("ControlSource", "step4_predicted")),
+                "IsImagingGroundTruth": int(control.get("IsImagingGroundTruth", 0) or 0),
                 "ControlX": float(control["X"]),
                 "ControlY": float(control["Y"]),
                 "ControlTime": float(control["TIME"]),
                 "ControlDensity": float(control["Density"]) if "Density" in control and pd.notna(control["Density"]) else np.nan,
+                "ControlSizeFactor": float(control["WellControlSizeFactor"]),
+                "ControlLengthM": float(control["WellControlLengthM"]),
+                "ControlHeightTimeMs": float(control["WellControlHeightTimeMs"]),
                 "Action": action,
                 "ActionReason": reason,
                 "PatchID": patch_id,
@@ -387,11 +751,14 @@ def apply_well_controls(
                 "OriginalCenterX": original_x,
                 "OriginalCenterY": original_y,
                 "OriginalCenterTime": original_time,
-                "CorrectedCenterX": float(control["X"]),
-                "CorrectedCenterY": float(control["Y"]),
-                "CorrectedCenterTime": float(control["TIME"]),
+                "CorrectedCenterX": corrected_x,
+                "CorrectedCenterY": corrected_y,
+                "CorrectedCenterTime": corrected_time,
+                "CenterOffsetM": center_offset_m,
+                "CenterOffsetTimeMs": center_offset_time_ms,
+                "ControlInsidePatchEnvelope": inside_envelope,
                 "BeforeMatchDistance": before,
-                "AfterMatchDistance": 0.0,
+                "AfterMatchDistance": after,
                 "NearestTrajectoryDistance": track_distance,
                 "XYSearchDistance": xy_dist,
                 "TimeSearchDistance": time_dist,
@@ -407,27 +774,70 @@ def apply_well_controls(
     return corrected.reset_index(drop=True), pd.DataFrame(audit_rows)
 
 
-def write_legacy_vtk(path: Path, patch_df: pd.DataFrame, title: str, display: bool, display_z_scale: float) -> None:
+def patch_vertices(
+    row: pd.Series,
+    display: bool,
+    display_z_scale: float,
+    use_dip_geometry: bool,
+    geometry_time_scale_m_per_ms: float,
+) -> list[tuple[float, float, float]]:
+    theta = np.deg2rad(float(row["AzimuthDeg"]))
+    half_length = 0.5 * float(row["LengthM"])
+    half_h = 0.5 * float(row["HeightTimeMs"])
+    center_x = float(row["CenterX"])
+    center_y = float(row["CenterY"])
+    center_time = float(row["CenterTime"])
+    strike = np.asarray([np.cos(theta), np.sin(theta)], dtype=float)
+
+    if use_dip_geometry:
+        dip = np.deg2rad(float(np.clip(row["DipDeg"], 1.0, 89.9)))
+        dip_horizontal = np.asarray([-np.sin(theta), np.cos(theta)], dtype=float)
+        half_dip_xy = (half_h * geometry_time_scale_m_per_ms) / max(np.tan(dip), 1.0e-6)
+        corners: list[tuple[float, float, float]] = []
+        for strike_sign, dip_sign in [(-1, -1), (1, -1), (1, 1), (-1, 1)]:
+            xy = np.asarray([center_x, center_y], dtype=float) + strike_sign * half_length * strike + dip_sign * half_dip_xy * dip_horizontal
+            z = center_time + dip_sign * half_h
+            if display:
+                z = -z / display_z_scale
+            corners.append((float(xy[0]), float(xy[1]), float(z)))
+        return corners
+
+    half_dx = half_length * np.cos(theta)
+    half_dy = half_length * np.sin(theta)
+    z0 = center_time - half_h
+    z1 = center_time + half_h
+    if display:
+        z0 = -z0 / display_z_scale
+        z1 = -z1 / display_z_scale
+    return [
+        (center_x - half_dx, center_y - half_dy, z0),
+        (center_x + half_dx, center_y + half_dy, z0),
+        (center_x + half_dx, center_y + half_dy, z1),
+        (center_x - half_dx, center_y - half_dy, z1),
+    ]
+
+
+def write_legacy_vtk(
+    path: Path,
+    patch_df: pd.DataFrame,
+    title: str,
+    display: bool,
+    display_z_scale: float,
+    use_dip_geometry: bool = False,
+    geometry_time_scale_m_per_ms: float = 1.0,
+) -> None:
     points: list[tuple[float, float, float]] = []
     polygons: list[list[int]] = []
     for _, row in patch_df.iterrows():
-        theta = np.deg2rad(float(row["AzimuthDeg"]))
-        half_dx = 0.5 * float(row["LengthM"]) * np.cos(theta)
-        half_dy = 0.5 * float(row["LengthM"]) * np.sin(theta)
-        half_h = 0.5 * float(row["HeightTimeMs"])
-        z0 = float(row["CenterTime"]) - half_h
-        z1 = float(row["CenterTime"]) + half_h
-        if display:
-            z0 = -z0 / display_z_scale
-            z1 = -z1 / display_z_scale
         base = len(points)
         points.extend(
-            [
-                (float(row["CenterX"]) - half_dx, float(row["CenterY"]) - half_dy, z0),
-                (float(row["CenterX"]) + half_dx, float(row["CenterY"]) + half_dy, z0),
-                (float(row["CenterX"]) + half_dx, float(row["CenterY"]) + half_dy, z1),
-                (float(row["CenterX"]) - half_dx, float(row["CenterY"]) - half_dy, z1),
-            ]
+            patch_vertices(
+                row,
+                display=display,
+                display_z_scale=display_z_scale,
+                use_dip_geometry=use_dip_geometry,
+                geometry_time_scale_m_per_ms=geometry_time_scale_m_per_ms,
+            )
         )
         polygons.append([base, base + 1, base + 2, base + 3])
 
@@ -473,26 +883,42 @@ def load_density_mass_from_initial_summary(path: Path) -> dict[str, float]:
     if not path.exists():
         return {}
     payload = read_json(path)
-    return {
+    legacy_mass = {
         str(key): float(value)
         for key, value in payload.get("density_volume", {}).get("density_mass_by_layer", {}).items()
     }
+    if legacy_mass:
+        return legacy_mass
+    return {
+        str(layer): float(summary.get("density_mass", 0.0))
+        for layer, summary in payload.get("macro_distribution_check", {}).items()
+        if isinstance(summary, dict)
+    }
 
 
-def macro_distribution(density_mass: dict[str, float], corrected_df: pd.DataFrame) -> dict[str, dict[str, float]]:
+def macro_distribution(density_mass: dict[str, float], initial_df: pd.DataFrame, corrected_df: pd.DataFrame) -> dict[str, dict[str, float]]:
     total_density = float(sum(density_mass.values()))
     total_patches = int(len(corrected_df))
+    total_initial = int(len(initial_df))
     patch_counts = corrected_df["LayerGroup"].value_counts().to_dict()
+    initial_counts = initial_df["LayerGroup"].value_counts().to_dict()
     result: dict[str, dict[str, float]] = {}
     for layer in ALLOWED_LAYERS:
-        density_share = float(density_mass.get(layer, 0.0)) / total_density if total_density > 0 else 0.0
+        target_share = (
+            float(density_mass.get(layer, 0.0)) / total_density
+            if total_density > 0
+            else float(initial_counts.get(layer, 0)) / total_initial if total_initial > 0 else 0.0
+        )
         patch_share = float(patch_counts.get(layer, 0)) / total_patches if total_patches > 0 else 0.0
         result[layer] = {
             "density_mass": float(density_mass.get(layer, 0.0)),
-            "density_mass_share": density_share,
+            "target_share": target_share,
+            "target_share_basis": "density_mass" if total_density > 0 else "initial_patch_count",
+            "initial_patch_count": int(initial_counts.get(layer, 0)),
+            "initial_patch_share": float(initial_counts.get(layer, 0)) / total_initial if total_initial > 0 else 0.0,
             "patch_count": int(patch_counts.get(layer, 0)),
             "patch_count_share": patch_share,
-            "absolute_share_difference": abs(density_share - patch_share),
+            "absolute_share_difference": abs(target_share - patch_share),
         }
     return result
 
@@ -510,7 +936,7 @@ def build_summary(
     track_dist: pd.Series,
     density_mass: dict[str, float],
 ) -> dict[str, Any]:
-    macro = macro_distribution(density_mass=density_mass, corrected_df=corrected_df)
+    macro = macro_distribution(density_mass=density_mass, initial_df=initial_df, corrected_df=corrected_df)
     action_counts = {
         str(key): int(value)
         for key, value in audit_df["Action"].value_counts(dropna=False).to_dict().items()
@@ -522,16 +948,26 @@ def build_summary(
     before_median = float(before_dist.median()) if before_dist.notna().any() else None
     after_median = float(after_dist.median()) if after_dist.notna().any() else None
     changed_fraction = float(changed_initial_count + added_count) / max(float(len(initial_df)), 1.0)
+    max_allowed_offset = float(config.get("well_control_center_offset_max_m", 45.0))
+    audit_after = safe_numeric(audit_df["AfterMatchDistance"]) if "AfterMatchDistance" in audit_df.columns else pd.Series(dtype=float)
+    audit_offsets = safe_numeric(audit_df["CenterOffsetM"]) if "CenterOffsetM" in audit_df.columns else pd.Series(dtype=float)
+    control_envelope = safe_numeric(audit_df["ControlInsidePatchEnvelope"]).fillna(0) if "ControlInsidePatchEnvelope" in audit_df.columns else pd.Series(dtype=float)
     checks = {
         "has_well_controls_in_target_block": int(len(control_df)) > 0,
-        "match_mean_improved": bool(after_mean is not None and before_mean is not None and after_mean < before_mean),
-        "match_median_improved": bool(after_median is not None and before_median is not None and after_median <= before_median),
-        "hard_control_points_satisfied": bool(after_dist.fillna(np.inf).max() <= 1.0e-6),
+        "linked_patch_centers_no_farther_than_before_mean": bool(
+            not audit_after.empty and before_mean is not None and float(audit_after.mean()) <= before_mean
+        ),
+        "control_points_inside_patch_envelopes": bool(not control_envelope.empty and control_envelope.eq(1).all()),
+        "well_control_center_offsets_within_limit": bool(not audit_offsets.empty and audit_offsets.fillna(np.inf).max() <= max_allowed_offset + 1.0e-6),
         "macro_distribution_preserved": bool(all(item["absolute_share_difference"] <= 0.05 for item in macro.values())),
         "far_field_preserved": bool(changed_fraction <= 0.15),
         "audit_rows_match_control_points": bool(len(audit_df) == len(control_df)),
         "layers_limited_to_sha3_sha4": bool(set(corrected_df["LayerGroup"].dropna().astype(str)).issubset(set(ALLOWED_LAYERS))),
-        "vtk_outputs_exist": bool(paths["raw_vtk"].exists() and paths["display_vtk"].exists()),
+        "centers_within_layer_windows": bool(corrected_df["CenterTime"].between(corrected_df["TimeWindowMin"], corrected_df["TimeWindowMax"]).all())
+        if {"CenterTime", "TimeWindowMin", "TimeWindowMax"}.issubset(corrected_df.columns)
+        else True,
+        "orientation_fields_complete": bool(corrected_df[["AzimuthDeg", "DipDeg"]].notna().all().all()),
+        "raw_vtk_output_exists": bool(paths["raw_vtk"].exists()),
     }
     return {
         "status": "pass" if all(checks.values()) else "fail",
@@ -541,7 +977,6 @@ def build_summary(
         "real_well_samples_root": str(Path(config["real_well_samples_root"]).resolve()),
         "corrected_dfn_csv": str(paths["corrected_csv"]),
         "corrected_dfn_raw_vtk": str(paths["raw_vtk"]),
-        "corrected_dfn_display_vtk": str(paths["display_vtk"]),
         "well_control_correction_audit_csv": str(paths["audit_csv"]),
         "summary_json": str(paths["summary_json"]),
         "target_block": config["target_block"],
@@ -552,6 +987,15 @@ def build_summary(
             "far_field_density_volume_patches_unchanged": True,
             "xy_search_radius_m": float(config.get("xy_search_radius_m", 80.0)),
             "time_search_radius_ms": float(config.get("time_search_radius_ms", 30.0)),
+            "surface_dir": str(Path(config["surface_dir"]).resolve()) if config.get("surface_dir") else None,
+            "surface_windows_recomputed_for_well_control_patches": bool(config.get("surface_dir")),
+            "use_dip_geometry": bool(config.get("use_dip_geometry", False)),
+            "geometry_time_scale_m_per_ms": float(config.get("geometry_time_scale_m_per_ms", 1.0)),
+            "enable_well_control_center_offset": bool(config.get("enable_well_control_center_offset", True)),
+            "well_control_center_offset_max_m": max_allowed_offset,
+            "step3_imaging_gt_enabled": bool(config.get("step3_imaging_group_csvs")),
+            "replace_step4_inside_step3_imaging_windows": bool(config.get("replace_step4_inside_step3_imaging_windows", True)),
+            "well_control_size": dict(config.get("well_control_size", {})),
         },
         "initial_dfn": {
             "patch_count": int(len(initial_df)),
@@ -561,6 +1005,11 @@ def build_summary(
             "control_point_count": int(len(control_df)),
             "well_count": int(control_df["WellName"].nunique()) if not control_df.empty else 0,
             "layer_distribution": layer_counts(control_df) if not control_df.empty else {},
+            "source_distribution": {
+                str(key): int(value)
+                for key, value in control_df["ControlSource"].value_counts(dropna=False).sort_index().items()
+            } if "ControlSource" in control_df.columns else {},
+            "imaging_ground_truth_count": int(safe_numeric(control_df.get("IsImagingGroundTruth", pd.Series(dtype=float))).fillna(0).sum()),
             "nearest_trajectory_distance_stats": finite_stats(track_dist),
         },
         "correction_actions": {
@@ -580,6 +1029,8 @@ def build_summary(
         "match_quality": {
             "before_distance_stats": finite_stats(before_dist),
             "after_distance_stats": finite_stats(after_dist),
+            "linked_patch_after_distance_stats": finite_stats(audit_after),
+            "linked_patch_center_offset_m_stats": finite_stats(audit_offsets),
             "mean_distance_improvement": (before_mean - after_mean) if before_mean is not None and after_mean is not None else None,
             "median_distance_improvement": (before_median - after_median) if before_median is not None and after_median is not None else None,
         },
@@ -600,14 +1051,42 @@ def main() -> int:
     fracture_csv = Path(config["fracture_points_csv"]).resolve()
     samples_root = Path(config["real_well_samples_root"]).resolve()
     initial_summary_json = Path(config.get("initial_dfn_summary_json", "")).resolve()
+    surface_dir = Path(config["surface_dir"]).resolve() if config.get("surface_dir") else None
     for label, path in [("initial_dfn_csv", initial_csv), ("fracture_points_csv", fracture_csv), ("real_well_samples_root", samples_root)]:
         if not path.exists():
             raise FileNotFoundError(f"{label} does not exist: {path}")
+    if surface_dir is not None and not surface_dir.exists():
+        raise FileNotFoundError(f"surface_dir does not exist: {surface_dir}")
 
     initial_df = load_initial_dfn(initial_csv)
-    control_df = load_control_points(fracture_csv, dict(config["target_block"]))
+    step4_control_df = load_control_points(fracture_csv, dict(config["target_block"]))
+    step3_group_paths = [Path(str(value)).resolve() for value in config.get("step3_imaging_group_csvs", [])]
+    for path in step3_group_paths:
+        if not path.exists():
+            raise FileNotFoundError(f"step3_imaging_group_csvs entry does not exist: {path}")
+    if step3_group_paths:
+        step3_well_name = str(config.get("step3_imaging_well_name", "车页1导眼"))
+        step3_control_df = load_step3_imaging_controls(
+            paths=step3_group_paths,
+            well_name=step3_well_name,
+            target_block=dict(config["target_block"]),
+        )
+        step3_windows = load_step3_imaging_time_windows(
+            paths=step3_group_paths,
+            well_name=step3_well_name,
+            target_block=dict(config["target_block"]),
+        )
+        control_df = merge_step3_imaging_controls(
+            step4_df=step4_control_df,
+            step3_df=step3_control_df,
+            windows=step3_windows,
+            config=config,
+        )
+    else:
+        control_df = step4_control_df
     tracks = load_real_well_tracks(samples_root, set(control_df["WellName"].astype(str).unique()))
     time_scale = float(config.get("time_scale_m_per_ms", 2.0))
+    surface_lookup = load_surface_time_lookup(surface_dir)
     track_dist = nearest_track_distances(control_df, tracks, time_scale=time_scale)
     before_dist = nearest_patch_distances(initial_df, control_df, time_scale=time_scale)
     corrected_df, audit_df = apply_well_controls(
@@ -615,14 +1094,24 @@ def main() -> int:
         control_df=control_df,
         track_distances=track_dist,
         config=config,
+        surface_lookup=surface_lookup,
     )
     after_dist = nearest_patch_distances(corrected_df, control_df, time_scale=time_scale)
 
     corrected_df.to_csv(paths["corrected_csv"], index=False, encoding="utf-8-sig")
     audit_df.to_csv(paths["audit_csv"], index=False, encoding="utf-8-sig")
     display_z_scale = float(config.get("display_z_scale", 5.0))
-    write_legacy_vtk(paths["raw_vtk"], corrected_df, "well_corrected_dfn_raw_time", display=False, display_z_scale=display_z_scale)
-    write_legacy_vtk(paths["display_vtk"], corrected_df, "well_corrected_dfn_display", display=True, display_z_scale=display_z_scale)
+    use_dip_geometry = bool(config.get("use_dip_geometry", False))
+    geometry_time_scale = float(config.get("geometry_time_scale_m_per_ms", 1.0))
+    write_legacy_vtk(
+        paths["raw_vtk"],
+        corrected_df,
+        "well_corrected_dfn_raw_time",
+        display=False,
+        display_z_scale=display_z_scale,
+        use_dip_geometry=use_dip_geometry,
+        geometry_time_scale_m_per_ms=geometry_time_scale,
+    )
 
     density_mass = load_density_mass_from_initial_summary(initial_summary_json)
     summary = build_summary(
@@ -642,7 +1131,6 @@ def main() -> int:
 
     print(f"Corrected DFN CSV: {paths['corrected_csv']}")
     print(f"Corrected DFN raw VTK: {paths['raw_vtk']}")
-    print(f"Corrected DFN display VTK: {paths['display_vtk']}")
     print(f"Summary JSON: {paths['summary_json']}")
     print(f"Control points: {len(control_df)} corrected patches: {len(corrected_df)} status={summary['status']}")
     return 0 if summary["status"] == "pass" else 1

@@ -1,0 +1,40 @@
+{
+  "density_volume_csv": "/home/tyh/projects/petroleum/code/GAN-DFN/优化阶段二/正式主线/step6_demo_density_volume/output/candidate_cheye1/candidate_cheye1_t4_t7_predicted_density_volume.csv",
+  "fracture_points_csv": "/home/tyh/projects/petroleum/code/GAN-DFN/优化阶段二/正式主线/step4_expert_real_well_prediction/output/formal_well_expert_library/all_wells_t4_t7_fracture_points.csv",
+  "output_dir": "/home/tyh/projects/petroleum/code/GAN-DFN/优化阶段二/正式主线/step7_initial_dfn/output/candidate_cheye1",
+  "target_block": {
+    "name": "candidate_cheye1",
+    "x_min": 577325,
+    "x_max": 580325,
+    "y_min": 4198850,
+    "y_max": 4201850
+  },
+  "random_seed": 20260702,
+  "count_scale": 0.25,
+  "min_patch_count": 2500,
+  "max_patch_count": 15000,
+  "max_patches_per_cell": 3,
+  "base_length_m": {
+    "沙三段": 32.0,
+    "沙四段": 38.0
+  },
+  "base_height_time_ms": {
+    "沙三段": 18.0,
+    "沙四段": 14.0
+  },
+  "base_azimuth_deg": {
+    "沙三段": 55.0,
+    "沙四段": 125.0
+  },
+  "base_dip_deg": {
+    "沙三段": 75.0,
+    "沙四段": 70.0
+  },
+  "azimuth_jitter_deg": 15.0,
+  "dip_jitter_deg": 5.0,
+  "length_density_gain": 0.7,
+  "height_density_gain": 0.45,
+  "max_height_fraction_of_layer": 0.65,
+  "min_height_time_ms": 4.0,
+  "display_z_scale": 5.0
+}

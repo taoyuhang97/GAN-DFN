@@ -82,12 +82,13 @@ def finite_stats(series: pd.Series | np.ndarray) -> dict[str, float | int | None
     }
 
 
-def output_paths(output_dir: Path) -> dict[str, Path]:
+def output_paths(output_dir: Path, candidate_name: str = "candidate_a") -> dict[str, Path]:
+    prefix = candidate_name.strip() or "candidate_a"
     return {
-        "target_attribute_csv": output_dir / "candidate_a_target_trace_attributes.csv",
-        "density_volume_csv": output_dir / "candidate_a_t4_t7_predicted_density_volume.csv",
-        "summary_json": output_dir / "candidate_a_density_volume_summary.json",
-        "training_table_csv": output_dir / "candidate_a_density_training_table.csv",
+        "target_attribute_csv": output_dir / f"{prefix}_target_trace_attributes.csv",
+        "density_volume_csv": output_dir / f"{prefix}_t4_t7_predicted_density_volume.csv",
+        "summary_json": output_dir / f"{prefix}_density_volume_summary.json",
+        "training_table_csv": output_dir / f"{prefix}_density_training_table.csv",
     }
 
 
@@ -688,9 +689,9 @@ def main() -> int:
     config_path = Path(args.config).resolve()
     config = read_json(config_path)
 
-    output_dir = Path(config["output_dir"]).resolve()
-    paths = output_paths(output_dir)
     target_block = dict(config["target_block"])
+    output_dir = Path(config["output_dir"]).resolve()
+    paths = output_paths(output_dir, str(target_block.get("name", "candidate_a")))
     trace_header_csv = Path(config["trace_header_csv"]).resolve()
     layer_dir = Path(config["layer_dir"]).resolve()
     unified_samples_csv = Path(config["unified_samples_csv"]).resolve()

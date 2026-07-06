@@ -1,0 +1,19 @@
+{
+  "initial_dfn_csv": "/home/tyh/projects/petroleum/code/GAN-DFN/优化阶段二/正式主线/step7_initial_dfn/output/candidate_cheye1/initial_dfn_fracture_patches.csv",
+  "fracture_points_csv": "/home/tyh/projects/petroleum/code/GAN-DFN/优化阶段二/正式主线/step4_expert_real_well_prediction/output/formal_well_expert_library/all_wells_t4_t7_fracture_points.csv",
+  "real_well_samples_root": "/home/tyh/projects/petroleum/code/GAN-DFN/优化阶段二/正式主线/step2_real_well_t4_t7_samples/output/formal_all_wells",
+  "initial_dfn_summary_json": "/home/tyh/projects/petroleum/code/GAN-DFN/优化阶段二/正式主线/step7_initial_dfn/output/candidate_cheye1/initial_dfn_summary.json",
+  "output_dir": "/home/tyh/projects/petroleum/code/GAN-DFN/优化阶段二/正式主线/step8_dfn_well_correction/output/candidate_cheye1",
+  "target_block": {
+    "name": "candidate_cheye1",
+    "x_min": 577325,
+    "x_max": 580325,
+    "y_min": 4198850,
+    "y_max": 4201850
+  },
+  "xy_search_radius_m": 80.0,
+  "time_search_radius_ms": 30.0,
+  "time_scale_m_per_ms": 2.0,
+  "max_query_candidates": 30,
+  "display_z_scale": 5.0
+}

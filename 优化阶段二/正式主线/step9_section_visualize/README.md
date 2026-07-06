@@ -36,6 +36,22 @@
   --config 优化阶段二/正式主线/step9_section_visualize/configs/formal_mine_attribute_section_visualization.json
 ```
 
+车页1导眼 `candidate_cheye1` DFN-相干体剖面最终8图：
+
+```bash
+/home/tyh/anaconda3/envs/gan-dfn/bin/python \
+  优化阶段二/正式主线/step9_section_visualize/build_cheye1_dfn_coherence_sections.py \
+  --config 优化阶段二/正式主线/step9_section_visualize/configs/formal_candidate_cheye1_dfn_coherence_sections.json
+```
+
+车页1导眼 `candidate_cheye1_3d` 三维密度 DFN-相干体剖面最终8图：
+
+```bash
+/home/tyh/anaconda3/envs/gan-dfn/bin/python \
+  优化阶段二/正式主线/step9_section_visualize/build_cheye1_dfn_coherence_sections.py \
+  --config 优化阶段二/正式主线/step9_section_visualize/configs/formal_candidate_cheye1_3d_dfn_coherence_sections.json
+```
+
 ## 输入
 
 - 最终井控校正 DFN：`优化阶段二/正式主线/step8_dfn_well_correction/output/well_corrected_dfn_raw_time.vtk`
@@ -93,6 +109,22 @@
 - `attribute_section_summary.json`
 
 全矿区尺度属性体剖面输出在 `output/mine_attribute_sections/<井名>/<section_tag>`，当前配置 `section_tag=anttrack_coherence_t4_t7_mine_extent`，横向范围不再按 candidate A 裁剪，而是使用全矿区 `trace_header_xy.csv` 范围并按 `axis_sample_count=720` 重采样。
+
+车页1导眼 `candidate_cheye1` 最终8图输出在 `output/candidate_cheye1/cheye1_dfn_coherence_sections`，只保留 PNG，不生成 SVG 或 combined 图：
+
+车页1导眼 `candidate_cheye1_3d` 最终8图输出在 `output/candidate_cheye1_3d/cheye1_dfn_coherence_sections`，命名和图片内容与 `candidate_cheye1` 版本一致，但 DFN 输入来自 Step7B/Step8 的三维密度路径。
+
+- `01_dfn_section_xz_t4_t7.png`
+- `02_dfn_section_yz_t4_t7.png`
+- `03_coherence_section_xz_t4_t7.png`
+- `04_coherence_section_yz_t4_t7.png`
+- `05_coherence_dfn_overlay_xz_t4_t7.png`
+- `06_coherence_dfn_overlay_yz_t4_t7.png`
+- `07_coherence_dfn_overlay_200m_xz_t4_t7.png`
+- `08_coherence_dfn_overlay_200m_yz_t4_t7.png`
+- `section_summary.json` 为验收摘要，不属于最终图片。
+
+上述8图中的青色粗线为 Step3 `formal_rebuild/groups/车页1导眼_*.csv` 对应成像测井井段轨迹；洋红色圆点为 `GT_POINT_FLAG=1` 的原始成像测井裂缝点位，即现实井上解释裂缝映射到样本网格后的标签；洋红色短线为 `Frac_Azimuth/Frac_Dip` 投影到当前 XZ/YZ 剖面后的视倾角符号。该标签不是 Step4 专家预测后的井控裂缝点。
 
 属性体配色口径：
 
