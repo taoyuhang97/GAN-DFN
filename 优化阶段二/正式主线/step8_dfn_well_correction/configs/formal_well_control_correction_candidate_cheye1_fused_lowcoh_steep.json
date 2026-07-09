@@ -1,0 +1,29 @@
+{
+  "initial_dfn_csv": "/home/tyh/projects/petroleum/code/GAN-DFN/优化阶段二/正式主线/step7c_fused_dfn/output/candidate_cheye1_lowcoh_steep/fused_initial_dfn_fracture_patches.csv",
+  "fracture_points_csv": "/home/tyh/projects/petroleum/code/GAN-DFN/优化阶段二/正式主线/step4_expert_real_well_prediction/output/formal_well_expert_library/all_wells_t4_t7_fracture_points.csv",
+  "real_well_samples_root": "/home/tyh/projects/petroleum/code/GAN-DFN/优化阶段二/正式主线/step2_real_well_t4_t7_samples/output/formal_all_wells",
+  "surface_dir": "/data/shared/project-oil/wx数据/砂砾岩/层位",
+  "initial_dfn_summary_json": "/home/tyh/projects/petroleum/code/GAN-DFN/优化阶段二/正式主线/step7c_fused_dfn/output/candidate_cheye1_lowcoh_steep/fused_initial_dfn_summary.json",
+  "output_dir": "/home/tyh/projects/petroleum/code/GAN-DFN/优化阶段二/正式主线/step8_dfn_well_correction/output/candidate_cheye1_fused_lowcoh_steep",
+  "target_block": {"name": "candidate_cheye1_fused_lowcoh_steep", "x_min": 577325, "x_max": 580325, "y_min": 4198850, "y_max": 4201850},
+  "xy_search_radius_m": 80.0,
+  "time_search_radius_ms": 30.0,
+  "time_scale_m_per_ms": 2.0,
+  "max_query_candidates": 30,
+  "use_dip_geometry": true,
+  "geometry_time_scale_m_per_ms": 1.0,
+  "display_z_scale": 5.0,
+  "step3_imaging_well_name": "车页1导眼",
+  "step3_imaging_group_csvs": [
+    "/home/tyh/projects/petroleum/code/GAN-DFN/优化阶段二/正式主线/step3_imaging_supervision_samples/output/formal_rebuild/groups/车页1导眼_沙三段.csv",
+    "/home/tyh/projects/petroleum/code/GAN-DFN/优化阶段二/正式主线/step3_imaging_supervision_samples/output/formal_rebuild/groups/车页1导眼_沙四段.csv"
+  ],
+  "replace_step4_inside_step3_imaging_windows": true,
+  "step3_imaging_window_time_padding_ms": 1.0,
+  "enable_well_control_center_offset": true,
+  "well_control_center_offset_min_m": 6.0,
+  "well_control_center_offset_max_m": 45.0,
+  "well_control_center_offset_max_fraction": 0.35,
+  "well_control_size": {"min_length_m": 30.0, "max_length_m": 120.0, "min_height_time_ms": 6.0, "max_height_time_ms": 28.0, "imaging_gt_size_multiplier": 1.0}
+}
+

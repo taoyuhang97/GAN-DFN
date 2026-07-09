@@ -22,8 +22,11 @@ from build_all_area_section_visualization import (
     SurfaceSectionCurve,
     build_surface_section_curves,
     configure_matplotlib_fonts,
+    interval_for_center,
+    next_nonempty,
     load_surface_lookups,
     polygon_area,
+    read_points,
     representative_line_2d,
     scan_vtk,
     select_demo_well,
@@ -69,6 +72,7 @@ IMAGING_PATCH_ASPECT_RATIO = 1.5
 IMAGING_PATCH_SIZE_POWER = 1.25
 IMAGING_PATCH_LINE_WIDTH = 2.2
 IMAGING_PATCH_GEOMETRY_TIME_SCALE_M_PER_MS = 1.0
+SECTION_INTERSECTION_EPS_M = 1.0e-6
 
 
 def read_json(path: Path) -> dict[str, Any]:
@@ -270,6 +274,205 @@ def segment_lines(
         lines.append(((h_mid - h_half, z_mid - z_half), (h_mid + h_half, z_mid + z_half)))
         widths.append(float(width))
     return lines, colors, widths
+
+
+def plane_polygon_intersection_line(vertices: np.ndarray, axis: int, value: float) -> tuple[tuple[float, float], tuple[float, float]] | None:
+    """Return the line segment where a convex polygon crosses X=value or Y=value."""
+    points: list[np.ndarray] = []
+    count = len(vertices)
+    if count < 3:
+        return None
+    for idx in range(count):
+        p1 = vertices[idx]
+        p2 = vertices[(idx + 1) % count]
+        d1 = float(p1[axis] - value)
+        d2 = float(p2[axis] - value)
+        if abs(d1) <= SECTION_INTERSECTION_EPS_M:
+            points.append(p1.copy())
+        if d1 * d2 < 0.0:
+            ratio = abs(d1) / (abs(d1) + abs(d2))
+            points.append(p1 + ratio * (p2 - p1))
+        elif abs(d2) <= SECTION_INTERSECTION_EPS_M:
+            points.append(p2.copy())
+    if len(points) < 2:
+        return None
+    unique: list[np.ndarray] = []
+    for point in points:
+        if not any(float(np.linalg.norm(point - other)) <= 1.0e-5 for other in unique):
+            unique.append(point)
+    if len(unique) < 2:
+        return None
+    arr = np.asarray(unique, dtype=float)
+    if axis == 1:  # XZ section: horizontal axis is X.
+        coords = arr[:, [0, 2]]
+    else:  # YZ section: horizontal axis is Y.
+        coords = arr[:, [1, 2]]
+    if len(coords) == 2:
+        p1, p2 = coords[0], coords[1]
+    else:
+        line = representative_line_2d(coords)
+        if line is None:
+            return None
+        return line
+    if float(np.linalg.norm(p2 - p1)) <= 1.0e-8:
+        return None
+    return (float(p1[0]), float(p1[1])), (float(p2[0]), float(p2[1]))
+
+
+def scan_vtk_intersections(args: SimpleNamespace, surfaces: dict[str, Any], well_df: pd.DataFrame) -> tuple[list[ProjectionSegment], dict[str, float | int | str]]:
+    well_time = well_df["TIME"].to_numpy(dtype=float)
+    well_x = well_df["X"].to_numpy(dtype=float)
+    well_y = well_df["Y"].to_numpy(dtype=float)
+    well_time_min = float(np.nanmin(well_time))
+    well_time_max = float(np.nanmax(well_time))
+    segments: list[ProjectionSegment] = []
+    skipped_by_curve_time = 0
+    skipped_by_interval = 0
+    skipped_by_area = 0
+    skipped_by_geometry = 0
+    skipped_by_surface_distance = 0
+    skipped_by_surface_distance_xz = 0
+    skipped_by_surface_distance_yz = 0
+    skipped_by_no_intersection_xz = 0
+    skipped_by_no_intersection_yz = 0
+
+    with args.input_vtk.open("r", encoding="utf-8", errors="ignore") as handle:
+        header = [next_nonempty(handle) for _ in range(4)]
+        if not header[0].startswith("# vtk DataFile") or header[2] != "ASCII" or header[3] != "DATASET POLYDATA":
+            raise ValueError(f"unsupported ASCII legacy POLYDATA VTK: {args.input_vtk}")
+        point_header = next_nonempty(handle).split()
+        if len(point_header) < 3 or point_header[0] != "POINTS":
+            raise ValueError(f"POINTS block missing: {args.input_vtk}")
+        point_count = int(point_header[1])
+        print(f"[cheye1-section] reading points for intersection scan: {point_count}", flush=True)
+        points = read_points(handle, point_count)
+        bounds_min = np.nanmin(points, axis=0)
+        bounds_max = np.nanmax(points, axis=0)
+        polygon_header = next_nonempty(handle).split()
+        if len(polygon_header) < 3 or polygon_header[0] != "POLYGONS":
+            raise ValueError(f"POLYGONS block missing: {args.input_vtk}")
+        polygon_count = int(polygon_header[1])
+        total_to_scan = min(polygon_count, int(args.max_polygons)) if int(args.max_polygons) > 0 else polygon_count
+        print(f"[cheye1-section] intersection scanning polygons: {total_to_scan}/{polygon_count}", flush=True)
+
+        for polygon_index in range(total_to_scan):
+            parts = next_nonempty(handle).split()
+            vertex_count = int(parts[0])
+            vertex_indices = [int(value) for value in parts[1:]]
+            if len(vertex_indices) != vertex_count or vertex_count < 3:
+                skipped_by_geometry += 1
+                continue
+            vertices = points[np.asarray(vertex_indices, dtype=np.int64)]
+            if not np.all(np.isfinite(vertices)):
+                skipped_by_geometry += 1
+                continue
+            center = vertices.mean(axis=0)
+            center_time = float(center[2])
+            if center_time < well_time_min or center_time > well_time_max:
+                skipped_by_curve_time += 1
+                continue
+            area = polygon_area(vertices)
+            if area < float(args.min_patch_area) or (float(args.max_patch_area) > 0.0 and area > float(args.max_patch_area)):
+                skipped_by_area += 1
+                continue
+            interval = interval_for_center(center, surfaces)
+            if interval is None:
+                skipped_by_interval += 1
+                continue
+
+            y_on_well_curve = float(np.interp(center_time, well_time, well_y))
+            x_on_well_curve = float(np.interp(center_time, well_time, well_x))
+            xz_surface_distance = abs(float(center[1]) - y_on_well_curve)
+            yz_surface_distance = abs(float(center[0]) - x_on_well_curve)
+            selected_this_patch = False
+
+            if xz_surface_distance <= float(args.half_width):
+                line = plane_polygon_intersection_line(vertices, axis=1, value=y_on_well_curve)
+                if line is None:
+                    skipped_by_no_intersection_xz += 1
+                else:
+                    selected_this_patch = True
+                    segments.append(
+                        ProjectionSegment(
+                            polygon_index=int(polygon_index),
+                            projection="XZ",
+                            interval=interval,
+                            center_x=float(center[0]),
+                            center_y=float(center[1]),
+                            center_z=center_time,
+                            surface_distance=xz_surface_distance,
+                            patch_area=float(area),
+                            h1=float(line[0][0]),
+                            z1=float(line[0][1]),
+                            h2=float(line[1][0]),
+                            z2=float(line[1][1]),
+                        )
+                    )
+            else:
+                skipped_by_surface_distance_xz += 1
+
+            if yz_surface_distance <= float(args.half_width):
+                line = plane_polygon_intersection_line(vertices, axis=0, value=x_on_well_curve)
+                if line is None:
+                    skipped_by_no_intersection_yz += 1
+                else:
+                    selected_this_patch = True
+                    segments.append(
+                        ProjectionSegment(
+                            polygon_index=int(polygon_index),
+                            projection="YZ",
+                            interval=interval,
+                            center_x=float(center[0]),
+                            center_y=float(center[1]),
+                            center_z=center_time,
+                            surface_distance=yz_surface_distance,
+                            patch_area=float(area),
+                            h1=float(line[0][0]),
+                            z1=float(line[0][1]),
+                            h2=float(line[1][0]),
+                            z2=float(line[1][1]),
+                        )
+                    )
+            else:
+                skipped_by_surface_distance_yz += 1
+
+            if not selected_this_patch:
+                skipped_by_surface_distance += 1
+            if int(args.max_selected) > 0 and len(segments) >= int(args.max_selected):
+                print(f"[cheye1-section] stopped early by max_selected={args.max_selected}", flush=True)
+                break
+            if args.progress_interval > 0 and (polygon_index + 1) % args.progress_interval == 0:
+                print(f"[cheye1-section] intersection scanned {polygon_index + 1}/{total_to_scan}, selected={len(segments)}", flush=True)
+
+    summary = {
+        "input_vtk": str(args.input_vtk),
+        "well_trajectory_csv": str(args.well_trajectory_csv),
+        "surface_dir": str(args.surface_dir),
+        "half_width": float(args.half_width),
+        "section_geometry_mode": "polygon_plane_intersection",
+        "point_count": int(point_count),
+        "polygon_count": int(polygon_count),
+        "scanned_polygon_count": int(total_to_scan),
+        "selected_segment_count": int(len(segments)),
+        "selected_segment_count_xz": int(sum(segment.projection == "XZ" for segment in segments)),
+        "selected_segment_count_yz": int(sum(segment.projection == "YZ" for segment in segments)),
+        "skipped_by_surface_distance": int(skipped_by_surface_distance),
+        "skipped_by_surface_distance_xz": int(skipped_by_surface_distance_xz),
+        "skipped_by_surface_distance_yz": int(skipped_by_surface_distance_yz),
+        "skipped_by_no_intersection_xz": int(skipped_by_no_intersection_xz),
+        "skipped_by_no_intersection_yz": int(skipped_by_no_intersection_yz),
+        "skipped_by_curve_time": int(skipped_by_curve_time),
+        "skipped_by_interval": int(skipped_by_interval),
+        "skipped_by_area": int(skipped_by_area),
+        "skipped_by_geometry": int(skipped_by_geometry),
+        "bounds_x_min": float(bounds_min[0]),
+        "bounds_x_max": float(bounds_max[0]),
+        "bounds_y_min": float(bounds_min[1]),
+        "bounds_y_max": float(bounds_max[1]),
+        "bounds_z_min": float(bounds_min[2]),
+        "bounds_z_max": float(bounds_max[2]),
+    }
+    return segments, summary
 
 
 def add_dfn_segments(ax, segments: list[ProjectionSegment], projection: str, *, overlay: bool) -> int:
@@ -647,10 +850,10 @@ def main() -> None:
     local_time_min, local_time_max = finite_bounds_from_curves(local_surface_curves, float(config.get("time_padding_ms", 20.0)))
     local_summary = make_summary(local_display, local_time_min, local_time_max)
 
-    print("[cheye1-section] scanning DFN standard band", flush=True)
-    standard_segments, standard_scan = scan_vtk(standard_args, surfaces, well_df)
-    print("[cheye1-section] scanning DFN local 200m band", flush=True)
-    local_segments, local_scan = scan_vtk(local_args, surfaces, well_df)
+    print("[cheye1-section] scanning DFN standard band as section intersections", flush=True)
+    standard_segments, standard_scan = scan_vtk_intersections(standard_args, surfaces, well_df)
+    print("[cheye1-section] scanning DFN local 200m band as section intersections", flush=True)
+    local_segments, local_scan = scan_vtk_intersections(local_args, surfaces, well_df)
 
     x_values = np.sort(trace_df["X"].unique()).astype(np.float64)
     y_values = np.sort(trace_df["Y"].unique()).astype(np.float64)
@@ -734,6 +937,7 @@ def main() -> None:
             "local_200m_yz": visible_fracture_label_count(fracture_df, "YZ", local_summary),
         },
         "coherence_display": {"colormap": COHERENCE_CMAP, "vmin_q02": float(vmin), "vmax_q98": float(vmax)},
+        "dfn_section_geometry_mode": "polygon_plane_intersection",
         "dfn_standard_half_width_m": float(standard_args.half_width),
         "dfn_local_half_width_m": float(local_args.half_width),
         "local_axis_radius_m": local_radius,

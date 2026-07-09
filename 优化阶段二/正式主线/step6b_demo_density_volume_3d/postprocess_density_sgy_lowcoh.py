@@ -8,6 +8,7 @@ from typing import Any
 import numpy as np
 import pandas as pd
 import segyio
+from scipy import ndimage
 
 
 CURRENT_DIR = Path(__file__).resolve().parent
@@ -97,6 +98,115 @@ def low_coherence_weight(coherence: np.ndarray, valid_mask: np.ndarray, config: 
         "low_coherence_weight_stats": finite_stats(weight[valid]),
     }
     return score, weight, summary
+
+
+def weight_from_score(score: np.ndarray, valid_mask: np.ndarray, config: dict[str, Any]) -> np.ndarray:
+    gain = float(config.get("gain", 1.5))
+    power = float(config.get("power", 1.2))
+    max_weight = float(config.get("max_weight", 3.0))
+    weight = 1.0 + gain * np.power(np.clip(score, 0.0, 1.0), power)
+    weight = np.clip(weight, 1.0, max_weight).astype(np.float32)
+    weight[~valid_mask] = 1.0
+    weight[~np.isfinite(weight)] = 1.0
+    return weight
+
+
+def steep_low_coherence_score(
+    low_score_flat: np.ndarray,
+    valid_flat: np.ndarray,
+    mapping: dict[str, np.ndarray],
+    config: dict[str, Any],
+) -> tuple[np.ndarray, dict[str, Any]]:
+    """Suppress horizontal stratigraphic low-coherence bands and keep steep anomalies."""
+    steep_cfg = dict(config.get("steep_anomaly", {}))
+    if not bool(steep_cfg.get("enabled", False)):
+        return low_score_flat.astype(np.float32), {"enabled": False}
+
+    ix = mapping["ix"].astype(np.int32)
+    iy = mapping["iy"].astype(np.int32)
+    nx = int(ix.max()) + 1
+    ny = int(iy.max()) + 1
+    ntrace, nt = low_score_flat.shape
+    score_grid = np.zeros((ny, nx, nt), dtype=np.float32)
+    valid_grid = np.zeros((ny, nx, nt), dtype=bool)
+    score_grid[iy, ix, :] = low_score_flat
+    valid_grid[iy, ix, :] = valid_flat
+
+    threshold = float(steep_cfg.get("component_score_threshold", 0.55))
+    mask = valid_grid & np.isfinite(score_grid) & (score_grid >= threshold)
+    if not mask.any():
+        return np.zeros_like(low_score_flat, dtype=np.float32), {
+            "enabled": True,
+            "component_score_threshold": threshold,
+            "component_count": 0,
+        }
+
+    structure = np.ones((3, 3, 3), dtype=np.uint8) if bool(steep_cfg.get("use_26_connectivity", True)) else None
+    labels, component_count = ndimage.label(mask, structure=structure)
+    objects = ndimage.find_objects(labels)
+    multiplier_by_label = np.zeros(component_count + 1, dtype=np.float32)
+
+    min_vertical_t = float(steep_cfg.get("min_vertical_time_samples", 6.0))
+    strong_vertical_t = float(steep_cfg.get("strong_vertical_time_samples", 18.0))
+    horizontal_max_t = float(steep_cfg.get("horizontal_max_time_samples", 5.0))
+    horizontal_min_xy = float(steep_cfg.get("horizontal_min_xy_cells", 60.0))
+    horizontal_penalty = float(steep_cfg.get("horizontal_sheet_penalty", 0.85))
+    min_multiplier = float(steep_cfg.get("min_component_multiplier", 0.08))
+    max_multiplier = float(steep_cfg.get("max_component_multiplier", 1.0))
+
+    horizontal_component_count = 0
+    steep_component_count = 0
+    component_summaries: list[dict[str, Any]] = []
+    for label_id, slc in enumerate(objects, start=1):
+        if slc is None:
+            continue
+        y_slice, x_slice, t_slice = slc
+        y_extent = y_slice.stop - y_slice.start
+        x_extent = x_slice.stop - x_slice.start
+        t_extent = t_slice.stop - t_slice.start
+        xy_extent = max(x_extent, y_extent)
+        vertical_score = np.clip((t_extent - min_vertical_t) / max(strong_vertical_t - min_vertical_t, 1.0e-6), 0.0, 1.0)
+        horizontal_like = t_extent <= horizontal_max_t and xy_extent >= horizontal_min_xy
+        multiplier = min_multiplier + (max_multiplier - min_multiplier) * float(vertical_score)
+        if horizontal_like:
+            multiplier *= max(0.0, 1.0 - horizontal_penalty)
+            horizontal_component_count += 1
+        if vertical_score >= 0.75 and not horizontal_like:
+            steep_component_count += 1
+        multiplier_by_label[label_id] = np.float32(np.clip(multiplier, 0.0, max_multiplier))
+        if len(component_summaries) < int(steep_cfg.get("summary_component_limit", 20)):
+            component_summaries.append(
+                {
+                    "label": int(label_id),
+                    "x_extent_cells": int(x_extent),
+                    "y_extent_cells": int(y_extent),
+                    "time_extent_samples": int(t_extent),
+                    "vertical_score": float(vertical_score),
+                    "horizontal_like": bool(horizontal_like),
+                    "multiplier": float(multiplier_by_label[label_id]),
+                }
+            )
+
+    multiplier_grid = multiplier_by_label[labels]
+    steep_grid = score_grid * multiplier_grid
+    steep_flat = np.zeros_like(low_score_flat, dtype=np.float32)
+    steep_flat[:, :] = steep_grid[iy, ix, :]
+    steep_flat[~valid_flat] = 0.0
+    summary = {
+        "enabled": True,
+        "component_score_threshold": threshold,
+        "component_count": int(component_count),
+        "horizontal_component_count": int(horizontal_component_count),
+        "steep_component_count": int(steep_component_count),
+        "min_vertical_time_samples": min_vertical_t,
+        "strong_vertical_time_samples": strong_vertical_t,
+        "horizontal_max_time_samples": horizontal_max_t,
+        "horizontal_min_xy_cells": horizontal_min_xy,
+        "horizontal_sheet_penalty": horizontal_penalty,
+        "steep_low_coherence_score_stats": finite_stats(steep_flat[valid_flat]),
+        "component_examples": component_summaries,
+    }
+    return steep_flat, summary
 
 
 def additive_density_compensation(
@@ -200,12 +310,24 @@ def main() -> int:
         guidance_config = dict(config.get("coherence_guidance", {}))
         mode = str(config.get("mode", guidance_config.get("mode", "multiply")))
         score, weight, guidance_summary = low_coherence_weight(coherence_matrix, valid_density, guidance_config)
+        valid_coh_for_steep = np.isfinite(coherence_matrix) & (coherence_matrix >= float(guidance_config.get("valid_min", 0.0)))
+        if "valid_max" in guidance_config:
+            valid_coh_for_steep &= coherence_matrix <= float(guidance_config["valid_max"])
+        steep_score, steep_summary = steep_low_coherence_score(
+            low_score_flat=score,
+            valid_flat=valid_coh_for_steep,
+            mapping=mapping,
+            config=guidance_config,
+        )
+        score_for_compensation = steep_score if mode == "steep_multiply_plus_add" else score
+        if mode == "steep_multiply_plus_add" and bool(guidance_config.get("steep_anomaly", {}).get("apply_to_multiply", True)):
+            weight = weight_from_score(score_for_compensation, valid_density, guidance_config)
         multiplicative_density = np.asarray(density_matrix, dtype=np.float32) * weight
-        if mode == "multiply_plus_add":
+        if mode in {"multiply_plus_add", "steep_multiply_plus_add"}:
             additive_density, additive_summary = additive_density_compensation(
                 density=density_matrix,
-                low_score=score,
-                valid_mask=np.isfinite(coherence_matrix) & (coherence_matrix >= float(guidance_config.get("valid_min", 0.0))),
+                low_score=score_for_compensation,
+                valid_mask=valid_coh_for_steep,
                 config=guidance_config,
             )
             output_density = multiplicative_density + additive_density
@@ -258,6 +380,7 @@ def main() -> int:
         "trace_count": int(tracecount),
         "coherence_sample_axis_matched": bool(same_samples),
         "guidance": guidance_summary,
+        "steep_anomaly_guidance": steep_summary,
         "additive_compensation": additive_summary,
         "input_density_stats": finite_stats(np.concatenate(stats_parts["input_density"])),
         "output_density_stats": finite_stats(np.concatenate(stats_parts["output_density"])),
