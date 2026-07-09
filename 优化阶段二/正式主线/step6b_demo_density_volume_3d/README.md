@@ -43,3 +43,19 @@ tmux new -s step6b_cheye1_3d
 - `candidate_cheye1_3d_density_sgy_summary.json`：训练、采样轴、SGY 和 QC 摘要。
 
 不输出逐点 CSV。SGY 继承原始地震体 trace header，只写入 `candidate_cheye1` demo 区内 trace；demo 区外 trace 不写入输出文件。
+
+## 低相干后处理
+
+低相干后处理不重新训练模型，只读取原 Step6B 三维密度 SGY 和相干体 SGY，将低相干黑色异常转换为密度权重，输出独立 lowcoh 密度体，不覆盖原结果：
+
+```bash
+/home/tyh/anaconda3/envs/gan-dfn/bin/python \
+  优化阶段二/正式主线/step6b_demo_density_volume_3d/postprocess_density_sgy_lowcoh.py \
+  --config 优化阶段二/正式主线/step6b_demo_density_volume_3d/configs/formal_candidate_cheye1_3d_density_lowcoh_postprocess.json
+```
+
+输出目录：`output/candidate_cheye1_lowcoh_post`。
+
+- `candidate_cheye1_3d_predicted_density_lowcoh.sgy`：低相干引导后的三维裂缝密度 SGY。
+- `candidate_cheye1_3d_trace_mapping.npz`：复制原 Step6B trace 映射，供 Step7B 直接使用。
+- `candidate_cheye1_3d_density_lowcoh_postprocess_summary.json`：低相干权重和密度变化统计。

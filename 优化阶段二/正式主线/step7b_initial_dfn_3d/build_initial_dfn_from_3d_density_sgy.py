@@ -125,6 +125,110 @@ def load_density_grid(sgy_path: Path, mapping_path: Path) -> dict[str, Any]:
     }
 
 
+def load_guidance_grid(
+    sgy_path: Path,
+    source_trace_idx: np.ndarray,
+    target_samples: np.ndarray,
+) -> tuple[np.ndarray, dict[str, Any]]:
+    ny, nx = source_trace_idx.shape
+    nt = len(target_samples)
+    guidance = np.full((ny, nx, nt), np.nan, dtype=np.float32)
+    valid_flat = np.where(source_trace_idx.ravel() >= 0)[0]
+
+    with segyio.open(str(sgy_path), "r", ignore_geometry=True) as handle:
+        source_samples = np.asarray(handle.samples, dtype=np.float64)
+        tracecount = int(handle.tracecount)
+        sample_count = int(len(source_samples))
+        max_trace_idx = int(np.max(source_trace_idx[source_trace_idx >= 0])) if valid_flat.size else -1
+        if max_trace_idx >= tracecount:
+            raise ValueError(f"guidance SGY tracecount {tracecount} is smaller than required source trace index {max_trace_idx}")
+
+        same_samples = sample_count == nt and np.allclose(source_samples, target_samples, rtol=0.0, atol=1.0e-6)
+        flat_guidance = guidance.reshape(-1, nt)
+        flat_trace_idx = source_trace_idx.ravel()
+        for ordinal, flat_idx in enumerate(valid_flat, start=1):
+            trace = np.asarray(handle.trace[int(flat_trace_idx[flat_idx])], dtype=np.float32)
+            if same_samples:
+                flat_guidance[flat_idx, :] = trace
+            else:
+                flat_guidance[flat_idx, :] = np.interp(target_samples, source_samples, trace, left=np.nan, right=np.nan).astype(np.float32)
+            if ordinal % 10000 == 0:
+                print(f"[step7b-3d] loaded guidance traces={ordinal}/{len(valid_flat)}", flush=True)
+
+    summary = {
+        "guidance_sgy": str(sgy_path),
+        "tracecount": tracecount,
+        "source_sample_count": sample_count,
+        "target_sample_count": int(nt),
+        "sample_axis_matched": bool(same_samples),
+        "loaded_trace_count": int(len(valid_flat)),
+        "stats": finite_stats(guidance.ravel()),
+    }
+    return guidance, summary
+
+
+def coherence_guidance_config(config: dict[str, Any]) -> dict[str, Any]:
+    guidance = dict(config.get("coherence_guidance", {}))
+    guidance["enabled"] = bool(guidance.get("enabled", False))
+    return guidance
+
+
+def compute_low_coherence_fields(
+    coherence: np.ndarray,
+    valid_mask: np.ndarray,
+    guidance_config: dict[str, Any],
+) -> tuple[np.ndarray, np.ndarray, dict[str, Any]]:
+    coherence_valid = valid_mask & np.isfinite(coherence)
+    if "valid_min" in guidance_config:
+        coherence_valid &= coherence >= float(guidance_config["valid_min"])
+    if "valid_max" in guidance_config:
+        coherence_valid &= coherence <= float(guidance_config["valid_max"])
+
+    finite = coherence[coherence_valid]
+    if finite.size == 0:
+        score = np.zeros_like(coherence, dtype=np.float32)
+        weight = np.ones_like(coherence, dtype=np.float32)
+        return score, weight, {"enabled": True, "finite_count": 0, "low_bound": None, "high_bound": None}
+
+    low_q = float(guidance_config.get("low_quantile", 0.05))
+    high_q = float(guidance_config.get("high_quantile", 0.95))
+    low_bound = float(np.nanquantile(finite, low_q))
+    high_bound = float(np.nanquantile(finite, high_q))
+    if high_bound <= low_bound:
+        high_bound = low_bound + 1.0e-6
+
+    score = (high_bound - coherence) / (high_bound - low_bound)
+    score = np.clip(score, 0.0, 1.0).astype(np.float32)
+    score[~np.isfinite(score)] = 0.0
+    score[~coherence_valid] = 0.0
+
+    gain = float(guidance_config.get("gain", 1.5))
+    power = float(guidance_config.get("power", 1.2))
+    max_weight = float(guidance_config.get("max_weight", 3.0))
+    weight = 1.0 + gain * np.power(score, power)
+    weight = np.clip(weight, 1.0, max_weight).astype(np.float32)
+    weight[~np.isfinite(weight)] = 1.0
+    weight[~coherence_valid] = 1.0
+
+    return score, weight, {
+        "enabled": True,
+        "finite_count": int(finite.size),
+        "valid_min": guidance_config.get("valid_min"),
+        "valid_max": guidance_config.get("valid_max"),
+        "invalid_or_missing_count": int(valid_mask.sum() - coherence_valid.sum()),
+        "low_quantile": low_q,
+        "high_quantile": high_q,
+        "low_bound": low_bound,
+        "high_bound": high_bound,
+        "gain": gain,
+        "power": power,
+        "max_weight": max_weight,
+        "coherence_stats": finite_stats(finite),
+        "low_coherence_score_stats": finite_stats(score[coherence_valid]),
+        "low_coherence_weight_stats": finite_stats(weight[coherence_valid]),
+    }
+
+
 def build_xy_records(x_values: np.ndarray, y_values: np.ndarray) -> pd.DataFrame:
     xx, yy = np.meshgrid(x_values, y_values)
     return pd.DataFrame({"X": xx.ravel(), "Y": yy.ravel(), "TIME": np.zeros(xx.size, dtype=float)})
@@ -200,22 +304,40 @@ def build_candidate_voxels(
     surfaces: dict[str, np.ndarray],
     source_trace_idx: np.ndarray,
     config: dict[str, Any],
+    coherence: np.ndarray | None = None,
 ) -> tuple[pd.DataFrame, dict[str, Any]]:
     rows: list[pd.DataFrame] = []
     layer_summary: dict[str, Any] = {}
     min_density = float(config.get("min_candidate_density", 1.0e-6))
     min_component_voxels = int(config.get("min_component_voxels", 12))
+    guidance = coherence_guidance_config(config)
+    use_guidance = bool(guidance.get("enabled", False)) and coherence is not None
+    apply_to_candidate_selection = bool(guidance.get("apply_to_candidate_selection", True))
+    apply_to_sampling = bool(guidance.get("apply_to_sampling", True))
 
     for layer in ALLOWED_LAYERS:
         layer_mask = layer_mask_for_grid(layer, samples, surfaces)
-        positive = density[layer_mask]
-        positive = positive[np.isfinite(positive) & (positive > min_density)]
+        valid_density_mask = layer_mask & np.isfinite(density) & (density > min_density)
+        if use_guidance:
+            low_score, low_weight, guidance_summary = compute_low_coherence_fields(coherence, valid_density_mask, guidance)
+            guided_score = density * low_weight
+            candidate_score_grid = guided_score if apply_to_candidate_selection else density
+            sampling_weight_grid = guided_score if apply_to_sampling else density
+        else:
+            low_score = np.zeros_like(density, dtype=np.float32)
+            low_weight = np.ones_like(density, dtype=np.float32)
+            candidate_score_grid = density
+            sampling_weight_grid = density
+            guidance_summary = {"enabled": False}
+
+        positive = candidate_score_grid[valid_density_mask]
+        positive = positive[np.isfinite(positive) & (positive > 0.0)]
         if positive.size == 0:
-            layer_summary[layer] = {"candidate_count": 0, "kept_candidate_count": 0, "threshold": None}
+            layer_summary[layer] = {"candidate_count": 0, "kept_candidate_count": 0, "threshold": None, "coherence_guidance": guidance_summary}
             continue
         quantile = float(layer_param(config, "candidate_density_quantile", layer, 0.90))
         threshold = max(float(np.quantile(positive, quantile)), min_density)
-        raw_mask = layer_mask & (density >= threshold)
+        raw_mask = valid_density_mask & (candidate_score_grid >= threshold)
         labels, size_by_id, keep_mask = compute_component_labels(raw_mask, min_component_voxels=min_component_voxels)
         if not keep_mask.any():
             keep_mask = raw_mask
@@ -248,6 +370,12 @@ def build_candidate_voxels(
                 "TimeWindowMax": base.astype(float),
                 "LayerThickness": (base - top).astype(float),
                 "SourceDensity": density[yy, xx, tt].astype(float),
+                "CoherenceValue": coherence[yy, xx, tt].astype(float) if coherence is not None else np.full(yy.size, np.nan, dtype=float),
+                "LowCoherenceScore": low_score[yy, xx, tt].astype(float),
+                "LowCoherenceWeight": low_weight[yy, xx, tt].astype(float),
+                "GuidedDensityScore": guided_score[yy, xx, tt].astype(float) if use_guidance else density[yy, xx, tt].astype(float),
+                "CandidateScore": candidate_score_grid[yy, xx, tt].astype(float),
+                "SamplingWeight": sampling_weight_grid[yy, xx, tt].astype(float),
                 "ComponentID": comp,
                 "ComponentVoxelCount": comp_size,
                 "LayerDensityThreshold": threshold,
@@ -262,6 +390,9 @@ def build_candidate_voxels(
             "component_count": int(len(size_by_id)),
             "kept_component_count": int(len(set(int(v) for v in part["ComponentID"]))),
             "candidate_density_stats": finite_stats(part["SourceDensity"]),
+            "candidate_score_stats": finite_stats(part["CandidateScore"]),
+            "sampling_weight_stats": finite_stats(part["SamplingWeight"]),
+            "coherence_guidance": guidance_summary,
         }
 
     if not rows:
@@ -274,19 +405,35 @@ def build_candidate_voxels(
 
 
 def sample_candidate_voxels(candidates: pd.DataFrame, config: dict[str, Any], rng: np.random.Generator) -> tuple[pd.DataFrame, dict[str, Any]]:
-    weights = candidates["SourceDensity"].to_numpy(dtype=float)
-    weights = np.clip(weights, 0.0, None)
-    target_count, density_mass, effective_scale = choose_target_count(weights, config)
-    probability = weights / weights.sum()
+    guidance = coherence_guidance_config(config)
+    sampling_weights = candidates.get("SamplingWeight", candidates["SourceDensity"]).to_numpy(dtype=float)
+    sampling_weights = np.clip(sampling_weights, 0.0, None)
+    if sampling_weights.sum() <= 0:
+        raise RuntimeError("candidate sampling weights have no positive mass")
+
+    target_basis = str(guidance.get("target_count_basis", "source_density")) if guidance.get("enabled", False) else "source_density"
+    if target_basis == "sampling_weight":
+        count_weights = sampling_weights
+    else:
+        count_weights = candidates["SourceDensity"].to_numpy(dtype=float)
+        count_weights = np.clip(count_weights, 0.0, None)
+    target_count, count_basis_mass, count_basis_effective_scale = choose_target_count(count_weights, config)
+    probability = sampling_weights / sampling_weights.sum()
     selected_idx = rng.choice(np.arange(len(candidates)), size=target_count, replace=False, p=probability)
     selected = candidates.iloc[selected_idx].reset_index(drop=True).copy()
-    selected["ExpectedPatchCountForCell"] = selected["SourceDensity"].to_numpy(dtype=float) * effective_scale
-    selected["EffectiveCountScale"] = effective_scale
+    sampling_effective_scale = float(target_count) / float(sampling_weights.sum())
+    selected["ExpectedPatchCountForCell"] = selected["SamplingWeight"].to_numpy(dtype=float) * sampling_effective_scale
+    selected["EffectiveCountScale"] = sampling_effective_scale
+    selected["CountBasisEffectiveScale"] = count_basis_effective_scale
     selected["DensityCellPatchOrdinal"] = 1
     return selected, {
-        "density_mass": density_mass,
+        "density_mass": float(np.clip(candidates["SourceDensity"].to_numpy(dtype=float), 0.0, None).sum()),
+        "sampling_weight_mass": float(sampling_weights.sum()),
+        "target_count_basis": target_basis,
+        "target_count_basis_mass": count_basis_mass,
         "requested_count_scale": float(config.get("count_scale", 0.02)),
-        "effective_count_scale": effective_scale,
+        "effective_count_scale": sampling_effective_scale,
+        "count_basis_effective_scale": count_basis_effective_scale,
         "expected_patch_count": float(target_count),
         "actual_patch_count": int(len(selected)),
         "positive_density_candidate_count": int(len(candidates)),
@@ -471,6 +618,12 @@ def build_patch_table(
                 "TimeWindowMax": float(row["TimeWindowMax"]),
                 "LayerThickness": layer_thickness,
                 "SourceDensity": source_density,
+                "CoherenceValue": float(row.get("CoherenceValue", np.nan)),
+                "LowCoherenceScore": float(row.get("LowCoherenceScore", 0.0)),
+                "LowCoherenceWeight": float(row.get("LowCoherenceWeight", 1.0)),
+                "GuidedDensityScore": float(row.get("GuidedDensityScore", source_density)),
+                "CandidateScore": float(row.get("CandidateScore", source_density)),
+                "SamplingWeight": float(row.get("SamplingWeight", source_density)),
                 "DensityQuantileP95Layer": density_p95.get(layer),
                 "ExpectedPatchCountForCell": float(row["ExpectedPatchCountForCell"]),
                 "EffectiveCountScale": float(row["EffectiveCountScale"]),
@@ -495,7 +648,7 @@ def build_patch_table(
                 "DensitySizeFactor": density_factor,
                 "OrientationSource": str(orientation["source"]),
                 "SizeRule": "base_size_scaled_by_3d_density_quantile",
-                "SamplingRule": "weighted_sampling_from_3d_high_density_connected_voxels",
+                "SamplingRule": "low_coherence_guided_weighted_sampling_from_3d_density_voxels" if coherence_guidance_config(config).get("enabled", False) else "weighted_sampling_from_3d_high_density_connected_voxels",
                 "NeedsWellCorrection": 1,
             }
         )
@@ -556,6 +709,9 @@ def write_legacy_vtk(path: Path, patch_df: pd.DataFrame, title: str, display: bo
         ("DensitySizeFactor", patch_df["DensitySizeFactor"].to_numpy(), "float"),
         ("LocalDensityPlanarity", patch_df["LocalDensityPlanarity"].to_numpy(), "float"),
     ]
+    for optional_name in ["CoherenceValue", "LowCoherenceScore", "LowCoherenceWeight", "GuidedDensityScore", "SamplingWeight"]:
+        if optional_name in patch_df.columns:
+            scalar_columns.append((optional_name, patch_df[optional_name].to_numpy(), "float"))
     total_polygon_size = sum(len(poly) + 1 for poly in polygons)
     lines = [
         "# vtk DataFile Version 3.0",
@@ -590,6 +746,12 @@ def build_audit(patch_df: pd.DataFrame) -> pd.DataFrame:
         "VoxelIY",
         "VoxelIT",
         "SourceDensity",
+        "CoherenceValue",
+        "LowCoherenceScore",
+        "LowCoherenceWeight",
+        "GuidedDensityScore",
+        "CandidateScore",
+        "SamplingWeight",
         "DensitySizeFactor",
         "ExpectedPatchCountForCell",
         "EffectiveCountScale",
@@ -608,6 +770,7 @@ def build_audit(patch_df: pd.DataFrame) -> pd.DataFrame:
         "SamplingRule",
         "NeedsWellCorrection",
     ]
+    columns = [column for column in columns if column in patch_df.columns]
     audit = patch_df[columns].copy()
     audit["Action"] = "create_initial_3d_fracture_patch"
     audit["ActionReason"] = "sampled_from_step6b_3d_density_connected_high_density_voxel"
@@ -624,9 +787,12 @@ def build_summary(
     candidate_summary: dict[str, Any],
     sampling_summary: dict[str, Any],
     patch_build_summary: dict[str, Any],
+    guidance_summary: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     target = dict(config.get("target_block", {}))
-    density_by_layer = candidates.groupby("LayerGroup")["SourceDensity"].sum().to_dict()
+    guidance = coherence_guidance_config(config)
+    macro_mass_column = "SamplingWeight" if guidance.get("enabled", False) and "SamplingWeight" in candidates.columns else "SourceDensity"
+    density_by_layer = candidates.groupby("LayerGroup")[macro_mass_column].sum().to_dict()
     patch_by_layer = patch_df["LayerGroup"].value_counts().to_dict()
     density_mass = float(sum(float(value) for value in density_by_layer.values()))
     patch_count = int(len(patch_df))
@@ -670,9 +836,10 @@ def build_summary(
         "initial_dfn_raw_vtk": str(paths["raw_vtk"]),
         "initial_dfn_generation_audit_csv": str(paths["audit_csv"]),
         "summary_json": str(paths["summary_json"]),
-        "generation_logic": "3d_density_connected_voxel_sampling_with_local_pca_orientation_and_density_scaled_patch_size",
+        "generation_logic": "low_coherence_guided_3d_density_sampling_with_local_pca_orientation_and_density_scaled_patch_size" if guidance.get("enabled", False) else "3d_density_connected_voxel_sampling_with_local_pca_orientation_and_density_scaled_patch_size",
         "target_block": target,
         "allowed_layers": ALLOWED_LAYERS,
+        "coherence_guidance": guidance_summary or {"enabled": False},
         "density_grid": {
             "shape_y_x_t": [int(grid["density"].shape[0]), int(grid["density"].shape[1]), int(grid["density"].shape[2])],
             "x_range": [float(np.min(grid["x_values"])), float(np.max(grid["x_values"]))],
@@ -687,6 +854,10 @@ def build_summary(
             "row_count": int(len(candidates)),
             "layer_distribution": layer_distribution(candidates["LayerGroup"]),
             "density_stats": finite_stats(candidates["SourceDensity"]),
+            "macro_mass_column": macro_mass_column,
+            "sampling_weight_stats": finite_stats(candidates["SamplingWeight"]) if "SamplingWeight" in candidates.columns else None,
+            "coherence_value_stats": finite_stats(candidates["CoherenceValue"]) if "CoherenceValue" in candidates.columns else None,
+            "low_coherence_score_stats": finite_stats(candidates["LowCoherenceScore"]) if "LowCoherenceScore" in candidates.columns else None,
         },
         "sampling_summary": sampling_summary,
         "patch_build_summary": patch_build_summary,
@@ -700,6 +871,9 @@ def build_summary(
             "length_m_stats": finite_stats(patch_df["LengthM"]),
             "height_time_ms_stats": finite_stats(patch_df["HeightTimeMs"]),
             "source_density_stats": finite_stats(patch_df["SourceDensity"]),
+            "coherence_value_stats": finite_stats(patch_df["CoherenceValue"]) if "CoherenceValue" in patch_df.columns else None,
+            "low_coherence_score_stats": finite_stats(patch_df["LowCoherenceScore"]) if "LowCoherenceScore" in patch_df.columns else None,
+            "sampling_weight_stats": finite_stats(patch_df["SamplingWeight"]) if "SamplingWeight" in patch_df.columns else None,
             "azimuth_deg_stats": finite_stats(patch_df["AzimuthDeg"]),
             "dip_deg_stats": finite_stats(patch_df["DipDeg"]),
             "density_size_factor_stats": finite_stats(patch_df["DensitySizeFactor"]),
@@ -726,9 +900,29 @@ def main() -> int:
         if not path.exists():
             raise FileNotFoundError(f"{label_name} not found: {path}")
 
+    guidance = coherence_guidance_config(config)
+    coherence_sgy = Path(guidance["coherence_sgy"]).resolve() if guidance.get("enabled", False) else None
+    if coherence_sgy is not None and not coherence_sgy.exists():
+        raise FileNotFoundError(f"coherence_sgy not found: {coherence_sgy}")
+
     rng = np.random.default_rng(int(config.get("random_seed", 20260703)))
     print("[step7b-3d] loading density SGY", flush=True)
     grid = load_density_grid(density_sgy, trace_mapping_npz)
+    coherence_grid = None
+    guidance_summary: dict[str, Any] = {"enabled": False}
+    if coherence_sgy is not None:
+        print("[step7b-3d] loading coherence guidance SGY", flush=True)
+        coherence_grid, guidance_summary = load_guidance_grid(coherence_sgy, grid["source_trace_idx"], grid["samples"])
+        invalid_guidance = ~np.isfinite(coherence_grid)
+        if "valid_min" in guidance:
+            invalid_guidance |= coherence_grid < float(guidance["valid_min"])
+        if "valid_max" in guidance:
+            invalid_guidance |= coherence_grid > float(guidance["valid_max"])
+        invalid_count = int(invalid_guidance.sum())
+        if invalid_count > 0:
+            coherence_grid = coherence_grid.copy()
+            coherence_grid[invalid_guidance] = np.nan
+            guidance_summary["invalid_value_count_after_config_filter"] = invalid_count
     print("[step7b-3d] attaching T4-T7 surfaces", flush=True)
     surfaces = attach_surface_grids(layer_dir, grid["x_values"], grid["y_values"])
     print("[step7b-3d] selecting connected high-density voxels", flush=True)
@@ -738,6 +932,7 @@ def main() -> int:
         surfaces=surfaces,
         source_trace_idx=grid["source_trace_idx"],
         config=config,
+        coherence=coherence_grid,
     )
     print(f"[step7b-3d] candidate voxels={len(candidates)}", flush=True)
     selected, sampling_summary = sample_candidate_voxels(candidates, config=config, rng=rng)
@@ -767,6 +962,7 @@ def main() -> int:
         candidate_summary=candidate_summary,
         sampling_summary=sampling_summary,
         patch_build_summary=patch_build_summary,
+        guidance_summary=guidance_summary,
     )
     paths["summary_json"].write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
     print(f"Initial 3D DFN CSV: {paths['dfn_csv']}")
