@@ -442,6 +442,272 @@ def sample_candidate_voxels(candidates: pd.DataFrame, config: dict[str, Any], rn
     }
 
 
+def _component_axis_stats(group: pd.DataFrame, x_values: np.ndarray, y_values: np.ndarray, time_scale: float) -> dict[str, Any]:
+    coords = np.column_stack(
+        [
+            x_values[group["IX"].to_numpy(dtype=int)],
+            y_values[group["IY"].to_numpy(dtype=int)],
+            group["CenterTime"].to_numpy(dtype=float) * time_scale,
+        ]
+    )
+    center = coords.mean(axis=0)
+    centered = coords - center
+    if len(group) >= 3 and float(np.linalg.norm(centered)) > 1.0e-8:
+        _, _, vh = np.linalg.svd(centered, full_matrices=False)
+        axis = vh[0]
+    else:
+        axis = np.asarray([1.0, 0.0, 0.0], dtype=float)
+    projections = centered @ axis
+    axis_length = float(np.nanmax(projections) - np.nanmin(projections)) if projections.size else 0.0
+    return {
+        "coords": coords,
+        "center": center,
+        "axis": axis,
+        "projections": projections,
+        "axis_length_m": axis_length,
+        "x_extent_m": float(np.nanmax(coords[:, 0]) - np.nanmin(coords[:, 0])) if len(coords) else 0.0,
+        "y_extent_m": float(np.nanmax(coords[:, 1]) - np.nanmin(coords[:, 1])) if len(coords) else 0.0,
+        "time_extent_ms": float(group["CenterTime"].max() - group["CenterTime"].min()) if len(group) else 0.0,
+    }
+
+
+def _classify_component(group: pd.DataFrame, stats: dict[str, Any], config: dict[str, Any]) -> str:
+    ms = dict(config.get("multi_scale", {}))
+    voxel_count = int(len(group))
+    mean_density = float(group["SourceDensity"].mean())
+    large_cfg = dict(ms.get("large_band", {}))
+    medium_cfg = dict(ms.get("medium_band", {}))
+    if (
+        voxel_count >= int(large_cfg.get("min_candidate_voxels", 5000))
+        and stats["time_extent_ms"] >= float(large_cfg.get("min_time_extent_ms", 80.0))
+        and stats["axis_length_m"] >= float(large_cfg.get("min_axis_length_m", 250.0))
+    ):
+        return "large"
+    if (
+        voxel_count >= int(medium_cfg.get("min_candidate_voxels", 800))
+        and stats["axis_length_m"] >= float(medium_cfg.get("min_axis_length_m", 150.0))
+        and mean_density >= float(medium_cfg.get("min_mean_density", 0.0))
+    ):
+        return "medium"
+    return "small"
+
+
+def _select_chain_rows(
+    group: pd.DataFrame,
+    stats: dict[str, Any],
+    scale: str,
+    band_id: str,
+    config: dict[str, Any],
+    used_indices: set[int],
+    requested_count: int | None = None,
+) -> list[pd.Series]:
+    ms = dict(config.get("multi_scale", {}))
+    scale_cfg = dict(ms.get(f"{scale}_band", {}))
+    spacing = float(scale_cfg.get("patch_spacing_m", 55.0 if scale == "large" else 42.0))
+    min_count = int(scale_cfg.get("min_patch_count", 5 if scale == "large" else 3))
+    max_count = int(scale_cfg.get("max_patch_count", 24 if scale == "large" else 10))
+    axis_length = max(float(stats["axis_length_m"]), spacing)
+    if requested_count is None:
+        target_count = int(np.clip(round(axis_length / max(spacing, 1.0)) + 1, min_count, max_count))
+    else:
+        target_count = max(int(requested_count), min_count)
+        if bool(scale_cfg.get("enforce_max_patch_count", False)):
+            target_count = min(target_count, max_count)
+    available_count = int(sum(int(idx) not in used_indices for idx in group.index.to_numpy(dtype=int)))
+    target_count = min(target_count, available_count)
+    if target_count <= 0:
+        return []
+    projections = np.asarray(stats["projections"], dtype=float)
+    if projections.size == 0:
+        return []
+    positions = np.linspace(float(np.nanmin(projections)), float(np.nanmax(projections)), target_count)
+    order_by_density = group["SourceDensity"].to_numpy(dtype=float)
+    selected_rows: list[pd.Series] = []
+    local_used: set[int] = set()
+    group_indices = group.index.to_numpy(dtype=int)
+    for ordinal, position in enumerate(positions, start=1):
+        distances = np.abs(projections - position)
+        # Prefer points near the chain position, then the denser candidate if ties are close.
+        rank_value = distances - 1.0e-4 * order_by_density
+        ranked = np.argsort(rank_value)
+        chosen_pos = None
+        for pos in ranked:
+            original_idx = int(group_indices[pos])
+            if original_idx not in used_indices and original_idx not in local_used:
+                chosen_pos = int(pos)
+                break
+        if chosen_pos is None:
+            continue
+        original_idx = int(group_indices[chosen_pos])
+        local_used.add(original_idx)
+        row = group.iloc[chosen_pos].copy()
+        row["FractureScale"] = scale
+        row["FractureScaleCode"] = 3 if scale == "large" else 2
+        row["BandID"] = band_id
+        row["BandPatchOrdinal"] = int(ordinal)
+        row["BandContinuityMode"] = "pca_chain"
+        row["BandVoxelCount"] = int(len(group))
+        row["BandLengthM"] = float(axis_length)
+        row["BandTimeExtentMs"] = float(stats["time_extent_ms"])
+        row["BandPatchSpacingM"] = float(spacing)
+        row["BandMeanDensity"] = float(group["SourceDensity"].mean())
+        selected_rows.append(row)
+    used_indices.update(local_used)
+    return selected_rows
+
+
+def sample_candidate_voxels_multiscale(
+    candidates: pd.DataFrame,
+    x_values: np.ndarray,
+    y_values: np.ndarray,
+    config: dict[str, Any],
+    rng: np.random.Generator,
+) -> tuple[pd.DataFrame, dict[str, Any]]:
+    ms = dict(config.get("multi_scale", {}))
+    sampling_weights = np.clip(candidates.get("SamplingWeight", candidates["SourceDensity"]).to_numpy(dtype=float), 0.0, None)
+    count_weights = np.clip(candidates["SourceDensity"].to_numpy(dtype=float), 0.0, None)
+    target_count, count_basis_mass, count_basis_effective_scale = choose_target_count(count_weights, config)
+    continuous_target = int(round(target_count * float(ms.get("continuous_patch_fraction", 0.50))))
+    time_scale = float(config.get("orientation_time_scale_m_per_ms", 1.0))
+
+    work = candidates.copy()
+    work["_ComponentKey"] = work["LayerGroup"].astype(str) + "_" + work["ComponentID"].astype(str)
+    component_rows: list[pd.Series] = []
+    component_summary: list[dict[str, Any]] = []
+    used_indices: set[int] = set()
+    band_serial = 1
+
+    grouped = sorted(work.groupby("_ComponentKey"), key=lambda item: float(item[1]["SourceDensity"].sum()), reverse=True)
+    eligible_components: list[dict[str, Any]] = []
+    for _, group in grouped:
+        stats = _component_axis_stats(group, x_values=x_values, y_values=y_values, time_scale=time_scale)
+        scale = _classify_component(group, stats, config)
+        if scale == "small":
+            continue
+        eligible_components.append(
+            {
+                "group": group,
+                "stats": stats,
+                "scale": scale,
+                "density_mass": float(np.clip(group["SourceDensity"].to_numpy(dtype=float), 0.0, None).sum()),
+            }
+        )
+
+    continuous_components = eligible_components[: int(ms.get("max_continuous_band_count", len(eligible_components)))]
+    total_band_mass = sum(max(item["density_mass"], 0.0) for item in continuous_components)
+    allocated_counts: list[int] = []
+    if continuous_components and continuous_target > 0:
+        min_counts = []
+        raw_counts = []
+        for item in continuous_components:
+            scale_cfg = dict(ms.get(f"{item['scale']}_band", {}))
+            min_count = int(scale_cfg.get("min_patch_count", 5 if item["scale"] == "large" else 3))
+            min_counts.append(min_count)
+            if total_band_mass > 0:
+                raw_counts.append(continuous_target * max(item["density_mass"], 0.0) / total_band_mass)
+            else:
+                raw_counts.append(continuous_target / len(continuous_components))
+        allocated_counts = [max(int(round(raw)), min_count) for raw, min_count in zip(raw_counts, min_counts)]
+        overflow = sum(allocated_counts) - continuous_target
+        if overflow > 0:
+            # Remove excess from the weakest allocations first while respecting per-band minimums.
+            order = sorted(range(len(allocated_counts)), key=lambda i: raw_counts[i])
+            for i in order:
+                removable = min(overflow, max(0, allocated_counts[i] - min_counts[i]))
+                allocated_counts[i] -= removable
+                overflow -= removable
+                if overflow <= 0:
+                    break
+        underflow = continuous_target - sum(allocated_counts)
+        if underflow > 0:
+            order = sorted(range(len(allocated_counts)), key=lambda i: raw_counts[i], reverse=True)
+            j = 0
+            while underflow > 0 and order:
+                allocated_counts[order[j % len(order)]] += 1
+                underflow -= 1
+                j += 1
+
+    for item, allocated_count in zip(continuous_components, allocated_counts):
+        if len(component_rows) >= continuous_target:
+            break
+        group = item["group"]
+        stats = item["stats"]
+        scale = item["scale"]
+        band_id = f"band_{band_serial:05d}"
+        band_serial += 1
+        rows = _select_chain_rows(group, stats, scale, band_id, config, used_indices, requested_count=allocated_count)
+        remaining = max(0, continuous_target - len(component_rows))
+        rows = rows[:remaining]
+        component_rows.extend(rows)
+        component_summary.append(
+            {
+                "band_id": band_id,
+                "scale": scale,
+                "candidate_voxels": int(len(group)),
+                "allocated_patch_count": int(allocated_count),
+                "selected_patch_count": int(len(rows)),
+                "axis_length_m": float(stats["axis_length_m"]),
+                "time_extent_ms": float(stats["time_extent_ms"]),
+                "mean_density": float(group["SourceDensity"].mean()),
+                "density_mass": float(group["SourceDensity"].sum()),
+            }
+        )
+
+    selected_parts: list[pd.DataFrame] = []
+    if component_rows:
+        selected_parts.append(pd.DataFrame(component_rows))
+    remaining_count = target_count - sum(len(part) for part in selected_parts)
+    remaining = candidates.drop(index=list(used_indices), errors="ignore").copy()
+    if remaining_count > 0 and not remaining.empty:
+        weights = np.clip(remaining.get("SamplingWeight", remaining["SourceDensity"]).to_numpy(dtype=float), 0.0, None)
+        if weights.sum() <= 0:
+            raise RuntimeError("remaining candidate sampling weights have no positive mass")
+        remaining_count = min(remaining_count, len(remaining))
+        sampled_idx = rng.choice(remaining.index.to_numpy(), size=remaining_count, replace=False, p=weights / weights.sum())
+        small = remaining.loc[sampled_idx].copy()
+        small["FractureScale"] = "small"
+        small["FractureScaleCode"] = 1
+        small["BandID"] = ""
+        small["BandPatchOrdinal"] = 0
+        small["BandContinuityMode"] = "isolated_patch"
+        small["BandVoxelCount"] = small["ComponentVoxelCount"].astype(int)
+        small["BandLengthM"] = 0.0
+        small["BandTimeExtentMs"] = 0.0
+        small["BandPatchSpacingM"] = 0.0
+        small["BandMeanDensity"] = small["SourceDensity"].astype(float)
+        selected_parts.append(small)
+
+    if not selected_parts:
+        raise RuntimeError("multi-scale sampling produced no selected candidates")
+    selected = pd.concat(selected_parts, ignore_index=True).head(target_count).copy()
+    selected["DensityCellPatchOrdinal"] = selected.groupby(["SourceTraceIdx", "LayerGroup", "IT"]).cumcount() + 1
+    sampling_effective_scale = float(len(selected)) / float(max(sampling_weights.sum(), 1.0e-12))
+    selected["ExpectedPatchCountForCell"] = selected.get("SamplingWeight", selected["SourceDensity"]).to_numpy(dtype=float) * sampling_effective_scale
+    selected["EffectiveCountScale"] = sampling_effective_scale
+    selected["CountBasisEffectiveScale"] = count_basis_effective_scale
+    return selected.reset_index(drop=True), {
+        "generation_mode": "multi_scale_connected_bands",
+        "density_mass": float(np.clip(candidates["SourceDensity"].to_numpy(dtype=float), 0.0, None).sum()),
+        "sampling_weight_mass": float(sampling_weights.sum()),
+        "target_count_basis": "source_density",
+        "target_count_basis_mass": count_basis_mass,
+        "requested_count_scale": float(config.get("count_scale", 0.02)),
+        "effective_count_scale": sampling_effective_scale,
+        "count_basis_effective_scale": count_basis_effective_scale,
+        "expected_patch_count": float(target_count),
+        "actual_patch_count": int(len(selected)),
+        "continuous_target_count": int(continuous_target),
+        "continuous_actual_count": int((selected["FractureScale"].astype(str) != "small").sum()),
+        "small_isolated_count": int((selected["FractureScale"].astype(str) == "small").sum()),
+        "eligible_band_count": int(len(eligible_components)),
+        "band_count": int(sum(1 for item in component_summary if item["selected_patch_count"] > 0)),
+        "band_examples": component_summary[: int(ms.get("summary_band_limit", 20))],
+        "positive_density_candidate_count": int(len(candidates)),
+        "sampled_density_cell_count": int(len(selected)),
+        "sampling_replacement": False,
+    }
+
+
 def estimate_local_orientation(
     density: np.ndarray,
     y_idx: int,
@@ -581,6 +847,11 @@ def build_patch_table(
         height = base_height * (1.0 + float(config.get("height_density_gain", 0.6)) * density_factor)
         length *= float(rng.uniform(float(config.get("length_jitter_min", 0.85)), float(config.get("length_jitter_max", 1.15))))
         height *= float(rng.uniform(float(config.get("height_jitter_min", 0.85)), float(config.get("height_jitter_max", 1.15))))
+        fracture_scale = str(row.get("FractureScale", "small"))
+        if fracture_scale in {"large", "medium"}:
+            scale_cfg = dict(config.get("multi_scale", {}).get(f"{fracture_scale}_band", {}))
+            length *= float(scale_cfg.get("length_multiplier", 1.35 if fracture_scale == "large" else 1.18))
+            height *= float(scale_cfg.get("height_multiplier", 1.12 if fracture_scale == "large" else 1.05))
         layer_thickness = float(row["LayerThickness"])
         height = min(height, layer_thickness * float(config.get("max_height_fraction_of_layer", 0.65)))
         height = max(height, min(float(config.get("min_height_time_ms", 4.0)), max(layer_thickness * 0.5, 0.0)))
@@ -648,7 +919,17 @@ def build_patch_table(
                 "DensitySizeFactor": density_factor,
                 "OrientationSource": str(orientation["source"]),
                 "SizeRule": "base_size_scaled_by_3d_density_quantile",
-                "SamplingRule": "low_coherence_guided_weighted_sampling_from_3d_density_voxels" if coherence_guidance_config(config).get("enabled", False) else "weighted_sampling_from_3d_high_density_connected_voxels",
+                "SamplingRule": str(row.get("BandContinuityMode", "")) or ("low_coherence_guided_weighted_sampling_from_3d_density_voxels" if coherence_guidance_config(config).get("enabled", False) else "weighted_sampling_from_3d_high_density_connected_voxels"),
+                "FractureScale": fracture_scale,
+                "FractureScaleCode": int(row.get("FractureScaleCode", 1)),
+                "BandID": str(row.get("BandID", "")),
+                "BandPatchOrdinal": int(row.get("BandPatchOrdinal", 0)),
+                "BandContinuityMode": str(row.get("BandContinuityMode", "isolated_patch")),
+                "BandVoxelCount": int(row.get("BandVoxelCount", row["ComponentVoxelCount"])),
+                "BandLengthM": float(row.get("BandLengthM", 0.0)),
+                "BandTimeExtentMs": float(row.get("BandTimeExtentMs", 0.0)),
+                "BandPatchSpacingM": float(row.get("BandPatchSpacingM", 0.0)),
+                "BandMeanDensity": float(row.get("BandMeanDensity", source_density)),
                 "NeedsWellCorrection": 1,
             }
         )
@@ -711,6 +992,14 @@ def write_legacy_vtk(path: Path, patch_df: pd.DataFrame, title: str, display: bo
     ]
     for optional_name in ["CoherenceValue", "LowCoherenceScore", "LowCoherenceWeight", "GuidedDensityScore", "SamplingWeight"]:
         if optional_name in patch_df.columns:
+            values = pd.to_numeric(patch_df[optional_name], errors="coerce").to_numpy(dtype=float)
+            if np.isfinite(values).any():
+                scalar_columns.append((optional_name, values, "float"))
+    for optional_name in ["FractureScaleCode", "BandPatchOrdinal", "BandVoxelCount"]:
+        if optional_name in patch_df.columns:
+            scalar_columns.append((optional_name, patch_df[optional_name].to_numpy(), "int"))
+    for optional_name in ["BandLengthM", "BandTimeExtentMs", "BandPatchSpacingM", "BandMeanDensity"]:
+        if optional_name in patch_df.columns:
             scalar_columns.append((optional_name, patch_df[optional_name].to_numpy(), "float"))
     total_polygon_size = sum(len(poly) + 1 for poly in polygons)
     lines = [
@@ -729,9 +1018,11 @@ def write_legacy_vtk(path: Path, patch_df: pd.DataFrame, title: str, display: bo
         lines.append(f"SCALARS {name} {vtk_type} 1")
         lines.append("LOOKUP_TABLE default")
         if vtk_type == "int":
-            lines.extend(str(int(value)) for value in values)
+            safe_values = np.nan_to_num(np.asarray(values, dtype=float), nan=0.0, posinf=0.0, neginf=0.0)
+            lines.extend(str(int(value)) for value in safe_values)
         else:
-            lines.extend(f"{float(value):.6f}" for value in values)
+            safe_values = np.nan_to_num(np.asarray(values, dtype=float), nan=-9999.0, posinf=9999.0, neginf=-9999.0)
+            lines.extend(f"{float(value):.6f}" for value in safe_values)
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
@@ -768,6 +1059,15 @@ def build_audit(patch_df: pd.DataFrame) -> pd.DataFrame:
         "OrientationSource",
         "SizeRule",
         "SamplingRule",
+        "FractureScale",
+        "BandID",
+        "BandPatchOrdinal",
+        "BandContinuityMode",
+        "BandVoxelCount",
+        "BandLengthM",
+        "BandTimeExtentMs",
+        "BandPatchSpacingM",
+        "BandMeanDensity",
         "NeedsWellCorrection",
     ]
     columns = [column for column in columns if column in patch_df.columns]
@@ -864,6 +1164,8 @@ def build_summary(
         "initial_dfn": {
             "patch_count": patch_count,
             "layer_distribution": layer_distribution(patch_df["LayerGroup"]),
+            "fracture_scale_distribution": layer_distribution(patch_df["FractureScale"]) if "FractureScale" in patch_df.columns else {"small": patch_count},
+            "band_count": int(patch_df.loc[patch_df.get("BandID", pd.Series(dtype=object)).astype(str).ne(""), "BandID"].nunique()) if "BandID" in patch_df.columns else 0,
             "source_trace_count": int(patch_df["SourceTraceIdx"].nunique()),
             "center_x_stats": finite_stats(patch_df["CenterX"]),
             "center_y_stats": finite_stats(patch_df["CenterY"]),
@@ -935,7 +1237,19 @@ def main() -> int:
         coherence=coherence_grid,
     )
     print(f"[step7b-3d] candidate voxels={len(candidates)}", flush=True)
-    selected, sampling_summary = sample_candidate_voxels(candidates, config=config, rng=rng)
+    generation_mode = str(config.get("generation_mode", "weighted_sampling"))
+    if generation_mode == "multi_scale_connected_bands":
+        selected, sampling_summary = sample_candidate_voxels_multiscale(
+            candidates,
+            x_values=grid["x_values"],
+            y_values=grid["y_values"],
+            config=config,
+            rng=rng,
+        )
+    elif generation_mode == "weighted_sampling":
+        selected, sampling_summary = sample_candidate_voxels(candidates, config=config, rng=rng)
+    else:
+        raise ValueError(f"unsupported generation_mode: {generation_mode}")
     print(f"[step7b-3d] sampled patches={len(selected)}", flush=True)
     patch_df, patch_build_summary = build_patch_table(
         selected=selected,
