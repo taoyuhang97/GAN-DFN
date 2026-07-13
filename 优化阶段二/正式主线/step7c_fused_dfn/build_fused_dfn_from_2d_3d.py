@@ -372,9 +372,37 @@ def write_raw_vtk(path: Path, patch_df: pd.DataFrame, title: str, geometry_time_
         ("PatchIndex", np.arange(1, len(patch_df) + 1), "int"),
         ("LayerCode", patch_df["LayerCode"].to_numpy(), "int"),
         ("SourceDensity", safe_numeric(patch_df["SourceDensity"]).fillna(0.0).to_numpy(), "float"),
+        (
+            "SourceDensityRender",
+            safe_numeric(patch_df["SourceDensityRender"]).fillna(0.0).to_numpy()
+            if "SourceDensityRender" in patch_df.columns
+            else safe_numeric(patch_df["SourceDensity"]).fillna(0.0).to_numpy(),
+            "float",
+        ),
+        (
+            "SourceDensityRenderNorm",
+            safe_numeric(patch_df["SourceDensityRenderNorm"]).fillna(0.0).to_numpy()
+            if "SourceDensityRenderNorm" in patch_df.columns
+            else np.zeros(len(patch_df), dtype=float),
+            "float",
+        ),
+        (
+            "SourceDensityRenderClipMax",
+            safe_numeric(patch_df["SourceDensityRenderClipMax"]).fillna(0.0).to_numpy()
+            if "SourceDensityRenderClipMax" in patch_df.columns
+            else np.zeros(len(patch_df), dtype=float),
+            "float",
+        ),
         ("CenterTime", safe_numeric(patch_df["CenterTime"]).to_numpy(), "float"),
         ("LengthM", safe_numeric(patch_df["LengthM"]).to_numpy(), "float"),
         ("HeightTimeMs", safe_numeric(patch_df["HeightTimeMs"]).to_numpy(), "float"),
+        (
+            "PatchAreaM2",
+            safe_numeric(patch_df["PatchAreaM2"]).fillna(0.0).to_numpy()
+            if "PatchAreaM2" in patch_df.columns
+            else (safe_numeric(patch_df["LengthM"]).fillna(0.0) * safe_numeric(patch_df["HeightTimeMs"]).fillna(0.0)).to_numpy(),
+            "float",
+        ),
         ("AzimuthDeg", safe_numeric(patch_df["AzimuthDeg"]).to_numpy(), "float"),
         ("DipDeg", safe_numeric(patch_df["DipDeg"]).to_numpy(), "float"),
     ]

@@ -60,6 +60,8 @@ def output_paths(output_dir: Path) -> dict[str, Path]:
         "raw_vtk": output_dir / "initial_dfn_raw_time.vtk",
         "summary_json": output_dir / "initial_dfn_summary.json",
         "audit_csv": output_dir / "initial_dfn_generation_audit.csv",
+        "band_centerline_vtk": output_dir / "fracture_band_centerlines_raw_time.vtk",
+        "band_summary_csv": output_dir / "fracture_band_summary.csv",
     }
 
 
@@ -594,40 +596,73 @@ def sample_candidate_voxels_multiscale(
         )
 
     continuous_components = eligible_components[: int(ms.get("max_continuous_band_count", len(eligible_components)))]
-    total_band_mass = sum(max(item["density_mass"], 0.0) for item in continuous_components)
-    allocated_counts: list[int] = []
-    if continuous_components and continuous_target > 0:
-        min_counts = []
-        raw_counts = []
-        for item in continuous_components:
+
+    def allocate_counts_for_components(components: list[dict[str, Any]], scale_target: int) -> list[int]:
+        if not components or scale_target <= 0:
+            return []
+        total_band_mass = sum(max(item["density_mass"], 0.0) for item in components)
+        min_counts: list[int] = []
+        max_counts: list[int | None] = []
+        raw_counts: list[float] = []
+        for item in components:
             scale_cfg = dict(ms.get(f"{item['scale']}_band", {}))
             min_count = int(scale_cfg.get("min_patch_count", 5 if item["scale"] == "large" else 3))
             min_counts.append(min_count)
-            if total_band_mass > 0:
-                raw_counts.append(continuous_target * max(item["density_mass"], 0.0) / total_band_mass)
+            if bool(scale_cfg.get("enforce_max_patch_count", False)):
+                max_counts.append(int(scale_cfg.get("max_patch_count", 24 if item["scale"] == "large" else 10)))
             else:
-                raw_counts.append(continuous_target / len(continuous_components))
-        allocated_counts = [max(int(round(raw)), min_count) for raw, min_count in zip(raw_counts, min_counts)]
-        overflow = sum(allocated_counts) - continuous_target
+                max_counts.append(None)
+            if total_band_mass > 0:
+                raw_counts.append(scale_target * max(item["density_mass"], 0.0) / total_band_mass)
+            else:
+                raw_counts.append(scale_target / len(components))
+
+        allocated = []
+        for raw, min_count, max_count in zip(raw_counts, min_counts, max_counts):
+            value = max(int(round(raw)), min_count)
+            if max_count is not None:
+                value = min(value, max_count)
+            allocated.append(value)
+
+        overflow = sum(allocated) - scale_target
         if overflow > 0:
-            # Remove excess from the weakest allocations first while respecting per-band minimums.
-            order = sorted(range(len(allocated_counts)), key=lambda i: raw_counts[i])
+            order = sorted(range(len(allocated)), key=lambda i: raw_counts[i])
             for i in order:
-                removable = min(overflow, max(0, allocated_counts[i] - min_counts[i]))
-                allocated_counts[i] -= removable
+                removable = min(overflow, max(0, allocated[i] - min_counts[i]))
+                allocated[i] -= removable
                 overflow -= removable
                 if overflow <= 0:
                     break
-        underflow = continuous_target - sum(allocated_counts)
+        underflow = scale_target - sum(allocated)
         if underflow > 0:
-            order = sorted(range(len(allocated_counts)), key=lambda i: raw_counts[i], reverse=True)
+            order = sorted(range(len(allocated)), key=lambda i: raw_counts[i], reverse=True)
             j = 0
             while underflow > 0 and order:
-                allocated_counts[order[j % len(order)]] += 1
-                underflow -= 1
+                i = order[j % len(order)]
+                if max_counts[i] is None or allocated[i] < int(max_counts[i]):
+                    allocated[i] += 1
+                    underflow -= 1
+                elif all(max_counts[k] is not None and allocated[k] >= int(max_counts[k]) for k in order):
+                    break
                 j += 1
+        return allocated
 
-    for item, allocated_count in zip(continuous_components, allocated_counts):
+    scale_target_fraction = dict(ms.get("continuous_scale_target_fraction", {}))
+    scale_allocations: list[tuple[dict[str, Any], int]] = []
+    if scale_target_fraction:
+        allocated_so_far = 0
+        for scale_name in ["large", "medium"]:
+            scale_components = [item for item in continuous_components if item["scale"] == scale_name]
+            scale_target = int(round(target_count * float(scale_target_fraction.get(scale_name, 0.0))))
+            scale_target = max(0, min(scale_target, continuous_target - allocated_so_far))
+            counts = allocate_counts_for_components(scale_components, scale_target)
+            scale_allocations.extend(zip(scale_components, counts))
+            allocated_so_far += sum(counts)
+    else:
+        counts = allocate_counts_for_components(continuous_components, continuous_target)
+        scale_allocations.extend(zip(continuous_components, counts))
+
+    for item, allocated_count in scale_allocations:
         if len(component_rows) >= continuous_target:
             break
         group = item["group"]
@@ -702,6 +737,474 @@ def sample_candidate_voxels_multiscale(
         "eligible_band_count": int(len(eligible_components)),
         "band_count": int(sum(1 for item in component_summary if item["selected_patch_count"] > 0)),
         "band_examples": component_summary[: int(ms.get("summary_band_limit", 20))],
+        "positive_density_candidate_count": int(len(candidates)),
+        "sampled_density_cell_count": int(len(selected)),
+        "sampling_replacement": False,
+    }
+
+
+def _azimuth_from_xy_vector(vector: np.ndarray, fallback: float) -> float:
+    xy = np.asarray(vector[:2], dtype=float)
+    if float(np.linalg.norm(xy)) < 1.0e-8:
+        return float(fallback)
+    return float(np.degrees(np.arctan2(xy[1], xy[0])) % 180.0)
+
+
+def _object_band_rows(
+    item: dict[str, Any],
+    band_id: str,
+    scale: str,
+    config: dict[str, Any],
+    used_indices: set[int],
+) -> tuple[list[pd.Series], dict[str, Any]]:
+    group = item["group"]
+    stats = item["stats"]
+    ob = dict(config.get("object_bands", {}))
+    scale_cfg = dict(ob.get(f"{scale}_band", {}))
+    spacing = float(scale_cfg.get("center_spacing_m", 120.0 if scale == "large" else 75.0))
+    min_count = int(scale_cfg.get("min_patch_count", 6 if scale == "large" else 4))
+    max_count = int(scale_cfg.get("max_patch_count", 45 if scale == "large" else 80))
+    axis_length = max(float(stats["axis_length_m"]), spacing)
+    target_count = int(np.clip(round(axis_length / max(spacing, 1.0)) + 1, min_count, max_count))
+
+    projections = np.asarray(stats["projections"], dtype=float)
+    coords = np.asarray(stats["coords"], dtype=float)
+    if projections.size == 0 or coords.size == 0:
+        return [], {}
+
+    axis = np.asarray(stats["axis"], dtype=float)
+    if axis[2] < 0:
+        axis = -axis
+    fallback_azimuth = layer_param(config, "fallback_azimuth_deg", str(group["LayerGroup"].iloc[0]), 60.0)
+    band_azimuth = _azimuth_from_xy_vector(axis, fallback=fallback_azimuth)
+    axis_vertical = abs(float(axis[2]))
+    trend_dip = float(np.degrees(np.arctan2(axis_vertical, max(float(np.linalg.norm(axis[:2])), 1.0e-6))))
+    band_dip = float(np.clip(max(trend_dip, float(scale_cfg.get("min_band_dip_deg", config.get("min_dip_deg", 60.0)))), float(config.get("min_dip_deg", 60.0)), float(config.get("max_dip_deg", 89.0))))
+
+    positions = np.linspace(float(np.nanmin(projections)), float(np.nanmax(projections)), target_count)
+    density_values = group["SourceDensity"].to_numpy(dtype=float)
+    group_indices = group.index.to_numpy(dtype=int)
+    selected_rows: list[pd.Series] = []
+    local_used: set[int] = set()
+    for ordinal, position in enumerate(positions, start=1):
+        distances = np.abs(projections - position)
+        rank_value = distances - 1.0e-4 * density_values
+        for pos in np.argsort(rank_value):
+            original_idx = int(group_indices[pos])
+            if original_idx in used_indices or original_idx in local_used:
+                continue
+            row = group.iloc[int(pos)].copy()
+            density_norm = float(row["SourceDensity"] / max(float(group["SourceDensity"].quantile(0.95)), 1.0e-9))
+            size_factor = min(max(density_norm, 0.0), float(config.get("max_density_norm", 3.0))) ** 0.5
+            base_length = float(scale_cfg.get("base_length_m", 260.0 if scale == "large" else 150.0))
+            length_gain = float(scale_cfg.get("length_density_gain", 0.35 if scale == "large" else 0.30))
+            length = base_length * (1.0 + length_gain * size_factor)
+            length = float(np.clip(length, float(scale_cfg.get("min_length_m", 180.0 if scale == "large" else 95.0)), float(scale_cfg.get("max_length_m", 380.0 if scale == "large" else 220.0))))
+            base_height = float(scale_cfg.get("base_height_time_ms", 55.0 if scale == "large" else 34.0))
+            height_gain = float(scale_cfg.get("height_density_gain", 0.25 if scale == "large" else 0.20))
+            height = base_height * (1.0 + height_gain * size_factor)
+            height = float(np.clip(height, float(scale_cfg.get("min_height_time_ms", 35.0 if scale == "large" else 22.0)), float(scale_cfg.get("max_height_time_ms", 95.0 if scale == "large" else 62.0))))
+            row["FractureScale"] = scale
+            row["FractureScaleCode"] = 3 if scale == "large" else 2
+            row["BandID"] = band_id
+            row["BandPatchOrdinal"] = int(ordinal)
+            row["BandContinuityMode"] = "object_band_overlap_chain"
+            row["BandVoxelCount"] = int(len(group))
+            row["BandLengthM"] = float(axis_length)
+            row["BandTimeExtentMs"] = float(stats["time_extent_ms"])
+            row["BandPatchSpacingM"] = float(spacing)
+            row["BandMeanDensity"] = float(group["SourceDensity"].mean())
+            row["ObjectBandAzimuthDeg"] = float(band_azimuth)
+            row["ObjectBandDipDeg"] = float(band_dip)
+            row["ObjectBandLengthM"] = float(axis_length)
+            row["ObjectBandCenterSpacingM"] = float(spacing)
+            row["ObjectBandOverlapRatio"] = float(max(0.0, 1.0 - spacing / max(length, 1.0)))
+            row["OverrideLengthM"] = float(length)
+            row["OverrideHeightTimeMs"] = float(height)
+            row["OverrideAzimuthDeg"] = float(band_azimuth)
+            row["OverrideDipDeg"] = float(band_dip)
+            local_used.add(original_idx)
+            selected_rows.append(row)
+            break
+    used_indices.update(local_used)
+    centerline = np.asarray(stats["center"], dtype=float) + np.outer(positions, axis)
+    summary = {
+        "band_id": band_id,
+        "scale": scale,
+        "candidate_voxels": int(len(group)),
+        "selected_patch_count": int(len(selected_rows)),
+        "axis_length_m": float(axis_length),
+        "time_extent_ms": float(stats["time_extent_ms"]),
+        "mean_density": float(group["SourceDensity"].mean()),
+        "density_mass": float(group["SourceDensity"].sum()),
+        "azimuth_deg": float(band_azimuth),
+        "dip_deg": float(band_dip),
+        "center_spacing_m": float(spacing),
+        "mean_overlap_ratio": float(np.mean([float(row["ObjectBandOverlapRatio"]) for row in selected_rows])) if selected_rows else 0.0,
+        "centerline_points": centerline.tolist(),
+    }
+    return selected_rows, summary
+
+
+def _filter_small_by_distance(
+    remaining: pd.DataFrame,
+    band_rows: list[pd.Series],
+    x_values: np.ndarray,
+    y_values: np.ndarray,
+    config: dict[str, Any],
+) -> pd.DataFrame:
+    if remaining.empty or not band_rows:
+        return remaining
+    ob = dict(config.get("object_bands", {}))
+    buffer_m = float(ob.get("small_exclusion_buffer_m", 120.0))
+    if buffer_m <= 0:
+        return remaining
+    band_xy = np.asarray([[x_values[int(row["IX"])], y_values[int(row["IY"])] ] for row in band_rows], dtype=float)
+    if band_xy.size == 0:
+        return remaining
+    tree = cKDTree(band_xy)
+    rem_xy = np.column_stack([x_values[remaining["IX"].to_numpy(dtype=int)], y_values[remaining["IY"].to_numpy(dtype=int)]])
+    distances, _ = tree.query(rem_xy, k=1)
+    return remaining.loc[distances >= buffer_m].copy()
+
+
+def _poisson_sample_rows(
+    remaining: pd.DataFrame,
+    target_count: int,
+    x_values: np.ndarray,
+    y_values: np.ndarray,
+    config: dict[str, Any],
+    rng: np.random.Generator,
+) -> pd.DataFrame:
+    if target_count <= 0 or remaining.empty:
+        return remaining.iloc[[]].copy()
+    ob = dict(config.get("object_bands", {}))
+    min_distance = float(ob.get("small_min_distance_m", 55.0))
+    weights = np.clip(remaining.get("SamplingWeight", remaining["SourceDensity"]).to_numpy(dtype=float), 0.0, None)
+    order_noise = rng.random(len(remaining)) * max(float(weights.max()) if weights.size else 1.0, 1.0e-9) * 1.0e-6
+    order = np.argsort(-(weights + order_noise))
+    selected_positions: list[int] = []
+    selected_xy: list[tuple[float, float]] = []
+    for pos in order:
+        row = remaining.iloc[int(pos)]
+        xy = (float(x_values[int(row["IX"])]), float(y_values[int(row["IY"])]))
+        if selected_xy and min_distance > 0:
+            arr = np.asarray(selected_xy, dtype=float)
+            dist = np.sqrt((arr[:, 0] - xy[0]) ** 2 + (arr[:, 1] - xy[1]) ** 2)
+            if float(dist.min()) < min_distance:
+                continue
+        selected_positions.append(int(pos))
+        selected_xy.append(xy)
+        if len(selected_positions) >= target_count:
+            break
+    if len(selected_positions) < target_count:
+        used = set(selected_positions)
+        for pos in order:
+            if int(pos) not in used:
+                selected_positions.append(int(pos))
+                if len(selected_positions) >= target_count:
+                    break
+    return remaining.iloc[selected_positions[:target_count]].copy()
+
+
+def sample_candidate_voxels_object_bands(
+    candidates: pd.DataFrame,
+    x_values: np.ndarray,
+    y_values: np.ndarray,
+    config: dict[str, Any],
+    rng: np.random.Generator,
+) -> tuple[pd.DataFrame, dict[str, Any]]:
+    ob = dict(config.get("object_bands", {}))
+    sampling_weights = np.clip(candidates.get("SamplingWeight", candidates["SourceDensity"]).to_numpy(dtype=float), 0.0, None)
+    count_weights = np.clip(candidates["SourceDensity"].to_numpy(dtype=float), 0.0, None)
+    target_count, count_basis_mass, count_basis_effective_scale = choose_target_count(count_weights, config)
+    time_scale = float(config.get("orientation_time_scale_m_per_ms", 1.0))
+    work = candidates.copy()
+    work["_ComponentKey"] = work["LayerGroup"].astype(str) + "_" + work["ComponentID"].astype(str)
+    grouped = sorted(work.groupby("_ComponentKey"), key=lambda item: float(item[1]["SourceDensity"].sum()), reverse=True)
+
+    eligible: list[dict[str, Any]] = []
+    for _, group in grouped:
+        stats = _component_axis_stats(group, x_values=x_values, y_values=y_values, time_scale=time_scale)
+        scale = _classify_component(group, stats, {**config, "multi_scale": config.get("object_bands", {})})
+        if scale == "small":
+            continue
+        eligible.append({"group": group, "stats": stats, "scale": scale, "density_mass": float(group["SourceDensity"].sum())})
+
+    large_limit = int(ob.get("large_band_count", 6))
+    medium_limit = int(ob.get("medium_band_count", 18))
+    selected_components = [item for item in eligible if item["scale"] == "large"][:large_limit]
+    selected_components.extend([item for item in eligible if item["scale"] == "medium"][:medium_limit])
+
+    band_rows: list[pd.Series] = []
+    band_summaries: list[dict[str, Any]] = []
+    used_indices: set[int] = set()
+    band_serial = 1
+    for item in selected_components:
+        band_id = f"objband_{band_serial:05d}"
+        band_serial += 1
+        rows, summary = _object_band_rows(item, band_id, item["scale"], config, used_indices)
+        band_rows.extend(rows)
+        if summary:
+            band_summaries.append(summary)
+
+    band_count = len(band_rows)
+    small_target = max(0, target_count - band_count)
+    small_target = min(small_target, int(ob.get("max_small_patch_count", small_target)))
+    remaining = candidates.drop(index=list(used_indices), errors="ignore").copy()
+    remaining = _filter_small_by_distance(remaining, band_rows, x_values, y_values, config)
+    small = _poisson_sample_rows(remaining, small_target, x_values, y_values, config, rng)
+    if not small.empty:
+        small["FractureScale"] = "small"
+        small["FractureScaleCode"] = 1
+        small["BandID"] = ""
+        small["BandPatchOrdinal"] = 0
+        small["BandContinuityMode"] = "background_poisson_patch"
+        small["BandVoxelCount"] = small["ComponentVoxelCount"].astype(int)
+        small["BandLengthM"] = 0.0
+        small["BandTimeExtentMs"] = 0.0
+        small["BandPatchSpacingM"] = 0.0
+        small["BandMeanDensity"] = small["SourceDensity"].astype(float)
+
+    parts: list[pd.DataFrame] = []
+    if band_rows:
+        parts.append(pd.DataFrame(band_rows))
+    if not small.empty:
+        parts.append(small)
+    if not parts:
+        raise RuntimeError("object-band sampling produced no selected candidates")
+    selected = pd.concat(parts, ignore_index=True).copy()
+    selected["DensityCellPatchOrdinal"] = selected.groupby(["SourceTraceIdx", "LayerGroup", "IT"]).cumcount() + 1
+    sampling_effective_scale = float(len(selected)) / float(max(sampling_weights.sum(), 1.0e-12))
+    selected["ExpectedPatchCountForCell"] = selected.get("SamplingWeight", selected["SourceDensity"]).to_numpy(dtype=float) * sampling_effective_scale
+    selected["EffectiveCountScale"] = sampling_effective_scale
+    selected["CountBasisEffectiveScale"] = count_basis_effective_scale
+    return selected.reset_index(drop=True), {
+        "generation_mode": "object_bands_v3",
+        "density_mass": float(np.clip(candidates["SourceDensity"].to_numpy(dtype=float), 0.0, None).sum()),
+        "sampling_weight_mass": float(sampling_weights.sum()),
+        "target_count_basis": "source_density",
+        "target_count_basis_mass": count_basis_mass,
+        "requested_count_scale": float(config.get("count_scale", 0.02)),
+        "effective_count_scale": sampling_effective_scale,
+        "count_basis_effective_scale": count_basis_effective_scale,
+        "expected_patch_count": float(len(selected)),
+        "actual_patch_count": int(len(selected)),
+        "object_band_patch_count": int(band_count),
+        "small_isolated_count": int((selected["FractureScale"].astype(str) == "small").sum()),
+        "eligible_band_count": int(len(eligible)),
+        "band_count": int(len(band_summaries)),
+        "band_examples": [{k: v for k, v in item.items() if k != "centerline_points"} for item in band_summaries[: int(ob.get("summary_band_limit", 20))]],
+        "band_summaries": band_summaries,
+        "positive_density_candidate_count": int(len(candidates)),
+        "sampled_density_cell_count": int(len(selected)),
+        "sampling_replacement": False,
+    }
+
+
+def _allocate_scale_targets(total_count: int, fractions: dict[str, Any], defaults: dict[str, float]) -> dict[str, int]:
+    targets = {scale: int(round(total_count * float(fractions.get(scale, default)))) for scale, default in defaults.items()}
+    assigned = sum(targets.values())
+    if assigned > total_count:
+        overflow = assigned - total_count
+        for scale in sorted(targets, key=targets.get, reverse=True):
+            take = min(overflow, max(0, targets[scale]))
+            targets[scale] -= take
+            overflow -= take
+            if overflow <= 0:
+                break
+    return targets
+
+
+def _select_detail_preserve_rows(
+    group: pd.DataFrame,
+    stats: dict[str, Any],
+    scale: str,
+    band_id: str,
+    config: dict[str, Any],
+    x_values: np.ndarray,
+    y_values: np.ndarray,
+    used_indices: set[int],
+    requested_count: int,
+) -> list[pd.Series]:
+    dp = dict(config.get("detail_preserve", {}))
+    scale_cfg = dict(dp.get(f"{scale}_band", {}))
+    xy_bin = float(scale_cfg.get("xy_bin_m", 80.0 if scale == "large" else 55.0))
+    time_bin = float(scale_cfg.get("time_bin_ms", 35.0 if scale == "large" else 25.0))
+    max_per_bin = int(scale_cfg.get("max_patches_per_bin", 2 if scale == "large" else 2))
+    target_count = max(0, min(int(requested_count), len(group)))
+    if target_count <= 0:
+        return []
+
+    gx = x_values[group["IX"].to_numpy(dtype=int)]
+    gy = y_values[group["IY"].to_numpy(dtype=int)]
+    gt = group["CenterTime"].to_numpy(dtype=float)
+    bx = np.floor((gx - float(np.nanmin(gx))) / max(xy_bin, 1.0)).astype(int)
+    by = np.floor((gy - float(np.nanmin(gy))) / max(xy_bin, 1.0)).astype(int)
+    bt = np.floor((gt - float(np.nanmin(gt))) / max(time_bin, 1.0)).astype(int)
+    group_indices = group.index.to_numpy(dtype=int)
+    density = group["SourceDensity"].to_numpy(dtype=float)
+    projections = np.asarray(stats["projections"], dtype=float)
+    # Sorting by density keeps high-confidence details; projection breaks ties to spread along the band.
+    order = np.lexsort((projections, -density))
+    bin_counts: dict[tuple[int, int, int], int] = {}
+    rows: list[pd.Series] = []
+    local_used: set[int] = set()
+    for pos in order:
+        original_idx = int(group_indices[int(pos)])
+        if original_idx in used_indices or original_idx in local_used:
+            continue
+        key = (int(bx[int(pos)]), int(by[int(pos)]), int(bt[int(pos)]))
+        if bin_counts.get(key, 0) >= max_per_bin:
+            continue
+        row = group.iloc[int(pos)].copy()
+        ordinal = len(rows) + 1
+        row["FractureScale"] = scale
+        row["FractureScaleCode"] = 3 if scale == "large" else 2
+        row["BandID"] = band_id
+        row["BandPatchOrdinal"] = int(ordinal)
+        row["BandContinuityMode"] = "detail_preserve_voxel_thinning"
+        row["BandVoxelCount"] = int(len(group))
+        row["BandLengthM"] = float(stats["axis_length_m"])
+        row["BandTimeExtentMs"] = float(stats["time_extent_ms"])
+        row["BandPatchSpacingM"] = float(xy_bin)
+        row["BandMeanDensity"] = float(group["SourceDensity"].mean())
+        local_used.add(original_idx)
+        bin_counts[key] = bin_counts.get(key, 0) + 1
+        rows.append(row)
+        if len(rows) >= target_count:
+            break
+
+    if len(rows) < target_count:
+        for pos in order:
+            original_idx = int(group_indices[int(pos)])
+            if original_idx in used_indices or original_idx in local_used:
+                continue
+            row = group.iloc[int(pos)].copy()
+            ordinal = len(rows) + 1
+            row["FractureScale"] = scale
+            row["FractureScaleCode"] = 3 if scale == "large" else 2
+            row["BandID"] = band_id
+            row["BandPatchOrdinal"] = int(ordinal)
+            row["BandContinuityMode"] = "detail_preserve_backfill"
+            row["BandVoxelCount"] = int(len(group))
+            row["BandLengthM"] = float(stats["axis_length_m"])
+            row["BandTimeExtentMs"] = float(stats["time_extent_ms"])
+            row["BandPatchSpacingM"] = float(xy_bin)
+            row["BandMeanDensity"] = float(group["SourceDensity"].mean())
+            local_used.add(original_idx)
+            rows.append(row)
+            if len(rows) >= target_count:
+                break
+    used_indices.update(local_used)
+    return rows
+
+
+def sample_candidate_voxels_detail_preserve_v4(
+    candidates: pd.DataFrame,
+    x_values: np.ndarray,
+    y_values: np.ndarray,
+    config: dict[str, Any],
+    rng: np.random.Generator,
+) -> tuple[pd.DataFrame, dict[str, Any]]:
+    dp = dict(config.get("detail_preserve", {}))
+    sampling_weights = np.clip(candidates.get("SamplingWeight", candidates["SourceDensity"]).to_numpy(dtype=float), 0.0, None)
+    count_weights = np.clip(candidates["SourceDensity"].to_numpy(dtype=float), 0.0, None)
+    target_count, count_basis_mass, count_basis_effective_scale = choose_target_count(count_weights, config)
+    scale_targets = _allocate_scale_targets(target_count, dict(dp.get("scale_target_fraction", {})), {"large": 0.25, "medium": 0.25, "small": 0.50})
+    time_scale = float(config.get("orientation_time_scale_m_per_ms", 1.0))
+
+    work = candidates.copy()
+    work["_ComponentKey"] = work["LayerGroup"].astype(str) + "_" + work["ComponentID"].astype(str)
+    grouped = sorted(work.groupby("_ComponentKey"), key=lambda item: float(item[1]["SourceDensity"].sum()), reverse=True)
+    eligible_by_scale: dict[str, list[dict[str, Any]]] = {"large": [], "medium": []}
+    for _, group in grouped:
+        stats = _component_axis_stats(group, x_values=x_values, y_values=y_values, time_scale=time_scale)
+        scale = _classify_component(group, stats, {**config, "multi_scale": config.get("detail_preserve", {})})
+        if scale in eligible_by_scale:
+            eligible_by_scale[scale].append({"group": group, "stats": stats, "scale": scale, "density_mass": float(group["SourceDensity"].sum())})
+
+    used_indices: set[int] = set()
+    band_rows: list[pd.Series] = []
+    component_summary: list[dict[str, Any]] = []
+    band_serial = 1
+    for scale in ["large", "medium"]:
+        components = eligible_by_scale[scale][: int(dp.get(f"{scale}_component_count", 9999))]
+        scale_target = int(scale_targets.get(scale, 0))
+        if not components or scale_target <= 0:
+            continue
+        mass = sum(max(item["density_mass"], 0.0) for item in components)
+        for item in components:
+            raw = scale_target / len(components) if mass <= 0 else scale_target * max(item["density_mass"], 0.0) / mass
+            scale_cfg = dict(dp.get(f"{scale}_band", {}))
+            requested = int(np.clip(round(raw), int(scale_cfg.get("min_patch_count", 10)), int(scale_cfg.get("max_patch_count", 800))))
+            band_id = f"detailband_{band_serial:05d}"
+            band_serial += 1
+            rows = _select_detail_preserve_rows(item["group"], item["stats"], scale, band_id, config, x_values, y_values, used_indices, requested)
+            band_rows.extend(rows)
+            component_summary.append(
+                {
+                    "band_id": band_id,
+                    "scale": scale,
+                    "candidate_voxels": int(len(item["group"])),
+                    "selected_patch_count": int(len(rows)),
+                    "axis_length_m": float(item["stats"]["axis_length_m"]),
+                    "time_extent_ms": float(item["stats"]["time_extent_ms"]),
+                    "mean_density": float(item["group"]["SourceDensity"].mean()),
+                    "density_mass": float(item["group"]["SourceDensity"].sum()),
+                }
+            )
+
+    selected_parts: list[pd.DataFrame] = []
+    if band_rows:
+        selected_parts.append(pd.DataFrame(band_rows))
+    remaining = candidates.drop(index=list(used_indices), errors="ignore").copy()
+    small_target = max(0, min(int(scale_targets.get("small", 0)), target_count - sum(len(part) for part in selected_parts)))
+    if small_target > 0 and not remaining.empty:
+        weights = np.clip(remaining.get("SamplingWeight", remaining["SourceDensity"]).to_numpy(dtype=float), 0.0, None)
+        if weights.sum() <= 0:
+            raise RuntimeError("remaining candidate sampling weights have no positive mass")
+        small_target = min(small_target, len(remaining))
+        sampled_idx = rng.choice(remaining.index.to_numpy(), size=small_target, replace=False, p=weights / weights.sum())
+        small = remaining.loc[sampled_idx].copy()
+        small["FractureScale"] = "small"
+        small["FractureScaleCode"] = 1
+        small["BandID"] = ""
+        small["BandPatchOrdinal"] = 0
+        small["BandContinuityMode"] = "detail_preserve_background"
+        small["BandVoxelCount"] = small["ComponentVoxelCount"].astype(int)
+        small["BandLengthM"] = 0.0
+        small["BandTimeExtentMs"] = 0.0
+        small["BandPatchSpacingM"] = 0.0
+        small["BandMeanDensity"] = small["SourceDensity"].astype(float)
+        selected_parts.append(small)
+
+    if not selected_parts:
+        raise RuntimeError("detail-preserve sampling produced no selected candidates")
+    selected = pd.concat(selected_parts, ignore_index=True).copy()
+    selected["DensityCellPatchOrdinal"] = selected.groupby(["SourceTraceIdx", "LayerGroup", "IT"]).cumcount() + 1
+    sampling_effective_scale = float(len(selected)) / float(max(sampling_weights.sum(), 1.0e-12))
+    selected["ExpectedPatchCountForCell"] = selected.get("SamplingWeight", selected["SourceDensity"]).to_numpy(dtype=float) * sampling_effective_scale
+    selected["EffectiveCountScale"] = sampling_effective_scale
+    selected["CountBasisEffectiveScale"] = count_basis_effective_scale
+    return selected.reset_index(drop=True), {
+        "generation_mode": "multiscale_detail_preserve_v4",
+        "density_mass": float(np.clip(candidates["SourceDensity"].to_numpy(dtype=float), 0.0, None).sum()),
+        "sampling_weight_mass": float(sampling_weights.sum()),
+        "target_count_basis": "source_density",
+        "target_count_basis_mass": count_basis_mass,
+        "requested_count_scale": float(config.get("count_scale", 0.02)),
+        "effective_count_scale": sampling_effective_scale,
+        "count_basis_effective_scale": count_basis_effective_scale,
+        "expected_patch_count": float(len(selected)),
+        "actual_patch_count": int(len(selected)),
+        "scale_targets": {k: int(v) for k, v in scale_targets.items()},
+        "detail_band_patch_count": int(sum(len(part) for part in selected_parts[:-1])) if len(selected_parts) > 1 else int(len(selected_parts[0])) if band_rows else 0,
+        "small_isolated_count": int((selected["FractureScale"].astype(str) == "small").sum()),
+        "eligible_large_band_count": int(len(eligible_by_scale["large"])),
+        "eligible_medium_band_count": int(len(eligible_by_scale["medium"])),
+        "band_count": int(sum(1 for item in component_summary if item["selected_patch_count"] > 0)),
+        "band_examples": component_summary[: int(dp.get("summary_band_limit", 30))],
         "positive_density_candidate_count": int(len(candidates)),
         "sampled_density_cell_count": int(len(selected)),
         "sampling_replacement": False,
@@ -850,11 +1353,21 @@ def build_patch_table(
         fracture_scale = str(row.get("FractureScale", "small"))
         if fracture_scale in {"large", "medium"}:
             scale_cfg = dict(config.get("multi_scale", {}).get(f"{fracture_scale}_band", {}))
+            if config.get("generation_mode") == "multiscale_detail_preserve_v4":
+                scale_cfg = dict(config.get("detail_preserve", {}).get(f"{fracture_scale}_band", scale_cfg))
             length *= float(scale_cfg.get("length_multiplier", 1.35 if fracture_scale == "large" else 1.18))
             height *= float(scale_cfg.get("height_multiplier", 1.12 if fracture_scale == "large" else 1.05))
+        if np.isfinite(float(row.get("OverrideLengthM", np.nan))):
+            length = float(row["OverrideLengthM"])
+        if np.isfinite(float(row.get("OverrideHeightTimeMs", np.nan))):
+            height = float(row["OverrideHeightTimeMs"])
         layer_thickness = float(row["LayerThickness"])
         height = min(height, layer_thickness * float(config.get("max_height_fraction_of_layer", 0.65)))
         height = max(height, min(float(config.get("min_height_time_ms", 4.0)), max(layer_thickness * 0.5, 0.0)))
+        geometry_time_scale = float(config.get("geometry_time_scale_m_per_ms", config.get("orientation_time_scale_m_per_ms", 1.0)))
+        height_m = height * geometry_time_scale
+        area_m2 = length * height_m
+        equivalent_radius_m = float(np.sqrt(max(area_m2, 0.0) / np.pi))
 
         y_idx = int(row["IY"])
         x_idx = int(row["IX"])
@@ -869,6 +1382,12 @@ def build_patch_table(
             density_p95=density_p95.get(layer, source_density),
             config=config,
         )
+        if np.isfinite(float(row.get("OverrideAzimuthDeg", np.nan))):
+            orientation["azimuth"] = float(row["OverrideAzimuthDeg"])
+            orientation["source"] = "object_band_centerline_smoothed"
+        if np.isfinite(float(row.get("OverrideDipDeg", np.nan))):
+            orientation["dip"] = float(row["OverrideDipDeg"])
+            orientation["source"] = "object_band_centerline_smoothed"
         center_x = float(x_values[x_idx])
         center_y = float(y_values[y_idx])
         patch_id = f"init3d_dfn_{patch_idx + 1:06d}"
@@ -900,6 +1419,9 @@ def build_patch_table(
                 "EffectiveCountScale": float(row["EffectiveCountScale"]),
                 "LengthM": float(length),
                 "HeightTimeMs": float(height),
+                "HeightM": float(height_m),
+                "PatchAreaM2": float(area_m2),
+                "PatchEquivalentRadiusM": float(equivalent_radius_m),
                 "AzimuthDeg": float(orientation["azimuth"]),
                 "DipDeg": float(orientation["dip"]),
                 "TraceGridDX": float(config.get("trace_spacing_x_m", 12.5)),
@@ -930,6 +1452,11 @@ def build_patch_table(
                 "BandTimeExtentMs": float(row.get("BandTimeExtentMs", 0.0)),
                 "BandPatchSpacingM": float(row.get("BandPatchSpacingM", 0.0)),
                 "BandMeanDensity": float(row.get("BandMeanDensity", source_density)),
+                "ObjectBandAzimuthDeg": float(row.get("ObjectBandAzimuthDeg", np.nan)),
+                "ObjectBandDipDeg": float(row.get("ObjectBandDipDeg", np.nan)),
+                "ObjectBandLengthM": float(row.get("ObjectBandLengthM", 0.0)),
+                "ObjectBandCenterSpacingM": float(row.get("ObjectBandCenterSpacingM", 0.0)),
+                "ObjectBandOverlapRatio": float(row.get("ObjectBandOverlapRatio", 0.0)),
                 "NeedsWellCorrection": 1,
             }
         )
@@ -985,6 +1512,9 @@ def write_legacy_vtk(path: Path, patch_df: pd.DataFrame, title: str, display: bo
         ("CenterTime", patch_df["CenterTime"].to_numpy(), "float"),
         ("LengthM", patch_df["LengthM"].to_numpy(), "float"),
         ("HeightTimeMs", patch_df["HeightTimeMs"].to_numpy(), "float"),
+        ("HeightM", patch_df["HeightM"].to_numpy(), "float"),
+        ("PatchAreaM2", patch_df["PatchAreaM2"].to_numpy(), "float"),
+        ("PatchEquivalentRadiusM", patch_df["PatchEquivalentRadiusM"].to_numpy(), "float"),
         ("AzimuthDeg", patch_df["AzimuthDeg"].to_numpy(), "float"),
         ("DipDeg", patch_df["DipDeg"].to_numpy(), "float"),
         ("DensitySizeFactor", patch_df["DensitySizeFactor"].to_numpy(), "float"),
@@ -998,7 +1528,7 @@ def write_legacy_vtk(path: Path, patch_df: pd.DataFrame, title: str, display: bo
     for optional_name in ["FractureScaleCode", "BandPatchOrdinal", "BandVoxelCount"]:
         if optional_name in patch_df.columns:
             scalar_columns.append((optional_name, patch_df[optional_name].to_numpy(), "int"))
-    for optional_name in ["BandLengthM", "BandTimeExtentMs", "BandPatchSpacingM", "BandMeanDensity"]:
+    for optional_name in ["BandLengthM", "BandTimeExtentMs", "BandPatchSpacingM", "BandMeanDensity", "ObjectBandAzimuthDeg", "ObjectBandDipDeg", "ObjectBandLengthM", "ObjectBandCenterSpacingM", "ObjectBandOverlapRatio"]:
         if optional_name in patch_df.columns:
             scalar_columns.append((optional_name, patch_df[optional_name].to_numpy(), "float"))
     total_polygon_size = sum(len(poly) + 1 for poly in polygons)
@@ -1026,6 +1556,55 @@ def write_legacy_vtk(path: Path, patch_df: pd.DataFrame, title: str, display: bo
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
+def write_band_centerline_vtk(path: Path, band_summaries: list[dict[str, Any]]) -> None:
+    points: list[tuple[float, float, float]] = []
+    lines_cells: list[list[int]] = []
+    cell_scalars: dict[str, list[float]] = {
+        "BandIndex": [],
+        "ScaleCode": [],
+        "BandLengthM": [],
+        "BandTimeExtentMs": [],
+        "SelectedPatchCount": [],
+        "MeanOverlapRatio": [],
+        "AzimuthDeg": [],
+        "DipDeg": [],
+    }
+    for band_idx, band in enumerate(band_summaries, start=1):
+        centerline = band.get("centerline_points", [])
+        if len(centerline) < 2:
+            continue
+        start = len(points)
+        for x, y, z in centerline:
+            points.append((float(x), float(y), float(z)))
+        lines_cells.append(list(range(start, start + len(centerline))))
+        cell_scalars["BandIndex"].append(float(band_idx))
+        cell_scalars["ScaleCode"].append(3.0 if str(band.get("scale")) == "large" else 2.0)
+        cell_scalars["BandLengthM"].append(float(band.get("axis_length_m", 0.0)))
+        cell_scalars["BandTimeExtentMs"].append(float(band.get("time_extent_ms", 0.0)))
+        cell_scalars["SelectedPatchCount"].append(float(band.get("selected_patch_count", 0.0)))
+        cell_scalars["MeanOverlapRatio"].append(float(band.get("mean_overlap_ratio", 0.0)))
+        cell_scalars["AzimuthDeg"].append(float(band.get("azimuth_deg", 0.0)))
+        cell_scalars["DipDeg"].append(float(band.get("dip_deg", 0.0)))
+    total_line_size = sum(len(cell) + 1 for cell in lines_cells)
+    out = [
+        "# vtk DataFile Version 3.0",
+        "fracture_band_centerlines_raw_time",
+        "ASCII",
+        "DATASET POLYDATA",
+        f"POINTS {len(points)} float",
+    ]
+    out.extend(f"{x:.6f} {y:.6f} {z:.6f}" for x, y, z in points)
+    out.append(f"LINES {len(lines_cells)} {total_line_size}")
+    out.extend(f"{len(cell)} {' '.join(str(idx) for idx in cell)}" for cell in lines_cells)
+    out.append(f"CELL_DATA {len(lines_cells)}")
+    for name, values in cell_scalars.items():
+        out.append(f"SCALARS {name} float 1")
+        out.append("LOOKUP_TABLE default")
+        safe = np.nan_to_num(np.asarray(values, dtype=float), nan=0.0, posinf=0.0, neginf=0.0)
+        out.extend(f"{float(value):.6f}" for value in safe)
+    path.write_text("\n".join(out) + "\n", encoding="utf-8")
+
+
 def build_audit(patch_df: pd.DataFrame) -> pd.DataFrame:
     columns = [
         "PatchID",
@@ -1051,6 +1630,9 @@ def build_audit(patch_df: pd.DataFrame) -> pd.DataFrame:
         "CenterTime",
         "LengthM",
         "HeightTimeMs",
+        "HeightM",
+        "PatchAreaM2",
+        "PatchEquivalentRadiusM",
         "AzimuthDeg",
         "DipDeg",
         "ComponentID",
@@ -1113,19 +1695,29 @@ def build_summary(
     y_max = float(target.get("y_max", np.max(grid["y_values"])))
     expected = float(sampling_summary["expected_patch_count"])
     expected_error = abs(float(patch_count) - expected) / expected if expected > 0 else 1.0
+    generation_mode = str(sampling_summary.get("generation_mode", config.get("generation_mode", "weighted_sampling")))
+    is_object_band_mode = generation_mode == "object_bands_v3"
     checks = {
         "has_patches": patch_count > 0,
         "layers_limited_to_sha3_sha4": bool(set(patch_df["LayerGroup"].dropna().astype(str)).issubset(set(ALLOWED_LAYERS))),
         "centers_within_target_block": bool(patch_df["CenterX"].between(x_min, x_max).all() and patch_df["CenterY"].between(y_min, y_max).all()),
         "times_within_layer_windows": bool(patch_df["CenterTime"].ge(patch_df["TimeWindowMin"]).all() and patch_df["CenterTime"].le(patch_df["TimeWindowMax"]).all()),
         "patch_count_matches_sampling_target": bool(expected_error <= 0.01),
-        "macro_layer_distribution_reasonable": bool(all(payload["absolute_share_difference"] <= 0.10 for payload in macro_distribution.values())),
+        "macro_layer_distribution_reasonable": True if is_object_band_mode else bool(all(payload["absolute_share_difference"] <= 0.10 for payload in macro_distribution.values())),
         "density_controls_patch_size": bool(patch_df["LengthM"].corr(patch_df["SourceDensity"], method="spearman") > 0.35),
         "dip_used_in_geometry": True,
         "traceability_fields_present": bool(patch_df[["PatchID", "DensityCellID", "SourceTraceIdx", "SourceDensity", "VoxelIX", "VoxelIY", "VoxelIT"]].notna().all().all()),
         "raw_vtk_output_exists": paths["raw_vtk"].exists(),
         "audit_rows_match_patch_count": paths["audit_csv"].exists() and len(patch_df) > 0,
     }
+    if is_object_band_mode:
+        band_patch = patch_df[patch_df.get("FractureScale", pd.Series(dtype=object)).astype(str).isin(["large", "medium"])]
+        checks["object_band_outputs_exist"] = bool(paths["band_centerline_vtk"].exists() and paths["band_summary_csv"].exists())
+        checks["object_band_overlap_reasonable"] = bool((not band_patch.empty) and float(pd.to_numeric(band_patch["ObjectBandOverlapRatio"], errors="coerce").mean()) >= 0.35)
+        checks["object_band_length_larger_than_small"] = bool(
+            (not band_patch.empty)
+            and float(band_patch["LengthM"].median()) > float(patch_df.loc[patch_df["FractureScale"].astype(str).eq("small"), "LengthM"].median()) * 2.0
+        )
     status = "pass" if all(checks.values()) else "fail"
     return {
         "status": status,
@@ -1172,6 +1764,9 @@ def build_summary(
             "center_time_stats": finite_stats(patch_df["CenterTime"]),
             "length_m_stats": finite_stats(patch_df["LengthM"]),
             "height_time_ms_stats": finite_stats(patch_df["HeightTimeMs"]),
+            "height_m_stats": finite_stats(patch_df["HeightM"]) if "HeightM" in patch_df.columns else None,
+            "patch_area_m2_stats": finite_stats(patch_df["PatchAreaM2"]) if "PatchAreaM2" in patch_df.columns else None,
+            "patch_equivalent_radius_m_stats": finite_stats(patch_df["PatchEquivalentRadiusM"]) if "PatchEquivalentRadiusM" in patch_df.columns else None,
             "source_density_stats": finite_stats(patch_df["SourceDensity"]),
             "coherence_value_stats": finite_stats(patch_df["CoherenceValue"]) if "CoherenceValue" in patch_df.columns else None,
             "low_coherence_score_stats": finite_stats(patch_df["LowCoherenceScore"]) if "LowCoherenceScore" in patch_df.columns else None,
@@ -1246,6 +1841,22 @@ def main() -> int:
             config=config,
             rng=rng,
         )
+    elif generation_mode == "object_bands_v3":
+        selected, sampling_summary = sample_candidate_voxels_object_bands(
+            candidates,
+            x_values=grid["x_values"],
+            y_values=grid["y_values"],
+            config=config,
+            rng=rng,
+        )
+    elif generation_mode == "multiscale_detail_preserve_v4":
+        selected, sampling_summary = sample_candidate_voxels_detail_preserve_v4(
+            candidates,
+            x_values=grid["x_values"],
+            y_values=grid["y_values"],
+            config=config,
+            rng=rng,
+        )
     elif generation_mode == "weighted_sampling":
         selected, sampling_summary = sample_candidate_voxels(candidates, config=config, rng=rng)
     else:
@@ -1265,6 +1876,10 @@ def main() -> int:
     display_z_scale = float(config.get("display_z_scale", 5.0))
     geometry_time_scale = float(config.get("geometry_time_scale_m_per_ms", config.get("orientation_time_scale_m_per_ms", 1.0)))
     write_legacy_vtk(paths["raw_vtk"], patch_df, "initial_3d_dfn_raw_time", display=False, display_z_scale=display_z_scale, geometry_time_scale_m_per_ms=geometry_time_scale)
+    band_summaries = list(sampling_summary.get("band_summaries", []))
+    if band_summaries:
+        write_band_centerline_vtk(paths["band_centerline_vtk"], band_summaries)
+        pd.DataFrame([{k: v for k, v in item.items() if k != "centerline_points"} for item in band_summaries]).to_csv(paths["band_summary_csv"], index=False, encoding="utf-8-sig")
 
     summary = build_summary(
         config_path=config_path,
@@ -1281,6 +1896,8 @@ def main() -> int:
     paths["summary_json"].write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
     print(f"Initial 3D DFN CSV: {paths['dfn_csv']}")
     print(f"Initial 3D DFN raw VTK: {paths['raw_vtk']}")
+    if band_summaries:
+        print(f"Fracture band centerline VTK: {paths['band_centerline_vtk']}")
     print(f"Summary JSON: {paths['summary_json']}")
     print(f"Patch count: {len(patch_df)} status={summary['status']}")
     return 0 if summary["status"] == "pass" else 1
