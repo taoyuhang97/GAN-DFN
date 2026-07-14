@@ -59,6 +59,10 @@ IMAGING_PATCH_COLOR = "#ff2bd6"
 IMAGING_PATCH_HALO = "#3b0764"
 IMAGING_SEGMENT_COLOR = "#00f5ff"
 IMAGING_SEGMENT_GLOW = "#083344"
+FAULT_TRACE_COLOR = "#ffe600"
+FAULT_TRACE_HALO = "#111827"
+FAULT_TRACE_WIDTH = 2.8
+FAULT_TRACE_HALO_WIDTH = 5.2
 DFN_WIDTH_MIN = 0.45
 DFN_WIDTH_MAX = 3.0
 DFN_WIDTH_POWER = 0.80
@@ -136,6 +140,14 @@ def validate_inputs(config: dict[str, Any]) -> None:
         path = path_from_config(config, key)
         if not path.exists():
             raise FileNotFoundError(f"{key} not found: {path}")
+    if config.get("fault_surface_csv"):
+        path = path_from_config(config, "fault_surface_csv")
+        if not path.exists():
+            raise FileNotFoundError(f"fault_surface_csv not found: {path}")
+    if config.get("original_fault_stick_dat"):
+        path = path_from_config(config, "original_fault_stick_dat")
+        if not path.exists():
+            raise FileNotFoundError(f"original_fault_stick_dat not found: {path}")
 
 
 def reset_output_images(output_dir: Path) -> None:
@@ -475,6 +487,281 @@ def scan_vtk_intersections(args: SimpleNamespace, surfaces: dict[str, Any], well
     return segments, summary
 
 
+def scan_fault_surface_csv_intersections(
+    fault_csv: Path | None,
+    surfaces: dict[str, Any],
+    well_df: pd.DataFrame,
+    half_width: float,
+    *,
+    max_polygons: int = 0,
+) -> tuple[list[ProjectionSegment], dict[str, Any]]:
+    if fault_csv is None:
+        return [], {"enabled": False, "segment_count": 0}
+    df = pd.read_csv(fault_csv, encoding="utf-8-sig", low_memory=False)
+    if "SourceType" in df.columns:
+        df = df[df["SourceType"].astype(str).eq("fault_surface")].copy()
+    required = [f"V{vertex_idx}{axis}" for vertex_idx in range(1, 5) for axis in ("X", "Y", "Z")]
+    missing = [column for column in required if column not in df.columns]
+    if missing:
+        raise ValueError(f"fault_surface_csv missing vertex columns: {missing}")
+    if int(max_polygons) > 0:
+        df = df.head(int(max_polygons)).copy()
+    well_time = well_df["TIME"].to_numpy(dtype=float)
+    well_x = well_df["X"].to_numpy(dtype=float)
+    well_y = well_df["Y"].to_numpy(dtype=float)
+    well_time_min = float(np.nanmin(well_time))
+    well_time_max = float(np.nanmax(well_time))
+    segments: list[ProjectionSegment] = []
+    skipped_by_time = 0
+    skipped_by_interval = 0
+    skipped_by_distance = 0
+    skipped_by_no_intersection = 0
+    skipped_by_geometry = 0
+    for polygon_index, row in df.reset_index(drop=True).iterrows():
+        vertices = np.asarray(
+            [
+                [float(row[f"V{vertex_idx}X"]), float(row[f"V{vertex_idx}Y"]), float(row[f"V{vertex_idx}Z"])]
+                for vertex_idx in range(1, 5)
+            ],
+            dtype=float,
+        )
+        if not np.all(np.isfinite(vertices)):
+            skipped_by_geometry += 1
+            continue
+        center = vertices.mean(axis=0)
+        center_time = float(center[2])
+        if center_time < well_time_min or center_time > well_time_max:
+            skipped_by_time += 1
+            continue
+        interval = interval_for_center(center, surfaces) or "fault_surface"
+        area = polygon_area(vertices)
+        y_on_well_curve = float(np.interp(center_time, well_time, well_y))
+        x_on_well_curve = float(np.interp(center_time, well_time, well_x))
+        selected_this_patch = False
+        xz_surface_distance = abs(float(center[1]) - y_on_well_curve)
+        if xz_surface_distance <= float(half_width):
+            line = plane_polygon_intersection_line(vertices, axis=1, value=y_on_well_curve)
+            if line is None:
+                line = representative_line_2d(vertices[:, [0, 2]])
+            if line is None:
+                skipped_by_no_intersection += 1
+            else:
+                selected_this_patch = True
+                segments.append(
+                    ProjectionSegment(
+                        polygon_index=int(polygon_index),
+                        projection="XZ",
+                        interval=interval,
+                        center_x=float(center[0]),
+                        center_y=float(center[1]),
+                        center_z=center_time,
+                        surface_distance=xz_surface_distance,
+                        patch_area=float(area),
+                        h1=float(line[0][0]),
+                        z1=float(line[0][1]),
+                        h2=float(line[1][0]),
+                        z2=float(line[1][1]),
+                    )
+                )
+        yz_surface_distance = abs(float(center[0]) - x_on_well_curve)
+        if yz_surface_distance <= float(half_width):
+            line = plane_polygon_intersection_line(vertices, axis=0, value=x_on_well_curve)
+            if line is None:
+                line = representative_line_2d(vertices[:, [1, 2]])
+            if line is None:
+                skipped_by_no_intersection += 1
+            else:
+                selected_this_patch = True
+                segments.append(
+                    ProjectionSegment(
+                        polygon_index=int(polygon_index),
+                        projection="YZ",
+                        interval=interval,
+                        center_x=float(center[0]),
+                        center_y=float(center[1]),
+                        center_z=center_time,
+                        surface_distance=yz_surface_distance,
+                        patch_area=float(area),
+                        h1=float(line[0][0]),
+                        z1=float(line[0][1]),
+                        h2=float(line[1][0]),
+                        z2=float(line[1][1]),
+                    )
+                )
+        if not selected_this_patch:
+            skipped_by_distance += 1
+    return segments, {
+        "enabled": True,
+        "fault_trace_source": "step7c_fault_surface_csv",
+        "fault_surface_csv": str(fault_csv),
+        "fault_surface_patch_count": int(len(df)),
+        "half_width_m": float(half_width),
+        "segment_count": int(len(segments)),
+        "segment_count_xz": int(sum(segment.projection == "XZ" for segment in segments)),
+        "segment_count_yz": int(sum(segment.projection == "YZ" for segment in segments)),
+        "skipped_by_time": int(skipped_by_time),
+        "skipped_by_interval": int(skipped_by_interval),
+        "skipped_by_distance": int(skipped_by_distance),
+        "skipped_by_no_intersection": int(skipped_by_no_intersection),
+        "skipped_by_geometry": int(skipped_by_geometry),
+    }
+
+
+def load_original_fault_sticks(path: Path, target_block: dict[str, Any], context_padding_m: float = 10000.0) -> pd.DataFrame:
+    rows: list[dict[str, Any]] = []
+    with path.open("r", encoding="utf-8", errors="ignore") as handle:
+        for line in handle:
+            stripped = line.strip()
+            if not stripped or stripped.startswith("#"):
+                continue
+            parts = stripped.split()
+            if len(parts) < 7:
+                continue
+            try:
+                rows.append(
+                    {
+                        "Line": int(float(parts[0])),
+                        "Trace": int(float(parts[1])),
+                        "X": float(parts[2]),
+                        "Y": float(parts[3]),
+                        "TIME": float(parts[4]),
+                        "Flag": int(float(parts[5])),
+                        "FaultName": str(parts[6]),
+                    }
+                )
+            except ValueError:
+                continue
+    df = pd.DataFrame(rows)
+    if df.empty:
+        raise RuntimeError(f"no fault stick rows parsed from {path}")
+    if target_block:
+        pad = float(context_padding_m)
+        df = df[
+            df["X"].between(float(target_block["x_min"]) - pad, float(target_block["x_max"]) + pad)
+            & df["Y"].between(float(target_block["y_min"]) - pad, float(target_block["y_max"]) + pad)
+        ].copy()
+    return df.reset_index(drop=True)
+
+
+def raw_fault_segments_for_projection(
+    fault_df: pd.DataFrame,
+    projection: str,
+    well_df: pd.DataFrame,
+    half_width: float,
+    display: dict[str, float],
+) -> tuple[list[ProjectionSegment], dict[str, int]]:
+    well_time = well_df["TIME"].to_numpy(dtype=float)
+    well_x = well_df["X"].to_numpy(dtype=float)
+    well_y = well_df["Y"].to_numpy(dtype=float)
+    well_time_min = float(np.nanmin(well_time))
+    well_time_max = float(np.nanmax(well_time))
+    work = fault_df[fault_df["TIME"].between(well_time_min, well_time_max)].copy()
+    if work.empty:
+        return [], {"selected_point_count": 0, "segment_count": 0, "selected_group_count": 0}
+    if projection == "XZ":
+        work["SectionDistance"] = np.abs(work["Y"].to_numpy(dtype=float) - np.interp(work["TIME"].to_numpy(dtype=float), well_time, well_y))
+        work["H"] = work["X"]
+        h_min = float(display["display_x_min"])
+        h_max = float(display["display_x_max"])
+    else:
+        work["SectionDistance"] = np.abs(work["X"].to_numpy(dtype=float) - np.interp(work["TIME"].to_numpy(dtype=float), well_time, well_x))
+        work["H"] = work["Y"]
+        h_min = float(display["display_y_min"])
+        h_max = float(display["display_y_max"])
+    selected = work[(work["SectionDistance"] <= float(half_width)) & work["H"].between(h_min, h_max)].copy()
+    if selected.empty:
+        return [], {"selected_point_count": 0, "segment_count": 0, "selected_group_count": 0}
+    segments: list[ProjectionSegment] = []
+    group_cols = ["FaultName", "Line", "Flag"]
+    selected_group_count = 0
+    selected_keys = selected[group_cols].drop_duplicates()
+    key_tuples = {tuple(row) for row in selected_keys.to_numpy()}
+    for key, group in work.sort_values(group_cols + ["TIME"]).groupby(group_cols, dropna=False):
+        if tuple(key if isinstance(key, tuple) else (key,)) not in key_tuples:
+            continue
+        if len(group) < 2:
+            continue
+        selected_group_count += 1
+        arr = group[["H", "TIME", "X", "Y", "SectionDistance"]].to_numpy(dtype=float)
+        for idx in range(len(arr) - 1):
+            h1, z1, x1, y1, d1 = arr[idx]
+            h2, z2, x2, y2, d2 = arr[idx + 1]
+            if not np.all(np.isfinite([h1, z1, h2, z2])):
+                continue
+            if max(h1, h2) < h_min or min(h1, h2) > h_max:
+                continue
+            if abs(z2 - z1) > 450.0:
+                continue
+            center_x = 0.5 * (x1 + x2)
+            center_y = 0.5 * (y1 + y2)
+            center_z = 0.5 * (z1 + z2)
+            segments.append(
+                ProjectionSegment(
+                    polygon_index=int(len(segments)),
+                    projection=projection,
+                    interval="original_fault",
+                    center_x=float(center_x),
+                    center_y=float(center_y),
+                    center_z=float(center_z),
+                    surface_distance=float(0.5 * (d1 + d2)),
+                    patch_area=0.0,
+                    h1=float(h1),
+                    z1=float(z1),
+                    h2=float(h2),
+                    z2=float(z2),
+                )
+            )
+    return segments, {
+        "selected_point_count": int(len(selected)),
+        "segment_count": int(len(segments)),
+        "selected_group_count": int(selected_group_count),
+    }
+
+
+def scan_original_fault_stick_traces(
+    fault_dat: Path | None,
+    target_block: dict[str, Any],
+    well_df: pd.DataFrame,
+    half_width: float,
+    display: dict[str, float],
+    *,
+    context_padding_m: float = 10000.0,
+) -> tuple[list[ProjectionSegment], dict[str, Any]]:
+    if fault_dat is None:
+        return [], {"enabled": False, "segment_count": 0}
+    fault_df = load_original_fault_sticks(fault_dat, target_block, context_padding_m=context_padding_m)
+    xz_segments, xz_summary = raw_fault_segments_for_projection(fault_df, "XZ", well_df, half_width, display)
+    yz_segments, yz_summary = raw_fault_segments_for_projection(fault_df, "YZ", well_df, half_width, display)
+    segments = xz_segments + yz_segments
+    return segments, {
+        "enabled": True,
+        "fault_trace_source": "original_fault_stick_dat",
+        "original_fault_stick_dat": str(fault_dat),
+        "raw_point_count_in_target_with_padding": int(len(fault_df)),
+        "context_padding_m": float(context_padding_m),
+        "half_width_m": float(half_width),
+        "segment_count": int(len(segments)),
+        "segment_count_xz": int(len(xz_segments)),
+        "segment_count_yz": int(len(yz_segments)),
+        "xz": xz_summary,
+        "yz": yz_summary,
+    }
+
+
+def add_fault_trace_segments(ax, segments: list[ProjectionSegment], projection: str) -> int:
+    lines = [
+        [(segment.h1, segment.z1), (segment.h2, segment.z2)]
+        for segment in segments
+        if segment.projection == projection
+    ]
+    if not lines:
+        return 0
+    ax.add_collection(LineCollection(lines, colors=FAULT_TRACE_HALO, linewidths=FAULT_TRACE_HALO_WIDTH, alpha=0.86, zorder=9))
+    ax.add_collection(LineCollection(lines, colors=FAULT_TRACE_COLOR, linewidths=FAULT_TRACE_WIDTH, alpha=0.96, zorder=10))
+    ax.plot([], [], color=FAULT_TRACE_COLOR, linewidth=FAULT_TRACE_WIDTH, label="断层轨迹")
+    return len(lines)
+
+
 def add_dfn_segments(ax, segments: list[ProjectionSegment], projection: str, *, overlay: bool) -> int:
     lines, colors, widths = segment_lines(segments, projection)
     if not lines:
@@ -686,6 +973,7 @@ def visible_fracture_label_count(fracture_df: pd.DataFrame, projection: str, sum
 
 def plot_dfn(
     segments: list[ProjectionSegment],
+    fault_segments: list[ProjectionSegment],
     imaging_patch_segments: list[ProjectionSegment],
     well_df: pd.DataFrame,
     surface_curves: list[SurfaceSectionCurve],
@@ -699,6 +987,7 @@ def plot_dfn(
     fig, ax = plt.subplots(figsize=(args.fig_width, args.fig_height))
     ax.set_facecolor("#f8fafc")
     count = add_dfn_segments(ax, segments, projection, overlay=False)
+    fault_count = add_fault_trace_segments(ax, fault_segments, projection)
     draw_surfaces(ax, surface_curves, projection)
     set_axes(ax, projection, well_df, imaging_df, summary, args.z_label)
     imaging_patch_count = add_imaging_fracture_patch_segments(ax, imaging_patch_segments, projection)
@@ -706,7 +995,7 @@ def plot_dfn(
     for interval, color in DFN_INTERVAL_COLORS.items():
         ax.plot([], [], color=color, linewidth=2.2, label=INTERVAL_LABELS.get(interval, interval))
     ax.legend(loc="upper right")
-    ax.set_title(f"{args.title_prefix} | DFN裂缝剖面+真实成像解释片 | {projection} | DFN={count} | 解释片={imaging_patch_count} | 交点={label_count}")
+    ax.set_title(f"{args.title_prefix} | DFN裂缝剖面+断层轨迹+真实成像解释片 | {projection} | DFN={count} | 断层={fault_count} | 解释片={imaging_patch_count} | 交点={label_count}")
     fig.tight_layout()
     fig.savefig(output_path, dpi=args.dpi)
     plt.close(fig)
@@ -715,6 +1004,7 @@ def plot_dfn(
 
 def plot_coherence(
     section: AttributeSection,
+    fault_segments: list[ProjectionSegment],
     imaging_patch_segments: list[ProjectionSegment],
     well_df: pd.DataFrame,
     surface_curves: list[SurfaceSectionCurve],
@@ -737,13 +1027,14 @@ def plot_coherence(
         vmax=vmax,
         zorder=1,
     )
+    fault_count = add_fault_trace_segments(ax, fault_segments, section.projection)
     draw_surfaces(ax, surface_curves, section.projection)
     set_axes(ax, section.projection, well_df, imaging_df, summary, args.z_label)
     imaging_patch_count = add_imaging_fracture_patch_segments(ax, imaging_patch_segments, section.projection)
     label_count = draw_fracture_labels(ax, fracture_df, section.projection, summary)
     fig.colorbar(mesh, ax=ax, pad=0.02, shrink=0.94, label="相干体")
     ax.legend(loc="upper right")
-    ax.set_title(f"{args.title_prefix} | 相干体剖面+真实成像解释片 | {section.projection} | 解释片={imaging_patch_count} | 交点={label_count}")
+    ax.set_title(f"{args.title_prefix} | 相干体剖面+断层轨迹+真实成像解释片 | {section.projection} | 断层={fault_count} | 解释片={imaging_patch_count} | 交点={label_count}")
     fig.tight_layout()
     fig.savefig(output_path, dpi=args.dpi)
     plt.close(fig)
@@ -752,6 +1043,7 @@ def plot_coherence(
 def plot_overlay(
     section: AttributeSection,
     segments: list[ProjectionSegment],
+    fault_segments: list[ProjectionSegment],
     imaging_patch_segments: list[ProjectionSegment],
     well_df: pd.DataFrame,
     surface_curves: list[SurfaceSectionCurve],
@@ -777,6 +1069,7 @@ def plot_overlay(
     )
     draw_surfaces(ax, surface_curves, section.projection)
     count = add_dfn_segments(ax, segments, section.projection, overlay=True)
+    fault_count = add_fault_trace_segments(ax, fault_segments, section.projection)
     set_axes(ax, section.projection, well_df, imaging_df, summary, args.z_label)
     imaging_patch_count = add_imaging_fracture_patch_segments(ax, imaging_patch_segments, section.projection)
     label_count = draw_fracture_labels(ax, fracture_df, section.projection, summary)
@@ -784,7 +1077,7 @@ def plot_overlay(
         ax.plot([], [], color=color, linewidth=2.4, label=INTERVAL_LABELS.get(interval, interval))
     ax.legend(loc="upper right")
     fig.colorbar(mesh, ax=ax, pad=0.02, shrink=0.94, label="相干体")
-    ax.set_title(f"{args.title_prefix} | {title_suffix}+真实成像解释片 | {section.projection} | DFN={count} | 解释片={imaging_patch_count} | 交点={label_count}")
+    ax.set_title(f"{args.title_prefix} | {title_suffix}+断层轨迹+真实成像解释片 | {section.projection} | DFN={count} | 断层={fault_count} | 解释片={imaging_patch_count} | 交点={label_count}")
     fig.tight_layout()
     fig.savefig(output_path, dpi=args.dpi)
     plt.close(fig)
@@ -854,6 +1147,41 @@ def main() -> None:
     standard_segments, standard_scan = scan_vtk_intersections(standard_args, surfaces, well_df)
     print("[cheye1-section] scanning DFN local 200m band as section intersections", flush=True)
     local_segments, local_scan = scan_vtk_intersections(local_args, surfaces, well_df)
+    print("[cheye1-section] scanning fault surface traces", flush=True)
+    fault_dat = path_from_config(config, "original_fault_stick_dat") if config.get("original_fault_stick_dat") else None
+    fault_csv = path_from_config(config, "fault_surface_csv") if config.get("fault_surface_csv") else None
+    if fault_dat is not None:
+        standard_fault_segments, standard_fault_scan = scan_original_fault_stick_traces(
+            fault_dat,
+            dict(config.get("target_block") or {}),
+            well_df,
+            float(config.get("fault_trace_half_width_m", config.get("dfn_half_width_m", 50.0))),
+            full_display,
+            context_padding_m=float(config.get("original_fault_context_padding_m", 10000.0)),
+        )
+        local_fault_segments, local_fault_scan = scan_original_fault_stick_traces(
+            fault_dat,
+            dict(config.get("target_block") or {}),
+            well_df,
+            float(config.get("local_fault_trace_half_width_m", config.get("local_dfn_half_width_m", 200.0))),
+            local_display,
+            context_padding_m=float(config.get("original_fault_context_padding_m", 10000.0)),
+        )
+    else:
+        standard_fault_segments, standard_fault_scan = scan_fault_surface_csv_intersections(
+            fault_csv,
+            surfaces,
+            well_df,
+            float(config.get("fault_trace_half_width_m", config.get("dfn_half_width_m", 50.0))),
+            max_polygons=int(config.get("fault_trace_max_polygons", 0)),
+        )
+        local_fault_segments, local_fault_scan = scan_fault_surface_csv_intersections(
+            fault_csv,
+            surfaces,
+            well_df,
+            float(config.get("local_fault_trace_half_width_m", config.get("local_dfn_half_width_m", 200.0))),
+            max_polygons=int(config.get("fault_trace_max_polygons", 0)),
+        )
 
     x_values = np.sort(trace_df["X"].unique()).astype(np.float64)
     y_values = np.sort(trace_df["Y"].unique()).astype(np.float64)
@@ -879,19 +1207,20 @@ def main() -> None:
     vmin, vmax = finite_quantile_bounds([full_xz, full_yz, local_xz, local_yz])
 
     image_counts: dict[str, int | None] = {}
-    image_counts["dfn_xz"] = plot_dfn(standard_segments, imaging_patch_segments, well_df, full_surface_curves, full_summary, "XZ", output_dir / "01_dfn_section_xz_t4_t7.png", standard_args, fracture_df, imaging_segment_df)
-    image_counts["dfn_yz"] = plot_dfn(standard_segments, imaging_patch_segments, well_df, full_surface_curves, full_summary, "YZ", output_dir / "02_dfn_section_yz_t4_t7.png", standard_args, fracture_df, imaging_segment_df)
-    plot_coherence(full_xz_section, imaging_patch_segments, well_df, full_surface_curves, full_summary, output_dir / "03_coherence_section_xz_t4_t7.png", standard_args, vmin, vmax, fracture_df, imaging_segment_df)
-    plot_coherence(full_yz_section, imaging_patch_segments, well_df, full_surface_curves, full_summary, output_dir / "04_coherence_section_yz_t4_t7.png", standard_args, vmin, vmax, fracture_df, imaging_segment_df)
-    image_counts["overlay_xz"] = plot_overlay(full_xz_section, standard_segments, imaging_patch_segments, well_df, full_surface_curves, full_summary, output_dir / "05_coherence_dfn_overlay_xz_t4_t7.png", standard_args, vmin, vmax, "相干体上的DFN裂缝分布", fracture_df, imaging_segment_df)
-    image_counts["overlay_yz"] = plot_overlay(full_yz_section, standard_segments, imaging_patch_segments, well_df, full_surface_curves, full_summary, output_dir / "06_coherence_dfn_overlay_yz_t4_t7.png", standard_args, vmin, vmax, "相干体上的DFN裂缝分布", fracture_df, imaging_segment_df)
-    image_counts["local_overlay_xz"] = plot_overlay(local_xz_section, local_segments, imaging_patch_segments, well_df, local_surface_curves, local_summary, output_dir / "07_coherence_dfn_overlay_200m_xz_t4_t7.png", local_args, vmin, vmax, "井周200m相干体上的DFN裂缝分布", fracture_df, imaging_segment_df)
-    image_counts["local_overlay_yz"] = plot_overlay(local_yz_section, local_segments, imaging_patch_segments, well_df, local_surface_curves, local_summary, output_dir / "08_coherence_dfn_overlay_200m_yz_t4_t7.png", local_args, vmin, vmax, "井周200m相干体上的DFN裂缝分布", fracture_df, imaging_segment_df)
+    image_counts["dfn_xz"] = plot_dfn(standard_segments, standard_fault_segments, imaging_patch_segments, well_df, full_surface_curves, full_summary, "XZ", output_dir / "01_dfn_section_xz_t4_t7.png", standard_args, fracture_df, imaging_segment_df)
+    image_counts["dfn_yz"] = plot_dfn(standard_segments, standard_fault_segments, imaging_patch_segments, well_df, full_surface_curves, full_summary, "YZ", output_dir / "02_dfn_section_yz_t4_t7.png", standard_args, fracture_df, imaging_segment_df)
+    plot_coherence(full_xz_section, standard_fault_segments, imaging_patch_segments, well_df, full_surface_curves, full_summary, output_dir / "03_coherence_section_xz_t4_t7.png", standard_args, vmin, vmax, fracture_df, imaging_segment_df)
+    plot_coherence(full_yz_section, standard_fault_segments, imaging_patch_segments, well_df, full_surface_curves, full_summary, output_dir / "04_coherence_section_yz_t4_t7.png", standard_args, vmin, vmax, fracture_df, imaging_segment_df)
+    image_counts["overlay_xz"] = plot_overlay(full_xz_section, standard_segments, standard_fault_segments, imaging_patch_segments, well_df, full_surface_curves, full_summary, output_dir / "05_coherence_dfn_overlay_xz_t4_t7.png", standard_args, vmin, vmax, "相干体上的DFN裂缝分布", fracture_df, imaging_segment_df)
+    image_counts["overlay_yz"] = plot_overlay(full_yz_section, standard_segments, standard_fault_segments, imaging_patch_segments, well_df, full_surface_curves, full_summary, output_dir / "06_coherence_dfn_overlay_yz_t4_t7.png", standard_args, vmin, vmax, "相干体上的DFN裂缝分布", fracture_df, imaging_segment_df)
+    image_counts["local_overlay_xz"] = plot_overlay(local_xz_section, local_segments, local_fault_segments, imaging_patch_segments, well_df, local_surface_curves, local_summary, output_dir / "07_coherence_dfn_overlay_200m_xz_t4_t7.png", local_args, vmin, vmax, "井周200m相干体上的DFN裂缝分布", fracture_df, imaging_segment_df)
+    image_counts["local_overlay_yz"] = plot_overlay(local_yz_section, local_segments, local_fault_segments, imaging_patch_segments, well_df, local_surface_curves, local_summary, output_dir / "08_coherence_dfn_overlay_200m_yz_t4_t7.png", local_args, vmin, vmax, "井周200m相干体上的DFN裂缝分布", fracture_df, imaging_segment_df)
 
     png_files = sorted(path.name for path in output_dir.glob("*.png"))
     summary = {
         "status": "pass" if len(png_files) == 8 and selected_well.well_name == WELL_NAME else "fail",
         "config_path": str(cli.config.resolve()),
+        "input_vtk": str(standard_args.input_vtk),
         "output_dir": str(output_dir),
         "retained_png_count": len(png_files),
         "retained_png_files": png_files,
@@ -947,6 +1276,9 @@ def main() -> None:
         "time_sample_count": int(len(time_values)),
         "standard_scan": standard_scan,
         "local_scan": local_scan,
+        "standard_fault_trace_scan": standard_fault_scan,
+        "local_fault_trace_scan": local_fault_scan,
+        "fault_trace_visible_segment_count": int(standard_fault_scan.get("segment_count", 0)) + int(local_fault_scan.get("segment_count", 0)),
         "plotted_segment_counts": image_counts,
         "checks": {
             "exactly_8_png_images": len(png_files) == 8,
@@ -954,6 +1286,10 @@ def main() -> None:
             "well_fully_inside_candidate": int(selected_well.inside_rows) == int(selected_well.total_rows),
             "standard_has_xz_yz_segments": int(image_counts["dfn_xz"] or 0) > 0 and int(image_counts["dfn_yz"] or 0) > 0,
             "local_has_xz_yz_segments": int(image_counts["local_overlay_xz"] or 0) > 0 and int(image_counts["local_overlay_yz"] or 0) > 0,
+            "fault_trace_loaded": bool(
+                not standard_fault_scan.get("enabled", False)
+                or int(standard_fault_scan.get("raw_point_count_in_target_with_padding", standard_fault_scan.get("fault_surface_patch_count", 0))) > 0
+            ),
             "coherence_samples_nonempty": int(np.isfinite(full_xz).sum()) > 0 and int(np.isfinite(full_yz).sum()) > 0,
             "step3_gt_point_labels_loaded": int(len(fracture_df)) > 0,
             "step3_imaging_segment_loaded": int(len(imaging_segment_df)) > 0,

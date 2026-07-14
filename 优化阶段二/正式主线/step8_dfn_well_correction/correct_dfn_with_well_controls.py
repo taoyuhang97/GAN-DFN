@@ -341,8 +341,29 @@ def update_layer_window_from_surfaces(row: pd.Series | dict[str, Any], surface_l
     return {"TimeWindowMin": top, "TimeWindowMax": base, "LayerThickness": base - top}
 
 
-def build_patch_tree(df: pd.DataFrame, layer: str, time_scale: float) -> tuple[cKDTree | None, np.ndarray]:
-    layer_idx = df.index[df["LayerGroup"].astype(str) == layer].to_numpy(dtype=int)
+def build_well_modifiable_mask(df: pd.DataFrame) -> pd.Series:
+    mask = pd.Series(True, index=df.index)
+    if "CanModifyInStep8" in df.columns:
+        mask &= safe_numeric(df["CanModifyInStep8"]).fillna(1).astype(int).ne(0)
+    if "NeedsWellCorrection" in df.columns:
+        mask &= safe_numeric(df["NeedsWellCorrection"]).fillna(1).astype(int).ne(0)
+    if "ConstraintLevel" in df.columns:
+        mask &= ~df["ConstraintLevel"].astype(str).eq("hard")
+    if "SourceType" in df.columns:
+        mask &= ~df["SourceType"].astype(str).eq("fault_surface")
+    return mask
+
+
+def build_patch_tree(
+    df: pd.DataFrame,
+    layer: str,
+    time_scale: float,
+    require_well_modifiable: bool = True,
+) -> tuple[cKDTree | None, np.ndarray]:
+    layer_mask = df["LayerGroup"].astype(str).eq(layer)
+    if require_well_modifiable:
+        layer_mask &= build_well_modifiable_mask(df)
+    layer_idx = df.index[layer_mask].to_numpy(dtype=int)
     if layer_idx.size == 0:
         return None, layer_idx
     coords = np.column_stack(
@@ -512,17 +533,21 @@ def offset_center_near_control(control: pd.Series, azimuth_deg: float, dip_deg: 
     half_height = 0.5 * float(height_time_ms)
     half_dip_xy = half_height * time_scale / max(float(np.tan(dip)), 1.0e-6)
     max_fraction = float(config.get("well_control_center_offset_max_fraction", 0.35))
+    dip_fraction = float(config.get("well_control_center_offset_dip_fraction", max_fraction))
+    target_fraction = float(config.get("well_control_center_offset_target_fraction", max_fraction))
     max_offset_m = float(config.get("well_control_center_offset_max_m", 45.0))
     min_offset_m = float(config.get("well_control_center_offset_min_m", 6.0))
     strike_limit = max(0.0, min(max_offset_m, half_length * max_fraction))
-    dip_limit = max(0.0, min(max_offset_m * 0.35, half_dip_xy * max_fraction))
+    dip_limit = max(0.0, min(max_offset_m, half_dip_xy * dip_fraction))
     key = f"{control.get('WellName', '')}|{control.get('WellControlSampleID', '')}|{control.get('LayerGroup', '')}"
     strike_raw = stable_unit_value(key + "|strike")
     dip_raw = stable_unit_value(key + "|dip")
-    strike_offset = strike_raw * strike_limit
+    strike_scale = min(1.0, max(0.0, target_fraction) + (1.0 - max(0.0, target_fraction)) * abs(strike_raw))
+    dip_scale = min(1.0, max(0.0, target_fraction) + (1.0 - max(0.0, target_fraction)) * abs(dip_raw))
+    strike_offset = np.sign(strike_raw if strike_raw != 0.0 else 1.0) * strike_limit * strike_scale
     if abs(strike_offset) < min_offset_m and strike_limit >= min_offset_m:
         strike_offset = np.sign(strike_raw if strike_raw != 0.0 else 1.0) * min_offset_m
-    dip_offset = dip_raw * dip_limit
+    dip_offset = np.sign(dip_raw if dip_raw != 0.0 else 1.0) * dip_limit * dip_scale
     xy_offset = strike_offset * strike + dip_offset * dip_horizontal
     time_offset = dip_offset * float(np.tan(dip)) / max(time_scale, 1.0e-6)
     center_x = float(control["X"]) + float(xy_offset[0])
@@ -781,6 +806,20 @@ def patch_vertices(
     use_dip_geometry: bool,
     geometry_time_scale_m_per_ms: float,
 ) -> list[tuple[float, float, float]]:
+    vertex_cols = [f"V{vertex_idx}{axis}" for vertex_idx in range(1, 5) for axis in ("X", "Y", "Z")]
+    preserve_vertices = all(col in row.index and pd.notna(row.get(col)) for col in vertex_cols)
+    correction_action = str(row.get("CorrectionAction", "unchanged_density_volume"))
+    if preserve_vertices and correction_action not in {"add_well_control_patch", "adjust_to_well_control"}:
+        points = []
+        for vertex_idx in range(1, 5):
+            x = float(row[f"V{vertex_idx}X"])
+            y = float(row[f"V{vertex_idx}Y"])
+            z = float(row[f"V{vertex_idx}Z"])
+            if display:
+                z = -z / display_z_scale
+            points.append((x, y, z))
+        return points
+
     theta = np.deg2rad(float(row["AzimuthDeg"]))
     half_length = 0.5 * float(row["LengthM"])
     half_h = 0.5 * float(row["HeightTimeMs"])
@@ -815,6 +854,46 @@ def patch_vertices(
         (center_x + half_dx, center_y + half_dy, z1),
         (center_x - half_dx, center_y - half_dy, z1),
     ]
+
+
+def polygon_area(points: list[tuple[float, float, float]]) -> float:
+    vertices = np.asarray(points, dtype=float)
+    if vertices.shape != (4, 3):
+        return 0.0
+    area_1 = 0.5 * float(np.linalg.norm(np.cross(vertices[1] - vertices[0], vertices[2] - vertices[0])))
+    area_2 = 0.5 * float(np.linalg.norm(np.cross(vertices[2] - vertices[0], vertices[3] - vertices[0])))
+    return area_1 + area_2
+
+
+def refresh_well_control_vertices(
+    patch_df: pd.DataFrame,
+    use_dip_geometry: bool,
+    geometry_time_scale_m_per_ms: float,
+) -> pd.DataFrame:
+    out = patch_df.copy()
+    if "CorrectionAction" not in out.columns:
+        return out
+    modified_mask = out["CorrectionAction"].astype(str).isin(["add_well_control_patch", "adjust_to_well_control"])
+    if not modified_mask.any():
+        return out
+    vertex_cols = [f"V{vertex_idx}{axis}" for vertex_idx in range(1, 5) for axis in ("X", "Y", "Z")]
+    for col in vertex_cols:
+        if col not in out.columns:
+            out[col] = np.nan
+    for idx, row in out.loc[modified_mask].iterrows():
+        points = patch_vertices(
+            row,
+            display=False,
+            display_z_scale=1.0,
+            use_dip_geometry=use_dip_geometry,
+            geometry_time_scale_m_per_ms=geometry_time_scale_m_per_ms,
+        )
+        for vertex_idx, point in enumerate(points, start=1):
+            out.loc[idx, f"V{vertex_idx}X"] = float(point[0])
+            out.loc[idx, f"V{vertex_idx}Y"] = float(point[1])
+            out.loc[idx, f"V{vertex_idx}Z"] = float(point[2])
+        out.loc[idx, "PatchAreaM2"] = polygon_area(points)
+    return out
 
 
 def write_legacy_vtk(
@@ -857,13 +936,38 @@ def write_legacy_vtk(
         ("PatchIndex", np.arange(1, len(patch_df) + 1), "int"),
         ("LayerCode", patch_df["LayerCode"].to_numpy(), "int"),
         ("SourceDensity", safe_numeric(patch_df["SourceDensity"]).fillna(0.0).to_numpy(), "float"),
+        (
+            "SourceDensityRender",
+            safe_numeric(patch_df["SourceDensityRender"]).fillna(0.0).to_numpy()
+            if "SourceDensityRender" in patch_df.columns
+            else safe_numeric(patch_df["SourceDensity"]).fillna(0.0).to_numpy(),
+            "float",
+        ),
+        (
+            "SourceDensityRenderNorm",
+            safe_numeric(patch_df["SourceDensityRenderNorm"]).fillna(0.0).to_numpy()
+            if "SourceDensityRenderNorm" in patch_df.columns
+            else np.zeros(len(patch_df), dtype=float),
+            "float",
+        ),
         ("IsWellControlPatch", safe_numeric(patch_df["IsWellControlPatch"]).fillna(0).to_numpy(), "int"),
         ("CenterTime", safe_numeric(patch_df["CenterTime"]).to_numpy(), "float"),
         ("LengthM", safe_numeric(patch_df["LengthM"]).to_numpy(), "float"),
         ("HeightTimeMs", safe_numeric(patch_df["HeightTimeMs"]).to_numpy(), "float"),
+        (
+            "PatchAreaM2",
+            safe_numeric(patch_df["PatchAreaM2"]).fillna(0.0).to_numpy()
+            if "PatchAreaM2" in patch_df.columns
+            else (safe_numeric(patch_df["LengthM"]).fillna(0.0) * safe_numeric(patch_df["HeightTimeMs"]).fillna(0.0)).to_numpy(),
+            "float",
+        ),
         ("AzimuthDeg", safe_numeric(patch_df["AzimuthDeg"]).to_numpy(), "float"),
         ("DipDeg", safe_numeric(patch_df["DipDeg"]).to_numpy(), "float"),
     ]
+    optional_int_columns = ["SourceTypeCode", "ConstraintLevelCode", "FaultRelationCode", "CanModifyInStep8"]
+    for column in optional_int_columns:
+        if column in patch_df.columns:
+            scalar_columns.append((column, safe_numeric(patch_df[column]).fillna(0).to_numpy(), "int"))
     for name, values, dtype in scalar_columns:
         vtk_type = "int" if dtype == "int" else "float"
         lines.append(f"SCALARS {name} {vtk_type} 1")
@@ -873,6 +977,82 @@ def write_legacy_vtk(
         else:
             lines.extend(f"{float(value):.6f}" for value in values)
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def export_debug_step_vtks(
+    output_dir: Path,
+    initial_df: pd.DataFrame,
+    corrected_df: pd.DataFrame,
+    config: dict[str, Any],
+    display_z_scale: float,
+    use_dip_geometry: bool,
+    geometry_time_scale_m_per_ms: float,
+) -> dict[str, str]:
+    debug_dir = output_dir / "debug_step_vtk"
+    ensure_dir(debug_dir)
+    modifiable_mask = build_well_modifiable_mask(initial_df)
+    correction_action = corrected_df["CorrectionAction"].astype(str)
+    no_added_df = corrected_df[correction_action.ne("add_well_control_patch")].copy()
+    adjusted_only_df = corrected_df[correction_action.eq("adjust_to_well_control")].copy()
+    added_only_df = corrected_df[correction_action.eq("add_well_control_patch")].copy()
+    no_hard_fault_df = corrected_df[
+        ~(
+            corrected_df.get("SourceType", pd.Series("", index=corrected_df.index)).astype(str).eq("fault_surface")
+            | corrected_df.get("ConstraintLevel", pd.Series("", index=corrected_df.index)).astype(str).eq("hard")
+        )
+    ].copy()
+    steps: list[tuple[str, str, pd.DataFrame]] = [
+        ("00_step7c_initial_input_all_raw_time.vtk", "step8_debug_00_initial_step7c_input_all", initial_df),
+        ("01_step8_initial_modifiable_pool_raw_time.vtk", "step8_debug_01_initial_modifiable_pool", initial_df.loc[modifiable_mask].copy()),
+        ("02_step8_initial_nonmodifiable_hard_or_no_well_correction_raw_time.vtk", "step8_debug_02_initial_nonmodifiable", initial_df.loc[~modifiable_mask].copy()),
+        ("03_step8_after_adjust_existing_before_add_raw_time.vtk", "step8_debug_03_adjusted_existing_before_additions", no_added_df),
+        ("04_step8_adjusted_existing_only_raw_time.vtk", "step8_debug_04_adjusted_existing_only", adjusted_only_df),
+        ("05_step8_added_well_control_only_raw_time.vtk", "step8_debug_05_added_well_control_only", added_only_df),
+        ("06_step8_final_without_hard_fault_surface_raw_time.vtk", "step8_debug_06_final_without_hard_fault_surface", no_hard_fault_df),
+        ("07_step8_final_all_raw_time.vtk", "step8_debug_07_final_all", corrected_df),
+    ]
+    exported: dict[str, str] = {}
+    for filename, title, df in steps:
+        if df.empty:
+            continue
+        path = debug_dir / filename
+        write_legacy_vtk(
+            path,
+            df.reset_index(drop=True),
+            title,
+            display=False,
+            display_z_scale=display_z_scale,
+            use_dip_geometry=use_dip_geometry,
+            geometry_time_scale_m_per_ms=geometry_time_scale_m_per_ms,
+        )
+        exported[filename] = str(path)
+    manifest = {
+        "description": "Step8 intermediate VTK exports for diagnosing where geometry changes appear.",
+        "notes": [
+            "00 is the Step7C input consumed by Step8.",
+            "01 is the initial patch pool eligible for well-control matching.",
+            "02 is the initial non-modifiable pool, including hard fault surfaces and patches not needing well correction.",
+            "03 is the cumulative result after adjusting existing matched patches, before adding unmatched well-control patches.",
+            "04 contains only existing patches adjusted to well controls.",
+            "05 contains only newly added well-control patches.",
+            "06 is the final corrected DFN with hard fault surfaces removed for display comparison.",
+            "07 is the full final corrected DFN, equivalent in content to well_corrected_dfn_raw_time.vtk.",
+        ],
+        "exported_vtks": exported,
+        "counts": {
+            "initial_all": int(len(initial_df)),
+            "initial_modifiable_pool": int(modifiable_mask.sum()),
+            "initial_nonmodifiable": int((~modifiable_mask).sum()),
+            "after_adjust_before_add": int(len(no_added_df)),
+            "adjusted_existing_only": int(len(adjusted_only_df)),
+            "added_well_control_only": int(len(added_only_df)),
+            "final_without_hard_fault_surface": int(len(no_hard_fault_df)),
+            "final_all": int(len(corrected_df)),
+        },
+        "config_export_debug_step_vtks": bool(config.get("export_debug_step_vtks", False)),
+    }
+    (debug_dir / "debug_step_vtk_manifest.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+    return exported
 
 
 def layer_counts(df: pd.DataFrame) -> dict[str, int]:
@@ -952,6 +1132,21 @@ def build_summary(
     audit_after = safe_numeric(audit_df["AfterMatchDistance"]) if "AfterMatchDistance" in audit_df.columns else pd.Series(dtype=float)
     audit_offsets = safe_numeric(audit_df["CenterOffsetM"]) if "CenterOffsetM" in audit_df.columns else pd.Series(dtype=float)
     control_envelope = safe_numeric(audit_df["ControlInsidePatchEnvelope"]).fillna(0) if "ControlInsidePatchEnvelope" in audit_df.columns else pd.Series(dtype=float)
+    layer_window_available = pd.Series(False, index=corrected_df.index)
+    centers_within_layer_windows = True
+    layer_window_missing_count = 0
+    layer_window_checked_count = 0
+    if {"CenterTime", "TimeWindowMin", "TimeWindowMax"}.issubset(corrected_df.columns):
+        layer_window_available = corrected_df[["CenterTime", "TimeWindowMin", "TimeWindowMax"]].notna().all(axis=1)
+        layer_window_missing_count = int((~layer_window_available).sum())
+        layer_window_checked_count = int(layer_window_available.sum())
+        if layer_window_checked_count > 0:
+            centers_within_layer_windows = bool(
+                corrected_df.loc[layer_window_available, "CenterTime"].between(
+                    corrected_df.loc[layer_window_available, "TimeWindowMin"],
+                    corrected_df.loc[layer_window_available, "TimeWindowMax"],
+                ).all()
+            )
     checks = {
         "has_well_controls_in_target_block": int(len(control_df)) > 0,
         "linked_patch_centers_no_farther_than_before_mean": bool(
@@ -963,9 +1158,7 @@ def build_summary(
         "far_field_preserved": bool(changed_fraction <= 0.15),
         "audit_rows_match_control_points": bool(len(audit_df) == len(control_df)),
         "layers_limited_to_sha3_sha4": bool(set(corrected_df["LayerGroup"].dropna().astype(str)).issubset(set(ALLOWED_LAYERS))),
-        "centers_within_layer_windows": bool(corrected_df["CenterTime"].between(corrected_df["TimeWindowMin"], corrected_df["TimeWindowMax"]).all())
-        if {"CenterTime", "TimeWindowMin", "TimeWindowMax"}.issubset(corrected_df.columns)
-        else True,
+        "centers_within_layer_windows": centers_within_layer_windows,
         "orientation_fields_complete": bool(corrected_df[["AzimuthDeg", "DipDeg"]].notna().all().all()),
         "raw_vtk_output_exists": bool(paths["raw_vtk"].exists()),
     }
@@ -1035,6 +1228,11 @@ def build_summary(
             "median_distance_improvement": (before_median - after_median) if before_median is not None and after_median is not None else None,
         },
         "macro_distribution_check": macro,
+        "layer_window_check": {
+            "checked_patch_count": layer_window_checked_count,
+            "missing_window_patch_count": layer_window_missing_count,
+            "note": "Only patches with non-null CenterTime/TimeWindowMin/TimeWindowMax are checked.",
+        },
         "checks": checks,
     }
 
@@ -1098,11 +1296,16 @@ def main() -> int:
     )
     after_dist = nearest_patch_distances(corrected_df, control_df, time_scale=time_scale)
 
-    corrected_df.to_csv(paths["corrected_csv"], index=False, encoding="utf-8-sig")
-    audit_df.to_csv(paths["audit_csv"], index=False, encoding="utf-8-sig")
     display_z_scale = float(config.get("display_z_scale", 5.0))
     use_dip_geometry = bool(config.get("use_dip_geometry", False))
     geometry_time_scale = float(config.get("geometry_time_scale_m_per_ms", 1.0))
+    corrected_df = refresh_well_control_vertices(
+        corrected_df,
+        use_dip_geometry=use_dip_geometry,
+        geometry_time_scale_m_per_ms=geometry_time_scale,
+    )
+    corrected_df.to_csv(paths["corrected_csv"], index=False, encoding="utf-8-sig")
+    audit_df.to_csv(paths["audit_csv"], index=False, encoding="utf-8-sig")
     write_legacy_vtk(
         paths["raw_vtk"],
         corrected_df,
@@ -1112,6 +1315,17 @@ def main() -> int:
         use_dip_geometry=use_dip_geometry,
         geometry_time_scale_m_per_ms=geometry_time_scale,
     )
+    debug_vtks: dict[str, str] = {}
+    if bool(config.get("export_debug_step_vtks", False)):
+        debug_vtks = export_debug_step_vtks(
+            output_dir=output_dir,
+            initial_df=initial_df,
+            corrected_df=corrected_df,
+            config=config,
+            display_z_scale=display_z_scale,
+            use_dip_geometry=use_dip_geometry,
+            geometry_time_scale_m_per_ms=geometry_time_scale,
+        )
 
     density_mass = load_density_mass_from_initial_summary(initial_summary_json)
     summary = build_summary(
@@ -1127,6 +1341,8 @@ def main() -> int:
         track_dist=track_dist,
         density_mass=density_mass,
     )
+    if debug_vtks:
+        summary["debug_step_vtks"] = debug_vtks
     paths["summary_json"].write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
 
     print(f"Corrected DFN CSV: {paths['corrected_csv']}")

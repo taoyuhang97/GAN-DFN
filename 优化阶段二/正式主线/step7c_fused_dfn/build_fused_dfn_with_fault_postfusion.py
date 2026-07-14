@@ -8,6 +8,7 @@ from typing import Any
 
 import numpy as np
 import pandas as pd
+from scipy.spatial import cKDTree
 
 
 CURRENT_DIR = Path(__file__).resolve().parent
@@ -310,12 +311,41 @@ def infer_fault_cell_range(fault_summary_csv: Path, config: dict[str, Any]) -> d
 
 def old_postfusion_to_step7c_df(fracture_csv: Path, surface_csv: Path | None, config: dict[str, Any]) -> pd.DataFrame:
     old = read_csv_flexible(fracture_csv, low_memory=False)
+    valid_layer = old[pd.to_numeric(old.get("LayerCode", 0), errors="coerce").isin([3, 4])].copy()
+    valid_layer_tree: cKDTree | None = None
+    valid_layer_positions: np.ndarray | None = None
+    if not valid_layer.empty:
+        valid_layer_positions = valid_layer.index.to_numpy(dtype=int)
+        valid_layer_tree = cKDTree(
+            np.column_stack(
+                [
+                    valid_layer["CenterX"].to_numpy(dtype=float),
+                    valid_layer["CenterY"].to_numpy(dtype=float),
+                    valid_layer["CenterTIME"].to_numpy(dtype=float),
+                ]
+            )
+        )
+
+    def infer_layer_from_nearest_valid(row: pd.Series) -> tuple[str, int]:
+        raw_code = pd.to_numeric(row.get("LayerCode", np.nan), errors="coerce")
+        if pd.notna(raw_code) and int(raw_code) in (3, 4):
+            code = int(raw_code)
+            return ("沙三段" if code == 3 else "沙四段"), code
+        if valid_layer_tree is not None and valid_layer_positions is not None and len(valid_layer_positions) > 0:
+            query = np.asarray([[float(row["CenterX"]), float(row["CenterY"]), float(row["CenterTIME"])]])
+            _, pos = valid_layer_tree.query(query, k=1)
+            nearest = old.loc[int(valid_layer_positions[int(pos[0])])]
+            nearest_code = int(pd.to_numeric(nearest.get("LayerCode", 4), errors="coerce"))
+            if nearest_code in (3, 4):
+                return ("沙三段" if nearest_code == 3 else "沙四段"), nearest_code
+        center_time = float(row.get("CenterTIME", np.nan))
+        return ("沙三段", 3) if np.isfinite(center_time) and center_time < 2600.0 else ("沙四段", 4)
+
     rows: list[dict[str, Any]] = []
     for idx, row in old.iterrows():
         origin_code = int(pd.to_numeric(row.get("PatchOriginCode", 0), errors="coerce") if pd.notna(row.get("PatchOriginCode", 0)) else 0)
         action_code = int(pd.to_numeric(row.get("FaultActionCode", 0), errors="coerce") if pd.notna(row.get("FaultActionCode", 0)) else 0)
-        layer_code = int(pd.to_numeric(row.get("LayerCode", 0), errors="coerce") if pd.notna(row.get("LayerCode", 0)) else 0)
-        layer_group = "沙三段" if layer_code == 3 else "沙四段" if layer_code == 4 else str(row.get("LayerGroup", ""))
+        layer_group, layer_code = infer_layer_from_nearest_valid(row)
         source_type = PATCH_ORIGIN_CODE_TO_SOURCE.get(origin_code, "density_3d_predicted")
         if action_code == 2:
             relation = "fault_damage_zone"
