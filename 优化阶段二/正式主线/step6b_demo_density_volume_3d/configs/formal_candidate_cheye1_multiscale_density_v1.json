@@ -1,0 +1,82 @@
+{
+  "input_density_sgy": "/home/tyh/projects/petroleum/code/GAN-DFN/优化阶段二/正式主线/step6b_demo_density_volume_3d/output/candidate_cheye1/candidate_cheye1_3d_predicted_density.sgy",
+  "trace_mapping_npz": "/home/tyh/projects/petroleum/code/GAN-DFN/优化阶段二/正式主线/step6b_demo_density_volume_3d/output/candidate_cheye1/candidate_cheye1_3d_trace_mapping.npz",
+  "volume_paths": {
+    "Coherence": "/data/shared/project-oil/wx数据/砂砾岩/补充材料-20260623/车西_T4-T7/车西-相干体T4-T7.sgy",
+    "AntTrack": "/data/shared/project-oil/wx数据/砂砾岩/补充材料-20260623/车西_T4-T7/车西-蚂蚁体T4-T7.sgy",
+    "CurvatureMax": "/data/shared/project-oil/wx数据/砂砾岩/补充材料-20260623/车西-最大曲率T4-T7.sgy",
+    "CurvaturePos": "/data/shared/project-oil/wx数据/砂砾岩/补充材料-20260623/车西_T4-T7/车西-最大正曲率T4-T7.sgy"
+  },
+  "output_dir": "/home/tyh/projects/petroleum/code/GAN-DFN/优化阶段二/正式主线/step6b_demo_density_volume_3d/output/candidate_cheye1_multiscale_v1",
+  "small_density_sgy_name": "candidate_cheye1_small_density.sgy",
+  "small_prior_sgy_name": "candidate_cheye1_small_prior.sgy",
+  "medium_prior_sgy_name": "candidate_cheye1_medium_prior.sgy",
+  "medium_mask_sgy_name": "candidate_cheye1_medium_candidate_mask.sgy",
+  "large_prior_sgy_name": "candidate_cheye1_large_prior.sgy",
+  "large_mask_sgy_name": "candidate_cheye1_large_candidate_mask.sgy",
+  "integrated_density_sgy_name": "candidate_cheye1_integrated_density.sgy",
+  "output_trace_mapping_name": "candidate_cheye1_3d_trace_mapping.npz",
+  "bundle_npz_name": "candidate_cheye1_multiscale_prior_bundle.npz",
+  "summary_name": "candidate_cheye1_multiscale_density_bundle_summary.json",
+  "score_config": {
+    "anttrack_score": {
+      "low_quantile": 0.20,
+      "high_quantile": 0.96,
+      "power": 1.0
+    },
+    "coherence_score": {
+      "valid_min": 0.0,
+      "low_quantile": 0.05,
+      "high_quantile": 0.95,
+      "power": 1.25
+    },
+    "curvaturemax_score": {
+      "low_quantile": 0.50,
+      "high_quantile": 0.98,
+      "power": 1.0
+    },
+    "curvaturepos_score": {
+      "low_quantile": 0.50,
+      "high_quantile": 0.98,
+      "power": 1.0
+    }
+  },
+  "small_prior": {
+    "density_quantile_scale": 0.95,
+    "large_medium_suppression": 0.55,
+    "large_medium_density_attenuation": 0.35
+  },
+  "medium_prior": {
+    "score_threshold": 0.52,
+    "min_ant_score": 0.58,
+    "min_component_voxels": 35,
+    "use_26_connectivity": true,
+    "ant_weight_base": 0.65,
+    "lowcoh_support_weight": 0.20,
+    "curvature_support_weight": 0.15,
+    "outside_mask_attenuation": 0.12,
+    "summary_component_limit": 30
+  },
+  "large_prior": {
+    "score_threshold": 0.68,
+    "min_component_voxels": 120,
+    "use_26_connectivity": true,
+    "orientation_time_scale_m_per_ms": 1.0,
+    "min_time_extent_ms": 35.0,
+    "strong_time_extent_ms": 120.0,
+    "horizontal_max_time_extent_ms": 12.0,
+    "horizontal_min_extent_m": 700.0,
+    "min_pca_dip_deg": 45.0,
+    "kept_component_floor": 0.35,
+    "mask_score_floor_multiplier": 0.65,
+    "summary_component_limit": 30
+  },
+  "integration": {
+    "small_weight": 1.0,
+    "medium_additive_density": 4.0,
+    "medium_power": 1.2,
+    "large_additive_density": 5.5,
+    "large_power": 1.15,
+    "density_cap": 10.0
+  }
+}
