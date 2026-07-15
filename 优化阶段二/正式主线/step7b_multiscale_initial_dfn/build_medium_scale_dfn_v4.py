@@ -233,6 +233,12 @@ def select_medium_patches(candidates: pd.DataFrame, grid: dict[str, Any], config
     summaries: list[dict[str, Any]] = []
     max_total = int(config.get("target_patch_count", 1800))
     max_components = int(config.get("max_component_count", 40))
+    reject_low_dip = bool(config.get("reject_low_dip_patches", False))
+    reject_dip_below = float(config.get("reject_dip_below_deg", -1.0))
+    adjust_dip_below = float(config.get("adjust_dip_below_deg", -1.0))
+    adjust_dip_to = float(config.get("adjust_dip_to_deg", adjust_dip_below))
+    low_dip_rejected_count = 0
+    low_dip_adjusted_count = 0
     component_items = []
     for (layer, component_id), group in candidates.groupby(["LayerGroup", "ComponentID"], dropna=False):
         mass = float(group["SamplingWeight"].sum())
@@ -261,6 +267,16 @@ def select_medium_patches(candidates: pd.DataFrame, grid: dict[str, Any], config
                 continue
             used_cells.add(key)
             geom = local_geometry(group, int(local_idx), grid, config)
+            raw_dip = float(geom["dip_deg"])
+            final_dip = raw_dip
+            orientation_adjusted = 0
+            if reject_low_dip and raw_dip < reject_dip_below:
+                low_dip_rejected_count += 1
+                continue
+            if adjust_dip_below >= 0.0 and raw_dip < adjust_dip_below:
+                final_dip = max(raw_dip, adjust_dip_to)
+                orientation_adjusted = 1
+                low_dip_adjusted_count += 1
             row["BandID"] = f"medium_component_{rank:04d}_{layer}_{component_id}"
             row["BandPatchOrdinal"] = ordinal
             row["BandContinuityMode"] = "medium_local_voxel_band_pca_v4"
@@ -270,7 +286,13 @@ def select_medium_patches(candidates: pd.DataFrame, grid: dict[str, Any], config
             row["BandPatchSpacingM"] = 0.0
             row["BandMeanDensity"] = float(group["SourceDensity"].mean())
             row["OverrideAzimuthDeg"] = float(geom["azimuth_deg"])
-            row["OverrideDipDeg"] = float(geom["dip_deg"])
+            row["RawDipDeg"] = raw_dip
+            row["OverrideDipDeg"] = final_dip
+            row["OrientationAdjusted"] = orientation_adjusted
+            row["LowDipRejected"] = 0
+            row["LowDipPolicy"] = (
+                f"reject_below_{reject_dip_below:g}_adjust_below_{adjust_dip_below:g}_to_{adjust_dip_to:g}"
+            )
             row["OverrideLengthM"] = float(geom["length_m"])
             row["OverrideHeightTimeMs"] = float(geom["height_time_ms"])
             row["LocalBandWidthM"] = float(geom["band_width_m"])
@@ -315,6 +337,8 @@ def select_medium_patches(candidates: pd.DataFrame, grid: dict[str, Any], config
     out["ExpectedPatchCountForCell"] = out["SamplingWeight"].astype(float) * scale
     out["EffectiveCountScale"] = scale
     out["CountBasisEffectiveScale"] = scale
+    out.attrs["low_dip_rejected_count"] = int(low_dip_rejected_count)
+    out.attrs["low_dip_adjusted_count"] = int(low_dip_adjusted_count)
     return out.reset_index(drop=True), summaries
 
 
@@ -380,10 +404,18 @@ def build_summary(config_path: Path, config: dict[str, Any], paths: dict[str, Pa
             "area_m2": legacy.finite_stats(patch_df["PatchAreaM2"]),
             "azimuth_deg": legacy.finite_stats(patch_df["AzimuthDeg"]),
             "dip_deg": legacy.finite_stats(patch_df["DipDeg"]),
+            "raw_dip_deg": legacy.finite_stats(patch_df["RawDipDeg"]) if "RawDipDeg" in patch_df else {},
             "local_band_width_m": legacy.finite_stats(patch_df["LocalBandWidthM"]) if "LocalBandWidthM" in patch_df else {},
             "local_band_thickness_ms": legacy.finite_stats(patch_df["LocalBandThicknessMs"]) if "LocalBandThicknessMs" in patch_df else {},
         },
         "orientation_source_distribution": legacy.layer_distribution(patch_df["OrientationSource"]),
+        "low_dip_policy": {
+            "reject_low_dip_patches": bool(config.get("reject_low_dip_patches", False)),
+            "reject_dip_below_deg": float(config.get("reject_dip_below_deg", -1.0)),
+            "adjust_dip_below_deg": float(config.get("adjust_dip_below_deg", -1.0)),
+            "adjust_dip_to_deg": float(config.get("adjust_dip_to_deg", config.get("adjust_dip_below_deg", -1.0))),
+            "selected_low_dip_adjusted_count": int(pd.to_numeric(patch_df.get("OrientationAdjusted", 0), errors="coerce").fillna(0).sum()),
+        },
         "checks": checks,
     }
 
@@ -417,6 +449,10 @@ def main() -> int:
         "LocalBandPcaLinearity",
         "PatchShapeMode",
         "OrientationSourceOverride",
+        "RawDipDeg",
+        "OrientationAdjusted",
+        "LowDipRejected",
+        "LowDipPolicy",
     ]:
         if column in selected.columns:
             patch_df[column] = selected[column].to_numpy()
