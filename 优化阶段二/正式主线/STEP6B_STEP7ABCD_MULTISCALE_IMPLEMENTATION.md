@@ -105,22 +105,26 @@
 - 大尺度候选不应主要由水平层位界面构成。
 - 候选异常应与原始断层或相干体竖向黑灰色不连续带更接近。
 
-### Step6D 多尺度整合
+### Step6D 最终小尺度衍生密度修正
 
 实现口径：
 
-- 整合不是简单相加成一个密度体，而是保留 `small/medium/large` 三类证据。
-- 为兼容旧流程，可额外输出一个综合密度体，但 Step7 主流程读取分尺度证据。
+- Step6D 不再把 `small/medium/large` 简单相加成一个总密度体。
+- Step6D 读取 Step6A 原始小尺度背景密度，并根据 Step6B 中尺度裂缝带、Step6C 大尺度断层周边损伤带增强小尺度密度。
+- 输出的 `final_small_density` 只表示小尺度/衍生小裂缝密度，不包含中尺度裂缝带或大尺度断层本体。
+- Step7A 读取 `final_small_density`，Step7B 读取 Step6B，Step7C 读取 Step6C。
 
 输出：
 
-- `integrated_density.sgy`
+- `final_small_density.sgy`
+- `final_small_candidate_mask.sgy`
 - `multiscale_prior_bundle.npz`
 - `multiscale_density_bundle_summary.json`
 
 检查点：
 
-- `npz` 中至少包含：`small_density`、`medium_prior`、`medium_mask`、`large_prior`、`large_mask`、`x_values`、`y_values`、`samples`。
+- `npz` 中至少包含：`base_small_density`、`final_small_density`、`medium_damage`、`large_damage`、`medium_prior`、`medium_mask`、`large_prior`、`large_mask`、`x_values`、`y_values`、`samples`。
+- 中/大尺度核心区不能被 Step6D 直接改造成小尺度高密度实心块；增强应主要表达核心外侧损伤带。
 
 ## Step7A 小尺度 DFN
 
@@ -178,20 +182,23 @@
 
 - 原始断层解释成果作为硬约束，优先生成与原始单元断层面类似的三维曲面。
 - 不把断层曲面压缩成小矩形碎片链条。
-- 对原始断层面按 demo 区域裁剪，并保留原始曲面点的局部几何。
-- 对未解释但 Step6C 高置信的大尺度低相干异常，可作为补充断裂带面片，但需要明确 `SourceType=large_lowcoh_inferred`。
+- 对原始单元断层 patch 按 demo 区域裁剪，并直接保留 raw surface fragments 的顶点几何。
+- Regional fault panels 只作为断层影响带构造依据，不再替代原始断层面本体。
+- 对未解释但 Step6C 高置信的大尺度低相干异常，可作为补充断裂带面片组，但需要明确 `SourceType=large_lowcoh_inferred_panel`。
 
 核心几何规则：
 
-- 原始断层曲面：由原始 fault stick 点按断层编号/相邻点构面或 panel 化，倾向倾角由曲面局部法向计算。
-- 断层影响带：围绕原始断层曲面生成少量平行/近似平行诱导裂缝片，大小和方向继承断层局部几何。
-- 大尺度低相干补充：只保留陡倾且垂向连续的候选体，局部 PCA 生成较大片。
+- 原始断层曲面：调用旧断层后融合工具中的 `run_build_fault_surface_fragments()`，直接读取单元断层 patch 的 surface fragments 和 `V1X..V4Z` 顶点。
+- 断层影响带：调用 `run_build_regional_fault_panels()` 生成 regional panels，再沿 panel 法向偏移生成 damage-zone patch，方向和大小继承 regional panel。
+- 大尺度低相干补充：读取 Step6C `large_fault_prior_components.npz`，在每个陡倾、垂向连续 component 内沿主方向拆成多个连续 panel，而不是一个 component 一个大矩形。
 
 输出：
 
-- `step7c_large_fault_dfn/output/candidate_cheye1_multiscale_v1/large_fault_surface_raw_time.vtk`
-- `large_fault_and_damage_patches.csv`
+- `step7c_large_fault_dfn/output/candidate_cheye1_step7c_large_from_step6c_rebuild_v3_surface_panelgroup_preview/large_fault_surface_raw_time.vtk`
+- `large_fault_only_and_influence_raw_time.vtk`
+- `large_lowcoh_component_panels_raw_time.vtk`
 - `large_fault_and_damage_raw_time.vtk`
+- `large_fault_and_damage_patches.csv`
 - `large_generation_audit.csv`
 
 检查点：

@@ -76,6 +76,14 @@ def normalize_input(df: pd.DataFrame, scale: str, source_file: Path) -> pd.DataF
         out["ConstraintLevel"] = "soft" if scale == "small" else "seismic_prior"
     if "Confidence" not in out.columns:
         out["Confidence"] = 0.55 if scale == "small" else 0.75 if scale == "medium" else 0.90
+    if "StructuralRelation" not in out.columns:
+        out["StructuralRelation"] = (
+            "small_background_density"
+            if scale == "small"
+            else "medium_structural_corridor"
+            if scale == "medium"
+            else "major_structure_hard_constraint"
+        )
     for col in ["CenterX", "CenterY", "CenterTime", "LengthM", "HeightTimeMs", "AzimuthDeg", "DipDeg", "PatchAreaM2", "SourceDensity", "Confidence"]:
         if col in out.columns:
             out[col] = pd.to_numeric(out[col], errors="coerce")
@@ -85,29 +93,46 @@ def normalize_input(df: pd.DataFrame, scale: str, source_file: Path) -> pd.DataF
     return out
 
 
-def downsample_small_near_major(small: pd.DataFrame, major: pd.DataFrame, config: dict[str, Any], rng: np.random.Generator) -> tuple[pd.DataFrame, dict[str, Any]]:
+def annotate_small_near_major(
+    small: pd.DataFrame,
+    major: pd.DataFrame,
+    config: dict[str, Any],
+) -> tuple[pd.DataFrame, dict[str, Any]]:
+    out = small.copy()
+    out["NearestMajorPatchID"] = ""
+    out["NearestMajorScale"] = ""
+    out["NearestMajorDistanceM"] = np.nan
+    out["StructuralRelation"] = "small_background"
+    out["MajorInfluenceRadiusM"] = float(config.get("small_downsample_near_major_radius_m", 80.0))
     if small.empty or major.empty:
-        return small, {"removed_count": 0, "reason": "empty_small_or_major"}
+        return out.reset_index(drop=True), {
+            "reason": "empty_small_or_major",
+            "input_small_count": int(len(small)),
+            "output_small_count": int(len(out)),
+            "near_major_count": 0,
+            "derivative_small_count": 0,
+            "background_small_count": int(len(out)),
+        }
+
     radius = float(config.get("small_downsample_near_major_radius_m", 80.0))
-    keep_fraction = float(config.get("small_keep_fraction_near_major", 0.45))
     major_xy = major[["CenterX", "CenterY"]].to_numpy(dtype=float)
     tree = cKDTree(major_xy)
     small_xy = small[["CenterX", "CenterY"]].to_numpy(dtype=float)
-    dist, _idx = tree.query(small_xy, k=1)
+    dist, idx = tree.query(small_xy, k=1)
+    nearest = major.iloc[idx].reset_index(drop=True)
+    out["NearestMajorPatchID"] = nearest["PatchID"].astype(str).to_numpy()
+    out["NearestMajorScale"] = nearest["FractureScale"].astype(str).to_numpy()
+    out["NearestMajorDistanceM"] = dist.astype(float)
     near = dist <= radius
-    keep = np.ones(len(small), dtype=bool)
-    near_idx = np.where(near)[0]
-    if near_idx.size:
-        keep_random = rng.random(near_idx.size) < keep_fraction
-        keep[near_idx] = keep_random
-    out = small.iloc[keep].reset_index(drop=True).copy()
-    return out, {
+    out.loc[near, "StructuralRelation"] = "small_derivative_near_major"
+    return out.reset_index(drop=True), {
         "radius_m": radius,
-        "keep_fraction_near_major": keep_fraction,
         "near_major_count": int(near.sum()),
-        "removed_count": int(len(small) - len(out)),
+        "derivative_small_count": int(near.sum()),
+        "background_small_count": int((~near).sum()),
         "input_small_count": int(len(small)),
         "output_small_count": int(len(out)),
+        "major_scale_counts": {str(k): int(v) for k, v in major["FractureScale"].value_counts(dropna=False).items()},
     }
 
 
@@ -187,12 +212,16 @@ def main() -> int:
     small = normalize_input(read_csv_flexible(Path(config["small_dfn_csv"]).resolve()), "small", Path(config["small_dfn_csv"]).resolve())
     medium = normalize_input(read_csv_flexible(Path(config["medium_dfn_csv"]).resolve()), "medium", Path(config["medium_dfn_csv"]).resolve())
     large = normalize_input(read_csv_flexible(Path(config["large_dfn_csv"]).resolve()), "large", Path(config["large_dfn_csv"]).resolve())
-    small_filtered, small_filter_summary = downsample_small_near_major(small, pd.concat([medium, large], ignore_index=True), config, rng)
-    fused = pd.concat([large, medium, small_filtered], ignore_index=True)
+    major = pd.concat([medium, large], ignore_index=True)
+    small_annotated, small_relation_summary = annotate_small_near_major(small, major, config)
+    fused = pd.concat([large, medium, small_annotated], ignore_index=True)
     fused["PatchID"] = [f"fused_multiscale_{idx + 1:06d}" for idx in range(len(fused))]
     fused = add_render_columns(fused)
     fused.to_csv(paths["dfn_csv"], index=False, encoding="utf-8-sig")
-    audit = fused[["PatchID", "FractureScale", "SourceType", "ConstraintLevel", "CenterX", "CenterY", "CenterTime", "LengthM", "HeightTimeMs", "AzimuthDeg", "DipDeg", "PatchAreaM2", "Step7SourceFile"]].copy()
+    audit_cols = ["PatchID", "FractureScale", "SourceType", "ConstraintLevel", "CenterX", "CenterY", "CenterTime", "LengthM", "HeightTimeMs", "AzimuthDeg", "DipDeg", "PatchAreaM2", "Step7SourceFile"]
+    if "StructuralRelation" in fused.columns:
+        audit_cols.extend(["StructuralRelation", "NearestMajorPatchID", "NearestMajorScale", "NearestMajorDistanceM"])
+    audit = fused[audit_cols].copy()
     audit["Action"] = "keep_multiscale_patch"
     audit.to_csv(paths["audit_csv"], index=False, encoding="utf-8-sig")
     write_vtk(paths["raw_vtk"], fused, "step7d_fused_multiscale_dfn_raw_time")
@@ -207,10 +236,11 @@ def main() -> int:
         },
         "outputs": {key: str(value) for key, value in paths.items()},
         "input_counts": {"small": int(len(small)), "medium": int(len(medium)), "large": int(len(large))},
-        "small_filter_summary": small_filter_summary,
+        "small_relation_summary": small_relation_summary,
         "patch_count": int(len(fused)),
         "scale_counts": {str(k): int(v) for k, v in fused["FractureScale"].value_counts(dropna=False).items()},
         "source_type_counts": {str(k): int(v) for k, v in fused["SourceType"].value_counts(dropna=False).items()},
+        "structural_relation_counts": {str(k): int(v) for k, v in fused["StructuralRelation"].value_counts(dropna=False).items()} if "StructuralRelation" in fused.columns else {},
         "patch_stats": {
             "length_m": finite_stats(fused["LengthM"]),
             "height_time_ms": finite_stats(fused["HeightTimeMs"]),

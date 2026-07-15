@@ -1,5 +1,9 @@
 # Step6 多尺度裂缝预测改造实现计划
 
+> 下一轮可落地执行方案见：
+> `STEP6_STEP7_MULTISCALE_REBALANCE_EXECUTION_PLAN.md`。
+> 该文档细化了 `candidate_cheye1_multiscale_rebalance_v1` 的输入 QC、Step6A/B/C/D、Step7A/B/C/D、Step8、Step9 执行顺序、输出目录、验收标准和不通过处理策略。
+
 ## 1. 改造目标
 
 当前旧 Step6/旧 Step6B 的问题不是“能不能生成密度体”，而是生成出来的裂缝密度和地震解释成果之间的关系不够清楚。后续改造目标是把裂缝预测拆成大、中、小三个尺度通道：
@@ -164,11 +168,12 @@ Step6B 当前 validation 是随机行抽样。由于相邻时间点、相邻虚�
 - 对没有原始解释的小断层，使用低相干垂向不连续带识别候选。
 - 过滤横向层界面：横向连续、垂向厚度很薄的低相干带不应进入大断层先验。
 
-### 4.4 Step6D 裂缝密度整合
+### 4.4 Step6D 最终小尺度衍生密度修正
 
 用途：
 
-- 将小、中、大三个通道组织成新版 Step7 可用的多尺度输入。
+- 在不改变大/中尺度断层和裂缝带本体的前提下，利用 Step6B/Step6C 的构造位置修正小尺度背景裂缝密度。
+- 为 Step7A 输出最终小尺度采样密度，同时为 Step7B/Step7C 保留中/大尺度先验索引。
 
 主要输入：
 
@@ -180,16 +185,19 @@ Step6B 当前 validation 是随机行抽样。由于相邻时间点、相邻虚�
 主要输出：
 
 - `multiscale_density_bundle.json`
-- `final_sampling_density.sgy`
+- `final_small_density.sgy`
+- `final_small_candidate_mask.sgy`
 - `scale_label.sgy`
 - `scale_confidence.sgy`
 - `multiscale_density_qc.json`
 
 关键逻辑：
 
-- 不只输出一个密度体，要保留尺度标签。
-- `final_sampling_density` 可以供采样使用，但新版 Step7 必须知道每个位置对应小、中、大哪个尺度。
-- 大尺度优先级最高，中尺度次之，小尺度作为背景补充。
+- Step6A 输出原始小尺度背景密度，不直接考虑大/中尺度影响。
+- Step6D 读取 Step6B/Step6C，对中尺度裂缝带和大尺度断层周边的损伤带做小尺度密度增强。
+- Step6D 输出的 `final_small_density` 仍然只表示小尺度/衍生小裂缝密度，不包含大/中尺度裂缝本体。
+- 大尺度断层本体由 Step7C 表达，中尺度裂缝带本体由 Step7B 表达，Step7A 只读取 Step6D 的最终小尺度密度。
+- `scale_label` 和 `scale_confidence` 只用于记录大/中/小尺度空间关系和 QC，不允许把三类证据压成一个来源不明的单通道最终密度。
 
 ## 5. 推荐实施顺序
 
@@ -278,21 +286,24 @@ Step6B 当前 validation 是随机行抽样。由于相邻时间点、相邻虚�
 - 横向层界面不被大量识别成断层。
 - 输出 `large_fault_candidates.vtk` 可在 ParaView 检查。
 
-### 阶段 4：裂缝密度整合 Step6D
+### 阶段 4：最终小尺度衍生密度修正 Step6D
 
 目标：
 
-- 为新版 Step7 提供统一但保留尺度信息的输入。
+- 将 Step6B 中尺度裂缝带和 Step6C 大尺度断层的损伤带影响加入小尺度背景密度。
+- 输出 Step7A 使用的最终小尺度密度，同时保留 Step7B/Step7C 使用的中/大尺度先验索引。
 
 改动点：
 
 - 输出多通道 SGY/NPZ/JSON。
-- 生成 `scale_label`，区分 large / medium / small。
-- 生成 `final_sampling_density`，用于后续采样。
+- 生成 `final_small_density` 和 `final_small_candidate_mask`，作为 Step7A 输入。
+- 生成 `scale_label`，记录 large / medium / small 的空间重叠和优先级。
+- 对中/大尺度核心区做防重复控制：不把大断层面或中尺度裂缝带本体直接变成小尺度高密度实心块，只增强周边损伤带。
 
 完成标准：
 
-- 新版 Step7 可以读取三个尺度通道。
+- Step7A 可以只读取 `final_small_density` 生成小尺度裂缝。
+- Step7B/Step7C 继续分别读取 Step6B/Step6C 结果，不从 Step6D 的小尺度密度反推中/大尺度裂缝。
 - QC 能统计每个尺度占比、密度分布、地震属性重合率。
 
 ### 阶段 5：改造新版 Step7

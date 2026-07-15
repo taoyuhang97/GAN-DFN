@@ -1,0 +1,62 @@
+{
+  "density_sgy": "/home/tyh/projects/petroleum/code/GAN-DFN/优化阶段二/正式主线/step6b_demo_density_volume_3d/output/candidate_cheye1_multiscale_rebalance_v1/step6a_small/small_background_score.sgy",
+  "trace_mapping_npz": "/home/tyh/projects/petroleum/code/GAN-DFN/优化阶段二/正式主线/step6b_demo_density_volume_3d/output/candidate_cheye1_multiscale_rebalance_v1/step6a_small/candidate_cheye1_3d_trace_mapping.npz",
+  "layer_dir": "/data/shared/project-oil/wx数据/砂砾岩/层位",
+  "output_dir": "/home/tyh/projects/petroleum/code/GAN-DFN/优化阶段二/正式主线/step7a_small_scale_dfn/output/candidate_cheye1_multiscale_rebalance_v1",
+  "target_block": {
+    "name": "candidate_cheye1_multiscale_rebalance_v1",
+    "x_min": 577325,
+    "x_max": 580325,
+    "y_min": 4198850,
+    "y_max": 4201850
+  },
+  "random_seed": 20260715,
+  "candidate_density_quantile": {
+    "沙三段": 0.88,
+    "沙四段": 0.88
+  },
+  "min_candidate_density": 0.000001,
+  "min_component_voxels": 6,
+  "count_scale": 0.035,
+  "min_patch_count": 3000,
+  "max_patch_count": 6500,
+  "trace_spacing_x_m": 12.5,
+  "trace_spacing_y_m": 12.5,
+  "base_length_m": {
+    "沙三段": 16.0,
+    "沙四段": 18.0
+  },
+  "base_height_time_ms": {
+    "沙三段": 5.0,
+    "沙四段": 6.0
+  },
+  "length_density_gain": 0.75,
+  "height_density_gain": 0.45,
+  "max_density_norm": 1.0,
+  "length_jitter_min": 0.78,
+  "length_jitter_max": 1.22,
+  "height_jitter_min": 0.82,
+  "height_jitter_max": 1.18,
+  "max_height_fraction_of_layer": 0.30,
+  "min_height_time_ms": 3.0,
+  "orientation_window_xy_cells": 4,
+  "orientation_window_time_samples": 3,
+  "orientation_time_scale_m_per_ms": 1.0,
+  "orientation_local_quantile": 0.70,
+  "min_orientation_points": 10,
+  "min_orientation_planarity": 0.05,
+  "min_dip_deg": 35.0,
+  "max_dip_deg": 89.0,
+  "fallback_azimuth_deg": {
+    "沙三段": 55.0,
+    "沙四段": 125.0
+  },
+  "fallback_dip_deg": {
+    "沙三段": 70.0,
+    "沙四段": 68.0
+  },
+  "geometry_time_scale_m_per_ms": 1.0,
+  "display_z_scale": 5.0,
+  "max_small_length_check_m": 90.0,
+  "max_small_height_check_ms": 30.0
+}
