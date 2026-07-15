@@ -9,6 +9,7 @@ import numpy as np
 import pandas as pd
 import pyvista as pv
 from scipy import ndimage
+from scipy.spatial import Delaunay
 
 from build_multiscale_density_bundle import (
     ensure_dir,
@@ -56,6 +57,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--layer-like-min-horizontal-extent-m", type=float, default=600.0)
     parser.add_argument("--min-ant-or-curv-support", type=float, default=0.08)
     parser.add_argument("--support-neighborhood-cells", type=int, default=1)
+    parser.add_argument("--faultlike-filter-mode", choices=["none", "vertical_continuity"], default="vertical_continuity")
+    parser.add_argument("--faultlike-xy-radius-cells", type=int, default=1)
+    parser.add_argument("--faultlike-min-vertical-extent-ms", type=float, default=120.0)
+    parser.add_argument("--faultlike-min-column-hits", type=int, default=8)
+    parser.add_argument("--faultlike-max-horizontal-slice-fraction", type=float, default=0.35)
     parser.add_argument("--fault-time-padding-ms", type=float, default=20.0)
     parser.add_argument("--fault-xy-padding-m", type=float, default=25.0)
     parser.add_argument("--vtk-max-points", type=int, default=250000)
@@ -71,6 +77,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--surface-max-panel-height-ms", type=float, default=360.0)
     parser.add_argument("--surface-max-horizontal-extent-m", type=float, default=1800.0)
     parser.add_argument("--surface-max-time-extent-ms", type=float, default=520.0)
+    parser.add_argument("--irregular-surface-max-points", type=int, default=3500)
+    parser.add_argument("--irregular-surface-max-edge-m", type=float, default=220.0)
     parser.add_argument("--random-state", type=int, default=42)
     return parser.parse_args()
 
@@ -304,6 +312,75 @@ def build_local_support_grid(ant_grid: np.ndarray, curv_grid: np.ndarray, radius
     return ndimage.maximum_filter(support, size=(size, size, size), mode="nearest").astype(np.float32)
 
 
+def filter_faultlike_evidence_grid(
+    candidate_grid: np.ndarray,
+    support_grid: np.ndarray,
+    score_grid: np.ndarray,
+    samples: np.ndarray,
+    args: argparse.Namespace,
+) -> tuple[np.ndarray, dict[str, Any]]:
+    raw = np.asarray(candidate_grid, dtype=bool)
+    if str(args.faultlike_filter_mode) == "none":
+        return raw.copy(), {
+            "mode": "none",
+            "raw_voxel_count": int(raw.sum()),
+            "filtered_voxel_count": int(raw.sum()),
+            "filtered_voxel_fraction_of_raw": 1.0 if int(raw.sum()) else 0.0,
+        }
+
+    radius = max(int(args.faultlike_xy_radius_cells), 0)
+    size = 2 * radius + 1
+    local_candidate = ndimage.maximum_filter(raw.astype(np.uint8), size=(size, size, 1), mode="nearest") > 0
+    local_support = ndimage.maximum_filter(
+        (support_grid >= float(args.min_ant_or_curv_support)).astype(np.uint8),
+        size=(size, size, 1),
+        mode="nearest",
+    ) > 0
+    column_hits = local_candidate.sum(axis=2)
+    nt = raw.shape[2]
+    dt = float(np.median(np.diff(samples))) if len(samples) > 1 else 1.0
+    min_hits_from_extent = int(np.ceil(float(args.faultlike_min_vertical_extent_ms) / max(abs(dt), 1.0e-6))) + 1
+    min_hits = max(int(args.faultlike_min_column_hits), min_hits_from_extent)
+    vertical_column = column_hits >= min_hits
+    vertical_grid = np.repeat(vertical_column[:, :, None], nt, axis=2)
+
+    slice_fraction = raw.mean(axis=(0, 1))
+    non_layer_slice = slice_fraction <= float(args.faultlike_max_horizontal_slice_fraction)
+    non_layer_grid = np.repeat(non_layer_slice[None, None, :], raw.shape[0], axis=0)
+    non_layer_grid = np.repeat(non_layer_grid, raw.shape[1], axis=1)
+
+    filtered = raw & vertical_grid & local_support & non_layer_grid
+    if filtered.any():
+        labels, count = ndimage.label(filtered, structure=np.ones((3, 3, 3), dtype=np.uint8))
+        sizes = np.bincount(labels.ravel())
+        keep_ids = np.where(sizes >= int(args.min_component_voxels))[0]
+        keep_ids = keep_ids[keep_ids > 0]
+        filtered = np.isin(labels, keep_ids)
+    else:
+        count = 0
+        keep_ids = np.asarray([], dtype=np.int64)
+
+    raw_count = int(raw.sum())
+    filtered_count = int(filtered.sum())
+    summary = {
+        "mode": "vertical_continuity",
+        "xy_radius_cells": int(radius),
+        "min_column_hits": int(min_hits),
+        "min_vertical_extent_ms": float(args.faultlike_min_vertical_extent_ms),
+        "max_horizontal_slice_fraction": float(args.faultlike_max_horizontal_slice_fraction),
+        "raw_voxel_count": raw_count,
+        "vertical_column_count": int(vertical_column.sum()),
+        "removed_by_vertical_or_support_or_layer_filter": int(raw_count - int((raw & vertical_grid & local_support & non_layer_grid).sum())),
+        "raw_component_count_after_prefilter": int(count),
+        "kept_component_count_after_size_filter": int(len(keep_ids)),
+        "filtered_voxel_count": filtered_count,
+        "filtered_voxel_fraction_of_raw": float(filtered_count / raw_count) if raw_count else 0.0,
+        "filtered_score_stats": finite_stats(score_grid[filtered]) if filtered_count else finite_stats([]),
+        "filtered_support_stats": finite_stats(support_grid[filtered]) if filtered_count else finite_stats([]),
+    }
+    return filtered, summary
+
+
 def extract_inferred_faults(
     score_grid: np.ndarray,
     candidate_grid: np.ndarray,
@@ -490,6 +567,7 @@ def extract_inferred_fault_surfaces(
     surface_id_grid = np.zeros(candidate_grid.shape, dtype=np.int32)
     rows: list[dict[str, Any]] = []
     surface_vertices: list[np.ndarray] = []
+    surface_point_sets: list[dict[str, Any]] = []
     time_scale = float(args.orientation_time_scale_m_per_ms)
     sizes = np.bincount(labels.ravel())
     raw_ids = [idx for idx in range(1, count + 1) if int(sizes[idx]) >= int(args.min_component_voxels)]
@@ -626,6 +704,20 @@ def extract_inferred_fault_surfaces(
                 row[f"V{vertex_idx}Z"] = float(vertices[vertex_idx - 1, 2])
             rows.append(row)
             surface_vertices.append(vertices)
+            surface_point_sets.append(
+                {
+                    "surface_id": int(next_surface_id),
+                    "raw_component_id": int(raw_component_id),
+                    "points_unscaled": inlier_points_unscaled.copy(),
+                    "points_scaled": inlier_points_scaled.copy(),
+                    "score": score_grid[iyy, ixx, itt].astype(np.float32).copy(),
+                    "support": support_grid[iyy, ixx, itt].astype(np.float32).copy(),
+                    "azimuth_deg": float(geom["azimuth_deg"]),
+                    "dip_deg": float(geom["dip_deg"]),
+                    "surface_area_m2": float(geom["area_m2"]),
+                    "surface_planarity": float(geom["planarity"]),
+                }
+            )
             next_surface_id += 1
             remaining[active_idx[inliers_local]] = False
 
@@ -651,7 +743,7 @@ def extract_inferred_fault_surfaces(
         "surface_max_time_extent_ms": float(args.surface_max_time_extent_ms),
         "orientation_time_scale_m_per_ms": time_scale,
     }
-    return surface_id_grid, pd.DataFrame(rows), summary, surface_vertices
+    return surface_id_grid, pd.DataFrame(rows), summary, surface_point_sets
 
 
 def write_component_vtk(
@@ -752,6 +844,103 @@ def write_surface_candidate_vtk(path: Path, surface_df: pd.DataFrame) -> dict[st
     return {"surface_count": int(len(surface_df)), "polygon_count": int(mesh.n_cells), "point_count": int(mesh.n_points)}
 
 
+def write_irregular_surface_candidate_vtk(
+    path: Path,
+    surface_point_sets: list[dict[str, Any]],
+    args: argparse.Namespace,
+    rng: np.random.Generator,
+) -> dict[str, Any]:
+    if not surface_point_sets:
+        pv.PolyData().save(path)
+        return {"surface_count": 0, "triangle_count": 0, "point_count": 0}
+    all_points: list[np.ndarray] = []
+    all_faces: list[list[int]] = []
+    cell_data: dict[str, list[float | int]] = {
+        "SurfaceID": [],
+        "RawComponentID": [],
+        "ScoreMean": [],
+        "SupportMean": [],
+        "AzimuthDeg": [],
+        "DipDeg": [],
+        "SurfaceAreaM2": [],
+        "SurfacePlanarity": [],
+    }
+    max_points = int(args.irregular_surface_max_points)
+    max_edge = float(args.irregular_surface_max_edge_m)
+    dropped_long_edge = 0
+    dropped_degenerate = 0
+    for surface in surface_point_sets:
+        points = np.asarray(surface["points_unscaled"], dtype=np.float64)
+        points_scaled = np.asarray(surface["points_scaled"], dtype=np.float64)
+        if len(points) < 3:
+            continue
+        if len(points) > max_points:
+            keep = rng.choice(np.arange(len(points)), size=max_points, replace=False)
+            points = points[keep]
+            points_scaled = points_scaled[keep]
+        center = points_scaled.mean(axis=0)
+        axis1, axis2, _normal, _azimuth, _dip, _planarity = plane_axes_from_points(points_scaled)
+        local = np.column_stack([(points_scaled - center) @ axis1, (points_scaled - center) @ axis2])
+        try:
+            tri = Delaunay(local)
+        except Exception:
+            continue
+        base = sum(len(item) for item in all_points)
+        all_points.append(points.astype(np.float32))
+        score_mean = float(np.mean(surface["score"])) if len(surface["score"]) else 0.0
+        support_mean = float(np.mean(surface["support"])) if len(surface["support"]) else 0.0
+        for simplex in tri.simplices:
+            tri_local = local[simplex]
+            edges = [
+                float(np.linalg.norm(tri_local[0] - tri_local[1])),
+                float(np.linalg.norm(tri_local[1] - tri_local[2])),
+                float(np.linalg.norm(tri_local[2] - tri_local[0])),
+            ]
+            edge_a = tri_local[1] - tri_local[0]
+            edge_b = tri_local[2] - tri_local[0]
+            area = 0.5 * float(abs(edge_a[0] * edge_b[1] - edge_a[1] * edge_b[0]))
+            if area <= 1.0e-6:
+                dropped_degenerate += 1
+                continue
+            if max(edges) > max_edge:
+                dropped_long_edge += 1
+                continue
+            all_faces.append([3, base + int(simplex[0]), base + int(simplex[1]), base + int(simplex[2])])
+            cell_data["SurfaceID"].append(int(surface["surface_id"]))
+            cell_data["RawComponentID"].append(int(surface["raw_component_id"]))
+            cell_data["ScoreMean"].append(score_mean)
+            cell_data["SupportMean"].append(support_mean)
+            cell_data["AzimuthDeg"].append(float(surface["azimuth_deg"]))
+            cell_data["DipDeg"].append(float(surface["dip_deg"]))
+            cell_data["SurfaceAreaM2"].append(float(surface["surface_area_m2"]))
+            cell_data["SurfacePlanarity"].append(float(surface["surface_planarity"]))
+    if not all_points or not all_faces:
+        pv.PolyData().save(path)
+        return {
+            "surface_count": int(len(surface_point_sets)),
+            "triangle_count": 0,
+            "point_count": int(sum(len(item) for item in all_points)),
+            "dropped_long_edge_triangle_count": int(dropped_long_edge),
+            "dropped_degenerate_triangle_count": int(dropped_degenerate),
+        }
+    points_arr = np.vstack(all_points).astype(np.float32)
+    faces_arr = np.asarray(all_faces, dtype=np.int64).ravel()
+    mesh = pv.PolyData(points_arr, faces_arr)
+    for name, values in cell_data.items():
+        dtype = np.int32 if name in {"SurfaceID", "RawComponentID"} else np.float32
+        mesh.cell_data[name] = np.asarray(values, dtype=dtype)
+    mesh.save(path)
+    return {
+        "surface_count": int(len(surface_point_sets)),
+        "triangle_count": int(mesh.n_cells),
+        "point_count": int(mesh.n_points),
+        "dropped_long_edge_triangle_count": int(dropped_long_edge),
+        "dropped_degenerate_triangle_count": int(dropped_degenerate),
+        "max_points_per_surface": int(max_points),
+        "max_edge_m": float(max_edge),
+    }
+
+
 def main() -> int:
     args = parse_args()
     config = read_json(args.config.resolve())
@@ -819,11 +1008,29 @@ def main() -> int:
         int(args.vtk_max_points),
         rng,
     )
+    faultlike_candidate_grid, faultlike_filter_summary = filter_faultlike_evidence_grid(
+        candidate_grid,
+        support_grid,
+        score_grid,
+        samples,
+        args,
+    )
+    faultlike_evidence_vtk_summary = write_candidate_evidence_vtk(
+        output_dir / "inferred_faultlike_evidence_points_raw_time.vtk",
+        faultlike_candidate_grid,
+        score_grid,
+        support_grid,
+        mapping,
+        samples,
+        int(args.vtk_max_points),
+        rng,
+    )
     inferred_surface_vtk_summary: dict[str, Any] = {"surface_count": 0, "polygon_count": 0}
+    inferred_irregular_surface_vtk_summary: dict[str, Any] = {"surface_count": 0, "triangle_count": 0}
     if args.inferred_extraction_mode == "surface_ransac":
-        inferred_id_grid, inferred_df, inferred_summary, _surface_vertices = extract_inferred_fault_surfaces(
+        inferred_id_grid, inferred_df, inferred_summary, surface_point_sets = extract_inferred_fault_surfaces(
             score_grid,
-            candidate_grid,
+            faultlike_candidate_grid,
             support_grid,
             mapping,
             samples,
@@ -834,16 +1041,23 @@ def main() -> int:
             output_dir / "inferred_fault_surface_candidates_raw_time.vtk",
             inferred_df,
         )
+        inferred_irregular_surface_vtk_summary = write_irregular_surface_candidate_vtk(
+            output_dir / "inferred_fault_surface_candidates_irregular_raw_time.vtk",
+            surface_point_sets,
+            args,
+            rng,
+        )
     else:
         inferred_id_grid, inferred_df, inferred_summary = extract_inferred_faults(
             score_grid,
-            candidate_grid,
+            faultlike_candidate_grid,
             support_grid,
             mapping,
             samples,
             args,
         )
         write_surface_candidate_vtk(output_dir / "inferred_fault_surface_candidates_raw_time.vtk", pd.DataFrame())
+        pv.PolyData().save(output_dir / "inferred_fault_surface_candidates_irregular_raw_time.vtk")
     inferred_mask = inferred_id_grid > 0
     combined_prior_grid = np.maximum(original_fault_grid, score_grid * inferred_mask.astype(np.float32))
     combined_mask_grid = original_fault_mask | inferred_mask
@@ -918,11 +1132,21 @@ def main() -> int:
                 "surface_ransac_distance_m": float(args.surface_ransac_distance_m),
                 "surface_ransac_min_inlier_voxels": int(args.surface_ransac_min_inlier_voxels),
                 "surface_ransac_min_inlier_fraction": float(args.surface_ransac_min_inlier_fraction),
+                "faultlike_filter_mode": str(args.faultlike_filter_mode),
+                "faultlike_xy_radius_cells": int(args.faultlike_xy_radius_cells),
+                "faultlike_min_vertical_extent_ms": float(args.faultlike_min_vertical_extent_ms),
+                "faultlike_min_column_hits": int(args.faultlike_min_column_hits),
+                "faultlike_max_horizontal_slice_fraction": float(args.faultlike_max_horizontal_slice_fraction),
+                "irregular_surface_max_points": int(args.irregular_surface_max_points),
+                "irregular_surface_max_edge_m": float(args.irregular_surface_max_edge_m),
             },
             "lowcoh_score_threshold": lowcoh_cut,
             "large_score_threshold": large_cut,
             "raw_candidate_voxel_count": int(candidate_flat.sum()),
             "raw_candidate_voxel_fraction": float(candidate_flat.mean()),
+            "faultlike_filter": faultlike_filter_summary,
+            "faultlike_candidate_voxel_count": int(faultlike_candidate_grid.sum()),
+            "faultlike_candidate_voxel_fraction": float(faultlike_candidate_grid.mean()),
             "kept_voxel_count": int(inferred_mask.sum()),
             "kept_voxel_fraction": float(inferred_mask.mean()),
             "component_count": int(len(inferred_df)),
@@ -932,7 +1156,9 @@ def main() -> int:
             "component_time_extent_stats": finite_stats(inferred_df["time_extent_ms"]) if len(inferred_df) else finite_stats([]),
             "vtk": inferred_vtk_summary,
             "evidence_vtk": evidence_vtk_summary,
+            "faultlike_evidence_vtk": faultlike_evidence_vtk_summary,
             "surface_vtk": inferred_surface_vtk_summary,
+            "irregular_surface_vtk": inferred_irregular_surface_vtk_summary,
         },
         "combined": {
             "large_prior_stats": finite_stats(large_prior_flat[large_prior_flat > 0]),
