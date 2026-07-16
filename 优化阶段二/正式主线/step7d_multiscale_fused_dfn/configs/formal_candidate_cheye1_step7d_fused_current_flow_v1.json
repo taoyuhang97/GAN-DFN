@@ -1,5 +1,5 @@
 {
-  "small_dfn_csv": "/home/tyh/projects/petroleum/code/GAN-DFN/优化阶段二/正式主线/step7a_small_scale_dfn/output/candidate_cheye1_current_flow_v1/small_dfn_patches.csv",
+  "small_dfn_csv": "/home/tyh/projects/petroleum/code/GAN-DFN/优化阶段二/正式主线/step7a_small_scale_dfn/output/candidate_cheye1_current_flow_v5_v2_density_v4_orientation/small_dfn_patches.csv",
   "medium_dfn_csv": "/home/tyh/projects/petroleum/code/GAN-DFN/优化阶段二/正式主线/step7b_multiscale_initial_dfn/output/candidate_cheye1_step7b_medium_from_step6b_rebuild_v3_strict_steep30_preview/medium_dfn_patches.csv",
   "large_dfn_csv": "/home/tyh/projects/petroleum/code/GAN-DFN/优化阶段二/正式主线/step7c_large_fault_dfn/output/candidate_cheye1_step7c_large_faultlike_surface_v1/large_fault_and_damage_patches.csv",
   "output_dir": "/home/tyh/projects/petroleum/code/GAN-DFN/优化阶段二/正式主线/step7d_multiscale_fused_dfn/output/candidate_cheye1_current_flow_v1",
