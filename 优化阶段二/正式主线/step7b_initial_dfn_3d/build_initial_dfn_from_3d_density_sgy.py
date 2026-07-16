@@ -1525,10 +1525,26 @@ def write_legacy_vtk(path: Path, patch_df: pd.DataFrame, title: str, display: bo
             values = pd.to_numeric(patch_df[optional_name], errors="coerce").to_numpy(dtype=float)
             if np.isfinite(values).any():
                 scalar_columns.append((optional_name, values, "float"))
-    for optional_name in ["FractureScaleCode", "BandPatchOrdinal", "BandVoxelCount"]:
+    for optional_name in ["FractureScaleCode", "SmallDomainCode", "BandPatchOrdinal", "BandVoxelCount", "OrientationFamilyCode"]:
         if optional_name in patch_df.columns:
             scalar_columns.append((optional_name, patch_df[optional_name].to_numpy(), "int"))
-    for optional_name in ["BandLengthM", "BandTimeExtentMs", "BandPatchSpacingM", "BandMeanDensity", "ObjectBandAzimuthDeg", "ObjectBandDipDeg", "ObjectBandLengthM", "ObjectBandCenterSpacingM", "ObjectBandOverlapRatio"]:
+    for optional_name in [
+        "BandLengthM",
+        "BandTimeExtentMs",
+        "BandPatchSpacingM",
+        "BandMeanDensity",
+        "ObjectBandAzimuthDeg",
+        "ObjectBandDipDeg",
+        "ObjectBandLengthM",
+        "ObjectBandCenterSpacingM",
+        "ObjectBandOverlapRatio",
+        "OrientationBaseAzimuthDeg",
+        "OrientationBaseDipDeg",
+        "LocalPcaAzimuthDeg",
+        "LocalPcaDipDeg",
+        "OrientationAzimuthOffsetDeg",
+        "OrientationDipOffsetDeg",
+    ]:
         if optional_name in patch_df.columns:
             scalar_columns.append((optional_name, patch_df[optional_name].to_numpy(), "float"))
     total_polygon_size = sum(len(poly) + 1 for poly in polygons)

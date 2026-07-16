@@ -1,0 +1,40 @@
+{
+  "input_vtk": "/home/tyh/projects/petroleum/code/GAN-DFN/优化阶段二/正式主线/step8_dfn_well_correction/output/candidate_cheye1_current_flow_v1/well_corrected_dfn_raw_time.vtk",
+  "original_fault_stick_dat": "/data/shared/project-oil/wx数据/砂砾岩/断层/FaultStick-GeoEast.dat",
+  "trace_header_csv": "/home/tyh/projects/petroleum/code/GAN-DFN/数据精简/trace_header_xy.csv",
+  "real_well_samples_root": "/home/tyh/projects/petroleum/code/GAN-DFN/优化阶段二/正式主线/step2_real_well_t4_t7_samples/output/formal_all_wells",
+  "surface_dir": "/data/shared/project-oil/wx数据/砂砾岩/层位",
+  "coherence_volume_path": "/data/shared/project-oil/wx数据/砂砾岩/补充材料-20260623/车西_T4-T7/车西-相干体T4-T7.sgy",
+  "step3_imaging_group_csvs": [
+    "/home/tyh/projects/petroleum/code/GAN-DFN/优化阶段二/正式主线/step3_imaging_supervision_samples/output/formal_rebuild/groups/车页1导眼_沙三段.csv",
+    "/home/tyh/projects/petroleum/code/GAN-DFN/优化阶段二/正式主线/step3_imaging_supervision_samples/output/formal_rebuild/groups/车页1导眼_沙四段.csv"
+  ],
+  "output_dir": "/home/tyh/projects/petroleum/code/GAN-DFN/优化阶段二/正式主线/step9_section_visualize/output/candidate_cheye1_current_flow_v1/cheye1_dfn_coherence_sections",
+  "well_name": "车页1导眼",
+  "exclude_wells": [],
+  "target_block": {
+    "name": "candidate_cheye1_current_flow_v1",
+    "x_min": 577325,
+    "x_max": 580325,
+    "y_min": 4198850,
+    "y_max": 4201850
+  },
+  "dfn_half_width_m": 50.0,
+  "fault_trace_half_width_m": 50.0,
+  "original_fault_context_padding_m": 10000.0,
+  "local_axis_radius_m": 200.0,
+  "local_dfn_half_width_m": 200.0,
+  "local_fault_trace_half_width_m": 200.0,
+  "time_padding_ms": 20.0,
+  "max_polygons": 0,
+  "max_selected": 0,
+  "min_patch_area": 0.0,
+  "max_patch_area": 0.0,
+  "surface_samples": 500,
+  "progress_interval": 100000,
+  "title_prefix": "candidate_cheye1_current_flow_v1 过车页1导眼",
+  "z_label": "TWT / ms",
+  "fig_width": 15.5,
+  "fig_height": 7.8,
+  "dpi": 240
+}
