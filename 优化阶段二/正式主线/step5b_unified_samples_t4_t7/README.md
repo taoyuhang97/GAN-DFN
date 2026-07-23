@@ -25,4 +25,4 @@ python 优化阶段二/正式主线/step5b_unified_samples_t4_t7/build_unified_t
 
 ## 下游关系
 
-`step6_demo_density_volume` 只读取本步骤输出的 `unified_t4_t7_density_samples.csv`，不直接读取 Step 5A 的虚拟井中间表。
+`step6b_demo_density_volume_3d/build_candidate_3d_density_sgy.py` 只读取本步骤输出的 `unified_t4_t7_density_samples.csv`，不直接读取 Step 5A 的虚拟井中间表。

@@ -1,6 +1,6 @@
-# Step 6B 3D Density SGY
+# Step 6 三维密度与多尺度先验
 
-本步骤是 Step6 的并行增强版本，先面向 `candidate_cheye1` 构造真正的 `X-Y-T` 三维裂缝密度体。
+本目录先面向 `candidate_cheye1` 构造 `X-Y-T` 基础三维裂缝密度体，再拆分为 Step6A 小尺度背景、Step6B 中尺度裂缝带、Step6C 大尺度断层/断裂带和 Step6D 多尺度整合。
 
 ## 运行
 
@@ -44,18 +44,17 @@ tmux new -s step6b_cheye1_3d
 
 不输出逐点 CSV。SGY 继承原始地震体 trace header，只写入 `candidate_cheye1` demo 区内 trace；demo 区外 trace 不写入输出文件。
 
-## 低相干后处理
+## 当前多尺度主线
 
-低相干后处理不重新训练模型，只读取原 Step6B 三维密度 SGY 和相干体 SGY，将低相干黑色异常转换为密度权重，输出独立 lowcoh 密度体，不覆盖原结果：
+- Step6A：`build_step6a_small_background.py`
+- Step6B：`build_step6b_medium_corridor_prior.py`
+- Step6C：`build_step6c_large_fault_prior.py`
+- Step6D：`build_step6d_multiscale_bundle.py`
 
-```bash
-/home/tyh/anaconda3/envs/gan-dfn/bin/python \
-  优化阶段二/正式主线/step6b_demo_density_volume_3d/postprocess_density_sgy_lowcoh.py \
-  --config 优化阶段二/正式主线/step6b_demo_density_volume_3d/configs/formal_candidate_cheye1_3d_density_lowcoh_postprocess.json
-```
+当前检查点的 Step6B 使用蚂蚁体主分支和独立陡倾低相干分支。低相干候选仍需通过垂向延伸、倾角、线性和层状异常过滤，不能把所有低相干区域直接转换为裂缝带。
 
-输出目录：`output/candidate_cheye1_lowcoh_post`。
+当前统一 Step6D 输出：
 
-- `candidate_cheye1_3d_predicted_density_lowcoh.sgy`：低相干引导后的三维裂缝密度 SGY。
-- `candidate_cheye1_3d_trace_mapping.npz`：复制原 Step6B trace 映射，供 Step7B 直接使用。
-- `candidate_cheye1_3d_density_lowcoh_postprocess_summary.json`：低相干权重和密度变化统计。
+`output/candidate_cheye1_final_lowcoh_vertical_v1/step6d_bundle/`
+
+现有输入对齐和定位 QC 已通过。当前基础密度可以作为小尺度背景使用，但真正的留一井重新训练验证尚未执行，因此不能据此宣称模型已经具备充分的跨井泛化能力。

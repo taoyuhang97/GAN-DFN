@@ -20,7 +20,6 @@ from build_all_area_section_visualization import (
     INTERVAL_LABELS,
     ProjectionSegment,
     SurfaceSectionCurve,
-    build_surface_section_curves,
     configure_matplotlib_fonts,
     interval_for_center,
     next_nonempty,
@@ -42,6 +41,7 @@ from build_well_attribute_section_visualization import (
     sample_attribute_section,
     select_time_samples,
 )
+from trace_horizon_section import build_trace_horizon_section_curves, resolve_horizon_trace_table
 
 
 WELL_NAME = "车页1导眼"
@@ -118,7 +118,43 @@ def build_namespace(config: dict[str, Any], half_width: float) -> SimpleNamespac
         surface_samples=int(config.get("surface_samples", 500)),
         progress_interval=int(config.get("progress_interval", 100000)),
         no_svg=True,
+        dfn_patch_metadata=None,
+        small_projection_enabled=bool(config.get("small_projection_enabled", False)),
+        small_projection_half_width=float(config.get("small_projection_half_width_m", half_width)),
+        small_projection_include_well_control=bool(config.get("small_projection_include_well_control", True)),
     )
+
+
+def infer_dfn_patch_csv(config: dict[str, Any]) -> Path | None:
+    if config.get("dfn_patch_csv"):
+        return path_from_config(config, "dfn_patch_csv")
+    input_vtk = path_from_config(config, "input_vtk")
+    candidate = input_vtk.with_name("well_corrected_dfn_fracture_patches.csv")
+    return candidate if candidate.exists() else None
+
+
+def load_dfn_patch_metadata(path: Path | None) -> pd.DataFrame | None:
+    if path is None:
+        return None
+    df = pd.read_csv(path, encoding="utf-8-sig", low_memory=False)
+    if "FractureScale" not in df.columns:
+        return None
+    return df.reset_index(drop=True)
+
+
+def patch_scale_for_index(metadata: pd.DataFrame | None, polygon_index: int) -> str:
+    if metadata is None or polygon_index < 0 or polygon_index >= len(metadata):
+        return ""
+    return str(metadata.iloc[int(polygon_index)].get("FractureScale", "")).strip().lower()
+
+
+def patch_is_well_control_for_index(metadata: pd.DataFrame | None, polygon_index: int) -> bool:
+    if metadata is None or polygon_index < 0 or polygon_index >= len(metadata):
+        return False
+    if "IsWellControlPatch" not in metadata.columns:
+        return False
+    value = pd.to_numeric(pd.Series([metadata.iloc[int(polygon_index)].get("IsWellControlPatch")]), errors="coerce").iloc[0]
+    return bool(pd.notna(value) and int(value) == 1)
 
 
 def validate_inputs(config: dict[str, Any]) -> None:
@@ -144,6 +180,10 @@ def validate_inputs(config: dict[str, Any]) -> None:
         path = path_from_config(config, "fault_surface_csv")
         if not path.exists():
             raise FileNotFoundError(f"fault_surface_csv not found: {path}")
+    if config.get("dfn_patch_csv"):
+        path = path_from_config(config, "dfn_patch_csv")
+        if not path.exists():
+            raise FileNotFoundError(f"dfn_patch_csv not found: {path}")
     if config.get("original_fault_stick_dat"):
         path = path_from_config(config, "original_fault_stick_dat")
         if not path.exists():
@@ -288,6 +328,13 @@ def segment_lines(
     return lines, colors, widths
 
 
+def append_segment_with_mode(segments: list[ProjectionSegment], segment: ProjectionSegment, mode: str) -> None:
+    # ProjectionSegment is imported from the shared section module and has no
+    # display-mode field; attach it dynamically for Step9-specific styling.
+    setattr(segment, "display_mode", mode)
+    segments.append(segment)
+
+
 def plane_polygon_intersection_line(vertices: np.ndarray, axis: int, value: float) -> tuple[tuple[float, float], tuple[float, float]] | None:
     """Return the line segment where a convex polygon crosses X=value or Y=value."""
     points: list[np.ndarray] = []
@@ -331,6 +378,16 @@ def plane_polygon_intersection_line(vertices: np.ndarray, axis: int, value: floa
     return (float(p1[0]), float(p1[1])), (float(p2[0]), float(p2[1]))
 
 
+def projected_polygon_line(vertices: np.ndarray, projection: str) -> tuple[tuple[float, float], tuple[float, float]] | None:
+    if projection == "XZ":
+        coords = vertices[:, [0, 2]]
+    elif projection == "YZ":
+        coords = vertices[:, [1, 2]]
+    else:
+        return None
+    return representative_line_2d(coords)
+
+
 def scan_vtk_intersections(args: SimpleNamespace, surfaces: dict[str, Any], well_df: pd.DataFrame) -> tuple[list[ProjectionSegment], dict[str, float | int | str]]:
     well_time = well_df["TIME"].to_numpy(dtype=float)
     well_x = well_df["X"].to_numpy(dtype=float)
@@ -347,6 +404,13 @@ def scan_vtk_intersections(args: SimpleNamespace, surfaces: dict[str, Any], well
     skipped_by_surface_distance_yz = 0
     skipped_by_no_intersection_xz = 0
     skipped_by_no_intersection_yz = 0
+    selected_intersection_xz = 0
+    selected_intersection_yz = 0
+    selected_small_projection_xz = 0
+    selected_small_projection_yz = 0
+    skipped_small_projection_well_control_xz = 0
+    skipped_small_projection_well_control_yz = 0
+    scanned_scale_counts: dict[str, int] = {}
 
     with args.input_vtk.open("r", encoding="utf-8", errors="ignore") as handle:
         header = [next_nonempty(handle) for _ in range(4)]
@@ -391,12 +455,17 @@ def scan_vtk_intersections(args: SimpleNamespace, surfaces: dict[str, Any], well
             if interval is None:
                 skipped_by_interval += 1
                 continue
+            patch_scale = patch_scale_for_index(getattr(args, "dfn_patch_metadata", None), polygon_index)
+            patch_is_well_control = patch_is_well_control_for_index(getattr(args, "dfn_patch_metadata", None), polygon_index)
+            scanned_scale_counts[patch_scale or "unknown"] = int(scanned_scale_counts.get(patch_scale or "unknown", 0)) + 1
 
             y_on_well_curve = float(np.interp(center_time, well_time, well_y))
             x_on_well_curve = float(np.interp(center_time, well_time, well_x))
             xz_surface_distance = abs(float(center[1]) - y_on_well_curve)
             yz_surface_distance = abs(float(center[0]) - x_on_well_curve)
             selected_this_patch = False
+            xz_added = False
+            yz_added = False
 
             if xz_surface_distance <= float(args.half_width):
                 line = plane_polygon_intersection_line(vertices, axis=1, value=y_on_well_curve)
@@ -404,7 +473,10 @@ def scan_vtk_intersections(args: SimpleNamespace, surfaces: dict[str, Any], well
                     skipped_by_no_intersection_xz += 1
                 else:
                     selected_this_patch = True
-                    segments.append(
+                    xz_added = True
+                    selected_intersection_xz += 1
+                    append_segment_with_mode(
+                        segments,
                         ProjectionSegment(
                             polygon_index=int(polygon_index),
                             projection="XZ",
@@ -418,10 +490,42 @@ def scan_vtk_intersections(args: SimpleNamespace, surfaces: dict[str, Any], well
                             z1=float(line[0][1]),
                             h2=float(line[1][0]),
                             z2=float(line[1][1]),
-                        )
+                        ),
+                        "intersection",
                     )
             else:
                 skipped_by_surface_distance_xz += 1
+            if (
+                bool(getattr(args, "small_projection_enabled", False))
+                and not xz_added
+                and patch_scale == "small"
+                and xz_surface_distance <= float(getattr(args, "small_projection_half_width", args.half_width))
+            ):
+                if patch_is_well_control and not bool(getattr(args, "small_projection_include_well_control", True)):
+                    skipped_small_projection_well_control_xz += 1
+                else:
+                    line = projected_polygon_line(vertices, "XZ")
+                    if line is not None:
+                        selected_this_patch = True
+                        selected_small_projection_xz += 1
+                        append_segment_with_mode(
+                            segments,
+                            ProjectionSegment(
+                                polygon_index=int(polygon_index),
+                                projection="XZ",
+                                interval=interval,
+                                center_x=float(center[0]),
+                                center_y=float(center[1]),
+                                center_z=center_time,
+                                surface_distance=xz_surface_distance,
+                                patch_area=float(area),
+                                h1=float(line[0][0]),
+                                z1=float(line[0][1]),
+                                h2=float(line[1][0]),
+                                z2=float(line[1][1]),
+                            ),
+                            "small_projection",
+                        )
 
             if yz_surface_distance <= float(args.half_width):
                 line = plane_polygon_intersection_line(vertices, axis=0, value=x_on_well_curve)
@@ -429,7 +533,10 @@ def scan_vtk_intersections(args: SimpleNamespace, surfaces: dict[str, Any], well
                     skipped_by_no_intersection_yz += 1
                 else:
                     selected_this_patch = True
-                    segments.append(
+                    yz_added = True
+                    selected_intersection_yz += 1
+                    append_segment_with_mode(
+                        segments,
                         ProjectionSegment(
                             polygon_index=int(polygon_index),
                             projection="YZ",
@@ -443,10 +550,42 @@ def scan_vtk_intersections(args: SimpleNamespace, surfaces: dict[str, Any], well
                             z1=float(line[0][1]),
                             h2=float(line[1][0]),
                             z2=float(line[1][1]),
-                        )
+                        ),
+                        "intersection",
                     )
             else:
                 skipped_by_surface_distance_yz += 1
+            if (
+                bool(getattr(args, "small_projection_enabled", False))
+                and not yz_added
+                and patch_scale == "small"
+                and yz_surface_distance <= float(getattr(args, "small_projection_half_width", args.half_width))
+            ):
+                if patch_is_well_control and not bool(getattr(args, "small_projection_include_well_control", True)):
+                    skipped_small_projection_well_control_yz += 1
+                else:
+                    line = projected_polygon_line(vertices, "YZ")
+                    if line is not None:
+                        selected_this_patch = True
+                        selected_small_projection_yz += 1
+                        append_segment_with_mode(
+                            segments,
+                            ProjectionSegment(
+                                polygon_index=int(polygon_index),
+                                projection="YZ",
+                                interval=interval,
+                                center_x=float(center[0]),
+                                center_y=float(center[1]),
+                                center_z=center_time,
+                                surface_distance=yz_surface_distance,
+                                patch_area=float(area),
+                                h1=float(line[0][0]),
+                                z1=float(line[0][1]),
+                                h2=float(line[1][0]),
+                                z2=float(line[1][1]),
+                            ),
+                            "small_projection",
+                        )
 
             if not selected_this_patch:
                 skipped_by_surface_distance += 1
@@ -462,12 +601,25 @@ def scan_vtk_intersections(args: SimpleNamespace, surfaces: dict[str, Any], well
         "surface_dir": str(args.surface_dir),
         "half_width": float(args.half_width),
         "section_geometry_mode": "polygon_plane_intersection",
+        "small_projection_enabled": bool(getattr(args, "small_projection_enabled", False)),
+        "small_projection_half_width_m": float(getattr(args, "small_projection_half_width", args.half_width)),
+        "small_projection_include_well_control": bool(getattr(args, "small_projection_include_well_control", True)),
         "point_count": int(point_count),
         "polygon_count": int(polygon_count),
         "scanned_polygon_count": int(total_to_scan),
         "selected_segment_count": int(len(segments)),
         "selected_segment_count_xz": int(sum(segment.projection == "XZ" for segment in segments)),
         "selected_segment_count_yz": int(sum(segment.projection == "YZ" for segment in segments)),
+        "selected_intersection_count": int(selected_intersection_xz + selected_intersection_yz),
+        "selected_intersection_count_xz": int(selected_intersection_xz),
+        "selected_intersection_count_yz": int(selected_intersection_yz),
+        "selected_small_projection_count": int(selected_small_projection_xz + selected_small_projection_yz),
+        "selected_small_projection_count_xz": int(selected_small_projection_xz),
+        "selected_small_projection_count_yz": int(selected_small_projection_yz),
+        "skipped_small_projection_well_control_count": int(skipped_small_projection_well_control_xz + skipped_small_projection_well_control_yz),
+        "skipped_small_projection_well_control_count_xz": int(skipped_small_projection_well_control_xz),
+        "skipped_small_projection_well_control_count_yz": int(skipped_small_projection_well_control_yz),
+        "scanned_scale_counts_after_time_interval_filter": {str(key): int(value) for key, value in sorted(scanned_scale_counts.items())},
         "skipped_by_surface_distance": int(skipped_by_surface_distance),
         "skipped_by_surface_distance_xz": int(skipped_by_surface_distance_xz),
         "skipped_by_surface_distance_yz": int(skipped_by_surface_distance_yz),
@@ -763,15 +915,35 @@ def add_fault_trace_segments(ax, segments: list[ProjectionSegment], projection: 
 
 
 def add_dfn_segments(ax, segments: list[ProjectionSegment], projection: str, *, overlay: bool) -> int:
-    lines, colors, widths = segment_lines(segments, projection)
-    if not lines:
+    intersection_segments = [
+        segment
+        for segment in segments
+        if segment.projection == projection and getattr(segment, "display_mode", "intersection") != "small_projection"
+    ]
+    projected_segments = [
+        segment
+        for segment in segments
+        if segment.projection == projection and getattr(segment, "display_mode", "intersection") == "small_projection"
+    ]
+    intersection_lines, intersection_colors, intersection_widths = segment_lines(intersection_segments, projection)
+    projected_lines, projected_colors, projected_widths = segment_lines(projected_segments, projection)
+    if not intersection_lines and not projected_lines:
         ax.text(0.5, 0.5, "无T4-T7裂缝片段", transform=ax.transAxes, ha="center", va="center")
         return 0
+    if projected_lines:
+        projected_widths = [max(0.35, width * 0.62) for width in projected_widths]
+        if overlay:
+            halo_widths = [width + 0.55 for width in projected_widths]
+            ax.add_collection(LineCollection(projected_lines, colors=DFN_HALO_COLOR, linewidths=halo_widths, alpha=0.22, zorder=4.6))
+        ax.add_collection(LineCollection(projected_lines, colors=projected_colors, linewidths=projected_widths, alpha=0.48, zorder=4.8 if overlay else 1.8))
+        ax.plot([], [], color="#6b7280", linewidth=1.4, alpha=0.58, label="小尺度裂缝投影")
+    if not intersection_lines:
+        return len(projected_lines)
     if overlay:
-        halo_widths = [width + 1.35 for width in widths]
-        ax.add_collection(LineCollection(lines, colors=DFN_HALO_COLOR, linewidths=halo_widths, alpha=0.72, zorder=5))
-    ax.add_collection(LineCollection(lines, colors=colors, linewidths=widths, alpha=0.92, zorder=6 if overlay else 2))
-    return len(lines)
+        halo_widths = [width + 1.35 for width in intersection_widths]
+        ax.add_collection(LineCollection(intersection_lines, colors=DFN_HALO_COLOR, linewidths=halo_widths, alpha=0.72, zorder=5))
+    ax.add_collection(LineCollection(intersection_lines, colors=intersection_colors, linewidths=intersection_widths, alpha=0.92, zorder=6 if overlay else 2))
+    return len(intersection_lines) + len(projected_lines)
 
 
 def density_size_factor(values: pd.Series) -> pd.Series:
@@ -1095,6 +1267,16 @@ def main() -> None:
 
     standard_args = build_namespace(config, float(config.get("dfn_half_width_m", 50.0)))
     local_args = build_namespace(config, float(config.get("local_dfn_half_width_m", 200.0)))
+    local_args.small_projection_half_width = float(
+        config.get(
+            "local_small_projection_half_width_m",
+            config.get("small_projection_half_width_m", local_args.half_width),
+        )
+    )
+    dfn_patch_csv = infer_dfn_patch_csv(config)
+    dfn_patch_metadata = load_dfn_patch_metadata(dfn_patch_csv)
+    standard_args.dfn_patch_metadata = dfn_patch_metadata
+    local_args.dfn_patch_metadata = dfn_patch_metadata
     selected_well = select_demo_well(standard_args)
     standard_args.well_trajectory_csv = selected_well.path
     local_args.well_trajectory_csv = selected_well.path
@@ -1117,6 +1299,9 @@ def main() -> None:
     trace_df = build_trace_grid(path_from_config(config, "trace_header_csv"), dict(config.get("target_block") or {}))
     trace_tree, trace_ids = build_trace_tree(trace_df)
     surfaces = load_surface_lookups(standard_args.surface_dir)
+    horizon_trace_table_path = resolve_horizon_trace_table(config)
+    x_values = np.sort(trace_df["X"].unique()).astype(np.float64)
+    y_values = np.sort(trace_df["Y"].unique()).astype(np.float64)
 
     full_display = {
         "display_x_min": float(trace_df["X"].min()),
@@ -1125,7 +1310,15 @@ def main() -> None:
         "display_y_max": float(trace_df["Y"].max()),
     }
     full_summary_base = make_summary(full_display, 0.0, 1.0)
-    full_surface_curves = build_surface_section_curves(surfaces, well_df, full_summary_base, standard_args)
+    full_surface_curves, full_horizon_summary = build_trace_horizon_section_curves(
+        horizon_trace_table_path,
+        well_df,
+        trace_tree,
+        trace_ids,
+        x_values,
+        y_values,
+        iteration_count=int(config.get("horizon_curve_iteration_count", 12)),
+    )
     full_time_min, full_time_max = finite_bounds_from_curves(full_surface_curves, float(config.get("time_padding_ms", 20.0)))
     full_summary = make_summary(full_display, full_time_min, full_time_max)
 
@@ -1139,13 +1332,21 @@ def main() -> None:
         "display_y_max": float(y_local.max()),
     }
     local_summary_base = make_summary(local_display, 0.0, 1.0)
-    local_surface_curves = build_surface_section_curves(surfaces, well_df, local_summary_base, local_args)
+    local_surface_curves, local_horizon_summary = build_trace_horizon_section_curves(
+        horizon_trace_table_path,
+        well_df,
+        trace_tree,
+        trace_ids,
+        x_local,
+        y_local,
+        iteration_count=int(config.get("horizon_curve_iteration_count", 12)),
+    )
     local_time_min, local_time_max = finite_bounds_from_curves(local_surface_curves, float(config.get("time_padding_ms", 20.0)))
     local_summary = make_summary(local_display, local_time_min, local_time_max)
 
-    print("[cheye1-section] scanning DFN standard band as section intersections", flush=True)
+    print("[cheye1-section] scanning DFN standard band as section intersections + small-scale band projection", flush=True)
     standard_segments, standard_scan = scan_vtk_intersections(standard_args, surfaces, well_df)
-    print("[cheye1-section] scanning DFN local 200m band as section intersections", flush=True)
+    print("[cheye1-section] scanning DFN local 200m band as section intersections + small-scale band projection", flush=True)
     local_segments, local_scan = scan_vtk_intersections(local_args, surfaces, well_df)
     print("[cheye1-section] scanning fault surface traces", flush=True)
     fault_dat = path_from_config(config, "original_fault_stick_dat") if config.get("original_fault_stick_dat") else None
@@ -1183,8 +1384,6 @@ def main() -> None:
             max_polygons=int(config.get("fault_trace_max_polygons", 0)),
         )
 
-    x_values = np.sort(trace_df["X"].unique()).astype(np.float64)
-    y_values = np.sort(trace_df["Y"].unique()).astype(np.float64)
     coherence_path = path_from_config(config, "coherence_volume_path")
     handle, samples, trace_at = open_volume_context(coherence_path)
     try:
@@ -1266,9 +1465,22 @@ def main() -> None:
             "local_200m_yz": visible_fracture_label_count(fracture_df, "YZ", local_summary),
         },
         "coherence_display": {"colormap": COHERENCE_CMAP, "vmin_q02": float(vmin), "vmax_q98": float(vmax)},
-        "dfn_section_geometry_mode": "polygon_plane_intersection",
+        "horizon_display": {
+            "horizon_trace_table_path": str(horizon_trace_table_path),
+            "full": full_horizon_summary,
+            "local_200m": local_horizon_summary,
+        },
+        "dfn_patch_csv": str(dfn_patch_csv) if dfn_patch_csv is not None else None,
+        "dfn_patch_metadata_loaded": dfn_patch_metadata is not None,
+        "dfn_patch_metadata_count": int(len(dfn_patch_metadata)) if dfn_patch_metadata is not None else 0,
+        "dfn_section_geometry_mode": "polygon_plane_intersection_plus_small_band_projection"
+        if bool(config.get("small_projection_enabled", False))
+        else "polygon_plane_intersection",
         "dfn_standard_half_width_m": float(standard_args.half_width),
         "dfn_local_half_width_m": float(local_args.half_width),
+        "small_projection_enabled": bool(config.get("small_projection_enabled", False)),
+        "small_projection_half_width_m": float(standard_args.small_projection_half_width),
+        "local_small_projection_half_width_m": float(local_args.small_projection_half_width),
         "local_axis_radius_m": local_radius,
         "trace_count_in_candidate": int(len(trace_df)),
         "full_axis": {"x_count": int(len(x_values)), "y_count": int(len(y_values))},

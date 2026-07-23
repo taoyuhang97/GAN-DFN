@@ -257,6 +257,116 @@ def merge_step3_imaging_controls(step4_df: pd.DataFrame, step3_df: pd.DataFrame,
     return out
 
 
+def aggregate_step4_controls_to_events(step4_df: pd.DataFrame, config: dict[str, Any]) -> pd.DataFrame:
+    """Convert dense Step4 point controls into well-scale fracture events.
+
+    Step4 points are predicted from conventional logs and can be sampled much
+    more densely than any reasonable DFN patch spacing. Aggregating adjacent
+    points keeps the well constraint, but avoids drawing one patch per sample.
+    """
+    if step4_df.empty or not bool(config.get("enable_step4_event_aggregation", False)):
+        return step4_df.copy()
+
+    gap_ms = float(config.get("step4_event_gap_ms", 6.0))
+    max_span_ms = float(config.get("step4_event_max_span_ms", 18.0))
+    min_points = int(config.get("step4_event_min_points", 1))
+    density_rule = str(config.get("step4_event_density_aggregation", "max")).lower()
+    rows: list[dict[str, Any]] = []
+
+    for (well, layer), group in step4_df.sort_values(["WellName", "LayerGroup", "TIME"]).groupby(
+        ["WellName", "LayerGroup"], dropna=False
+    ):
+        current_indices: list[int] = []
+        event_idx = 0
+        previous_time: float | None = None
+        event_start_time: float | None = None
+
+        def flush_event(indices: list[int]) -> None:
+            nonlocal event_idx
+            if len(indices) < min_points:
+                return
+            event_idx += 1
+            event = group.loc[indices].copy()
+            density = safe_numeric(event["Density"]) if "Density" in event.columns else pd.Series(np.nan, index=event.index)
+            weights = density.clip(lower=0.0)
+            if not weights.notna().any() or float(weights.fillna(0.0).sum()) <= 0.0:
+                weights = pd.Series(1.0, index=event.index)
+            else:
+                weights = weights.fillna(float(weights[weights > 0].median()) if (weights > 0).any() else 1.0)
+            weights_np = weights.to_numpy(dtype=float)
+            weights_np = weights_np / max(float(weights_np.sum()), 1.0e-12)
+
+            row = event.iloc[0].to_dict()
+            for column in ["X", "Y", "TIME", "TVD", "DEPT"]:
+                if column in event.columns:
+                    values = safe_numeric(event[column]).to_numpy(dtype=float)
+                    valid = np.isfinite(values)
+                    if valid.any():
+                        local_weights = weights_np.copy()
+                        local_weights[~valid] = 0.0
+                        if float(local_weights.sum()) > 0.0:
+                            local_weights = local_weights / float(local_weights.sum())
+                            row[column] = float(np.sum(values[valid] * local_weights[valid]))
+                        else:
+                            row[column] = float(np.nanmedian(values[valid]))
+            if "Density" in event.columns:
+                event_density = safe_numeric(event["Density"]).dropna()
+                if event_density.empty:
+                    row["Density"] = np.nan
+                elif density_rule == "mean":
+                    row["Density"] = float(event_density.mean())
+                elif density_rule.startswith("q"):
+                    quantile = float(density_rule[1:]) / 100.0
+                    row["Density"] = float(event_density.quantile(np.clip(quantile, 0.0, 1.0)))
+                else:
+                    row["Density"] = float(event_density.max())
+            event_time_min = float(safe_numeric(event["TIME"]).min())
+            event_time_max = float(safe_numeric(event["TIME"]).max())
+            safe_well = str(well).replace("/", "_").replace(" ", "")
+            safe_layer = str(layer).replace("/", "_").replace(" ", "")
+            row["WellControlSampleID"] = f"step4_event_{safe_well}_{safe_layer}_{event_idx:04d}"
+            row["ControlSource"] = "step4_predicted_event"
+            row["IsImagingGroundTruth"] = 0
+            row["EventPointCount"] = int(len(event))
+            row["EventTimeMin"] = event_time_min
+            row["EventTimeMax"] = event_time_max
+            row["EventTimeSpanMs"] = event_time_max - event_time_min
+            row["EventDensityMax"] = float(safe_numeric(event["Density"]).max()) if "Density" in event.columns else np.nan
+            row["EventDensityMean"] = float(safe_numeric(event["Density"]).mean()) if "Density" in event.columns else np.nan
+            rows.append(row)
+
+        for idx, row in group.iterrows():
+            time_value = float(row["TIME"])
+            if not current_indices:
+                current_indices = [idx]
+                previous_time = time_value
+                event_start_time = time_value
+                continue
+            gap_break = previous_time is not None and (time_value - previous_time) > gap_ms
+            span_break = (
+                max_span_ms > 0.0
+                and event_start_time is not None
+                and (time_value - event_start_time) > max_span_ms
+            )
+            if gap_break or span_break:
+                flush_event(current_indices)
+                current_indices = [idx]
+                event_start_time = time_value
+            else:
+                current_indices.append(idx)
+            previous_time = time_value
+        if current_indices:
+            flush_event(current_indices)
+
+    if not rows:
+        out = step4_df.head(0).copy()
+    else:
+        out = pd.DataFrame(rows)
+    out = out.sort_values(["WellName", "LayerGroup", "TIME", "WellControlSampleID"]).reset_index(drop=True)
+    out["ControlPointID"] = ["ctrl_%06d" % (idx + 1) for idx in range(len(out))]
+    return out
+
+
 def load_real_well_tracks(root: Path, well_names: set[str]) -> dict[str, pd.DataFrame]:
     tracks: dict[str, pd.DataFrame] = {}
     for path in sorted(root.glob("*/*_t4_t7_real_well_main.csv")):
@@ -359,10 +469,13 @@ def build_patch_tree(
     layer: str,
     time_scale: float,
     require_well_modifiable: bool = True,
+    allowed_scales: set[str] | None = None,
 ) -> tuple[cKDTree | None, np.ndarray]:
     layer_mask = df["LayerGroup"].astype(str).eq(layer)
     if require_well_modifiable:
         layer_mask &= build_well_modifiable_mask(df)
+    if allowed_scales is not None and "FractureScale" in df.columns:
+        layer_mask &= df["FractureScale"].astype(str).str.lower().isin(allowed_scales)
     layer_idx = df.index[layer_mask].to_numpy(dtype=int)
     if layer_idx.size == 0:
         return None, layer_idx
@@ -417,11 +530,18 @@ def choose_patch_for_control(
     positions = np.atleast_1d(positions[0] if np.asarray(positions).ndim > 1 else positions)
     xy_radius = float(config.get("xy_search_radius_m", 80.0))
     time_radius = float(config.get("time_search_radius_ms", 30.0))
+    allowed_scales = {
+        str(item).lower()
+        for item in config.get("well_control_match_scales", [])
+        if str(item).strip()
+    }
     for pos in positions:
         patch_idx = int(layer_idx[int(pos)])
         if patch_idx in used_patch_indices:
             continue
         patch = initial_df.loc[patch_idx]
+        if allowed_scales and str(patch.get("FractureScale", "")).lower() not in allowed_scales:
+            continue
         xy_dist = float(np.hypot(float(patch["CenterX"]) - float(control["X"]), float(patch["CenterY"]) - float(control["Y"])))
         time_dist = abs(float(patch["CenterTime"]) - float(control["TIME"]))
         if xy_dist <= xy_radius and time_dist <= time_radius:
@@ -429,8 +549,28 @@ def choose_patch_for_control(
     return None, None, None
 
 
-def nearest_template_patch(initial_df: pd.DataFrame, layer: str, x: float, y: float, time_value: float, time_scale: float) -> pd.Series:
-    tree, layer_idx = build_patch_tree(initial_df, layer=layer, time_scale=time_scale)
+def nearest_template_patch(
+    initial_df: pd.DataFrame,
+    layer: str,
+    x: float,
+    y: float,
+    time_value: float,
+    time_scale: float,
+    config: dict[str, Any],
+) -> pd.Series:
+    allowed_scales = {
+        str(item).lower()
+        for item in config.get("well_control_template_scales", config.get("well_control_match_scales", []))
+        if str(item).strip()
+    }
+    tree, layer_idx = build_patch_tree(
+        initial_df,
+        layer=layer,
+        time_scale=time_scale,
+        allowed_scales=allowed_scales or None,
+    )
+    if tree is None or layer_idx.size == 0:
+        tree, layer_idx = build_patch_tree(initial_df, layer=layer, time_scale=time_scale)
     if tree is None or layer_idx.size == 0:
         raise RuntimeError(f"no template patches available for layer: {layer}")
     query = np.asarray([[x, y, time_value * time_scale]])
@@ -505,13 +645,53 @@ def add_control_size_columns(control_df: pd.DataFrame, config: dict[str, Any]) -
     return out
 
 
-def control_orientation(template: pd.Series, control: pd.Series) -> tuple[float, float, str]:
+def config_layer_value(config: dict[str, Any], key: str, layer: str, default: float) -> float:
+    value = config.get(key, default)
+    if isinstance(value, dict):
+        return float(value.get(layer, default))
+    return float(value)
+
+
+def control_orientation(template: pd.Series, control: pd.Series, config: dict[str, Any]) -> tuple[float, float, str]:
     is_gt = int(control.get("IsImagingGroundTruth", 0) or 0) == 1
     azimuth = pd.to_numeric(pd.Series([control.get("Frac_Azimuth")]), errors="coerce").iloc[0]
     dip = pd.to_numeric(pd.Series([control.get("Frac_Dip")]), errors="coerce").iloc[0]
     if is_gt and np.isfinite(azimuth) and np.isfinite(dip):
         return float(azimuth) % 180.0, float(np.clip(dip, 1.0, 89.0)), "step3_imaging_gt_orientation"
-    return float(template["AzimuthDeg"]) % 180.0, float(np.clip(template["DipDeg"], 1.0, 89.0)), "well_control_template_from_nearest_initial_patch"
+    template_azimuth = float(template["AzimuthDeg"]) % 180.0
+    template_dip = float(np.clip(template["DipDeg"], 1.0, 89.0))
+    policy = dict(config.get("step4_small_orientation_policy", {}))
+    if not bool(policy.get("enabled", False)):
+        return template_azimuth, template_dip, "well_control_template_from_nearest_initial_patch"
+    layer = str(control.get("LayerGroup", template.get("LayerGroup", "")))
+    target_dip = config_layer_value(policy, "target_dip_deg", layer, 62.0)
+    min_dip = float(policy.get("min_dip_deg", 35.0))
+    max_dip = float(policy.get("max_dip_deg", 78.0))
+    blend = float(policy.get("template_blend_to_target", 0.45))
+    steep_blend = float(policy.get("steep_template_blend_to_target", 0.65))
+    az_jitter = float(policy.get("azimuth_jitter_deg", 8.0))
+    dip_jitter = float(policy.get("dip_jitter_deg", 5.0))
+    key = f"{control.get('WellName', '')}|{control.get('WellControlSampleID', '')}|{layer}"
+    azimuth = (template_azimuth + stable_unit_value(key + "|azimuth") * az_jitter) % 180.0
+    clipped_template_dip = float(np.clip(template_dip, min_dip, max_dip))
+    use_blend = steep_blend if template_dip > max_dip else blend
+    dip = (1.0 - use_blend) * clipped_template_dip + use_blend * target_dip
+    dip += stable_unit_value(key + "|dip_soften") * dip_jitter
+    dip = float(np.clip(dip, min_dip, max_dip))
+    return azimuth, dip, "well_control_small_scale_template_softened_orientation"
+
+
+def force_well_control_small_scale(row: dict[str, Any], control: pd.Series, config: dict[str, Any]) -> dict[str, Any]:
+    if not bool(config.get("force_well_control_small_scale", False)):
+        return row
+    is_gt = int(control.get("IsImagingGroundTruth", 0) or 0) == 1
+    row["FractureScale"] = "small"
+    row["FractureScaleCode"] = 1
+    row["SourceType"] = "small_step3_imaging_well_control" if is_gt else "small_step4_predicted_well_control"
+    row["StructuralRelation"] = "small_well_control"
+    row["ConstraintLevel"] = "well_control"
+    row["GenerationStage"] = "step8_small_well_control"
+    return row
 
 
 def offset_center_near_control(control: pd.Series, azimuth_deg: float, dip_deg: float, length_m: float, height_time_ms: float, config: dict[str, Any]) -> dict[str, float]:
@@ -570,7 +750,7 @@ def offset_center_near_control(control: pd.Series, azimuth_deg: float, dip_deg: 
 
 def apply_geometry_from_control(row: pd.Series | dict[str, Any], template: pd.Series, control: pd.Series, config: dict[str, Any]) -> dict[str, Any]:
     out = dict(row)
-    azimuth, dip, orientation_source = control_orientation(template=template, control=control)
+    azimuth, dip, orientation_source = control_orientation(template=template, control=control, config=config)
     length = float(control["WellControlLengthM"]) if "WellControlLengthM" in control and pd.notna(control["WellControlLengthM"]) else float(template["LengthM"])
     height = float(control["WellControlHeightTimeMs"]) if "WellControlHeightTimeMs" in control and pd.notna(control["WellControlHeightTimeMs"]) else float(template["HeightTimeMs"])
     center = offset_center_near_control(control=control, azimuth_deg=azimuth, dip_deg=dip, length_m=length, height_time_ms=height, config=config)
@@ -589,6 +769,7 @@ def apply_geometry_from_control(row: pd.Series | dict[str, Any], template: pd.Se
     out["ControlTime"] = float(control["TIME"])
     out["ControlSource"] = str(control.get("ControlSource", "step4_predicted"))
     out["IsImagingGroundTruth"] = int(control.get("IsImagingGroundTruth", 0) or 0)
+    out = force_well_control_small_scale(out, control=control, config=config)
     return out
 
 
@@ -713,6 +894,7 @@ def apply_well_controls(
                 y=float(control["Y"]),
                 time_value=float(control["TIME"]),
                 time_scale=time_scale,
+                config=config,
             )
             added = build_added_patch(
                 template=template,
@@ -1123,6 +1305,8 @@ def build_summary(
     } if not audit_df.empty else {}
     changed_initial_count = int((corrected_df["CorrectionAction"].astype(str) == "adjust_to_well_control").sum())
     added_count = int((corrected_df["CorrectionAction"].astype(str) == "add_well_control_patch").sum())
+    well_control_mask = safe_numeric(corrected_df.get("IsWellControlPatch", pd.Series(0, index=corrected_df.index))).fillna(0).astype(int).eq(1)
+    well_control_df = corrected_df[well_control_mask].copy()
     before_mean = float(before_dist.mean()) if before_dist.notna().any() else None
     after_mean = float(after_dist.mean()) if after_dist.notna().any() else None
     before_median = float(before_dist.median()) if before_dist.notna().any() else None
@@ -1189,6 +1373,19 @@ def build_summary(
             "step3_imaging_gt_enabled": bool(config.get("step3_imaging_group_csvs")),
             "replace_step4_inside_step3_imaging_windows": bool(config.get("replace_step4_inside_step3_imaging_windows", True)),
             "well_control_size": dict(config.get("well_control_size", {})),
+            "force_well_control_small_scale": bool(config.get("force_well_control_small_scale", False)),
+            "well_control_match_scales": list(config.get("well_control_match_scales", [])),
+            "well_control_template_scales": list(config.get("well_control_template_scales", [])),
+            "step4_small_orientation_policy": dict(config.get("step4_small_orientation_policy", {})),
+            "step4_event_aggregation": {
+                "enabled": bool(config.get("enable_step4_event_aggregation", False)),
+                "gap_ms": float(config.get("step4_event_gap_ms", 6.0)),
+                "max_span_ms": float(config.get("step4_event_max_span_ms", 18.0)),
+                "min_points": int(config.get("step4_event_min_points", 1)),
+                "density_aggregation": str(config.get("step4_event_density_aggregation", "max")),
+                "raw_step4_point_count": int(config.get("_raw_step4_control_count", 0)),
+                "aggregated_step4_event_count": int(config.get("_aggregated_step4_control_count", 0)),
+            },
         },
         "initial_dfn": {
             "patch_count": int(len(initial_df)),
@@ -1202,6 +1399,8 @@ def build_summary(
                 str(key): int(value)
                 for key, value in control_df["ControlSource"].value_counts(dropna=False).sort_index().items()
             } if "ControlSource" in control_df.columns else {},
+            "step4_event_point_count_stats": finite_stats(control_df["EventPointCount"]) if "EventPointCount" in control_df.columns else finite_stats([]),
+            "step4_event_time_span_ms_stats": finite_stats(control_df["EventTimeSpanMs"]) if "EventTimeSpanMs" in control_df.columns else finite_stats([]),
             "imaging_ground_truth_count": int(safe_numeric(control_df.get("IsImagingGroundTruth", pd.Series(dtype=float))).fillna(0).sum()),
             "nearest_trajectory_distance_stats": finite_stats(track_dist),
         },
@@ -1215,6 +1414,15 @@ def build_summary(
             "patch_count": int(len(corrected_df)),
             "layer_distribution": layer_counts(corrected_df),
             "well_control_patch_count": int(safe_numeric(corrected_df["IsWellControlPatch"]).fillna(0).sum()),
+            "well_control_scale_distribution": {
+                str(key): int(value)
+                for key, value in well_control_df.get("FractureScale", pd.Series(dtype=str)).astype(str).value_counts(dropna=False).sort_index().items()
+            },
+            "well_control_orientation_source_distribution": {
+                str(key): int(value)
+                for key, value in well_control_df.get("OrientationSource", pd.Series(dtype=str)).astype(str).value_counts(dropna=False).sort_index().items()
+            },
+            "well_control_dip_stats": finite_stats(well_control_df["DipDeg"]) if "DipDeg" in well_control_df else finite_stats([]),
             "center_x_stats": finite_stats(corrected_df["CenterX"]),
             "center_y_stats": finite_stats(corrected_df["CenterY"]),
             "center_time_stats": finite_stats(corrected_df["CenterTime"]),
@@ -1258,6 +1466,10 @@ def main() -> int:
 
     initial_df = load_initial_dfn(initial_csv)
     step4_control_df = load_control_points(fracture_csv, dict(config["target_block"]))
+    raw_step4_count = int(len(step4_control_df))
+    step4_control_df = aggregate_step4_controls_to_events(step4_control_df, config=config)
+    config["_raw_step4_control_count"] = raw_step4_count
+    config["_aggregated_step4_control_count"] = int(len(step4_control_df))
     step3_group_paths = [Path(str(value)).resolve() for value in config.get("step3_imaging_group_csvs", [])]
     for path in step3_group_paths:
         if not path.exists():

@@ -110,6 +110,40 @@
 
 全矿区尺度属性体剖面输出在 `output/mine_attribute_sections/<井名>/<section_tag>`，当前配置 `section_tag=anttrack_coherence_t4_t7_mine_extent`，横向范围不再按 candidate A 裁剪，而是使用全矿区 `trace_header_xy.csv` 范围并按 `axis_sample_count=720` 重采样。
 
+车页1导眼地质背景扩展剖面使用配置：
+
+```bash
+/home/tyh/anaconda3/envs/gan-dfn/bin/python \
+  优化阶段二/正式主线/step9_section_visualize/qc_geological_background_volumes.py \
+  --config 优化阶段二/正式主线/step9_section_visualize/configs/formal_candidate_cheye1_geological_background_v1.json
+
+/home/tyh/anaconda3/envs/gan-dfn/bin/python \
+  优化阶段二/正式主线/step9_section_visualize/build_well_geological_attribute_sections.py \
+  --config 优化阶段二/正式主线/step9_section_visualize/configs/formal_candidate_cheye1_geological_background_v1.json
+
+/home/tyh/anaconda3/envs/gan-dfn/bin/python \
+  优化阶段二/正式主线/step9_section_visualize/build_well_seismic_amplitude_sections.py \
+  --config 优化阶段二/正式主线/step9_section_visualize/configs/formal_candidate_cheye1_geological_background_v1.json
+```
+
+该版本只使用 `AntTrack`、`CurvatureMax` 和 `SeisAmp`，不读取 `CurvaturePos`，也不生成综合曲率。输出位于 `output/candidate_cheye1_geological_background_v1/`，包含蚂蚁体、最大曲率体、振幅变密度、振幅波形+变面积的 XZ/YZ 共8张 PNG。剖面数值保存为压缩 NPZ，不展开为大体积 CSV。
+
+全矿区尺度过车页1导眼地震振幅剖面使用配置：
+
+```bash
+/home/tyh/anaconda3/envs/gan-dfn/bin/python \
+  优化阶段二/正式主线/step9_section_visualize/build_well_seismic_amplitude_sections.py \
+  --config 优化阶段二/正式主线/step9_section_visualize/configs/formal_mine_cheye1_seismic_amplitude_v1.json
+```
+
+该配置不设置 demo `target_block`，横向使用全矿区地震道范围并重采样为720点；波形+变面积图最多显示240道。结果单独写入 `output/mine_cheye1_seismic_amplitude_v1/`。
+
+原始道数保留版本使用 `formal_candidate_cheye1_geological_background_v2_full_traces.json`、`formal_mine_cheye1_geological_attributes_v2_full_traces.json` 和 `formal_mine_cheye1_seismic_amplitude_v2_full_traces.json`。这些配置将 `axis_sample_count=0`，并将 `wiggle_max_trace_count=0` 设置为不限制道数：蚂蚁体、相干体、最大曲率体、变密度和波形图都使用剖面横向全部原始坐标，不进行720点重采样或180/240道抽样。结果分别写入 `output/candidate_cheye1_geological_background_v2_full_traces/`、`output/mine_cheye1_geological_attributes_v2_full_traces/` 和 `output/mine_cheye1_seismic_amplitude_v2_full_traces/`。
+
+矿区地震振幅全道分幅版本使用 `formal_mine_cheye1_seismic_amplitude_v3_full_traces_panels.json`。XZ总图宽12000像素并连续分为4幅，YZ总图宽9000像素并连续分为3幅，每幅宽3000像素；波形摆幅系数为0.6，总图和分幅图同时输出PNG与SVG。曲面几何仍为随井轨迹变化的 `XZ=(x,Ywell(t),t)`、`YZ=(Xwell(t),y,t)`。
+
+当前层位显示统一读取 `common/horizon_trace_table/output/formal_horizon_trace_table_v1/horizon_trace_table.npy`。XZ对每个X道坐标求解 `T=Horizon[TraceIdx(x,Ywell(T))]`，YZ对每个Y道坐标求解 `T=Horizon[TraceIdx(Xwell(T),y)]`；不再使用500/900个层位采样点，也不再从四个层位文件临时建立最近邻曲线。源表层序反转不会被强制排序，相关数量写入各输出summary。
+
 车页1导眼 `candidate_cheye1` 最终8图输出在 `output/candidate_cheye1/cheye1_dfn_coherence_sections`，只保留 PNG，不生成 SVG 或 combined 图：
 
 车页1导眼 `candidate_cheye1_3d` 最终8图输出在 `output/candidate_cheye1_3d/cheye1_dfn_coherence_sections`，命名和图片内容与 `candidate_cheye1` 版本一致，但 DFN 输入来自 Step7B/Step8 的三维密度路径。

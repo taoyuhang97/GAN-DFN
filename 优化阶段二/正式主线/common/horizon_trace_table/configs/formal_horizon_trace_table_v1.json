@@ -1,0 +1,23 @@
+{
+  "trace_header_csv": "/home/tyh/projects/petroleum/code/GAN-DFN/数据精简/trace_header_xy.csv",
+  "horizon_paths": {
+    "T4": "/data/shared/project-oil/wx数据/砂砾岩/层位/T4（沙三上底）.dat",
+    "T5": "/data/shared/project-oil/wx数据/砂砾岩/层位/T5_20240715sm2+DM_Sm（沙三下顶面）.dat",
+    "T6": "/data/shared/project-oil/wx数据/砂砾岩/层位/T6_20240715AtoInt+DM_Sm（沙三下底面）.dat",
+    "T7": "/data/shared/project-oil/wx数据/砂砾岩/层位/T7_gljmAto地震+DM_Sm（沙四上底面）.dat"
+  },
+  "output_dir": "/home/tyh/projects/petroleum/code/GAN-DFN/优化阶段二/正式主线/common/horizon_trace_table/output/formal_horizon_trace_table_v1",
+  "output_filename": "horizon_trace_table.npy",
+  "coordinate_tolerance_m": 2.0,
+  "read_chunksize": 250000,
+  "show_progress": true,
+  "expected_source_rows": {
+    "T5": 2958092,
+    "T6": 2990030,
+    "T7": 2989701
+  },
+  "t4_idw_neighbors": 8,
+  "t4_idw_power": 2.0,
+  "t4_query_chunksize": 100000,
+  "t4_query_workers": -1
+}

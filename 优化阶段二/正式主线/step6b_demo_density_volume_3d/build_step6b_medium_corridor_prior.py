@@ -43,6 +43,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--min-local-support-score", type=float, default=0.35)
     parser.add_argument("--min-local-support-fraction", type=float, default=0.20)
     parser.add_argument("--support-neighborhood-cells", type=int, default=1)
+    parser.add_argument("--enable-lowcoh-vertical-branch", action="store_true")
+    parser.add_argument("--lowcoh-vertical-score-threshold", type=float, default=0.65)
+    parser.add_argument("--lowcoh-vertical-quantile", type=float, default=0.0)
+    parser.add_argument("--lowcoh-vertical-base-weight", type=float, default=0.82)
+    parser.add_argument("--lowcoh-vertical-ant-support-weight", type=float, default=0.10)
+    parser.add_argument("--lowcoh-vertical-curvature-support-weight", type=float, default=0.08)
+    parser.add_argument("--lowcoh-vertical-min-local-support-fraction", type=float, default=0.18)
+    parser.add_argument("--lowcoh-vertical-min-direct-support-score", type=float, default=0.55)
     parser.add_argument("--min-component-voxels", type=int, default=120)
     parser.add_argument("--max-component-voxels-before-split", type=int, default=12000)
     parser.add_argument("--split-tile-cells", type=int, default=16)
@@ -333,9 +341,34 @@ def main() -> int:
     )
     medium_score[~valid] = 0.0
     medium_score = np.clip(medium_score, 0.0, 1.0).astype(np.float32)
+    ant_branch_score = medium_score.copy()
+    lowcoh_branch_score = np.zeros_like(medium_score, dtype=np.float32)
+    lowcoh_branch_mask = np.zeros_like(valid, dtype=bool)
+    lowcoh_threshold = float(args.lowcoh_vertical_score_threshold)
+    if bool(args.enable_lowcoh_vertical_branch):
+        if float(args.lowcoh_vertical_quantile) > 0.0:
+            lowcoh_threshold = max(
+                lowcoh_threshold,
+                quantile(lowcoh_score[lowcoh_score > 0], float(args.lowcoh_vertical_quantile)),
+            )
+        lowcoh_branch_score = lowcoh_score * (
+            float(args.lowcoh_vertical_base_weight)
+            + float(args.lowcoh_vertical_ant_support_weight) * ant_score
+            + float(args.lowcoh_vertical_curvature_support_weight) * curv_score
+        )
+        lowcoh_branch_score[~valid] = 0.0
+        lowcoh_branch_score = np.clip(lowcoh_branch_score, 0.0, 1.0).astype(np.float32)
+        lowcoh_branch_mask = (
+            (lowcoh_score >= lowcoh_threshold)
+            & (lowcoh_branch_score >= lowcoh_threshold)
+            & (direct_support >= float(args.lowcoh_vertical_min_direct_support_score))
+            & (local_support_fraction >= float(args.lowcoh_vertical_min_local_support_fraction))
+            & valid
+        )
+    medium_score = np.maximum(ant_branch_score, lowcoh_branch_score).astype(np.float32)
     score_threshold = quantile(medium_score[medium_score > 0], float(args.candidate_quantile))
     ant_threshold = quantile(ant_score[ant_score > 0], float(args.anttrack_high_quantile))
-    raw_mask_flat = (
+    ant_branch_mask = (
         (medium_score >= score_threshold)
         & (ant_score >= ant_threshold)
         & (direct_support >= float(args.min_direct_support_score))
@@ -343,8 +376,14 @@ def main() -> int:
         & (local_support_fraction >= float(args.min_local_support_fraction))
         & valid
     )
+    raw_mask_flat = ant_branch_mask | lowcoh_branch_mask
+    branch_code_flat = np.zeros_like(raw_mask_flat, dtype=np.uint8)
+    branch_code_flat[ant_branch_mask] = 1
+    branch_code_flat[lowcoh_branch_mask] = np.maximum(branch_code_flat[lowcoh_branch_mask], 2)
+    branch_code_flat[ant_branch_mask & lowcoh_branch_mask] = 3
 
     medium_grid, _, _ = flat_to_grid(medium_score, mapping)
+    branch_code_grid, _, _ = flat_to_grid(branch_code_flat.astype(np.float32), mapping)
     support_grid, _, _ = flat_to_grid(local_support.astype(np.float32), mapping)
     mask_grid, _, _ = flat_to_grid(raw_mask_flat.astype(np.float32), mapping)
     mask_grid = mask_grid > 0.5
@@ -372,6 +411,9 @@ def main() -> int:
         medium_prior=medium_score_filtered.astype(np.float32),
         medium_mask=kept_mask_flat.astype(np.uint8),
         medium_component_id=component_id_flat.astype(np.int32),
+        candidate_branch_code=branch_code_flat.astype(np.uint8),
+        ant_branch_score=ant_branch_score.astype(np.float32),
+        lowcoh_vertical_branch_score=lowcoh_branch_score.astype(np.float32),
         local_support=local_support.astype(np.float32),
         local_support_fraction=local_support_fraction.astype(np.float32),
         direct_support=direct_support.astype(np.float32),
@@ -398,14 +440,21 @@ def main() -> int:
         },
         "score_threshold": score_threshold,
         "ant_score_threshold": ant_threshold,
+        "lowcoh_vertical_score_threshold": lowcoh_threshold,
         "direct_support_threshold": float(args.min_direct_support_score),
         "local_support_threshold": float(args.min_local_support_score),
         "local_support_fraction_threshold": float(args.min_local_support_fraction),
         "score_formula": {
-            "formula": "AntTrackScore * (ant_weight_base + lowcoh_support_weight * LowCoherenceScore + curvature_support_weight * CurvatureScore)",
+            "formula": "max(AntTrackBranch, LowCoherenceVerticalBranch if enabled)",
+            "anttrack_branch": "AntTrackScore * (ant_weight_base + lowcoh_support_weight * LowCoherenceScore + curvature_support_weight * CurvatureScore)",
+            "lowcoh_vertical_branch": "LowCoherenceScore * (lowcoh_vertical_base_weight + ant_support_weight * AntTrackScore + curvature_support_weight * CurvatureScore)",
             "ant_weight_base": float(args.ant_weight_base),
             "lowcoh_support_weight": float(args.lowcoh_support_weight),
             "curvature_support_weight": float(args.curvature_support_weight),
+            "enable_lowcoh_vertical_branch": bool(args.enable_lowcoh_vertical_branch),
+            "lowcoh_vertical_base_weight": float(args.lowcoh_vertical_base_weight),
+            "lowcoh_vertical_ant_support_weight": float(args.lowcoh_vertical_ant_support_weight),
+            "lowcoh_vertical_curvature_support_weight": float(args.lowcoh_vertical_curvature_support_weight),
             "direct_support": "max(LowCoherenceScore, CurvatureScore)",
             "local_support": "max_filter(max(LowCoherenceScore, CurvatureScore))",
             "local_support_fraction": "local fraction of max(LowCoherenceScore, CurvatureScore) >= support_score_threshold",
@@ -414,8 +463,18 @@ def main() -> int:
         },
         "raw_candidate_voxel_count": int(raw_mask_flat.sum()),
         "raw_candidate_voxel_fraction": float(raw_mask_flat.mean()),
+        "raw_candidate_branch_counts": {
+            "anttrack_only": int(np.sum(branch_code_flat == 1)),
+            "lowcoh_vertical_only": int(np.sum(branch_code_flat == 2)),
+            "both": int(np.sum(branch_code_flat == 3)),
+        },
         "kept_candidate_voxel_count": int(kept_mask_grid.sum()),
         "kept_candidate_voxel_fraction": float(kept_mask_grid.mean()),
+        "kept_candidate_branch_counts": {
+            "anttrack_only": int(np.sum((component_id_grid > 0) & (branch_code_grid == 1))),
+            "lowcoh_vertical_only": int(np.sum((component_id_grid > 0) & (branch_code_grid == 2))),
+            "both": int(np.sum((component_id_grid > 0) & (branch_code_grid == 3))),
+        },
         "max_component_fraction": max_component_fraction,
         "component_summary": component_summary,
         "component_count": int(len(component_df)),
@@ -436,8 +495,8 @@ def main() -> int:
         },
         "vtk": vtk_summary,
         "reflection": (
-            "Step6B creates explicit medium corridor components from AntTrack-led seismic evidence. "
-            "Local low-coherence/curvature support gates isolated ant-track noise, and layer-like low-dip components are filtered before Step7B."
+            "Step6B creates explicit medium corridor components from AntTrack-led seismic evidence plus an optional independent steep low-coherence branch. "
+            "Local low-coherence/curvature support gates isolated noise, and layer-like low-dip components are filtered before Step7B."
         ),
     }
     if max_component_fraction > 0.40:

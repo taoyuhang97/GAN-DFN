@@ -1,0 +1,25 @@
+{
+  "trace_header_csv": "/home/tyh/projects/petroleum/code/GAN-DFN/数据精简/trace_header_xy.csv",
+  "real_well_samples_root": "/home/tyh/projects/petroleum/code/GAN-DFN/优化阶段二/正式主线/step2_real_well_t4_t7_samples/output/formal_all_wells",
+  "surface_dir": "/data/shared/project-oil/wx数据/砂砾岩/层位",
+  "horizon_trace_table_path": "/home/tyh/projects/petroleum/code/GAN-DFN/优化阶段二/正式主线/common/horizon_trace_table/output/formal_horizon_trace_table_v1/horizon_trace_table.npy",
+  "output_root": "/home/tyh/projects/petroleum/code/GAN-DFN/优化阶段二/正式主线/step9_section_visualize/output/mine_cheye1_geological_attributes_v2_full_traces",
+  "well_name": "车页1导眼",
+  "exclude_wells": [],
+  "target_block": {},
+  "volume_paths": {
+    "AntTrack": "/data/shared/project-oil/wx数据/砂砾岩/补充材料-20260623/车西_T4-T7/车西-蚂蚁体T4-T7.sgy",
+    "Coherence": "/data/shared/project-oil/wx数据/砂砾岩/补充材料-20260623/车西_T4-T7/车西-相干体T4-T7.sgy",
+    "CurvatureMax": "/data/shared/project-oil/wx数据/砂砾岩/补充材料-20260623/车西-最大曲率T4-T7.sgy"
+  },
+  "attribute_names": ["AntTrack", "Coherence", "CurvatureMax"],
+  "title_prefix": "全矿区尺度过车页1导眼地质属性背景剖面（原始道数）",
+  "z_label": "TWT / ms",
+  "time_padding_ms": 20.0,
+  "axis_sample_count": 0,
+  "surface_samples": 900,
+  "progress_interval": 100,
+  "fig_width": 20.0,
+  "fig_height": 8.2,
+  "dpi": 240
+}

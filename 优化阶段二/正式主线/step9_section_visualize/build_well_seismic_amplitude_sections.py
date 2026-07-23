@@ -1,0 +1,263 @@
+# -*- coding: utf-8 -*-
+from __future__ import annotations
+
+import argparse
+import os
+from pathlib import Path
+
+os.environ.setdefault("MPLCONFIGDIR", "/tmp/gan_dfn_matplotlib_cache")
+
+import matplotlib
+
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import numpy as np
+from matplotlib.colors import TwoSlopeNorm
+
+from build_well_attribute_section_visualization import axis_edges
+from well_curved_section_common import (
+    AttributeSection,
+    draw_surface_curves,
+    draw_well_trajectory,
+    prepare_geometry,
+    read_json,
+    sample_volume_sections,
+    save_section_pair_npz,
+    write_json,
+)
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="Build seismic variable-density and wiggle/variable-area well-curved sections.")
+    parser.add_argument("--config", type=Path, required=True)
+    return parser
+
+
+def amplitude_limit(sections: list[AttributeSection], quantile: float) -> float:
+    finite = np.concatenate([section.values[np.isfinite(section.values)] for section in sections if np.isfinite(section.values).any()])
+    limit = float(np.quantile(np.abs(finite), quantile)) if finite.size else 1.0
+    return limit if np.isfinite(limit) and limit > 0 else 1.0
+
+
+def figure_size_inches(section: AttributeSection, geometry, panel: bool = False) -> tuple[float, float, int]:
+    dpi = int(geometry.config.get("render_dpi", geometry.args.dpi))
+    if panel:
+        width_px = int(geometry.config.get("panel_width_px", 3000))
+    elif section.projection == "XZ":
+        width_px = int(geometry.config.get("xz_total_width_px", round(geometry.args.fig_width * dpi)))
+    else:
+        width_px = int(geometry.config.get("yz_total_width_px", round(geometry.args.fig_width * dpi)))
+    height_px = int(geometry.config.get("figure_height_px", round(geometry.args.fig_height * dpi)))
+    return width_px / dpi, height_px / dpi, dpi
+
+
+def save_figure(fig, output_path: Path, dpi: int, write_svg: bool) -> None:
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(output_path, dpi=dpi)
+    if write_svg:
+        fig.savefig(output_path.with_suffix(".svg"))
+
+
+def apply_axes(ax, section: AttributeSection, geometry) -> None:
+    draw_surface_curves(ax, geometry.surface_curves, section.projection)
+    if section.projection == "XZ":
+        draw_well_trajectory(ax, geometry.well_df["X"], geometry.well_df["TIME"], label=f"{geometry.well_name}井轨迹")
+        ax.set_xlabel("X / m")
+    else:
+        draw_well_trajectory(ax, geometry.well_df["Y"], geometry.well_df["TIME"], label=f"{geometry.well_name}井轨迹")
+        ax.set_xlabel("Y / m")
+    ax.set_xlim(float(section.h[0]), float(section.h[-1]))
+    ax.set_ylim(float(geometry.summary["display_time_min"]), float(geometry.summary["display_time_max"]))
+    ax.invert_yaxis()
+    ax.set_ylabel(geometry.args.z_label)
+    ax.grid(True, linewidth=0.25, alpha=0.22)
+    ax.legend(loc="upper right")
+
+
+def plot_variable_density(
+    section: AttributeSection,
+    geometry,
+    output_path: Path,
+    limit: float,
+    title_suffix: str = "",
+    panel: bool = False,
+) -> None:
+    width, height, dpi = figure_size_inches(section, geometry, panel=panel)
+    fig, ax = plt.subplots(figsize=(width, height))
+    norm = TwoSlopeNorm(vmin=-limit, vcenter=0.0, vmax=limit)
+    mesh = ax.pcolormesh(
+        axis_edges(section.h),
+        axis_edges(section.time),
+        section.values,
+        shading="auto",
+        cmap="seismic",
+        norm=norm,
+        rasterized=True,
+        zorder=1,
+    )
+    apply_axes(ax, section, geometry)
+    fig.colorbar(mesh, ax=ax, pad=0.02, shrink=0.94, label="地震振幅")
+    ax.set_title(f"{geometry.config['title_prefix']} | 地震振幅变密度 | {section.projection} | T4-T7{title_suffix}")
+    fig.tight_layout()
+    save_figure(fig, output_path, dpi, bool(geometry.config.get("write_svg", False)))
+    plt.close(fig)
+
+
+def plot_wiggle_variable_area(
+    section: AttributeSection,
+    geometry,
+    output_path: Path,
+    limit: float,
+    title_suffix: str = "",
+    panel: bool = False,
+) -> int:
+    width, height, dpi = figure_size_inches(section, geometry, panel=panel)
+    fig, ax = plt.subplots(figsize=(width, height))
+    max_traces = int(geometry.config.get("wiggle_max_trace_count", 0))
+    if max_traces <= 0 or max_traces >= len(section.h):
+        selected = np.arange(len(section.h), dtype=int)
+    else:
+        selected = np.linspace(0, len(section.h) - 1, max_traces, dtype=int)
+        selected = np.unique(selected)
+    selected_h = section.h[selected]
+    spacing = float(np.median(np.diff(selected_h))) if len(selected_h) > 1 else 1.0
+    swing = float(geometry.config.get("wiggle_lateral_scale_fraction", 0.42))
+    lateral_scale = swing * spacing / limit
+    for idx in selected:
+        trace = np.nan_to_num(section.values[:, idx], nan=0.0, posinf=0.0, neginf=0.0)
+        trace = np.clip(trace, -limit, limit)
+        baseline = float(section.h[idx])
+        displaced = baseline + trace * lateral_scale
+        ax.plot(displaced, section.time, color="#111827", linewidth=0.42, alpha=0.88, zorder=1)
+        ax.fill_betweenx(
+            section.time,
+            baseline,
+            displaced,
+            where=trace >= 0.0,
+            facecolor="#111827",
+            alpha=0.72,
+            linewidth=0.0,
+            zorder=1,
+        )
+    apply_axes(ax, section, geometry)
+    ax.set_facecolor("white")
+    ax.set_title(
+        f"{geometry.config['title_prefix']} | 地震波形+变面积 | {section.projection} | "
+        f"T4-T7 | 显示道数={len(selected)} | 摆幅={swing:.2f}{title_suffix}"
+    )
+    fig.tight_layout()
+    save_figure(fig, output_path, dpi, bool(geometry.config.get("write_svg", False)))
+    plt.close(fig)
+    return int(len(selected))
+
+
+def split_section(section: AttributeSection, panel_count: int) -> list[AttributeSection]:
+    if panel_count <= 1:
+        return [section]
+    index_groups = [group for group in np.array_split(np.arange(len(section.h)), panel_count) if len(group) >= 2]
+    return [
+        AttributeSection(
+            section.attribute,
+            section.projection,
+            section.h[group].copy(),
+            section.time.copy(),
+            section.values[:, group].copy(),
+        )
+        for group in index_groups
+    ]
+
+
+def plot_section_panels(section: AttributeSection, geometry, output_dir: Path, limit: float) -> dict[str, object]:
+    panel_count = int(
+        geometry.config.get("xz_panel_count" if section.projection == "XZ" else "yz_panel_count", 0)
+    )
+    if panel_count <= 1:
+        return {"panel_count": 0, "density_pngs": [], "wiggle_pngs": [], "wiggle_trace_counts": []}
+    density_dir = output_dir / "variable_density_panels"
+    wiggle_dir = output_dir / "wiggle_variable_area_panels"
+    density_pngs: list[str] = []
+    wiggle_pngs: list[str] = []
+    wiggle_counts: list[int] = []
+    panels = split_section(section, panel_count)
+    for panel_index, panel_section in enumerate(panels, start=1):
+        suffix = f" | 分段{panel_index}/{len(panels)}"
+        density_name = f"seisamp_variable_density_{section.projection.lower()}_panel_{panel_index:02d}_t4_t7.png"
+        wiggle_name = f"seisamp_wiggle_variable_area_{section.projection.lower()}_panel_{panel_index:02d}_t4_t7.png"
+        plot_variable_density(panel_section, geometry, density_dir / density_name, limit, suffix, panel=True)
+        count = plot_wiggle_variable_area(panel_section, geometry, wiggle_dir / wiggle_name, limit, suffix, panel=True)
+        density_pngs.append(str(Path("variable_density_panels") / density_name))
+        wiggle_pngs.append(str(Path("wiggle_variable_area_panels") / wiggle_name))
+        wiggle_counts.append(count)
+    return {
+        "panel_count": len(panels),
+        "density_pngs": density_pngs,
+        "wiggle_pngs": wiggle_pngs,
+        "wiggle_trace_counts": wiggle_counts,
+    }
+
+
+def main() -> int:
+    args = build_parser().parse_args()
+    config = read_json(args.config.resolve())
+    geometry = prepare_geometry(config)
+    output_dir = Path(str(config["output_root"])).resolve() / "seismic_amplitude_sections"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    seis_path = Path(str(config["volume_paths"]["SeisAmp"])).resolve()
+    print("[seismic-section] sampling SeisAmp", flush=True)
+    xz, yz, stats = sample_volume_sections(geometry, "SeisAmp", seis_path)
+    sections = [xz, yz]
+    quantile = float(config.get("amplitude_clip_quantile", 0.99))
+    limit = amplitude_limit(sections, quantile)
+    image_names = {
+        ("density", "XZ"): "05_seisamp_variable_density_xz_t4_t7.png",
+        ("density", "YZ"): "06_seisamp_variable_density_yz_t4_t7.png",
+        ("wiggle", "XZ"): "07_seisamp_wiggle_variable_area_xz_t4_t7.png",
+        ("wiggle", "YZ"): "08_seisamp_wiggle_variable_area_yz_t4_t7.png",
+    }
+    plot_variable_density(xz, geometry, output_dir / image_names[("density", "XZ")], limit)
+    plot_variable_density(yz, geometry, output_dir / image_names[("density", "YZ")], limit)
+    wiggle_xz = plot_wiggle_variable_area(xz, geometry, output_dir / image_names[("wiggle", "XZ")], limit)
+    wiggle_yz = plot_wiggle_variable_area(yz, geometry, output_dir / image_names[("wiggle", "YZ")], limit)
+    xz_panels = plot_section_panels(xz, geometry, output_dir, limit)
+    yz_panels = plot_section_panels(yz, geometry, output_dir, limit)
+    save_section_pair_npz(output_dir / "seisamp_section_samples.npz", xz, yz)
+    images = sorted(path.name for path in output_dir.glob("*.png"))
+    checks = {
+        "four_pngs_generated": len(images) == 4,
+        "finite_section_values": float(stats["finite_fraction"]) > 0,
+        "symmetric_nonzero_display_limit": limit > 0,
+        "wiggle_traces_drawn": wiggle_xz > 0 and wiggle_yz > 0,
+    }
+    summary = {
+        "status": "pass" if all(checks.values()) else "fail",
+        "config_path": str(args.config.resolve()),
+        "output_dir": str(output_dir),
+        "section_geometry": geometry.summary,
+        "seismic_amplitude": stats,
+        "display": {
+            "clip_quantile": quantile,
+            "symmetric_limit": limit,
+            "variable_density_colormap": "seismic_zero_centered",
+            "wiggle_normalization": "global_section_limit_no_per_trace_normalization",
+            "wiggle_trace_selection": "all_section_trace_coordinates_when_configured_max_count_is_zero",
+            "wiggle_positive_fill": "black",
+            "wiggle_xz_trace_count": wiggle_xz,
+            "wiggle_yz_trace_count": wiggle_yz,
+            "wiggle_lateral_scale_fraction": float(config.get("wiggle_lateral_scale_fraction", 0.42)),
+            "write_svg": bool(config.get("write_svg", False)),
+            "xz_total_width_px": int(config.get("xz_total_width_px", 0)),
+            "yz_total_width_px": int(config.get("yz_total_width_px", 0)),
+            "panel_width_px": int(config.get("panel_width_px", 0)),
+        },
+        "panels": {"XZ": xz_panels, "YZ": yz_panels},
+        "png_files": images,
+        "checks": checks,
+    }
+    write_json(output_dir / "seismic_amplitude_section_summary.json", summary)
+    print(f"[seismic-section] output={output_dir}", flush=True)
+    print(f"[seismic-section] status={summary['status']}", flush=True)
+    return 0 if summary["status"] == "pass" else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

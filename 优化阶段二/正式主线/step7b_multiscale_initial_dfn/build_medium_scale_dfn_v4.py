@@ -233,6 +233,7 @@ def select_medium_patches(candidates: pd.DataFrame, grid: dict[str, Any], config
     summaries: list[dict[str, Any]] = []
     max_total = int(config.get("target_patch_count", 1800))
     max_components = int(config.get("max_component_count", 40))
+    component_voxels_per_patch = max(float(config.get("component_voxels_per_patch", 180.0)), 1.0)
     reject_low_dip = bool(config.get("reject_low_dip_patches", False))
     reject_dip_below = float(config.get("reject_dip_below_deg", -1.0))
     adjust_dip_below = float(config.get("adjust_dip_below_deg", -1.0))
@@ -244,23 +245,34 @@ def select_medium_patches(candidates: pd.DataFrame, grid: dict[str, Any], config
         mass = float(group["SamplingWeight"].sum())
         component_items.append((mass, str(layer), int(component_id), group.copy()))
     component_items.sort(key=lambda item: item[0], reverse=True)
-    component_items = component_items[:max_components]
+    if max_components > 0:
+        component_items = component_items[:max_components]
     total_mass = max(sum(item[0] for item in component_items), 1.0e-9)
     for rank, (mass, layer, component_id, group) in enumerate(component_items, start=1):
-        target = int(round(max_total * mass / total_mass))
-        target = int(np.clip(target, int(config.get("min_patches_per_component", 8)), int(config.get("max_patches_per_component", 180))))
+        if max_total > 0:
+            target = int(round(max_total * mass / total_mass))
+        else:
+            score_factor = 0.65 + 0.70 * float(np.clip(group["SamplingWeight"].mean(), 0.0, 1.0))
+            target = int(round(len(group) * score_factor / component_voxels_per_patch))
+        min_per_component = int(config.get("min_patches_per_component", 8))
+        max_per_component = int(config.get("max_patches_per_component", 180))
+        target = max(target, min_per_component)
+        if max_per_component > 0:
+            target = min(target, max_per_component)
         target = min(target, len(group))
         if target <= 0:
             continue
         weights = np.clip(group["SamplingWeight"].to_numpy(dtype=float), 0.0, None)
         if weights.sum() <= 0:
-            weights = None
+            order = rng.permutation(np.arange(len(group)))
         else:
             weights = weights / weights.sum()
-        chosen_local = rng.choice(np.arange(len(group)), size=target, replace=False, p=weights)
+            order = rng.choice(np.arange(len(group)), size=len(group), replace=False, p=weights)
         selected_rows = []
         used_cells: set[tuple[int, int, int]] = set()
-        for ordinal, local_idx in enumerate(chosen_local, start=1):
+        for local_idx in order:
+            if len(selected_rows) >= target:
+                break
             row = group.iloc[int(local_idx)].copy()
             key = (int(row["IY"]), int(row["IX"]), int(row["IT"]))
             if key in used_cells:
@@ -278,7 +290,7 @@ def select_medium_patches(candidates: pd.DataFrame, grid: dict[str, Any], config
                 orientation_adjusted = 1
                 low_dip_adjusted_count += 1
             row["BandID"] = f"medium_component_{rank:04d}_{layer}_{component_id}"
-            row["BandPatchOrdinal"] = ordinal
+            row["BandPatchOrdinal"] = 0
             row["BandContinuityMode"] = "medium_local_voxel_band_pca_v4"
             row["BandVoxelCount"] = int(len(group))
             row["BandLengthM"] = 0.0
@@ -304,6 +316,8 @@ def select_medium_patches(candidates: pd.DataFrame, grid: dict[str, Any], config
             row["PatchShapeMode"] = "rectangular_local_medium_band_pca_v4"
             row["OrientationSourceOverride"] = str(geom["reason"])
             selected_rows.append(row)
+        for ordinal, row in enumerate(selected_rows, start=1):
+            row["BandPatchOrdinal"] = ordinal
         if selected_rows:
             selected = pd.DataFrame(selected_rows)
             parts.append(selected)
@@ -328,7 +342,7 @@ def select_medium_patches(candidates: pd.DataFrame, grid: dict[str, Any], config
     if not parts:
         raise RuntimeError("no medium patches selected")
     out = pd.concat(parts, ignore_index=True)
-    if len(out) > max_total:
+    if max_total > 0 and len(out) > max_total:
         weights = np.clip(out["SamplingWeight"].to_numpy(dtype=float), 0.0, None)
         weights = weights / weights.sum() if weights.sum() > 0 else None
         out = out.iloc[rng.choice(np.arange(len(out)), size=max_total, replace=False, p=weights)].reset_index(drop=True)
@@ -337,9 +351,10 @@ def select_medium_patches(candidates: pd.DataFrame, grid: dict[str, Any], config
     out["ExpectedPatchCountForCell"] = out["SamplingWeight"].astype(float) * scale
     out["EffectiveCountScale"] = scale
     out["CountBasisEffectiveScale"] = scale
+    out = out.reset_index(drop=True)
     out.attrs["low_dip_rejected_count"] = int(low_dip_rejected_count)
     out.attrs["low_dip_adjusted_count"] = int(low_dip_adjusted_count)
-    return out.reset_index(drop=True), summaries
+    return out, summaries
 
 
 def write_candidate_components_vtk(path: Path, summaries: list[dict[str, Any]], candidates: pd.DataFrame, grid: dict[str, Any], title: str) -> None:
@@ -373,6 +388,10 @@ def write_candidate_components_vtk(path: Path, summaries: list[dict[str, Any]], 
 
 
 def build_summary(config_path: Path, config: dict[str, Any], paths: dict[str, Path], candidates: pd.DataFrame, selected: pd.DataFrame, patch_df: pd.DataFrame, bands: list[dict[str, Any]]) -> dict[str, Any]:
+    candidate_components = candidates[["LayerGroup", "ComponentID"]].drop_duplicates()
+    selected_components = selected[["LayerGroup", "ComponentID"]].drop_duplicates() if len(selected) else pd.DataFrame()
+    candidate_component_count = int(len(candidate_components))
+    selected_component_count = int(len(selected_components))
     checks = {
         "has_patches": len(patch_df) > 0,
         "all_medium_scale": bool(patch_df["FractureScale"].astype(str).eq("medium").all()),
@@ -381,6 +400,7 @@ def build_summary(config_path: Path, config: dict[str, Any], paths: dict[str, Pa
         "candidate_components_vtk_exists": paths["candidate_components_vtk"].exists(),
         "orientation_varies": bool(patch_df["AzimuthDeg"].round(2).nunique() > 10 and patch_df["DipDeg"].round(2).nunique() > 10),
         "size_varies": bool(patch_df["LengthM"].std(ddof=0) > 5.0 and patch_df["HeightTimeMs"].std(ddof=0) > 1.0),
+        "covers_candidate_components": bool(candidate_component_count == 0 or selected_component_count / candidate_component_count >= float(config.get("min_component_coverage_fraction", 0.70))),
     }
     return {
         "status": "pass" if all(checks.values()) else "fail",
@@ -397,6 +417,9 @@ def build_summary(config_path: Path, config: dict[str, Any], paths: dict[str, Pa
         "selected_count": int(len(selected)),
         "patch_count": int(len(patch_df)),
         "band_count": int(len(bands)),
+        "candidate_component_count": candidate_component_count,
+        "selected_component_count": selected_component_count,
+        "selected_component_fraction": float(selected_component_count / max(candidate_component_count, 1)),
         "band_examples": bands[:30],
         "patch_stats": {
             "length_m": legacy.finite_stats(patch_df["LengthM"]),
@@ -415,6 +438,7 @@ def build_summary(config_path: Path, config: dict[str, Any], paths: dict[str, Pa
             "adjust_dip_below_deg": float(config.get("adjust_dip_below_deg", -1.0)),
             "adjust_dip_to_deg": float(config.get("adjust_dip_to_deg", config.get("adjust_dip_below_deg", -1.0))),
             "selected_low_dip_adjusted_count": int(pd.to_numeric(patch_df.get("OrientationAdjusted", 0), errors="coerce").fillna(0).sum()),
+            "candidate_low_dip_rejected_count": int(selected.attrs.get("low_dip_rejected_count", 0)),
         },
         "checks": checks,
     }

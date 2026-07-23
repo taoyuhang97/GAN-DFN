@@ -1,0 +1,53 @@
+{
+  "manifest_version": "2026-07-23-checkpoint-v1",
+  "branch": "second-round-optimization",
+  "base_commit_before_checkpoint": "6726430",
+  "target_block": "candidate_cheye1",
+  "status": "checkpoint_for_followup_validation",
+  "workflow": {
+    "step6a_output": "step6b_demo_density_volume_3d/output/candidate_cheye1_multiscale_rebalance_v1/step6a_small",
+    "step6b_output": "step6b_demo_density_volume_3d/output/candidate_cheye1_step6b_medium_lowcoh_vertical_v1/step6b_medium",
+    "step6c_output": "step6b_demo_density_volume_3d/output/candidate_cheye1_step6c_large_faultlike_surface_v1/step6c_large",
+    "step6d_entrypoint": "step6b_demo_density_volume_3d/build_step6d_multiscale_bundle.py",
+    "step6d_output": "step6b_demo_density_volume_3d/output/candidate_cheye1_final_lowcoh_vertical_v1/step6d_bundle",
+    "step7a_config": "step7a_small_scale_dfn/configs/formal_candidate_cheye1_step7a_small_final_lowcoh_vertical_v1.json",
+    "step7a_output": "step7a_small_scale_dfn/output/candidate_cheye1_final_lowcoh_vertical_v1",
+    "step7b_config": "step7b_multiscale_initial_dfn/configs/formal_candidate_cheye1_step7b_medium_lowcoh_vertical_v1.json",
+    "step7b_output": "step7b_multiscale_initial_dfn/output/candidate_cheye1_step7b_medium_lowcoh_vertical_v1",
+    "step7c_config": "step7c_large_fault_dfn/configs/formal_candidate_cheye1_step7c_large_from_step6c_faultlike_surface_v1.json",
+    "step7c_output": "step7c_large_fault_dfn/output/candidate_cheye1_step7c_large_faultlike_surface_v1",
+    "step7d_config": "step7d_multiscale_fused_dfn/configs/formal_candidate_cheye1_step7d_fused_final_lowcoh_vertical_v1.json",
+    "step7d_output": "step7d_multiscale_fused_dfn/output/candidate_cheye1_final_lowcoh_vertical_v1",
+    "step8_config": "step8_dfn_well_correction/configs/formal_well_control_correction_candidate_cheye1_final_lowcoh_vertical_v1_smallwell_event_v1.json",
+    "step8_output": "step8_dfn_well_correction/output/candidate_cheye1_final_lowcoh_vertical_v1_smallwell_event_v1",
+    "step9_config": "step9_section_visualize/configs/formal_candidate_cheye1_final_lowcoh_vertical_v1_smallwell_event_v1_small_projection_dfn_coherence_sections.json",
+    "step9_output": "step9_section_visualize/output/candidate_cheye1_final_lowcoh_vertical_v1_smallwell_event_v1_small_projection/cheye1_dfn_coherence_sections",
+    "horizon_trace_table_config": "common/horizon_trace_table/configs/formal_horizon_trace_table_v1.json",
+    "horizon_trace_table_output": "common/horizon_trace_table/output/formal_horizon_trace_table_v1/horizon_trace_table.npy"
+  },
+  "key_qc": {
+    "step6b_component_count": 214,
+    "step6b_kept_voxels": 75527,
+    "step6b_lowcoh_vertical_only_kept_voxels": 65969,
+    "step7a_patch_count": 7575,
+    "step7b_patch_count": 593,
+    "step7b_component_coverage": "95/99",
+    "step7b_exact_steep_lowcoh_center_hit_fraction": 0.0776,
+    "step7c_patch_count": 228,
+    "step7d_patch_count": 8396,
+    "step8_patch_count": 8537,
+    "step8_well_control_patch_count": 159,
+    "step8_changed_or_added_fraction_of_initial": 0.01893758932825155,
+    "step9_status": "pass",
+    "step9_retained_png_count": 8,
+    "step9_standard_true_intersection_count": 281,
+    "step9_standard_small_projection_count": 778,
+    "horizon_trace_table_row_count": 2990065
+  },
+  "open_validation": [
+    "Run true leave-one-well retraining validation before external model-generalization claims.",
+    "Rerun all active Step9 products with the per-trace horizon table and visually inspect them.",
+    "Review Step4 event aggregation by well and layer before treating gap/max-span as final scientific parameters.",
+    "Use the new Step9 figures to decide whether Step7B in-component sampling needs further adjustment."
+  ]
+}

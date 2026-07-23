@@ -1,0 +1,33 @@
+{
+  "trace_header_csv": "/home/tyh/projects/petroleum/code/GAN-DFN/数据精简/trace_header_xy.csv",
+  "real_well_samples_root": "/home/tyh/projects/petroleum/code/GAN-DFN/优化阶段二/正式主线/step2_real_well_t4_t7_samples/output/formal_all_wells",
+  "surface_dir": "/data/shared/project-oil/wx数据/砂砾岩/层位",
+  "horizon_trace_table_path": "/home/tyh/projects/petroleum/code/GAN-DFN/优化阶段二/正式主线/common/horizon_trace_table/output/formal_horizon_trace_table_v1/horizon_trace_table.npy",
+  "output_root": "/home/tyh/projects/petroleum/code/GAN-DFN/优化阶段二/正式主线/step9_section_visualize/output/mine_cheye1_seismic_amplitude_v3_full_traces_panels",
+  "well_name": "车页1导眼",
+  "exclude_wells": [],
+  "target_block": {},
+  "volume_paths": {
+    "SeisAmp": "/data/shared/project-oil/wx数据/砂砾岩/psdm_final_time.sgy"
+  },
+  "title_prefix": "全矿区尺度过车页1导眼地震背景剖面（原始道数分幅版）",
+  "z_label": "TWT / ms",
+  "time_padding_ms": 20.0,
+  "axis_sample_count": 0,
+  "surface_samples": 900,
+  "progress_interval": 100,
+  "fig_width": 20.0,
+  "fig_height": 8.2,
+  "dpi": 240,
+  "render_dpi": 200,
+  "figure_height_px": 2400,
+  "xz_total_width_px": 12000,
+  "yz_total_width_px": 9000,
+  "panel_width_px": 3000,
+  "xz_panel_count": 4,
+  "yz_panel_count": 3,
+  "write_svg": true,
+  "amplitude_clip_quantile": 0.99,
+  "wiggle_max_trace_count": 0,
+  "wiggle_lateral_scale_fraction": 0.6
+}

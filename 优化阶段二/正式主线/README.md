@@ -22,7 +22,17 @@ Step1-5 样本准备
 - 曲率体主要作为小尺度裂缝背景和局部构造扰动辅助依据。
 - 原始断层解释成果是大尺度断层硬约束，不能被低相干自识别候选替代。
 
-## 当前最终 Step6
+## 2026-07-23 版本检查点
+
+本次固化的 DFN 主体后缀为 `candidate_cheye1_final_lowcoh_vertical_v1`。Step8 默认检查点采用事件聚合小尺度井控 `smallwell_event_v1`，Step9 对应使用 `smallwell_event_v1_small_projection`。完整谱系见：
+
+- `CANDIDATE_CHEYE1_FINAL_WORKFLOW.md`
+- `CANDIDATE_CHEYE1_VERSION_MANIFEST.json`
+- `../../docs/正式主线项目现状与后续修改_2026-07-23.md`
+
+该检查点用于后续对比和继续开发，不表示所有科学问题均已关闭。当前仍需补做 Step6 真正的留一井重训练验证，并完成 Step9 逐道层位图件的全链路重跑和视觉验收。
+
+## 当前 Step6
 
 目录：`step6b_demo_density_volume_3d`
 
@@ -30,30 +40,33 @@ Step1-5 样本准备
 
 - `build_candidate_3d_density_sgy.py`：构造基础三维裂缝密度体，SGY 输出继承地震 trace header。
 - `build_step6a_small_background.py`：Step6A，小尺度背景密度。
-- `build_step6b_medium_corridor_prior.py`：Step6B，中尺度裂缝带先验，蚂蚁体为主，相干体/曲率体辅助。
+- `build_step6b_medium_corridor_prior.py`：Step6B，中尺度裂缝带先验，使用蚂蚁体主分支和独立陡倾低相干分支，曲率作为辅助支持。
 - `build_step6c_large_fault_prior.py`：Step6C，大尺度断层/断裂带先验，原始断层 patch 为硬约束，低相干陡向异常仅作补充候选。
 - `build_step6d_multiscale_bundle.py`：Step6D，整合 A/B/C，输出最终小尺度背景与损伤带衍生密度。
 - `build_multiscale_density_bundle.py`：Step6A/B/C/D 共用 SGY、网格、属性体工具。
 - `qc_step6_positioning.py`、`qc_multiscale_density_vs_attributes.py`、`qc_multiscale_rebalance_inputs.py`：输入坐标、属性体一致性和多尺度证据 QC。
 
-保留配置：
+基础配置：
 
 - `configs/formal_candidate_cheye1_3d_density_sgy.json`：基础三维密度体构造。
 - `configs/formal_candidate_cheye1_multiscale_density_v1.json`：Step6A/B/C/D 多尺度密度构造基础配置。
 
-当前实际使用的 Step6D 输出：
+当前检查点使用的 Step6 输入谱系：
 
 ```text
-step6b_demo_density_volume_3d/output/candidate_cheye1_multiscale_current_flow_v2/step6d_bundle/
+Step6A: output/candidate_cheye1_multiscale_rebalance_v1/step6a_small/
+Step6B: output/candidate_cheye1_step6b_medium_lowcoh_vertical_v1/step6b_medium/
+Step6C: output/candidate_cheye1_step6c_large_faultlike_surface_v1/step6c_large/
+Step6D: output/candidate_cheye1_final_lowcoh_vertical_v1/step6d_bundle/
 ```
 
-其中 Step7A 当前使用：
+Step6D 输出给 Step7A 的三个小尺度密度域为：
 
 - `background_small_density.sgy`
 - `medium_damage_small_density.sgy`
 - `large_damage_small_density.sgy`
 
-## 当前最终 Step7
+## 当前 Step7
 
 ### Step7A 小尺度裂缝
 
@@ -63,9 +76,9 @@ step6b_demo_density_volume_3d/output/candidate_cheye1_multiscale_current_flow_v2
 
 - `build_small_scale_dfn.py`
 
-当前最终配置：
+当前检查点配置：
 
-- `configs/formal_candidate_cheye1_step7a_small_current_flow_v5_v2_density_v4_orientation.json`
+- `configs/formal_candidate_cheye1_step7a_small_final_lowcoh_vertical_v1.json`
 
 当前口径：
 
@@ -74,10 +87,10 @@ step6b_demo_density_volume_3d/output/candidate_cheye1_multiscale_current_flow_v2
 - 当前采用 `v2_weighted_probability`：每个候选体元按权重产生裂缝片，最终数量随密度体和区域规模自然变化。
 - 倾向倾角使用 v4 地质方向族，不直接复制中大尺度裂缝/断层方向。
 
-当前实际输出：
+当前输出：
 
 ```text
-step7a_small_scale_dfn/output/candidate_cheye1_current_flow_v5_v2_density_v4_orientation/
+step7a_small_scale_dfn/output/candidate_cheye1_final_lowcoh_vertical_v1/
 ```
 
 ### Step7B 中尺度裂缝带
@@ -89,15 +102,16 @@ step7a_small_scale_dfn/output/candidate_cheye1_current_flow_v5_v2_density_v4_ori
 - `build_medium_scale_dfn_v4.py`
 - `build_multiscale_initial_dfn_preview.py`：历史预览工具，当前不作为主入口。
 
-当前最终配置：
+当前检查点配置：
 
-- `configs/formal_candidate_cheye1_step7b_medium_from_step6b_rebuild_v3_strict_steep30_preview.json`
+- `configs/formal_candidate_cheye1_step7b_medium_lowcoh_vertical_v1.json`
 
 当前口径：
 
 - 中尺度裂缝来自 Step6B 识别的裂缝带/组件。
 - 倾角下限采用 30°，避免大量近水平裂缝主导结果。
 - 中尺度裂缝表达连续带主体，小尺度衍生裂缝由 Step7A 表达。
+- 当前覆盖 95/99 个层内 component，但陡倾低相干体素的精确中心命中率为 7.76%。component 覆盖率与体素精确贴合不是同一指标，后续需结合 Step9 图件判断是否继续调整采样位置。
 
 ### Step7C 大尺度断层/断裂带
 
@@ -107,7 +121,7 @@ step7a_small_scale_dfn/output/candidate_cheye1_current_flow_v5_v2_density_v4_ori
 
 - `build_large_fault_dfn.py`
 
-当前最终配置：
+当前检查点配置：
 
 - `configs/formal_candidate_cheye1_step7c_large_from_step6c_faultlike_surface_v1.json`
 
@@ -124,14 +138,14 @@ step7a_small_scale_dfn/output/candidate_cheye1_current_flow_v5_v2_density_v4_ori
 
 - `build_multiscale_fused_dfn.py`
 
-当前最终配置：
+当前检查点配置：
 
-- `configs/formal_candidate_cheye1_step7d_fused_current_flow_v1.json`
+- `configs/formal_candidate_cheye1_step7d_fused_final_lowcoh_vertical_v1.json`
 
 当前输入：
 
-- Step7A：`candidate_cheye1_current_flow_v5_v2_density_v4_orientation`
-- Step7B：`candidate_cheye1_step7b_medium_from_step6b_rebuild_v3_strict_steep30_preview`
+- Step7A：`candidate_cheye1_final_lowcoh_vertical_v1`
+- Step7B：`candidate_cheye1_step7b_medium_lowcoh_vertical_v1`
 - Step7C：`candidate_cheye1_step7c_large_faultlike_surface_v1`
 
 ## Step7B 初始三维工具说明
@@ -140,15 +154,31 @@ step7a_small_scale_dfn/output/candidate_cheye1_current_flow_v5_v2_density_v4_ori
 
 该目录当前不再作为正式独立 Step7B 主线，但 `build_initial_dfn_from_3d_density_sgy.py` 仍被 Step7A 复用，用于裂缝片几何、VTK 导出、局部 PCA 方向估计等工具函数。因此保留代码文件，删除旧试参配置。
 
-## Step8/Step9 当前配置
+## Step8 当前检查点
 
-Step8 当前最终配置：
+配置：
 
-- `step8_dfn_well_correction/configs/formal_well_control_correction_candidate_cheye1_current_flow_v1.json`
+- `step8_dfn_well_correction/configs/formal_well_control_correction_candidate_cheye1_final_lowcoh_vertical_v1_smallwell_event_v1.json`
 
-Step9 当前最终配置：
+当前逻辑：
 
-- `step9_section_visualize/configs/formal_candidate_cheye1_current_flow_v1_with_original_fault_trace_dfn_coherence_sections.json`
+- Step3 成像测井真值保留真实方向。
+- Step4 常规测井密集点按 `gap=6 ms`、`max_span=18 ms` 聚合为事件。
+- 所有井控裂缝限制为 small，不改变中大尺度构造主体。
+- 当前输出 8,537 个裂缝片，其中 159 个井控片全部为 small；相对 Step7D 的 changed/added 比例约 1.89%。
+
+## Step9 当前检查点
+
+DFN/相干体 8 图配置：
+
+- `step9_section_visualize/configs/formal_candidate_cheye1_final_lowcoh_vertical_v1_smallwell_event_v1_small_projection_dfn_coherence_sections.json`
+
+当前口径：
+
+- 中、大尺度裂缝只显示真实曲剖面交线。
+- small 裂缝允许限定半宽投影；井控 small 裂缝默认不参与该投影。
+- 原始断层解释已载入，但当前车页1导眼 XZ/YZ 曲剖面与原始断层没有足够交点，因此可见原始断层段数为 0；这不表示断层输入缺失。
+- 地质属性、地震振幅和逐道 T4-T7 层位工具已纳入代码。逐道层位目前只完成全矿区振幅预览，其他正式图件仍需在下一阶段重跑验收。
 
 Step9 仍保留通用矿区/井剖面属性体绘图配置，用于后续生成其它剖面图。
 

@@ -1,0 +1,23 @@
+{
+  "trace_header_csv": "/home/tyh/projects/petroleum/code/GAN-DFN/数据精简/trace_header_xy.csv",
+  "real_well_samples_root": "/home/tyh/projects/petroleum/code/GAN-DFN/优化阶段二/正式主线/step2_real_well_t4_t7_samples/output/formal_all_wells",
+  "surface_dir": "/data/shared/project-oil/wx数据/砂砾岩/层位",
+  "output_root": "/home/tyh/projects/petroleum/code/GAN-DFN/优化阶段二/正式主线/step9_section_visualize/output/mine_cheye1_seismic_amplitude_v1",
+  "well_name": "车页1导眼",
+  "exclude_wells": [],
+  "target_block": {},
+  "volume_paths": {
+    "SeisAmp": "/data/shared/project-oil/wx数据/砂砾岩/psdm_final_time.sgy"
+  },
+  "title_prefix": "全矿区尺度过车页1导眼地震背景剖面",
+  "z_label": "TWT / ms",
+  "time_padding_ms": 20.0,
+  "axis_sample_count": 720,
+  "surface_samples": 900,
+  "progress_interval": 100,
+  "fig_width": 18.0,
+  "fig_height": 7.8,
+  "dpi": 240,
+  "amplitude_clip_quantile": 0.99,
+  "wiggle_max_trace_count": 240
+}
