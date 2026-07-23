@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import os
 from pathlib import Path
+from typing import Any, Callable
 
 os.environ.setdefault("MPLCONFIGDIR", "/tmp/gan_dfn_matplotlib_cache")
 
@@ -60,9 +61,22 @@ def display_scale(attribute: str, values: list[np.ndarray]) -> tuple[float, floa
     return -limit, limit, norm, {"rule": "signed_zero_centered_symmetric_abs_q98", "limit": limit}
 
 
-def plot_section(section: AttributeSection, geometry, output_path: Path, vmin: float, vmax: float, norm) -> None:
+def plot_section(
+    section: AttributeSection,
+    geometry,
+    output_path: Path,
+    vmin: float,
+    vmax: float,
+    norm,
+    *,
+    overlay_drawer: Callable[[Any, str], dict[str, int]] | None = None,
+    scope_label: str | None = None,
+    product_title: str | None = None,
+) -> dict[str, int]:
     setting = ATTRIBUTE_SETTINGS[section.attribute]
-    fig, ax = plt.subplots(figsize=(geometry.args.fig_width, geometry.args.fig_height))
+    overlay_enabled = overlay_drawer is not None
+    figure_width = float(geometry.args.fig_width) + (4.0 if overlay_enabled else 0.0)
+    fig, ax = plt.subplots(figsize=(figure_width, geometry.args.fig_height))
     kwargs = {"shading": "auto", "cmap": setting["cmap"], "zorder": 1}
     if norm is None:
         kwargs.update({"vmin": vmin, "vmax": vmax})
@@ -82,12 +96,26 @@ def plot_section(section: AttributeSection, geometry, output_path: Path, vmin: f
     ax.invert_yaxis()
     ax.set_ylabel(geometry.args.z_label)
     ax.grid(True, linewidth=0.3, alpha=0.25)
-    ax.legend(loc="upper right")
-    fig.colorbar(mesh, ax=ax, pad=0.02, shrink=0.94, label=setting["label"])
-    ax.set_title(f"{geometry.config['title_prefix']} | {setting['label']} | {section.projection} | T4-T7")
-    fig.tight_layout()
+    overlay_stats: dict[str, int] = {}
+    if overlay_drawer is not None:
+        overlay_stats = overlay_drawer(ax, section.projection)
+        fig.subplots_adjust(left=0.06, right=0.76, bottom=0.10, top=0.88)
+        cax = fig.add_axes([0.78, 0.16, 0.014, 0.66])
+        fig.colorbar(mesh, cax=cax, label=setting["label"])
+        handles, labels = ax.get_legend_handles_labels()
+        fig.legend(handles, labels, loc="upper left", bbox_to_anchor=(0.81, 0.88), fontsize=8.4, framealpha=0.92)
+        title = product_title or "车页1导眼：DFN与成像测井裂缝对比剖面"
+        scope = scope_label or "剖面"
+        fig.suptitle(title, y=0.975, fontsize=13)
+        ax.set_title(f"{scope} | {setting['label']} | {section.projection} | T4-T7", fontsize=11, pad=8)
+    else:
+        ax.legend(loc="upper right")
+        fig.colorbar(mesh, ax=ax, pad=0.02, shrink=0.94, label=setting["label"])
+        ax.set_title(f"{geometry.config['title_prefix']} | {setting['label']} | {section.projection} | T4-T7")
+        fig.tight_layout()
     fig.savefig(output_path, dpi=geometry.args.dpi)
     plt.close(fig)
+    return overlay_stats
 
 
 def main() -> int:

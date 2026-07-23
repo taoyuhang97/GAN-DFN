@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import os
 from pathlib import Path
+from typing import Any, Callable
 
 os.environ.setdefault("MPLCONFIGDIR", "/tmp/gan_dfn_matplotlib_cache")
 
@@ -58,7 +59,7 @@ def save_figure(fig, output_path: Path, dpi: int, write_svg: bool) -> None:
         fig.savefig(output_path.with_suffix(".svg"))
 
 
-def apply_axes(ax, section: AttributeSection, geometry) -> None:
+def apply_axes(ax, section: AttributeSection, geometry, *, show_legend: bool = True) -> None:
     draw_surface_curves(ax, geometry.surface_curves, section.projection)
     if section.projection == "XZ":
         draw_well_trajectory(ax, geometry.well_df["X"], geometry.well_df["TIME"], label=f"{geometry.well_name}井轨迹")
@@ -71,7 +72,8 @@ def apply_axes(ax, section: AttributeSection, geometry) -> None:
     ax.invert_yaxis()
     ax.set_ylabel(geometry.args.z_label)
     ax.grid(True, linewidth=0.25, alpha=0.22)
-    ax.legend(loc="upper right")
+    if show_legend:
+        ax.legend(loc="upper right")
 
 
 def plot_variable_density(
@@ -81,8 +83,14 @@ def plot_variable_density(
     limit: float,
     title_suffix: str = "",
     panel: bool = False,
-) -> None:
+    *,
+    overlay_drawer: Callable[[Any, str], dict[str, int]] | None = None,
+    scope_label: str | None = None,
+    product_title: str | None = None,
+) -> dict[str, int]:
     width, height, dpi = figure_size_inches(section, geometry, panel=panel)
+    if overlay_drawer is not None:
+        width += 4.0
     fig, ax = plt.subplots(figsize=(width, height))
     norm = TwoSlopeNorm(vmin=-limit, vcenter=0.0, vmax=limit)
     mesh = ax.pcolormesh(
@@ -95,12 +103,24 @@ def plot_variable_density(
         rasterized=True,
         zorder=1,
     )
-    apply_axes(ax, section, geometry)
-    fig.colorbar(mesh, ax=ax, pad=0.02, shrink=0.94, label="地震振幅")
-    ax.set_title(f"{geometry.config['title_prefix']} | 地震振幅变密度 | {section.projection} | T4-T7{title_suffix}")
-    fig.tight_layout()
+    apply_axes(ax, section, geometry, show_legend=overlay_drawer is None)
+    overlay_stats: dict[str, int] = {}
+    if overlay_drawer is not None:
+        overlay_stats = overlay_drawer(ax, section.projection)
+        fig.subplots_adjust(left=0.06, right=0.76, bottom=0.10, top=0.88)
+        cax = fig.add_axes([0.78, 0.16, 0.014, 0.66])
+        fig.colorbar(mesh, cax=cax, label="地震振幅")
+        handles, labels = ax.get_legend_handles_labels()
+        fig.legend(handles, labels, loc="upper left", bbox_to_anchor=(0.81, 0.88), fontsize=8.4, framealpha=0.92)
+        fig.suptitle(product_title or "车页1导眼：DFN与成像测井裂缝对比剖面", y=0.975, fontsize=13)
+        ax.set_title(f"{scope_label or '剖面'} | 地震振幅变密度 | {section.projection} | T4-T7{title_suffix}", fontsize=11, pad=8)
+    else:
+        fig.colorbar(mesh, ax=ax, pad=0.02, shrink=0.94, label="地震振幅")
+        ax.set_title(f"{geometry.config['title_prefix']} | 地震振幅变密度 | {section.projection} | T4-T7{title_suffix}")
+        fig.tight_layout()
     save_figure(fig, output_path, dpi, bool(geometry.config.get("write_svg", False)))
     plt.close(fig)
+    return overlay_stats
 
 
 def plot_wiggle_variable_area(
@@ -110,8 +130,14 @@ def plot_wiggle_variable_area(
     limit: float,
     title_suffix: str = "",
     panel: bool = False,
+    *,
+    overlay_drawer: Callable[[Any, str], dict[str, int]] | None = None,
+    scope_label: str | None = None,
+    product_title: str | None = None,
 ) -> int:
     width, height, dpi = figure_size_inches(section, geometry, panel=panel)
+    if overlay_drawer is not None:
+        width += 3.6
     fig, ax = plt.subplots(figsize=(width, height))
     max_traces = int(geometry.config.get("wiggle_max_trace_count", 0))
     if max_traces <= 0 or max_traces >= len(section.h):
@@ -139,13 +165,26 @@ def plot_wiggle_variable_area(
             linewidth=0.0,
             zorder=1,
         )
-    apply_axes(ax, section, geometry)
+    apply_axes(ax, section, geometry, show_legend=overlay_drawer is None)
     ax.set_facecolor("white")
-    ax.set_title(
-        f"{geometry.config['title_prefix']} | 地震波形+变面积 | {section.projection} | "
-        f"T4-T7 | 显示道数={len(selected)} | 摆幅={swing:.2f}{title_suffix}"
-    )
-    fig.tight_layout()
+    if overlay_drawer is not None:
+        overlay_drawer(ax, section.projection)
+        fig.subplots_adjust(left=0.06, right=0.79, bottom=0.10, top=0.88)
+        handles, labels = ax.get_legend_handles_labels()
+        fig.legend(handles, labels, loc="upper left", bbox_to_anchor=(0.81, 0.88), fontsize=8.4, framealpha=0.92)
+        fig.suptitle(product_title or "车页1导眼：DFN与成像测井裂缝对比剖面", y=0.975, fontsize=13)
+        ax.set_title(
+            f"{scope_label or '剖面'} | 地震波形+变面积 | {section.projection} | "
+            f"T4-T7 | 道数={len(selected)}{title_suffix}",
+            fontsize=11,
+            pad=8,
+        )
+    else:
+        ax.set_title(
+            f"{geometry.config['title_prefix']} | 地震波形+变面积 | {section.projection} | "
+            f"T4-T7 | 显示道数={len(selected)} | 摆幅={swing:.2f}{title_suffix}"
+        )
+        fig.tight_layout()
     save_figure(fig, output_path, dpi, bool(geometry.config.get("write_svg", False)))
     plt.close(fig)
     return int(len(selected))

@@ -128,6 +128,18 @@
 
 该版本只使用 `AntTrack`、`CurvatureMax` 和 `SeisAmp`，不读取 `CurvaturePos`，也不生成综合曲率。输出位于 `output/candidate_cheye1_geological_background_v1/`，包含蚂蚁体、最大曲率体、振幅变密度、振幅波形+变面积的 XZ/YZ 共8张 PNG。剖面数值保存为压缩 NPZ，不展开为大体积 CSV。
 
+车页1导眼当前 DFN 的多背景正式对比图使用配置：
+
+```bash
+/home/tyh/anaconda3/envs/gan-dfn/bin/python \
+  优化阶段二/正式主线/step9_section_visualize/build_cheye1_dfn_multibackground_sections.py \
+  --config 优化阶段二/正式主线/step9_section_visualize/configs/formal_candidate_cheye1_final_lowcoh_vertical_v1_smallwell_event_v1_multibackground_sections.json
+```
+
+该入口保留五种现有剖面渲染逻辑，并统一叠加当前 Step8 DFN、Step3 真实成像裂缝点/解释片、成像井段轨迹、井轨迹和逐道 T4-T7 层位。输出为候选区整体和井周200 m两种尺度，每种尺度包含蚂蚁体、相干体、最大曲率体、地震振幅变密度、地震波形+变面积的 XZ/YZ，共20张编号 PNG。两种尺度独立采样，不再用局部时间范围截断整体剖面；PNG保留各渲染器的原生尺寸，不强制缩放为统一画布。输出目录同时写入 `section_summary.json` 和各体数据的压缩 NPZ 样本。
+
+当前 Step8 DFN 来自 `candidate_cheye1` 目标块，因此整体图标题使用“候选区整体”，不能解释为全矿区 DFN 覆盖。若要生成真正的全矿区整体图，需要先提供或构建全矿区范围的 DFN 输入。
+
 全矿区尺度过车页1导眼地震振幅剖面使用配置：
 
 ```bash
