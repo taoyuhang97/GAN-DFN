@@ -63,6 +63,8 @@ FAULT_TRACE_COLOR = "#ffe600"
 FAULT_TRACE_HALO = "#111827"
 FAULT_TRACE_WIDTH = 2.8
 FAULT_TRACE_HALO_WIDTH = 5.2
+FAULT_TRACE_OVERVIEW_WIDTH = 1.25
+FAULT_TRACE_OVERVIEW_HALO_WIDTH = 2.4
 DFN_WIDTH_MIN = 0.45
 DFN_WIDTH_MAX = 3.0
 DFN_WIDTH_POWER = 0.80
@@ -826,15 +828,16 @@ def raw_fault_segments_for_projection(
     segments: list[ProjectionSegment] = []
     group_cols = ["FaultName", "Line", "Flag"]
     selected_group_count = 0
-    selected_keys = selected[group_cols].drop_duplicates()
-    key_tuples = {tuple(row) for row in selected_keys.to_numpy()}
+    selected_group_count = 0
+    selected_keys = {tuple(row) for row in selected[group_cols].to_numpy()}
     for key, group in work.sort_values(group_cols + ["TIME"]).groupby(group_cols, dropna=False):
-        if tuple(key if isinstance(key, tuple) else (key,)) not in key_tuples:
+        key_tuple = tuple(key if isinstance(key, tuple) else (key,))
+        if key_tuple not in selected_keys:
             continue
         if len(group) < 2:
             continue
-        selected_group_count += 1
         arr = group[["H", "TIME", "X", "Y", "SectionDistance"]].to_numpy(dtype=float)
+        group_has_segment = False
         for idx in range(len(arr) - 1):
             h1, z1, x1, y1, d1 = arr[idx]
             h2, z2, x2, y2, d2 = arr[idx + 1]
@@ -843,6 +846,10 @@ def raw_fault_segments_for_projection(
             if max(h1, h2) < h_min or min(h1, h2) > h_max:
                 continue
             if abs(z2 - z1) > 450.0:
+                continue
+            # Retain only segments touching the projection band. This keeps a
+            # nearby fault visible without drawing its entire remote stick.
+            if min(d1, d2) > float(half_width):
                 continue
             center_x = 0.5 * (x1 + x2)
             center_y = 0.5 * (y1 + y2)
@@ -863,6 +870,9 @@ def raw_fault_segments_for_projection(
                     z2=float(z2),
                 )
             )
+            group_has_segment = True
+        if group_has_segment:
+            selected_group_count += 1
     return segments, {
         "selected_point_count": int(len(selected)),
         "segment_count": int(len(segments)),
@@ -900,7 +910,13 @@ def scan_original_fault_stick_traces(
     }
 
 
-def add_fault_trace_segments(ax, segments: list[ProjectionSegment], projection: str) -> int:
+def add_fault_trace_segments(
+    ax,
+    segments: list[ProjectionSegment],
+    projection: str,
+    *,
+    overview: bool = False,
+) -> int:
     lines = [
         [(segment.h1, segment.z1), (segment.h2, segment.z2)]
         for segment in segments
@@ -908,9 +924,12 @@ def add_fault_trace_segments(ax, segments: list[ProjectionSegment], projection: 
     ]
     if not lines:
         return 0
-    ax.add_collection(LineCollection(lines, colors=FAULT_TRACE_HALO, linewidths=FAULT_TRACE_HALO_WIDTH, alpha=0.86, zorder=9))
-    ax.add_collection(LineCollection(lines, colors=FAULT_TRACE_COLOR, linewidths=FAULT_TRACE_WIDTH, alpha=0.96, zorder=10))
-    ax.plot([], [], color=FAULT_TRACE_COLOR, linewidth=FAULT_TRACE_WIDTH, label="断层轨迹")
+    halo_width = FAULT_TRACE_OVERVIEW_HALO_WIDTH if overview else FAULT_TRACE_HALO_WIDTH
+    line_width = FAULT_TRACE_OVERVIEW_WIDTH if overview else FAULT_TRACE_WIDTH
+    line_style = (0, (5, 3)) if overview else "-"
+    ax.add_collection(LineCollection(lines, colors=FAULT_TRACE_HALO, linewidths=halo_width, alpha=0.70 if overview else 0.86, zorder=9, linestyles=line_style))
+    ax.add_collection(LineCollection(lines, colors=FAULT_TRACE_COLOR, linewidths=line_width, alpha=0.78 if overview else 0.96, zorder=10, linestyles=line_style))
+    ax.plot([], [], color=FAULT_TRACE_COLOR, linewidth=line_width, linestyle=line_style, label="断层轨迹")
     return len(lines)
 
 

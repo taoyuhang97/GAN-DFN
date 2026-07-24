@@ -32,6 +32,7 @@ from build_well_seismic_amplitude_sections import amplitude_limit, plot_variable
 from dfn_section_overlay import SectionOverlayContext, draw_section_overlays
 from trace_horizon_section import build_trace_horizon_section_curves, resolve_horizon_trace_table
 from well_curved_section_common import (
+    AttributeSection,
     CurvedSectionGeometry,
     prepare_geometry,
     read_json,
@@ -94,8 +95,20 @@ def local_geometry(base: CurvedSectionGeometry, config: dict[str, Any]) -> Curve
     local_args = SimpleNamespace(**vars(base.args))
     local_args.fig_width = float(config.get("local_fig_width", 15.5))
     local_args.fig_height = float(config.get("local_fig_height", 7.8))
+    local_config = dict(base.config)
+    for key in (
+        "figure_height_px",
+        "xz_total_width_px",
+        "yz_total_width_px",
+        "panel_width_px",
+        "xz_panel_count",
+        "yz_panel_count",
+    ):
+        local_config.pop(key, None)
+    local_config["render_dpi"] = int(config.get("local_render_dpi", config.get("dpi", 240)))
     return replace(
         base,
+        config=local_config,
         args=local_args,
         surface_curves=curves,
         summary=summary,
@@ -104,6 +117,36 @@ def local_geometry(base: CurvedSectionGeometry, config: dict[str, Any]) -> Curve
         time_min=float(time_min),
         time_max=float(time_max),
     )
+
+
+def load_section_pair_npz(path: Path, attribute: str) -> tuple[AttributeSection, AttributeSection, dict[str, Any]]:
+    if not path.exists():
+        raise FileNotFoundError(f"overview section cache not found: {path}")
+    with np.load(path) as data:
+        xz = AttributeSection(
+            attribute,
+            "XZ",
+            np.asarray(data["xz_h"], dtype=np.float64),
+            np.asarray(data["xz_time"], dtype=np.float64),
+            np.asarray(data["xz_values"], dtype=np.float64),
+        )
+        yz = AttributeSection(
+            attribute,
+            "YZ",
+            np.asarray(data["yz_h"], dtype=np.float64),
+            np.asarray(data["yz_time"], dtype=np.float64),
+            np.asarray(data["yz_values"], dtype=np.float64),
+        )
+    finite_count = int(np.isfinite(xz.values).sum() + np.isfinite(yz.values).sum())
+    return xz, yz, {
+        "source": "existing_mine_scale_npz",
+        "cache_path": str(path),
+        "xz_shape": [int(value) for value in xz.values.shape],
+        "yz_shape": [int(value) for value in yz.values.shape],
+        "finite_fraction": float(finite_count / (xz.values.size + yz.values.size)),
+        "section_time_min_ms": float(min(xz.time.min(), yz.time.min())),
+        "section_time_max_ms": float(max(xz.time.max(), yz.time.max())),
+    }
 
 
 def make_overlay_drawer(context: SectionOverlayContext) -> tuple[Callable[[Any, str], dict[str, int]], dict[str, int]]:
@@ -210,23 +253,30 @@ def render_all(config_path: Path, config: dict[str, Any]) -> dict[str, Any]:
     validate_inputs(config)
     output_dir = path_from_config(config, "output_dir")
     reset_output_images(output_dir)
-    overview = prepare_geometry(config)
+    overview_config = dict(config)
+    overview_config["target_block"] = dict(config.get("overview_target_block") or {})
+    overview = prepare_geometry(overview_config)
     overview.summary["scope_name"] = "overview"
     local = local_geometry(overview, config)
     scopes = {"overview": overview, "local_200m": local}
-    scope_labels = {"overview": "候选区整体", "local_200m": "井周200 m"}
+    scope_labels = {"overview": "矿区尺度 | 当前候选区DFN", "local_200m": "井周200 m"}
     overlay_contexts, overlay_summary = build_overlay_contexts(config, overview, local)
 
     sampled: dict[str, dict[str, tuple[Any, Any, dict[str, Any]]]] = {}
     for scope_name, geometry in scopes.items():
         sampled[scope_name] = {}
         for attribute in [*ATTRIBUTE_ORDER, "SeisAmp"]:
-            print(f"[multi-background] sampling scope={scope_name} attribute={attribute}", flush=True)
-            sampled[scope_name][attribute] = sample_volume_sections(
-                geometry,
-                attribute,
-                Path(str(config["volume_paths"][attribute])).resolve(),
-            )
+            cache_value = dict(config.get("overview_section_sample_paths") or {}).get(attribute) if scope_name == "overview" else None
+            if cache_value:
+                print(f"[multi-background] loading mine cache attribute={attribute}", flush=True)
+                sampled[scope_name][attribute] = load_section_pair_npz(Path(str(cache_value)).resolve(), attribute)
+            else:
+                print(f"[multi-background] sampling scope={scope_name} attribute={attribute}", flush=True)
+                sampled[scope_name][attribute] = sample_volume_sections(
+                    geometry,
+                    attribute,
+                    Path(str(config["volume_paths"][attribute])).resolve(),
+                )
             xz, yz, _ = sampled[scope_name][attribute]
             cache_dir = output_dir / "section_samples" / scope_name
             save_section_pair_npz(cache_dir / f"{attribute.lower()}_section_samples.npz", xz, yz)
@@ -268,12 +318,20 @@ def render_all(config_path: Path, config: dict[str, Any]) -> dict[str, Any]:
         (19, "local_200m", "SeisAmp", "XZ", "wiggle"),
         (20, "local_200m", "SeisAmp", "YZ", "wiggle"),
     ]
+    requested_numbers = {int(value) for value in config.get("image_numbers", [])}
+    if requested_numbers:
+        image_plan = [row for row in image_plan if row[0] in requested_numbers]
     image_rows: list[dict[str, Any]] = []
     mode_names = {"attribute": "dfn", "density": "density_dfn", "wiggle": "wiggle_dfn"}
     for number, scope_name, attribute, projection, renderer in image_plan:
         section_index = 0 if projection == "XZ" else 1
         section = sampled[scope_name][attribute][section_index]
         geometry = scopes[scope_name]
+        product_title = str(
+            config.get("overview_product_title", config.get("product_title", PRODUCT_TITLE))
+            if scope_name == "overview"
+            else config.get("local_product_title", PRODUCT_TITLE)
+        )
         drawer, captured = make_overlay_drawer(overlay_contexts[scope_name])
         token = attribute.lower() if attribute != "SeisAmp" else "seisamp"
         filename = f"{number:02d}_{'overview' if scope_name == 'overview' else 'local200m'}_{token}_{mode_names[renderer]}_{projection.lower()}_t4_t7.png"
@@ -289,7 +347,7 @@ def render_all(config_path: Path, config: dict[str, Any]) -> dict[str, Any]:
                 norm,
                 overlay_drawer=drawer,
                 scope_label=scope_labels[scope_name],
-                product_title=PRODUCT_TITLE,
+                product_title=product_title,
             )
         elif renderer == "density":
             stats = plot_variable_density(
@@ -299,7 +357,7 @@ def render_all(config_path: Path, config: dict[str, Any]) -> dict[str, Any]:
                 seis_limit,
                 overlay_drawer=drawer,
                 scope_label=scope_labels[scope_name],
-                product_title=PRODUCT_TITLE,
+                product_title=product_title,
             )
         else:
             trace_count = plot_wiggle_variable_area(
@@ -309,7 +367,7 @@ def render_all(config_path: Path, config: dict[str, Any]) -> dict[str, Any]:
                 seis_limit,
                 overlay_drawer=drawer,
                 scope_label=scope_labels[scope_name],
-                product_title=PRODUCT_TITLE,
+                product_title=product_title,
             )
             stats = dict(captured)
             stats["wiggle_trace_count"] = int(trace_count)
@@ -336,9 +394,10 @@ def render_all(config_path: Path, config: dict[str, Any]) -> dict[str, Any]:
                 for row in image_rows
                 if row["scope"] == scope_name and row["projection"] == projection
             }
-            overlay_consistent = overlay_consistent and len(counts) == 1 and next(iter(counts), 0) > 0
+            if counts:
+                overlay_consistent = overlay_consistent and len(counts) == 1 and next(iter(counts), 0) > 0
     checks = {
-        "exactly_20_pngs": len(png_files) == 20,
+        "expected_image_count": len(png_files) == (len(requested_numbers) if requested_numbers else 20),
         "all_planned_images_exist": all((output_dir / row["file"]).exists() for row in image_rows),
         "overlay_counts_consistent_across_backgrounds": bool(overlay_consistent),
         "step3_60_points_loaded": int(overlay_summary["step3_fracture_point_count"]) == 60,
@@ -352,7 +411,11 @@ def render_all(config_path: Path, config: dict[str, Any]) -> dict[str, Any]:
         "status": "pass" if all(checks.values()) else "fail",
         "config_path": str(config_path.resolve()),
         "output_dir": str(output_dir),
-        "product_title": PRODUCT_TITLE,
+        "product_title": str(config.get("product_title", PRODUCT_TITLE)),
+        "scope_product_titles": {
+            "overview": str(config.get("overview_product_title", config.get("product_title", PRODUCT_TITLE))),
+            "local_200m": str(config.get("local_product_title", PRODUCT_TITLE)),
+        },
         "well_name": overview.well_name,
         "scope_geometry": {name: geometry.summary for name, geometry in scopes.items()},
         "overlay_source": overlay_summary,

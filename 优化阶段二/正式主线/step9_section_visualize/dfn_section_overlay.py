@@ -39,7 +39,12 @@ class SectionOverlayContext:
 def draw_section_overlays(ax: Any, context: SectionOverlayContext, projection: str) -> dict[str, int]:
     """Draw DFN and real imaging-log observations above an existing background."""
     dfn_count = add_dfn_segments(ax, context.dfn_segments, projection, overlay=True)
-    fault_count = add_fault_trace_segments(ax, context.fault_segments, projection)
+    fault_count = add_fault_trace_segments(
+        ax,
+        context.fault_segments,
+        projection,
+        overview=context.name == "overview",
+    )
     draw_imaging_segment_trajectory(ax, context.imaging_df, projection)
     patch_count = add_imaging_fracture_patch_segments(ax, context.imaging_patch_segments, projection)
     point_count = draw_fracture_labels(ax, context.fracture_df, projection, context.display_summary)
