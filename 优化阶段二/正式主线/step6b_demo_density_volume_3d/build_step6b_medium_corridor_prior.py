@@ -19,6 +19,8 @@ from build_multiscale_density_bundle import (
     load_mapping,
     load_trace_matrix,
     low_score,
+    read_sgy_sample_axis,
+    regular_sample_axis,
     valid_values,
     write_sgy_like,
 )
@@ -156,10 +158,22 @@ def build_medium_components(
     rejected_low_score = 0
 
     sizes = np.bincount(raw_labels.ravel())
+    # ``np.where(raw_labels == raw_id)`` rescans the complete 3-D label volume
+    # once for every component.  That was tolerable for the old 3 km demo but
+    # becomes prohibitively expensive for the 10 km / 2 ms grid.  Compute the
+    # component bounding boxes once and search only inside each local box.
+    component_slices = ndimage.find_objects(raw_labels, max_label=raw_count)
     for raw_id in range(1, raw_count + 1):
         if int(sizes[raw_id]) <= 0:
             continue
-        yy, xx, tt = np.where(raw_labels == raw_id)
+        component_slice = component_slices[raw_id - 1]
+        if component_slice is None:
+            continue
+        local_labels = raw_labels[component_slice]
+        yy, xx, tt = np.where(local_labels == raw_id)
+        yy += int(component_slice[0].start)
+        xx += int(component_slice[1].start)
+        tt += int(component_slice[2].start)
         if yy.size > int(args.max_component_voxels_before_split):
             split_raw_count += 1
             tile = max(int(args.split_tile_cells), 1)
@@ -298,13 +312,21 @@ def main() -> int:
     volume_paths = {key: Path(value).resolve() for key, value in dict(config["volume_paths"]).items()}
     mapping = load_mapping(trace_mapping_npz)
     source_trace_idx = mapping["source_trace_idx"].astype(np.int64)
-    density, samples, density_load = load_trace_matrix(input_density_sgy, None, None, "Density")
+    source_samples, density_load = read_sgy_sample_axis(input_density_sgy)
+    interval_ms = float(dict(config.get("medium_evidence", {})).get("sample_interval_ms", 10.0))
+    samples = regular_sample_axis(source_samples, interval_ms)
+    density_load["target_sample_count"] = int(len(samples))
+    density_load["target_sample_interval_ms"] = interval_ms
 
     print("[step6b-medium] loading seismic attributes", flush=True)
     coherence, _, coh_load = load_trace_matrix(volume_paths["Coherence"], source_trace_idx, samples, "Coherence")
     anttrack, _, ant_load = load_trace_matrix(volume_paths["AntTrack"], source_trace_idx, samples, "AntTrack")
     curvmax, _, curvmax_load = load_trace_matrix(volume_paths["CurvatureMax"], source_trace_idx, samples, "CurvatureMax")
-    curvpos, _, curvpos_load = load_trace_matrix(volume_paths["CurvaturePos"], source_trace_idx, samples, "CurvaturePos")
+    if "CurvaturePos" in volume_paths:
+        curvpos, _, curvpos_load = load_trace_matrix(volume_paths["CurvaturePos"], source_trace_idx, samples, "CurvaturePos")
+    else:
+        curvpos = None
+        curvpos_load = {"status": "not_configured"}
 
     score_cfg = dict(config.get("score_config", {}))
     ant_cfg = dict(score_cfg.get("anttrack_score", {"low_quantile": 0.20, "high_quantile": 0.96}))
@@ -314,14 +336,18 @@ def main() -> int:
     ant_valid = valid_values(anttrack, ant_cfg)
     coh_valid = valid_values(coherence, coh_cfg)
     curvmax_valid = valid_values(curvmax, curvmax_cfg)
-    curvpos_valid = valid_values(curvpos, curvpos_cfg)
+    curvpos_valid = valid_values(curvpos, curvpos_cfg) if curvpos is not None else None
     valid = ant_valid & coh_valid
 
     ant_score, ant_summary = high_score(anttrack, ant_valid, ant_cfg)
     lowcoh_score, lowcoh_summary = low_score(coherence, coh_valid, coh_cfg)
     curvmax_score, curvmax_summary = high_score(curvmax, curvmax_valid, curvmax_cfg)
-    curvpos_score, curvpos_summary = high_score(curvpos, curvpos_valid, curvpos_cfg)
-    curv_score = np.maximum(curvmax_score, curvpos_score).astype(np.float32)
+    if curvpos is not None and curvpos_valid is not None:
+        curvpos_score, curvpos_summary = high_score(curvpos, curvpos_valid, curvpos_cfg)
+        curv_score = np.maximum(curvmax_score, curvpos_score).astype(np.float32)
+    else:
+        curvpos_summary = {"status": "not_configured"}
+        curv_score = curvmax_score.astype(np.float32)
 
     lowcoh_grid, _, _ = flat_to_grid(lowcoh_score, mapping)
     curv_grid, _, _ = flat_to_grid(curv_score, mapping)
@@ -395,28 +421,24 @@ def main() -> int:
     medium_score_filtered[kept_mask_flat <= 0.0] = 0.0
 
     write_sgy_like(output_dir / "medium_corridor_prior.sgy", input_density_sgy, medium_score_filtered, samples)
-    write_sgy_like(output_dir / "medium_corridor_mask.sgy", input_density_sgy, kept_mask_flat.astype(np.float32), samples)
     component_df.to_csv(output_dir / "medium_corridor_component_summary.csv", index=False, encoding="utf-8-sig")
-    vtk_summary = write_component_vtk(
-        output_dir / "medium_corridor_components_raw_time.vtk",
-        component_id_grid,
-        medium_grid,
-        mapping,
-        samples,
-        max_points=int(args.vtk_max_points),
-        rng=rng,
-    )
+    if bool(config.get("write_intermediate_vtk", False)):
+        vtk_summary = write_component_vtk(
+            output_dir / "medium_corridor_components_raw_time.vtk",
+            component_id_grid,
+            medium_grid,
+            mapping,
+            samples,
+            max_points=int(args.vtk_max_points),
+            rng=rng,
+        )
+    else:
+        vtk_summary = {"status": "disabled_by_config"}
     np.savez_compressed(
         output_dir / "medium_corridor_components.npz",
         medium_prior=medium_score_filtered.astype(np.float32),
         medium_mask=kept_mask_flat.astype(np.uint8),
         medium_component_id=component_id_flat.astype(np.int32),
-        candidate_branch_code=branch_code_flat.astype(np.uint8),
-        ant_branch_score=ant_branch_score.astype(np.float32),
-        lowcoh_vertical_branch_score=lowcoh_branch_score.astype(np.float32),
-        local_support=local_support.astype(np.float32),
-        local_support_fraction=local_support_fraction.astype(np.float32),
-        direct_support=direct_support.astype(np.float32),
         samples=samples.astype(np.float32),
         x=mapping["x"].astype(np.float64),
         y=mapping["y"].astype(np.float64),
@@ -431,6 +453,13 @@ def main() -> int:
         "status": "pass",
         "input_density_sgy": str(input_density_sgy),
         "output_dir": str(output_dir),
+        "sample_interval_ms": interval_ms,
+        "sample_count": int(len(samples)),
+        "output_contract": {
+            "medium_prior_sgy": str(output_dir / "medium_corridor_prior.sgy"),
+            "component_npz": str(output_dir / "medium_corridor_components.npz"),
+            "mask_storage": "medium_mask inside component_npz",
+        },
         "load": {
             "density": density_load,
             "coherence": coh_load,

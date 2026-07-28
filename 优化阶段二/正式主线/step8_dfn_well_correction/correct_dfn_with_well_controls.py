@@ -442,13 +442,23 @@ def update_layer_window_from_surfaces(row: pd.Series | dict[str, Any], surface_l
         base = query_surface_time(surface_lookup, "T7", x, y)
     else:
         return {}
-    if not np.isfinite(top) or not np.isfinite(base) or base <= top:
+    if not np.isfinite(top) or not np.isfinite(base):
         return {}
+    surface_order_repaired = int(base <= top)
+    if surface_order_repaired:
+        top, base = min(top, base), max(top, base)
     center_time = float(row["CenterTime"])
     if np.isfinite(center_time):
         top = min(top, center_time)
         base = max(base, center_time)
-    return {"TimeWindowMin": top, "TimeWindowMax": base, "LayerThickness": base - top}
+    if base <= top:
+        return {}
+    return {
+        "TimeWindowMin": top,
+        "TimeWindowMax": base,
+        "LayerThickness": base - top,
+        "LayerWindowSurfaceOrderRepaired": surface_order_repaired,
+    }
 
 
 def build_well_modifiable_mask(df: pd.DataFrame) -> pd.Series:
@@ -1320,6 +1330,14 @@ def build_summary(
     centers_within_layer_windows = True
     layer_window_missing_count = 0
     layer_window_checked_count = 0
+    layer_window_surface_order_repaired_count = int(
+        safe_numeric(
+            corrected_df.get(
+                "LayerWindowSurfaceOrderRepaired",
+                pd.Series(0, index=corrected_df.index),
+            )
+        ).fillna(0).eq(1).sum()
+    )
     if {"CenterTime", "TimeWindowMin", "TimeWindowMax"}.issubset(corrected_df.columns):
         layer_window_available = corrected_df[["CenterTime", "TimeWindowMin", "TimeWindowMax"]].notna().all(axis=1)
         layer_window_missing_count = int((~layer_window_available).sum())
@@ -1366,6 +1384,7 @@ def build_summary(
             "time_search_radius_ms": float(config.get("time_search_radius_ms", 30.0)),
             "surface_dir": str(Path(config["surface_dir"]).resolve()) if config.get("surface_dir") else None,
             "surface_windows_recomputed_for_well_control_patches": bool(config.get("surface_dir")),
+            "inverted_surface_window_policy": "sort_finite_boundaries_then_include_hard_control_center",
             "use_dip_geometry": bool(config.get("use_dip_geometry", False)),
             "geometry_time_scale_m_per_ms": float(config.get("geometry_time_scale_m_per_ms", 1.0)),
             "enable_well_control_center_offset": bool(config.get("enable_well_control_center_offset", True)),
@@ -1439,6 +1458,7 @@ def build_summary(
         "layer_window_check": {
             "checked_patch_count": layer_window_checked_count,
             "missing_window_patch_count": layer_window_missing_count,
+            "surface_order_repaired_patch_count": layer_window_surface_order_repaired_count,
             "note": "Only patches with non-null CenterTime/TimeWindowMin/TimeWindowMax are checked.",
         },
         "checks": checks,

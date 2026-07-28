@@ -122,6 +122,29 @@ def load_mapping(path: Path) -> dict[str, np.ndarray]:
     return {key: mapping[key] for key in mapping.files}
 
 
+def read_sgy_sample_axis(path: Path) -> tuple[np.ndarray, dict[str, Any]]:
+    with segyio.open(str(path), "r", ignore_geometry=True) as handle:
+        samples = np.asarray(handle.samples, dtype=np.float64)
+        return samples, {
+            "path": str(path),
+            "trace_count": int(handle.tracecount),
+            "sample_count": int(len(samples)),
+            "sample_interval_us": float(segyio.tools.dt(handle)),
+        }
+
+
+def regular_sample_axis(source_samples: np.ndarray, interval_ms: float) -> np.ndarray:
+    if len(source_samples) < 1:
+        raise ValueError("source sample axis is empty")
+    interval = float(interval_ms)
+    if interval <= 0.0:
+        raise ValueError(f"sample interval must be positive: {interval}")
+    start = float(source_samples[0])
+    stop = float(source_samples[-1])
+    count = int(np.floor((stop - start) / interval + 1.0e-9)) + 1
+    return (start + np.arange(count, dtype=np.float64) * interval).astype(np.float64)
+
+
 def load_trace_matrix(path: Path, source_trace_idx: np.ndarray | None, target_samples: np.ndarray | None, label: str) -> tuple[np.ndarray, np.ndarray, dict[str, Any]]:
     with segyio.open(str(path), "r", ignore_geometry=True) as handle:
         samples = np.asarray(handle.samples, dtype=np.float64)

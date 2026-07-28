@@ -351,10 +351,19 @@ def estimate_selected_local_orientation(
         for layer, group in selected.groupby("LayerGroup", dropna=False)
     }
     orientations: list[dict[str, Any]] = []
+    cache: dict[tuple[str, int, int, int], dict[str, Any]] = {}
+    cache_xy = max(int(config.get("orientation_cache_xy_cells", 2)), 1)
+    cache_time = max(int(config.get("orientation_cache_time_samples", 5)), 1)
     for _, row in selected.iterrows():
         layer = str(row["LayerGroup"])
-        orientations.append(
-            legacy.estimate_local_orientation(
+        key = (
+            layer,
+            int(row["IY"]) // cache_xy,
+            int(row["IX"]) // cache_xy,
+            int(row["IT"]) // cache_time,
+        )
+        if key not in cache:
+            cache[key] = legacy.estimate_local_orientation(
                 density=density,
                 y_idx=int(row["IY"]),
                 x_idx=int(row["IX"]),
@@ -364,8 +373,164 @@ def estimate_selected_local_orientation(
                 density_p95=density_p95.get(layer, float(row["SourceDensity"])),
                 config=config,
             )
-        )
+        orientations.append(cache[key])
     return orientations
+
+
+def build_compact_selected_candidates(
+    grid: dict[str, Any],
+    surfaces: dict[str, np.ndarray],
+    config: dict[str, Any],
+    rng: np.random.Generator,
+) -> tuple[pd.DataFrame, dict[str, Any]]:
+    context_path = Path(str(config["damage_context_npz"])).resolve()
+    qc_path = Path(str(config["small_qc_json"])).resolve()
+    context = np.load(context_path)
+    qc = read_json(qc_path)
+    context_samples = context["samples"].astype(float)
+    medium_damage = context["medium_damage"]
+    medium_core = context["medium_core_mask"]
+    large_damage = context["large_damage"]
+    large_core = context["large_core_mask"]
+    mapping = np.load(Path(config["trace_mapping_npz"]).resolve())
+    iy = mapping["iy"].astype(np.int32)
+    ix = mapping["ix"].astype(np.int32)
+    source_trace_idx = mapping["source_trace_idx"].astype(np.int64)
+    score_flat = grid["density"][iy, ix, :]
+    expected_context_shape = (len(score_flat), len(context_samples))
+    for name, values in {
+        "medium_damage": medium_damage,
+        "medium_core": medium_core,
+        "large_damage": large_damage,
+        "large_core": large_core,
+    }.items():
+        if values.shape != expected_context_shape:
+            raise ValueError(f"{name} shape {values.shape} != {expected_context_shape}")
+
+    generation = dict(config.get("small_domain_generation", {}))
+    domain_names = np.asarray(["background", "medium_damage", "large_damage"], dtype=object)
+    probability_scales = np.asarray(
+        [float(dict(generation.get(name, {})).get("weighted_probability_scale", 0.0)) for name in domain_names],
+        dtype=float,
+    )
+    probability_powers = np.asarray(
+        [float(dict(generation.get(name, {})).get("weighted_probability_density_power", 1.0)) for name in domain_names],
+        dtype=float,
+    )
+    probability_caps = np.asarray(
+        [float(dict(generation.get(name, {})).get("max_cell_probability", 0.12)) for name in domain_names],
+        dtype=float,
+    )
+    fail_limit = int(config.get("step7a_fail_fast_patch_count_limit", 120000))
+    candidate_threshold = float(qc["candidate_threshold"])
+    fusion = dict(config.get("small_domain_fusion", {}))
+    background_floor = float(fusion.get("background_floor", 0.06))
+    background_dynamic_weight = float(fusion.get("background_dynamic_weight", 0.85))
+    medium_core_attenuation = float(fusion.get("medium_core_attenuation", 0.35))
+    large_core_attenuation = float(fusion.get("large_core_attenuation", 0.65))
+    chunk_samples = max(int(config.get("compact_sampling_chunk_samples", 25)), 1)
+
+    top_flat = {
+        "沙三段": surfaces["T4_TIME"][iy, ix],
+        "沙四段": surfaces["T6_TIME"][iy, ix],
+    }
+    base_flat = {
+        "沙三段": surfaces["T6_TIME"][iy, ix],
+        "沙四段": surfaces["T7_TIME"][iy, ix],
+    }
+    rows: list[pd.DataFrame] = []
+    candidate_counts = {name: 0 for name in domain_names}
+    selected_counts = {name: 0 for name in domain_names}
+    expected_counts = {name: 0.0 for name in domain_names}
+    selected_total = 0
+    samples = grid["samples"].astype(float)
+    for t0 in range(0, len(samples), chunk_samples):
+        t1 = min(t0 + chunk_samples, len(samples))
+        chunk_times = samples[t0:t1]
+        context_idx = np.abs(context_samples[:, None] - chunk_times[None, :]).argmin(axis=0)
+        small = score_flat[:, t0:t1]
+        medium = medium_damage[:, context_idx].astype(np.float32)
+        large = large_damage[:, context_idx].astype(np.float32)
+        background = np.where(small > 0.0, background_floor + background_dynamic_weight * small, 0.0).astype(np.float32)
+        background *= 1.0 - medium_core[:, context_idx].astype(np.float32) * medium_core_attenuation
+        background *= 1.0 - large_core[:, context_idx].astype(np.float32) * large_core_attenuation
+        stacked = np.stack([background, medium, large], axis=0)
+        domain_code = np.argmax(stacked, axis=0).astype(np.int8)
+        domain_score = np.take_along_axis(stacked, domain_code[None, :, :], axis=0)[0]
+        candidate = (small >= candidate_threshold) | ((domain_code > 0) & (domain_score > 0.0))
+        for layer in legacy.ALLOWED_LAYERS:
+            layer_mask = (
+                np.isfinite(top_flat[layer])[:, None]
+                & np.isfinite(base_flat[layer])[:, None]
+                & (chunk_times[None, :] >= top_flat[layer][:, None])
+                & (chunk_times[None, :] <= base_flat[layer][:, None])
+            )
+            for code, domain_name in enumerate(domain_names):
+                eligible = candidate & layer_mask & (domain_code == code) & np.isfinite(domain_score)
+                candidate_counts[domain_name] += int(eligible.sum())
+                if not eligible.any():
+                    continue
+                probability = np.clip(
+                    probability_scales[code] * np.power(np.clip(domain_score, 0.0, None), probability_powers[code]),
+                    0.0,
+                    probability_caps[code],
+                )
+                expected_counts[domain_name] += float(probability[eligible].sum())
+                chosen = eligible & (rng.random(eligible.shape) < probability)
+                trace_pos, local_t = np.where(chosen)
+                if len(trace_pos) == 0:
+                    continue
+                selected_total += int(len(trace_pos))
+                selected_counts[domain_name] += int(len(trace_pos))
+                if selected_total > fail_limit:
+                    raise RuntimeError(
+                        f"compact Step7A selected {selected_total} patches, exceeding configured limit {fail_limit}"
+                    )
+                it = local_t + t0
+                frame = pd.DataFrame(
+                    {
+                        "LayerGroup": layer,
+                        "LayerCode": legacy.LAYER_CODE[layer],
+                        "IY": iy[trace_pos],
+                        "IX": ix[trace_pos],
+                        "IT": it.astype(np.int32),
+                        "SourceTraceIdx": source_trace_idx[trace_pos],
+                        "CenterTime": samples[it],
+                        "TimeWindowMin": top_flat[layer][trace_pos],
+                        "TimeWindowMax": base_flat[layer][trace_pos],
+                        "LayerThickness": base_flat[layer][trace_pos] - top_flat[layer][trace_pos],
+                        "SourceDensity": domain_score[trace_pos, local_t].astype(float),
+                        "CandidateScore": domain_score[trace_pos, local_t].astype(float),
+                        "GuidedDensityScore": domain_score[trace_pos, local_t].astype(float),
+                        "SamplingWeight": domain_score[trace_pos, local_t].astype(float),
+                        "ComponentID": 0,
+                        "ComponentVoxelCount": 1,
+                        "LayerDensityThreshold": candidate_threshold,
+                        "ExpectedPatchCountForCell": probability[trace_pos, local_t].astype(float),
+                        "EffectiveCountScale": probability_scales[code],
+                        "CountBasisEffectiveScale": probability_scales[code],
+                        "DensityCellPatchOrdinal": 1,
+                        "FractureScale": "small",
+                        "FractureScaleCode": 1,
+                        "SmallDomain": domain_name,
+                        "SmallDomainCode": code + 1,
+                    }
+                )
+                rows.append(frame)
+    if not rows:
+        raise RuntimeError("compact Step7A sampling produced no patches")
+    selected = pd.concat(rows, ignore_index=True)
+    return selected, {
+        "mode": "compact_array_sampling",
+        "candidate_threshold": candidate_threshold,
+        "candidate_counts": {str(k): int(v) for k, v in candidate_counts.items()},
+        "expected_counts": {str(k): float(v) for k, v in expected_counts.items()},
+        "selected_counts": {str(k): int(v) for k, v in selected_counts.items()},
+        "selected_total": int(len(selected)),
+        "fail_fast_patch_count_limit": fail_limit,
+        "chunk_samples": chunk_samples,
+        "damage_context_npz": str(context_path),
+    }
 
 
 def apply_geologic_orientation_prior(
@@ -610,6 +775,8 @@ def build_summary(
         "inputs": {
             "density_sgy": str(Path(config["density_sgy"]).resolve()) if config.get("density_sgy") else "",
             "small_domain_density_sgys": config.get("small_domain_density_sgys", {}),
+            "small_qc_json": str(Path(config["small_qc_json"]).resolve()) if config.get("small_qc_json") else "",
+            "damage_context_npz": str(Path(config["damage_context_npz"]).resolve()) if config.get("damage_context_npz") else "",
             "trace_mapping_npz": str(Path(config["trace_mapping_npz"]).resolve()),
             "layer_dir": str(Path(config["layer_dir"]).resolve()),
         },
@@ -658,6 +825,97 @@ def main() -> int:
         raise ValueError("config must define density_sgy or small_domain_density_sgys")
     axis_grid = legacy.load_density_grid(density_for_axis, trace_mapping_npz)
     surfaces = legacy.attach_surface_grids(Path(config["layer_dir"]).resolve(), axis_grid["x_values"], axis_grid["y_values"])
+
+    if bool(config.get("compact_step7_sampling", False)):
+        selected, compact_summary = build_compact_selected_candidates(axis_grid, surfaces, config, rng)
+        domain_generation = dict(config.get("small_domain_generation", {}))
+        selected_parts: list[pd.DataFrame] = []
+        patch_parts: list[pd.DataFrame] = []
+        audit_parts: list[pd.DataFrame] = []
+        orientation_summary: dict[str, Any] = {}
+        patch_summary: dict[str, Any] = {}
+        for domain_name, domain_selected in selected.groupby("SmallDomain", sort=False):
+            domain_cfg = dict(domain_generation.get(str(domain_name), {}))
+            domain_config = merged_domain_config(config, domain_cfg)
+            domain_selected = domain_selected.reset_index(drop=True).copy()
+            domain_selected["BandID"] = ""
+            domain_selected["BandPatchOrdinal"] = 0
+            domain_selected["BandContinuityMode"] = str(
+                domain_cfg.get("band_continuity_mode", f"compact_{domain_name}_array_sampling")
+            )
+            domain_selected["BandVoxelCount"] = 1
+            domain_selected["BandLengthM"] = 0.0
+            domain_selected["BandTimeExtentMs"] = 0.0
+            domain_selected["BandPatchSpacingM"] = 0.0
+            domain_selected["BandMeanDensity"] = domain_selected["SourceDensity"].astype(float)
+            oriented, orientation_i = apply_geologic_orientation_prior(
+                domain_selected,
+                axis_grid["density"],
+                domain_config,
+                str(domain_name),
+                orientation_rng_for_domain(domain_config, domain_cfg, str(domain_name)),
+            )
+            patch_i, patch_i_summary = legacy.build_patch_table(
+                selected=oriented,
+                density=axis_grid["density"],
+                x_values=axis_grid["x_values"],
+                y_values=axis_grid["y_values"],
+                config=domain_config,
+                rng=rng,
+            )
+            patch_i = attach_selected_orientation_columns(patch_i, oriented)
+            patch_i["SmallDomain"] = str(domain_name)
+            patch_i["SmallDomainCode"] = int(domain_cfg.get("domain_code", oriented["SmallDomainCode"].iloc[0]))
+            patch_i["GenerationStage"] = "step7a_compact_array_sampling"
+            patch_i["SourceType"] = str(domain_cfg.get("source_type", f"small_{domain_name}_density"))
+            patch_i["StructuralRelation"] = str(domain_cfg.get("structural_relation", f"small_{domain_name}"))
+            patch_i["ConstraintLevel"] = "soft"
+            patch_i["Confidence"] = normalize_patch_confidence(patch_i)
+            patch_i["NeedsWellCorrection"] = 1
+            audit_i = legacy.build_audit(patch_i)
+            audit_i["ActionReason"] = str(domain_cfg.get("action_reason", f"compact_{domain_name}_array_sampling"))
+            selected_parts.append(oriented)
+            patch_parts.append(patch_i)
+            audit_parts.append(audit_i)
+            orientation_summary[str(domain_name)] = orientation_i
+            patch_summary[str(domain_name)] = patch_i_summary
+        selected = pd.concat(selected_parts, ignore_index=True)
+        patch_df = pd.concat(patch_parts, ignore_index=True)
+        audit_df = pd.concat(audit_parts, ignore_index=True)
+        patch_df["PatchID"] = [f"step7a_small_{idx + 1:06d}" for idx in range(len(patch_df))]
+        audit_df["PatchID"] = patch_df["PatchID"].to_numpy()
+        patch_df.to_csv(paths["dfn_csv"], index=False, encoding="utf-8-sig")
+        audit_df.to_csv(paths["audit_csv"], index=False, encoding="utf-8-sig")
+        if bool(config.get("write_intermediate_vtk", False)):
+            legacy.write_legacy_vtk(
+                paths["raw_vtk"],
+                patch_df,
+                "step7a_small_dfn_raw_time",
+                display=False,
+                display_z_scale=float(config.get("display_z_scale", 5.0)),
+                geometry_time_scale_m_per_ms=float(config.get("geometry_time_scale_m_per_ms", 1.0)),
+            )
+        summary = build_summary(
+            config_path,
+            config,
+            paths,
+            selected,
+            selected,
+            patch_df,
+            compact_summary,
+            compact_summary,
+            orientation_summary,
+            patch_summary,
+        )
+        summary["generation_logic"] = "step7a_compact_2ms_array_sampling_with_10ms_damage_context"
+        summary["compact_sampling"] = compact_summary
+        summary["checks"]["raw_vtk_exists"] = bool(
+            not config.get("write_intermediate_vtk", False) or paths["raw_vtk"].exists()
+        )
+        summary["status"] = "pass" if all(bool(v) for v in summary["checks"].values()) else "fail"
+        paths["summary_json"].write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
+        print(f"[step7a-small] compact status={summary['status']} patch_count={len(patch_df)}", flush=True)
+        return 0 if summary["status"] == "pass" else 1
 
     domain_density_sgys = dict(config.get("small_domain_density_sgys", {}))
     domain_generation = dict(config.get("small_domain_generation", {}))

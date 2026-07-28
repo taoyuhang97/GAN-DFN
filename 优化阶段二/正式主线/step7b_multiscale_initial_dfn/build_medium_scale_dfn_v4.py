@@ -130,6 +130,118 @@ def layer_candidates(
     return candidates, component_rows
 
 
+def component_candidates_from_step6b(
+    config: dict[str, Any],
+    grid: dict[str, Any],
+    surfaces: dict[str, np.ndarray],
+) -> tuple[pd.DataFrame, list[dict[str, Any]]]:
+    component_path = Path(config["medium_components_npz"]).resolve()
+    summary_path = Path(config["medium_component_summary_csv"]).resolve()
+    component_npz = np.load(component_path)
+    component_flat = component_npz["medium_component_id"].astype(np.int32)
+    if component_flat.shape != (grid["tracecount"], grid["sample_count"]):
+        raise ValueError(f"medium component shape {component_flat.shape} does not match prior SGY")
+    mapping = np.load(Path(config["trace_mapping_npz"]).resolve())
+    ix = mapping["ix"].astype(np.int32)
+    iy = mapping["iy"].astype(np.int32)
+    component_grid = np.zeros_like(grid["density"], dtype=np.int32)
+    component_grid[iy, ix, :] = component_flat
+    summary = pd.read_csv(summary_path)
+    if summary.empty:
+        raise RuntimeError("Step6B component summary is empty")
+    summary["selection_score"] = (
+        pd.to_numeric(summary["voxel_count"], errors="coerce").fillna(0.0)
+        * pd.to_numeric(summary["score_mean"], errors="coerce").fillna(0.0)
+    )
+    max_components = int(config.get("max_component_count", 80))
+    summary = summary.sort_values("selection_score", ascending=False)
+    if max_components > 0:
+        summary = summary.head(max_components)
+    max_id = int(component_grid.max())
+    slices = ndimage.find_objects(component_grid, max_label=max_id)
+    max_points = max(int(config.get("geometry_max_points_per_component", 5000)), 100)
+    min_score = float(config.get("min_prior_score", 0.65))
+    rows: list[pd.DataFrame] = []
+    component_rows: list[dict[str, Any]] = []
+    for comp_row in summary.itertuples(index=False):
+        component_id = int(comp_row.component_id)
+        component_slice = slices[component_id - 1] if 0 < component_id <= len(slices) else None
+        if component_slice is None:
+            continue
+        local_ids = component_grid[component_slice]
+        yy, xx, tt = np.where(local_ids == component_id)
+        yy += int(component_slice[0].start)
+        xx += int(component_slice[1].start)
+        tt += int(component_slice[2].start)
+        scores = grid["density"][yy, xx, tt]
+        valid = np.isfinite(scores) & (scores >= min_score)
+        yy, xx, tt, scores = yy[valid], xx[valid], tt[valid], scores[valid]
+        if len(scores) == 0:
+            continue
+        if len(scores) > max_points:
+            keep = np.argpartition(scores, -max_points)[-max_points:]
+            yy, xx, tt, scores = yy[keep], xx[keep], tt[keep], scores[keep]
+        for layer in legacy.ALLOWED_LAYERS:
+            top = surfaces["T4_TIME"][yy, xx] if layer == "沙三段" else surfaces["T6_TIME"][yy, xx]
+            base = surfaces["T6_TIME"][yy, xx] if layer == "沙三段" else surfaces["T7_TIME"][yy, xx]
+            time = grid["samples"][tt]
+            in_layer = np.isfinite(top) & np.isfinite(base) & (time >= top) & (time <= base)
+            if not in_layer.any():
+                continue
+            lyy, lxx, ltt = yy[in_layer], xx[in_layer], tt[in_layer]
+            lscore, ltop, lbase = scores[in_layer], top[in_layer], base[in_layer]
+            frame = pd.DataFrame(
+                {
+                    "LayerGroup": layer,
+                    "LayerCode": legacy.LAYER_CODE[layer],
+                    "IY": lyy.astype(np.int32),
+                    "IX": lxx.astype(np.int32),
+                    "IT": ltt.astype(np.int32),
+                    "SourceTraceIdx": grid["source_trace_idx"][lyy, lxx].astype(np.int64),
+                    "CenterTime": grid["samples"][ltt].astype(float),
+                    "TimeWindowMin": ltop.astype(float),
+                    "TimeWindowMax": lbase.astype(float),
+                    "LayerThickness": (lbase - ltop).astype(float),
+                    "SourceDensity": lscore.astype(float),
+                    "GuidedDensityScore": lscore.astype(float),
+                    "CandidateScore": lscore.astype(float),
+                    "SamplingWeight": lscore.astype(float),
+                    "ComponentID": component_id,
+                    "ComponentVoxelCount": int(comp_row.voxel_count),
+                    "GlobalComponentAzimuthDeg": float(comp_row.pca_azimuth_deg),
+                    "GlobalComponentDipDeg": float(comp_row.pca_dip_deg),
+                    "GlobalComponentLinearity": float(comp_row.pca_linearity),
+                    "GlobalComponentXExtentM": float(comp_row.x_extent_m),
+                    "GlobalComponentYExtentM": float(comp_row.y_extent_m),
+                    "GlobalComponentTimeExtentMs": float(comp_row.time_extent_ms),
+                    "LayerDensityThreshold": min_score,
+                    "FractureScale": "medium",
+                    "FractureScaleCode": 2,
+                }
+            )
+            rows.append(frame)
+            component_rows.append(
+                {
+                    "LayerGroup": layer,
+                    "ComponentID": component_id,
+                    "VoxelCount": int(comp_row.voxel_count),
+                    "GeometryPointCount": int(len(frame)),
+                    "ScoreMean": float(np.mean(lscore)),
+                    "ScoreMax": float(np.max(lscore)),
+                    "TimeExtentMs": float(frame["CenterTime"].max() - frame["CenterTime"].min()),
+                    "GlobalAzimuthDeg": float(comp_row.pca_azimuth_deg),
+                    "GlobalDipDeg": float(comp_row.pca_dip_deg),
+                    "GlobalLinearity": float(comp_row.pca_linearity),
+                    "GlobalXExtentM": float(comp_row.x_extent_m),
+                    "GlobalYExtentM": float(comp_row.y_extent_m),
+                    "GlobalTimeExtentMs": float(comp_row.time_extent_ms),
+                }
+            )
+    if not rows:
+        raise RuntimeError("no medium candidates remained after Step6B component reuse")
+    return pd.concat(rows, ignore_index=True), component_rows
+
+
 def local_geometry(
     group: pd.DataFrame,
     local_idx: int,
@@ -147,6 +259,14 @@ def local_geometry(
         ]
     )
     center = coords[int(local_idx)]
+    source_row = group.iloc[int(local_idx)]
+    global_azimuth = float(source_row.get("GlobalComponentAzimuthDeg", config.get("fallback_azimuth_deg", 60.0)))
+    global_dip = float(source_row.get("GlobalComponentDipDeg", config.get("fallback_dip_deg", 70.0)))
+    global_xy_extent = max(
+        float(source_row.get("GlobalComponentXExtentM", 0.0)),
+        float(source_row.get("GlobalComponentYExtentM", 0.0)),
+    )
+    global_time_extent = float(source_row.get("GlobalComponentTimeExtentMs", 0.0))
     radius = float(config.get("local_pca_radius_m", 125.0))
     dist = np.linalg.norm(coords - center.reshape(1, 3), axis=1)
     local_mask = dist <= radius
@@ -157,13 +277,25 @@ def local_geometry(
         local_mask[order] = True
     local_coords = coords[local_mask]
     if len(local_coords) < 3:
+        length = float(np.clip(
+            float(config.get("length_base_m", 35.0))
+            + float(config.get("global_extent_length_fraction", 0.16)) * global_xy_extent,
+            float(config.get("min_length_m", 45.0)),
+            float(config.get("max_length_m", 220.0)),
+        ))
+        height = float(np.clip(
+            float(config.get("height_base_ms", 5.0))
+            + float(config.get("global_extent_height_fraction", 0.10)) * global_time_extent,
+            float(config.get("min_height_time_ms", 6.0)),
+            float(config.get("max_height_time_ms", 38.0)),
+        ))
         return {
-            "ok": False,
-            "reason": "insufficient_points",
-            "azimuth_deg": float(config.get("fallback_azimuth_deg", 60.0)),
-            "dip_deg": float(config.get("fallback_dip_deg", 70.0)),
-            "length_m": float(config.get("fallback_length_m", 90.0)),
-            "height_time_ms": float(config.get("fallback_height_time_ms", 14.0)),
+            "ok": True,
+            "reason": "step6_component_global_geometry_insufficient_local_points",
+            "azimuth_deg": global_azimuth,
+            "dip_deg": global_dip,
+            "length_m": length,
+            "height_time_ms": height,
             "band_width_m": 0.0,
             "band_thickness_ms": 0.0,
             "planarity": 0.0,
@@ -198,15 +330,32 @@ def local_geometry(
     axis_span = float(np.quantile(proj1, 0.90) - np.quantile(proj1, 0.10))
     band_width = float(np.quantile(proj2, 0.90) - np.quantile(proj2, 0.10))
     band_thickness = float(np.quantile(times_ms, 0.90) - np.quantile(times_ms, 0.10))
+    min_planarity = float(config.get("local_pca_min_planarity", 0.03))
+    local_min_dip = float(config.get("local_geometry_min_dip_deg", config.get("reject_dip_below_deg", 30.0)))
+    use_global_orientation = bool(
+        config.get("use_global_component_orientation_fallback", True)
+        and (planarity < min_planarity or dip < local_min_dip)
+    )
+    if use_global_orientation:
+        azimuth = global_azimuth
+        dip = global_dip
     score = float(group.iloc[int(local_idx)]["SamplingWeight"])
     score_factor = float(np.sqrt(np.clip(score, 0.0, 1.0)))
+    effective_axis_span = max(
+        axis_span,
+        float(config.get("global_extent_axis_floor_fraction", 0.12)) * global_xy_extent,
+    )
+    effective_time_span = max(
+        band_thickness,
+        float(config.get("global_extent_time_floor_fraction", 0.12)) * global_time_extent,
+    )
     length = (
-        float(config.get("length_axis_fraction", 0.35)) * max(axis_span, 0.0)
+        float(config.get("length_axis_fraction", 0.35)) * max(effective_axis_span, 0.0)
         + float(config.get("length_width_gain", 2.2)) * max(band_width, 0.0)
         + float(config.get("length_base_m", 35.0))
     ) * (1.0 + float(config.get("length_score_gain", 0.35)) * score_factor)
     height = (
-        float(config.get("height_time_gain", 1.25)) * max(band_thickness, 0.0)
+        float(config.get("height_time_gain", 1.25)) * max(effective_time_span, 0.0)
         + float(config.get("height_width_time_gain", 0.035)) * max(band_width, 0.0)
         + float(config.get("height_base_ms", 5.0))
     ) * (1.0 + float(config.get("height_score_gain", 0.25)) * score_factor)
@@ -214,7 +363,7 @@ def local_geometry(
     height = float(np.clip(height, float(config.get("min_height_time_ms", 6.0)), float(config.get("max_height_time_ms", 38.0))))
     return {
         "ok": True,
-        "reason": "local_medium_candidate_band_pca",
+        "reason": "step6_component_global_orientation_fallback" if use_global_orientation else "local_medium_candidate_band_pca",
         "azimuth_deg": azimuth,
         "dip_deg": dip,
         "length_m": length,
@@ -225,7 +374,33 @@ def local_geometry(
         "planarity": planarity,
         "linearity": linearity,
         "point_count": int(len(local_coords)),
+        "used_global_orientation": int(use_global_orientation),
     }
+
+
+def spatially_distributed_order(group: pd.DataFrame, time_scale: float, limit: int) -> np.ndarray:
+    coords = np.column_stack(
+        [
+            group["IX"].to_numpy(dtype=float),
+            group["IY"].to_numpy(dtype=float),
+            group["CenterTime"].to_numpy(dtype=float) * time_scale / 12.5,
+        ]
+    )
+    weights = np.clip(group["SamplingWeight"].to_numpy(dtype=float), 0.0, None)
+    first = int(np.argmax(weights)) if len(weights) else 0
+    selected = [first]
+    remaining = np.ones(len(group), dtype=bool)
+    remaining[first] = False
+    min_dist = np.linalg.norm(coords - coords[first], axis=1)
+    while remaining.any() and len(selected) < max(int(limit), 1):
+        score_norm = weights / max(float(weights.max()), 1.0e-9)
+        priority = min_dist * (0.75 + 0.25 * score_norm)
+        priority[~remaining] = -np.inf
+        next_idx = int(np.argmax(priority))
+        selected.append(next_idx)
+        remaining[next_idx] = False
+        min_dist = np.minimum(min_dist, np.linalg.norm(coords - coords[next_idx], axis=1))
+    return np.asarray(selected, dtype=np.int64)
 
 
 def select_medium_patches(candidates: pd.DataFrame, grid: dict[str, Any], config: dict[str, Any], rng: np.random.Generator) -> tuple[pd.DataFrame, list[dict[str, Any]]]:
@@ -262,12 +437,19 @@ def select_medium_patches(candidates: pd.DataFrame, grid: dict[str, Any], config
         target = min(target, len(group))
         if target <= 0:
             continue
-        weights = np.clip(group["SamplingWeight"].to_numpy(dtype=float), 0.0, None)
-        if weights.sum() <= 0:
-            order = rng.permutation(np.arange(len(group)))
+        if str(config.get("component_selection_mode", "spatial_farthest")) == "spatial_farthest":
+            order = spatially_distributed_order(
+                group,
+                time_scale=float(config.get("orientation_time_scale_m_per_ms", 1.0)),
+                limit=target,
+            )
         else:
-            weights = weights / weights.sum()
-            order = rng.choice(np.arange(len(group)), size=len(group), replace=False, p=weights)
+            weights = np.clip(group["SamplingWeight"].to_numpy(dtype=float), 0.0, None)
+            if weights.sum() <= 0:
+                order = rng.permutation(np.arange(len(group)))
+            else:
+                weights = weights / weights.sum()
+                order = rng.choice(np.arange(len(group)), size=len(group), replace=False, p=weights)
         selected_rows = []
         used_cells: set[tuple[int, int, int]] = set()
         for local_idx in order:
@@ -283,8 +465,18 @@ def select_medium_patches(candidates: pd.DataFrame, grid: dict[str, Any], config
             final_dip = raw_dip
             orientation_adjusted = 0
             if reject_low_dip and raw_dip < reject_dip_below:
-                low_dip_rejected_count += 1
-                continue
+                global_dip = float(row.get("GlobalComponentDipDeg", np.nan))
+                if np.isfinite(global_dip) and global_dip >= reject_dip_below:
+                    raw_dip = global_dip
+                    final_dip = global_dip
+                    geom["dip_deg"] = global_dip
+                    geom["azimuth_deg"] = float(row.get("GlobalComponentAzimuthDeg", geom["azimuth_deg"]))
+                    geom["reason"] = "step6_component_global_orientation_low_local_dip"
+                    orientation_adjusted = 1
+                    low_dip_adjusted_count += 1
+                else:
+                    low_dip_rejected_count += 1
+                    continue
             if adjust_dip_below >= 0.0 and raw_dip < adjust_dip_below:
                 final_dip = max(raw_dip, adjust_dip_to)
                 orientation_adjusted = 1
@@ -396,8 +588,8 @@ def build_summary(config_path: Path, config: dict[str, Any], paths: dict[str, Pa
         "has_patches": len(patch_df) > 0,
         "all_medium_scale": bool(patch_df["FractureScale"].astype(str).eq("medium").all()),
         "csv_exists": paths["dfn_csv"].exists(),
-        "raw_vtk_exists": paths["raw_vtk"].exists(),
-        "candidate_components_vtk_exists": paths["candidate_components_vtk"].exists(),
+        "raw_vtk_exists": bool(not config.get("write_intermediate_vtk", False) or paths["raw_vtk"].exists()),
+        "candidate_components_vtk_exists": bool(not config.get("write_intermediate_vtk", False) or paths["candidate_components_vtk"].exists()),
         "orientation_varies": bool(patch_df["AzimuthDeg"].round(2).nunique() > 10 and patch_df["DipDeg"].round(2).nunique() > 10),
         "size_varies": bool(patch_df["LengthM"].std(ddof=0) > 5.0 and patch_df["HeightTimeMs"].std(ddof=0) > 1.0),
         "covers_candidate_components": bool(candidate_component_count == 0 or selected_component_count / candidate_component_count >= float(config.get("min_component_coverage_fraction", 0.70))),
@@ -408,7 +600,8 @@ def build_summary(config_path: Path, config: dict[str, Any], paths: dict[str, Pa
         "generation_logic": "step7b_medium_local_candidate_band_voxel_pca_v4",
         "inputs": {
             "medium_prior_sgy": str(Path(config["medium_prior_sgy"]).resolve()),
-            "medium_mask_sgy": str(Path(config["medium_mask_sgy"]).resolve()),
+            "medium_mask_sgy": str(Path(config["medium_mask_sgy"]).resolve()) if config.get("medium_mask_sgy") else "",
+            "medium_components_npz": str(Path(config["medium_components_npz"]).resolve()) if config.get("medium_components_npz") else "",
             "trace_mapping_npz": str(Path(config["trace_mapping_npz"]).resolve()),
             "layer_dir": str(Path(config["layer_dir"]).resolve()),
         },
@@ -455,11 +648,14 @@ def main() -> int:
 
     print("[step7b-medium-v4] loading medium prior", flush=True)
     grid = legacy.load_density_grid(Path(config["medium_prior_sgy"]).resolve(), Path(config["trace_mapping_npz"]).resolve())
-    mask_grid = legacy.load_density_grid(Path(config["medium_mask_sgy"]).resolve(), Path(config["trace_mapping_npz"]).resolve())["density"]
     print("[step7b-medium-v4] loading surfaces", flush=True)
     surfaces = legacy.attach_surface_grids(Path(config["layer_dir"]).resolve(), grid["x_values"], grid["y_values"])
     print("[step7b-medium-v4] building candidate components", flush=True)
-    candidates, component_rows = layer_candidates(grid["density"], mask_grid, grid, surfaces, config)
+    if config.get("medium_components_npz"):
+        candidates, component_rows = component_candidates_from_step6b(config, grid, surfaces)
+    else:
+        mask_grid = legacy.load_density_grid(Path(config["medium_mask_sgy"]).resolve(), Path(config["trace_mapping_npz"]).resolve())["density"]
+        candidates, component_rows = layer_candidates(grid["density"], mask_grid, grid, surfaces, config)
     print("[step7b-medium-v4] selecting local band patches", flush=True)
     selected, bands = select_medium_patches(candidates, grid, config, rng)
     print(f"[step7b-medium-v4] building patches={len(selected)}", flush=True)
@@ -495,8 +691,9 @@ def main() -> int:
     pd.DataFrame(component_rows).to_csv(paths["component_summary_csv"], index=False, encoding="utf-8-sig")
     pd.DataFrame(bands).to_csv(output_dir / "medium_band_summary.csv", index=False, encoding="utf-8-sig")
     geometry_time_scale = float(config.get("geometry_time_scale_m_per_ms", config.get("orientation_time_scale_m_per_ms", 1.0)))
-    legacy.write_legacy_vtk(paths["raw_vtk"], patch_df, "step7b_medium_dfn_raw_time", display=False, display_z_scale=float(config.get("display_z_scale", 5.0)), geometry_time_scale_m_per_ms=geometry_time_scale)
-    write_candidate_components_vtk(paths["candidate_components_vtk"], bands, candidates, grid, "medium_candidate_components_raw_time")
+    if bool(config.get("write_intermediate_vtk", False)):
+        legacy.write_legacy_vtk(paths["raw_vtk"], patch_df, "step7b_medium_dfn_raw_time", display=False, display_z_scale=float(config.get("display_z_scale", 5.0)), geometry_time_scale_m_per_ms=geometry_time_scale)
+        write_candidate_components_vtk(paths["candidate_components_vtk"], bands, candidates, grid, "medium_candidate_components_raw_time")
     summary = build_summary(config_path, config, paths, candidates, selected, patch_df, bands)
     paths["summary_json"].write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
     print(f"[step7b-medium-v4] CSV: {paths['dfn_csv']}", flush=True)

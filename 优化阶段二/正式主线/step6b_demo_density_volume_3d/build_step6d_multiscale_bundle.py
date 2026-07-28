@@ -100,6 +100,106 @@ def build_damage_shell(
     return grid_to_flat(damage_grid, mapping), grid_to_flat(shell.astype(np.float32), mapping).astype(bool)
 
 
+def run_compact_context(
+    args: argparse.Namespace,
+    config: dict[str, Any],
+    output_dir: Path,
+    root: Path,
+    mapping: dict[str, np.ndarray],
+) -> int:
+    step6a_dir = resolve_step_dir(args.step6a_dir, root, "step6a_small")
+    step6b_dir = resolve_step_dir(args.step6b_dir, root, "step6b_medium")
+    step6c_dir = resolve_step_dir(args.step6c_dir, root, "step6c_large")
+    small_score_sgy = step6a_dir / "small_background_score.sgy"
+    small_qc = step6a_dir / "small_background_qc.json"
+    if not small_score_sgy.exists() or not small_qc.exists():
+        raise FileNotFoundError("compact Step6D requires the Step6A score SGY and QC")
+
+    step6b = load_npz_dict(step6b_dir / "medium_corridor_components.npz")
+    step6c = load_npz_dict(step6c_dir / "large_fault_prior_components.npz")
+    medium_samples = step6b["samples"].astype(np.float32)
+    large_samples = step6c["samples"].astype(np.float32)
+    if medium_samples.shape != large_samples.shape or not np.allclose(medium_samples, large_samples, atol=1.0e-6):
+        raise ValueError("compact Step6D requires matching medium and large 10 ms sample axes")
+
+    medium_prior = step6b["medium_prior"].astype(np.float32)
+    medium_mask = step6b["medium_mask"].astype(bool)
+    large_prior = step6c["large_prior"].astype(np.float32)
+    large_mask = step6c["large_mask"].astype(bool)
+    expected_shape = (len(mapping["x"]), len(medium_samples))
+    for name, values in {
+        "medium_prior": medium_prior,
+        "medium_mask": medium_mask,
+        "large_prior": large_prior,
+        "large_mask": large_mask,
+    }.items():
+        if values.shape != expected_shape:
+            raise ValueError(f"{name} shape {values.shape} != {expected_shape}")
+
+    medium_damage, medium_damage_mask = build_damage_shell(
+        medium_prior,
+        medium_mask,
+        mapping,
+        xy_cells=int(args.medium_damage_xy_cells),
+        time_samples=int(args.medium_damage_time_samples),
+    )
+    large_damage, large_damage_mask = build_damage_shell(
+        large_prior,
+        large_mask,
+        mapping,
+        xy_cells=int(args.large_damage_xy_cells),
+        time_samples=int(args.large_damage_time_samples),
+    )
+    context_path = output_dir / "multiscale_damage_context_10ms.npz"
+    np.savez_compressed(
+        context_path,
+        samples=medium_samples,
+        medium_damage=(float(args.medium_damage_boost) * medium_damage).astype(np.float16),
+        medium_damage_mask=medium_damage_mask.astype(np.uint8),
+        medium_core_mask=medium_mask.astype(np.uint8),
+        large_damage=(float(args.large_damage_boost) * large_damage).astype(np.float16),
+        large_damage_mask=large_damage_mask.astype(np.uint8),
+        large_core_mask=large_mask.astype(np.uint8),
+    )
+    summary = {
+        "status": "pass",
+        "mode": "compact_10ms_damage_context",
+        "output_dir": str(output_dir),
+        "small_score_sgy": str(small_score_sgy),
+        "small_qc": str(small_qc),
+        "context_npz": str(context_path),
+        "sample_interval_ms": float(np.median(np.diff(medium_samples))) if len(medium_samples) > 1 else None,
+        "sample_count": int(len(medium_samples)),
+        "trace_count": int(len(mapping["x"])),
+        "medium": {
+            "core_voxel_count": int(medium_mask.sum()),
+            "damage_voxel_count": int(medium_damage_mask.sum()),
+            "damage_stats": finite_stats(medium_damage[medium_damage_mask]),
+        },
+        "large": {
+            "core_voxel_count": int(large_mask.sum()),
+            "damage_voxel_count": int(large_damage_mask.sum()),
+            "damage_stats": finite_stats(large_damage[large_damage_mask]),
+        },
+        "fusion_parameters": {
+            "medium_damage_xy_cells": int(args.medium_damage_xy_cells),
+            "medium_damage_time_samples": int(args.medium_damage_time_samples),
+            "large_damage_xy_cells": int(args.large_damage_xy_cells),
+            "large_damage_time_samples": int(args.large_damage_time_samples),
+            "medium_damage_boost": float(args.medium_damage_boost),
+            "large_damage_boost": float(args.large_damage_boost),
+            "medium_core_attenuation": float(args.medium_core_attenuation),
+            "large_core_attenuation": float(args.large_core_attenuation),
+            "background_floor": float(args.background_floor),
+            "background_dynamic_weight": float(args.background_dynamic_weight),
+        },
+        "reflection": "The compact bundle keeps medium/large damage context at 10 ms and does not expand it into duplicate 2 ms SGYs.",
+    }
+    write_json(output_dir / "multiscale_bundle_summary.json", summary)
+    print(json.dumps(summary, ensure_ascii=False, indent=2))
+    return 0
+
+
 def main() -> int:
     args = parse_args()
     config = read_json(args.config.resolve())
@@ -109,6 +209,8 @@ def main() -> int:
     input_density_sgy = Path(config["input_density_sgy"]).resolve()
     trace_mapping_npz = Path(config["trace_mapping_npz"]).resolve()
     mapping = load_mapping(trace_mapping_npz)
+    if bool(config.get("compact_multiscale_flow", False)):
+        return run_compact_context(args, config, output_dir, root, mapping)
     _, samples, density_load = load_trace_matrix(input_density_sgy, None, None, "Density")
 
     step6a_dir = resolve_step_dir(args.step6a_dir, root, "step6a_small")

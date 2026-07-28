@@ -20,6 +20,8 @@ from build_multiscale_density_bundle import (
     load_mapping,
     load_trace_matrix,
     low_score,
+    read_sgy_sample_axis,
+    regular_sample_axis,
     valid_values,
     write_sgy_like,
 )
@@ -404,12 +406,20 @@ def extract_inferred_faults(
     rejected_low_support = 0
     split_raw_count = 0
     sizes = np.bincount(labels.ravel())
+    component_slices = ndimage.find_objects(labels, max_label=count)
     next_id = 1
     for component_id in range(1, count + 1):
         voxel_count = int(sizes[component_id])
         if voxel_count <= 0:
             continue
-        yy, xx, tt = np.where(labels == component_id)
+        component_slice = component_slices[component_id - 1]
+        if component_slice is None:
+            continue
+        local_labels = labels[component_slice]
+        yy, xx, tt = np.where(local_labels == component_id)
+        yy += int(component_slice[0].start)
+        xx += int(component_slice[1].start)
+        tt += int(component_slice[2].start)
         if yy.size > int(args.max_component_voxels_before_split):
             split_raw_count += 1
             tile = max(int(args.split_tile_cells), 1)
@@ -573,6 +583,7 @@ def extract_inferred_fault_surfaces(
     raw_ids = [idx for idx in range(1, count + 1) if int(sizes[idx]) >= int(args.min_component_voxels)]
     raw_ids.sort(key=lambda idx: int(sizes[idx]), reverse=True)
     raw_ids = raw_ids[: int(args.surface_ransac_max_raw_components)]
+    component_slices = ndimage.find_objects(labels, max_label=count)
 
     rejected_small = 0
     rejected_low_support = 0
@@ -585,7 +596,14 @@ def extract_inferred_fault_surfaces(
     next_surface_id = 1
 
     for raw_component_id in raw_ids:
-        yy, xx, tt = np.where(labels == raw_component_id)
+        component_slice = component_slices[raw_component_id - 1]
+        if component_slice is None:
+            continue
+        local_labels = labels[component_slice]
+        yy, xx, tt = np.where(local_labels == raw_component_id)
+        yy += int(component_slice[0].start)
+        xx += int(component_slice[1].start)
+        tt += int(component_slice[2].start)
         if len(yy) < int(args.min_component_voxels):
             rejected_small += 1
             continue
@@ -953,7 +971,11 @@ def main() -> int:
     volume_paths = {key: Path(value).resolve() for key, value in dict(config["volume_paths"]).items()}
     mapping = load_mapping(trace_mapping_npz)
     source_trace_idx = mapping["source_trace_idx"].astype(np.int64)
-    _, samples, density_load = load_trace_matrix(input_density_sgy, None, None, "Density")
+    source_samples, density_load = read_sgy_sample_axis(input_density_sgy)
+    interval_ms = float(dict(config.get("large_evidence", {})).get("sample_interval_ms", 10.0))
+    samples = regular_sample_axis(source_samples, interval_ms)
+    density_load["target_sample_count"] = int(len(samples))
+    density_load["target_sample_interval_ms"] = interval_ms
 
     selected_faults = load_fault_overlap(args.input_qc_dir.resolve())
     selected_faults = selected_faults[selected_faults["intersects_demo_xy_t"].astype(bool)].copy()
@@ -969,7 +991,11 @@ def main() -> int:
     coherence, _, coh_load = load_trace_matrix(volume_paths["Coherence"], source_trace_idx, samples, "Coherence")
     anttrack, _, ant_load = load_trace_matrix(volume_paths["AntTrack"], source_trace_idx, samples, "AntTrack")
     curvmax, _, curvmax_load = load_trace_matrix(volume_paths["CurvatureMax"], source_trace_idx, samples, "CurvatureMax")
-    curvpos, _, curvpos_load = load_trace_matrix(volume_paths["CurvaturePos"], source_trace_idx, samples, "CurvaturePos")
+    if "CurvaturePos" in volume_paths:
+        curvpos, _, curvpos_load = load_trace_matrix(volume_paths["CurvaturePos"], source_trace_idx, samples, "CurvaturePos")
+    else:
+        curvpos = None
+        curvpos_load = {"status": "not_configured"}
 
     score_cfg = dict(config.get("score_config", {}))
     coh_cfg = dict(score_cfg.get("coherence_score", {"valid_min": 0.0, "low_quantile": 0.05, "high_quantile": 0.95}))
@@ -979,12 +1005,16 @@ def main() -> int:
     coh_valid = valid_values(coherence, coh_cfg)
     ant_valid = valid_values(anttrack, ant_cfg)
     curvmax_valid = valid_values(curvmax, curvmax_cfg)
-    curvpos_valid = valid_values(curvpos, curvpos_cfg)
+    curvpos_valid = valid_values(curvpos, curvpos_cfg) if curvpos is not None else None
     lowcoh_score, lowcoh_summary = low_score(coherence, coh_valid, coh_cfg)
     ant_score, ant_summary = high_score(anttrack, ant_valid, ant_cfg)
     curvmax_score, curvmax_summary = high_score(curvmax, curvmax_valid, curvmax_cfg)
-    curvpos_score, curvpos_summary = high_score(curvpos, curvpos_valid, curvpos_cfg)
-    curv_score = np.maximum(curvmax_score, curvpos_score).astype(np.float32)
+    if curvpos is not None and curvpos_valid is not None:
+        curvpos_score, curvpos_summary = high_score(curvpos, curvpos_valid, curvpos_cfg)
+        curv_score = np.maximum(curvmax_score, curvpos_score).astype(np.float32)
+    else:
+        curvpos_summary = {"status": "not_configured"}
+        curv_score = curvmax_score.astype(np.float32)
     ant_grid, _, _ = flat_to_grid(ant_score, mapping)
     curv_grid, _, _ = flat_to_grid(curv_score, mapping)
     support_grid = build_local_support_grid(ant_grid, curv_grid, int(args.support_neighborhood_cells))
@@ -998,15 +1028,20 @@ def main() -> int:
     score_grid, _, _ = flat_to_grid(large_score, mapping)
     candidate_grid, _, _ = flat_to_grid(candidate_flat.astype(np.float32), mapping)
     candidate_grid = candidate_grid > 0.5
-    evidence_vtk_summary = write_candidate_evidence_vtk(
-        output_dir / "inferred_fault_evidence_points_raw_time.vtk",
-        candidate_grid,
-        score_grid,
-        support_grid,
-        mapping,
-        samples,
-        int(args.vtk_max_points),
-        rng,
+    write_intermediate_vtk = bool(config.get("write_intermediate_vtk", False))
+    evidence_vtk_summary = (
+        write_candidate_evidence_vtk(
+            output_dir / "inferred_fault_evidence_points_raw_time.vtk",
+            candidate_grid,
+            score_grid,
+            support_grid,
+            mapping,
+            samples,
+            int(args.vtk_max_points),
+            rng,
+        )
+        if write_intermediate_vtk
+        else {"status": "disabled_by_config"}
     )
     faultlike_candidate_grid, faultlike_filter_summary = filter_faultlike_evidence_grid(
         candidate_grid,
@@ -1015,15 +1050,19 @@ def main() -> int:
         samples,
         args,
     )
-    faultlike_evidence_vtk_summary = write_candidate_evidence_vtk(
-        output_dir / "inferred_faultlike_evidence_points_raw_time.vtk",
-        faultlike_candidate_grid,
-        score_grid,
-        support_grid,
-        mapping,
-        samples,
-        int(args.vtk_max_points),
-        rng,
+    faultlike_evidence_vtk_summary = (
+        write_candidate_evidence_vtk(
+            output_dir / "inferred_faultlike_evidence_points_raw_time.vtk",
+            faultlike_candidate_grid,
+            score_grid,
+            support_grid,
+            mapping,
+            samples,
+            int(args.vtk_max_points),
+            rng,
+        )
+        if write_intermediate_vtk
+        else {"status": "disabled_by_config"}
     )
     inferred_surface_vtk_summary: dict[str, Any] = {"surface_count": 0, "polygon_count": 0}
     inferred_irregular_surface_vtk_summary: dict[str, Any] = {"surface_count": 0, "triangle_count": 0}
@@ -1037,16 +1076,20 @@ def main() -> int:
             args,
             rng,
         )
-        inferred_surface_vtk_summary = write_surface_candidate_vtk(
-            output_dir / "inferred_fault_surface_candidates_raw_time.vtk",
-            inferred_df,
-        )
-        inferred_irregular_surface_vtk_summary = write_irregular_surface_candidate_vtk(
-            output_dir / "inferred_fault_surface_candidates_irregular_raw_time.vtk",
-            surface_point_sets,
-            args,
-            rng,
-        )
+        if write_intermediate_vtk:
+            inferred_surface_vtk_summary = write_surface_candidate_vtk(
+                output_dir / "inferred_fault_surface_candidates_raw_time.vtk",
+                inferred_df,
+            )
+            inferred_irregular_surface_vtk_summary = write_irregular_surface_candidate_vtk(
+                output_dir / "inferred_fault_surface_candidates_irregular_raw_time.vtk",
+                surface_point_sets,
+                args,
+                rng,
+            )
+        else:
+            inferred_surface_vtk_summary = {"status": "disabled_by_config"}
+            inferred_irregular_surface_vtk_summary = {"status": "disabled_by_config"}
     else:
         inferred_id_grid, inferred_df, inferred_summary = extract_inferred_faults(
             score_grid,
@@ -1056,8 +1099,9 @@ def main() -> int:
             samples,
             args,
         )
-        write_surface_candidate_vtk(output_dir / "inferred_fault_surface_candidates_raw_time.vtk", pd.DataFrame())
-        pv.PolyData().save(output_dir / "inferred_fault_surface_candidates_irregular_raw_time.vtk")
+        if write_intermediate_vtk:
+            write_surface_candidate_vtk(output_dir / "inferred_fault_surface_candidates_raw_time.vtk", pd.DataFrame())
+            pv.PolyData().save(output_dir / "inferred_fault_surface_candidates_irregular_raw_time.vtk")
     inferred_mask = inferred_id_grid > 0
     combined_prior_grid = np.maximum(original_fault_grid, score_grid * inferred_mask.astype(np.float32))
     combined_mask_grid = original_fault_mask | inferred_mask
@@ -1066,16 +1110,19 @@ def main() -> int:
     inferred_id_flat = grid_to_flat(inferred_id_grid.astype(np.float32), mapping).astype(np.int32)
 
     write_sgy_like(output_dir / "large_fault_prior.sgy", input_density_sgy, large_prior_flat, samples)
-    write_sgy_like(output_dir / "large_fault_mask.sgy", input_density_sgy, large_mask_flat.astype(np.float32), samples)
     inferred_df.to_csv(output_dir / "large_fault_component_summary.csv", index=False, encoding="utf-8-sig")
-    inferred_vtk_summary = write_component_vtk(
-        output_dir / "inferred_large_fault_candidates_raw_time.vtk",
-        inferred_id_grid,
-        score_grid,
-        mapping,
-        samples,
-        int(args.vtk_max_points),
-        rng,
+    inferred_vtk_summary = (
+        write_component_vtk(
+            output_dir / "inferred_large_fault_candidates_raw_time.vtk",
+            inferred_id_grid,
+            score_grid,
+            mapping,
+            samples,
+            int(args.vtk_max_points),
+            rng,
+        )
+        if write_intermediate_vtk
+        else {"status": "disabled_by_config"}
     )
     np.savez_compressed(
         output_dir / "large_fault_prior_components.npz",
@@ -1093,6 +1140,13 @@ def main() -> int:
         "status": "pass",
         "input_density_sgy": str(input_density_sgy),
         "output_dir": str(output_dir),
+        "sample_interval_ms": interval_ms,
+        "sample_count": int(len(samples)),
+        "output_contract": {
+            "large_prior_sgy": str(output_dir / "large_fault_prior.sgy"),
+            "component_npz": str(output_dir / "large_fault_prior_components.npz"),
+            "mask_storage": "large_mask inside component_npz",
+        },
         "load": {
             "density": density_load,
             "coherence": coh_load,

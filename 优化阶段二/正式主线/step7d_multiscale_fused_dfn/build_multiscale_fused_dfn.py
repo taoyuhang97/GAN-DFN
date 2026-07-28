@@ -224,7 +224,9 @@ def main() -> int:
     audit = fused[audit_cols].copy()
     audit["Action"] = "keep_multiscale_patch"
     audit.to_csv(paths["audit_csv"], index=False, encoding="utf-8-sig")
-    write_vtk(paths["raw_vtk"], fused, "step7d_fused_multiscale_dfn_raw_time")
+    write_vtk_enabled = bool(config.get("write_vtk", True))
+    if write_vtk_enabled:
+        write_vtk(paths["raw_vtk"], fused, "step7d_fused_multiscale_dfn_raw_time")
     summary = {
         "status": "pass",
         "config_path": str(config_path),
@@ -251,14 +253,14 @@ def main() -> int:
         "checks": {
             "has_all_scales": set(fused["FractureScale"].astype(str)).issuperset({"small", "medium", "large"}),
             "csv_exists": paths["dfn_csv"].exists(),
-            "raw_vtk_exists": paths["raw_vtk"].exists(),
+            "raw_vtk_exists": bool(not write_vtk_enabled or paths["raw_vtk"].exists()),
             "audit_exists": paths["audit_csv"].exists(),
         },
     }
     summary["status"] = "pass" if all(bool(v) for v in summary["checks"].values()) else "fail"
     paths["summary_json"].write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
     print(f"[step7d-fused] CSV: {paths['dfn_csv']}", flush=True)
-    print(f"[step7d-fused] VTK: {paths['raw_vtk']}", flush=True)
+    print(f"[step7d-fused] VTK: {'disabled' if not write_vtk_enabled else paths['raw_vtk']}", flush=True)
     print(f"[step7d-fused] status={summary['status']} patch_count={len(fused)}", flush=True)
     return 0 if summary["status"] == "pass" else 1
 

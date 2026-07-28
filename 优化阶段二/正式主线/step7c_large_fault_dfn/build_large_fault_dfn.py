@@ -878,31 +878,54 @@ def build_lowcoh_component_panels(config: dict[str, Any]) -> pd.DataFrame:
     )
     summary_df = summary_df.sort_values("selection_score", ascending=False).head(max_components)
 
+    selected_component_ids = summary_df["component_id"].astype(int).tolist()
+    component_positions: dict[int, tuple[np.ndarray, ...]] = {}
+    if component_id_grid.ndim == 2:
+        selected_mask = np.isin(component_id_grid, np.asarray(selected_component_ids, dtype=np.int32))
+        trace_idx_all, tt_all = np.where(selected_mask)
+        ids_all = component_id_grid[trace_idx_all, tt_all]
+        for comp_id in selected_component_ids:
+            keep = ids_all == comp_id
+            component_positions[comp_id] = (trace_idx_all[keep], tt_all[keep])
+        x_axis = y_axis = None
+    elif component_id_grid.ndim == 3:
+        slices = ndimage.find_objects(component_id_grid, max_label=int(component_id_grid.max()))
+        for comp_id in selected_component_ids:
+            component_slice = slices[comp_id - 1] if 0 < comp_id <= len(slices) else None
+            if component_slice is None:
+                component_positions[comp_id] = (np.asarray([], dtype=int),) * 3
+                continue
+            local = component_id_grid[component_slice]
+            yy, xx, tt = np.where(local == comp_id)
+            yy += int(component_slice[0].start)
+            xx += int(component_slice[1].start)
+            tt += int(component_slice[2].start)
+            component_positions[comp_id] = (yy, xx, tt)
+        ix = npz["ix"].astype(np.int32)
+        iy = npz["iy"].astype(np.int32)
+        x_axis = np.zeros(int(ix.max()) + 1, dtype=float)
+        y_axis = np.zeros(int(iy.max()) + 1, dtype=float)
+        for idx in range(len(x_axis)):
+            x_axis[idx] = float(np.median(x_values[ix == idx]))
+        for idx in range(len(y_axis)):
+            y_axis[idx] = float(np.median(y_values[iy == idx]))
+    else:
+        raise ValueError(f"unsupported inferred_component_id shape: {component_id_grid.shape}")
+
     rows: list[dict[str, Any]] = []
     patch_idx = 0
     for component_ord, comp_row in enumerate(summary_df.itertuples(index=False), start=1):
         comp_id = int(comp_row.component_id)
-        component_where = np.where(component_id_grid == comp_id)
         if component_id_grid.ndim == 2:
-            trace_idx, tt = component_where
+            trace_idx, tt = component_positions[comp_id]
             if len(trace_idx) < min_panel_voxels:
                 continue
             points = np.column_stack([x_values[trace_idx], y_values[trace_idx], samples[tt]]).astype(float)
-        elif component_id_grid.ndim == 3:
-            yy, xx, tt = component_where
+        else:
+            yy, xx, tt = component_positions[comp_id]
             if len(xx) < min_panel_voxels:
                 continue
-            ix = npz["ix"].astype(np.int32)
-            iy = npz["iy"].astype(np.int32)
-            x_axis = np.zeros(int(ix.max()) + 1, dtype=float)
-            y_axis = np.zeros(int(iy.max()) + 1, dtype=float)
-            for idx in range(len(x_axis)):
-                x_axis[idx] = float(np.median(x_values[ix == idx]))
-            for idx in range(len(y_axis)):
-                y_axis[idx] = float(np.median(y_values[iy == idx]))
             points = np.column_stack([x_axis[xx], y_axis[yy], samples[tt]]).astype(float)
-        else:
-            raise ValueError(f"unsupported inferred_component_id shape: {component_id_grid.shape}")
         if len(points) < min_panel_voxels:
             continue
         scaled_points = np.column_stack([points[:, 0], points[:, 1], points[:, 2] * time_scale]).astype(float)
@@ -1115,8 +1138,10 @@ def main() -> int:
     fault_patches.to_csv(paths["fault_only_csv"], index=False, encoding="utf-8-sig")
     fault_panels_only.to_csv(paths["fault_panel_csv"], index=False, encoding="utf-8-sig")
     lowcoh_patches.to_csv(paths["lowcoh_csv"], index=False, encoding="utf-8-sig")
-    write_patch_vtk(paths["fault_only_vtk"], fault_patches, "step7c_large_original_fault_and_influence_raw_time")
-    write_patch_vtk(paths["lowcoh_vtk"], lowcoh_patches, "step7c_large_lowcoh_component_panels_raw_time")
+    write_intermediate_vtk = bool(config.get("write_intermediate_vtk", False))
+    if write_intermediate_vtk:
+        write_patch_vtk(paths["fault_only_vtk"], fault_patches, "step7c_large_original_fault_and_influence_raw_time")
+        write_patch_vtk(paths["lowcoh_vtk"], lowcoh_patches, "step7c_large_lowcoh_component_panels_raw_time")
     parts = [df for df in [fault_patches, lowcoh_patches] if not df.empty]
     if not parts:
         raise RuntimeError("no large fault/fault-zone patches generated")
@@ -1143,7 +1168,8 @@ def main() -> int:
         "ComponentPanelCount",
     ]
     patch_df[[col for col in audit_cols if col in patch_df.columns]].to_csv(paths["audit_csv"], index=False, encoding="utf-8-sig")
-    write_patch_vtk(paths["raw_vtk"], patch_df, "step7c_large_fault_and_damage_raw_time")
+    if write_intermediate_vtk:
+        write_patch_vtk(paths["raw_vtk"], patch_df, "step7c_large_fault_and_damage_raw_time")
     summary = {
         "status": "pass",
         "config_path": str(config_path),
@@ -1153,7 +1179,7 @@ def main() -> int:
             "fault_patches_root": str(fault_patches_root),
             "fault_patch_overlap_csv": str(Path(config["fault_patch_overlap_csv"]).resolve()),
             "large_prior_sgy": str(Path(config["large_prior_sgy"]).resolve()),
-            "large_mask_sgy": str(Path(config["large_mask_sgy"]).resolve()),
+            "large_mask_sgy": str(Path(config["large_mask_sgy"]).resolve()) if config.get("large_mask_sgy") else "",
             "large_prior_components_npz": str(Path(config["large_prior_components_npz"]).resolve()),
             "large_component_summary_csv": str(Path(config["large_component_summary_csv"]).resolve()),
         },
@@ -1190,9 +1216,9 @@ def main() -> int:
         "checks": {
             "has_large_patches": len(patch_df) > 0,
             "fault_surface_vtk_exists": paths["fault_surface_vtk"].exists(),
-            "fault_only_vtk_exists": paths["fault_only_vtk"].exists(),
-            "lowcoh_vtk_exists": paths["lowcoh_vtk"].exists(),
-            "raw_vtk_exists": paths["raw_vtk"].exists(),
+            "fault_only_vtk_exists": bool(not write_intermediate_vtk or paths["fault_only_vtk"].exists()),
+            "lowcoh_vtk_exists": bool(not write_intermediate_vtk or paths["lowcoh_vtk"].exists()),
+            "raw_vtk_exists": bool(not write_intermediate_vtk or paths["raw_vtk"].exists()),
             "csv_exists": paths["dfn_csv"].exists(),
         },
     }
