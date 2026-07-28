@@ -1,0 +1,51 @@
+{
+  "status": "approved_for_ablation_not_approved_as_standalone_rule",
+  "evidence_source": "output/gr_resistivity_diagnostic_md_v2/three_well_summary.json",
+  "required_context_columns": [
+    "WellName",
+    "StrataName",
+    "PairType",
+    "MeasurementFamily"
+  ],
+  "raw_traceability_columns": [
+    "GRSourceCurve",
+    "DeepSourceCurve",
+    "NearSourceCurve",
+    "LogSourcePath"
+  ],
+  "candidate_numeric_features": [
+    "GR",
+    "LogRDeep",
+    "LogRNear",
+    "DeltaLogR",
+    "AbsDeltaLogR",
+    "NormalizedContrast",
+    "DeltaLogRResidual"
+  ],
+  "normalization_policy": {
+    "scope": "within_well_and_strata",
+    "method": "median_and_1.4826_mad",
+    "retain_raw_and_normalized": true
+  },
+  "required_interactions": [
+    "DeltaLogR_x_StrataName",
+    "DeltaLogR_x_PairType",
+    "GR_x_DeltaLogR"
+  ],
+  "rejected_shortcuts": [
+    "single_global_delta_threshold",
+    "single_global_absolute_delta_threshold",
+    "pool_raw_resistivity_without_pair_type",
+    "rename_R25_R4_as_deep_near_lateral",
+    "replace_imaging_labels_with_interpolated_time_grid_duplicates"
+  ],
+  "validation_policy": {
+    "compare": [
+      "baseline_without_gr_resistivity_features",
+      "baseline_plus_candidate_features"
+    ],
+    "split": "leave_one_well_out_with_depth_block_sensitivity",
+    "depth_block_m": 10.0,
+    "promotion_rule": "promote only when holdout improvement is directionally consistent and not driven by one well or one strata"
+  }
+}

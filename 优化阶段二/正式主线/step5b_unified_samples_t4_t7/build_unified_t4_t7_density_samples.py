@@ -12,47 +12,20 @@ import pandas as pd
 CURRENT_DIR = Path(__file__).resolve().parent
 DEFAULT_CONFIG = CURRENT_DIR / "configs/formal_unified_t4_t7_density_samples.json"
 ALLOWED_LAYERS = ["沙三段", "沙四段"]
-ATTRIBUTE_COLUMNS = ["SeisAmp", "Coherence", "AntTrack", "CurvatureMax", "CurvaturePos"]
-STAT_SUFFIXES = ["Mean", "Std", "Min", "Max", "ValidCount"]
-REQUIRED_OUTPUT_COLUMNS = [
-    "SampleID",
-    "SourceKind",
-    "SourceWellName",
-    "TrackWellName",
-    "WellName",
-    "X",
-    "Y",
-    "TIME",
-    "TVD",
-    "DEPT",
-    "StrataName",
-    "LayerGroup",
-    "Density",
-    "DensityLabel",
-    "HasFracture",
-    "PointConfidence",
+ATTRIBUTE_COLUMNS = ["SeisAmp", "Coherence", "AntTrack", "CurvatureMax"]
+OUTPUT_COLUMNS = [
+    "SourceKind", "SourceWellName", "TrackWellName",
+    "X", "Y", "TIME", "LayerGroup",
+    "PresenceLabel", "DensityLabel", "HasFracture", "PointConfidence", "SampleWeight",
     *ATTRIBUTE_COLUMNS,
-    *[f"{attr}{suffix}" for attr in ATTRIBUTE_COLUMNS for suffix in STAT_SUFFIXES],
 ]
-OPTIONAL_OUTPUT_COLUMNS = [
-    "SourceSampleID",
-    "VirtualWellName",
-    "DistanceToSource",
-    "AttributeContinuity",
-    "ValidContinuityAttributeCount",
-    "SourceDensity",
-    "DensitySourceLogic",
-    "DistanceConfidenceWeight",
-    "ConfidenceLogic",
-    "SingleSourceCheck",
-    "IsRefinedFracturePoint",
-]
-OUTPUT_COLUMNS = [*REQUIRED_OUTPUT_COLUMNS, *OPTIONAL_OUTPUT_COLUMNS]
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Build Step 5B formal unified T4-T7 density samples.")
-    parser.add_argument("--config", default=str(DEFAULT_CONFIG), help="Path to JSON config.")
+    parser = argparse.ArgumentParser(description="Build curvature-led Step5B unified T4-T7 samples.")
+    parser.add_argument("--config", default=str(DEFAULT_CONFIG))
+    parser.add_argument("--output-dir", type=Path)
+    parser.add_argument("--virtual-samples-csv", type=Path)
     return parser.parse_args()
 
 
@@ -60,11 +33,24 @@ def read_json(path: Path) -> dict[str, Any]:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
-def ensure_dir(path: Path) -> None:
-    path.mkdir(parents=True, exist_ok=True)
+def write_json(path: Path, payload: dict[str, Any]) -> None:
+    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
-def safe_numeric(series: pd.Series | Any, index: pd.Index | None = None) -> pd.Series:
+def resolve_step4_inputs(manifest_path: Path) -> tuple[Path, Path, dict[str, Any]]:
+    manifest = read_json(manifest_path)
+    prediction_rel = manifest.get("step5_input") or manifest.get("prediction_table")
+    points_rel = manifest.get("fracture_point_table")
+    if not prediction_rel or not points_rel:
+        raise RuntimeError("Step4 manifest lacks the merged prediction or fracture-point table")
+    prediction_csv = (manifest_path.parent / str(prediction_rel)).resolve()
+    points_csv = (manifest_path.parent / str(points_rel)).resolve()
+    if not prediction_csv.exists() or not points_csv.exists():
+        raise FileNotFoundError("Step4 manifest references a missing input file")
+    return prediction_csv, points_csv, manifest
+
+
+def numeric(series: pd.Series | Any, index: pd.Index | None = None) -> pd.Series:
     if isinstance(series, pd.Series):
         return pd.to_numeric(series, errors="coerce")
     return pd.to_numeric(pd.Series(series, index=index), errors="coerce")
@@ -73,18 +59,10 @@ def safe_numeric(series: pd.Series | Any, index: pd.Index | None = None) -> pd.S
 def require_columns(df: pd.DataFrame, columns: list[str], label: str) -> None:
     missing = [column for column in columns if column not in df.columns]
     if missing:
-        raise ValueError(f"{label} missing required columns: {missing}")
+        raise RuntimeError(f"{label} missing required columns: {missing}")
 
 
-def layer_group_from_strata(series: pd.Series) -> pd.Series:
-    return series.astype(str).where(series.astype(str).isin(ALLOWED_LAYERS), pd.NA)
-
-
-def normalize_has_fracture(df: pd.DataFrame) -> pd.Series:
-    return safe_numeric(df.get("HasFracture", pd.Series(0, index=df.index))).fillna(0).gt(0).astype(int)
-
-
-def add_missing_output_columns(df: pd.DataFrame) -> pd.DataFrame:
+def add_output_columns(df: pd.DataFrame) -> pd.DataFrame:
     out = df.copy()
     for column in OUTPUT_COLUMNS:
         if column not in out.columns:
@@ -92,322 +70,206 @@ def add_missing_output_columns(df: pd.DataFrame) -> pd.DataFrame:
     return out[OUTPUT_COLUMNS]
 
 
-def normalize_density_columns(df: pd.DataFrame) -> pd.DataFrame:
-    out = df.copy()
-    density = safe_numeric(out.get("Density", pd.Series(np.nan, index=out.index)))
-    out["Density"] = density.clip(lower=0)
-    out["DensityLabel"] = out["Density"].fillna(0.0)
-    out["HasFracture"] = normalize_has_fracture(out)
+def load_real_attributes(roots: list[Path], target_wells: set[str]) -> pd.DataFrame:
+    keep = ["WellName", "DEPT", *ATTRIBUTE_COLUMNS]
+    frames: list[pd.DataFrame] = []
+    seen_paths: set[Path] = set()
+    for root in roots:
+        for path in sorted(root.glob("*/*_t4_t7_real_well_main.csv")):
+            path = path.resolve()
+            if path in seen_paths or path.parent.name not in target_wells:
+                continue
+            seen_paths.add(path)
+            header = pd.read_csv(path, nrows=0).columns
+            usecols = [column for column in keep if column in header]
+            frame = pd.read_csv(path, usecols=usecols)
+            frames.append(frame)
+    if not frames:
+        raise RuntimeError("No Step2 real-well attribute tables matched the Step4 wells")
+    out = pd.concat(frames, ignore_index=True)
+    require_columns(out, ["WellName", "DEPT", *ATTRIBUTE_COLUMNS], "Step2 real attributes")
+    if out.duplicated(["WellName", "DEPT"]).any():
+        raise RuntimeError("Step2 attribute roots contain duplicate WellName+DEPT rows")
     return out
 
 
-def normalize_real_samples(real_df: pd.DataFrame, refined_point_ids: set[str]) -> pd.DataFrame:
-    require_columns(real_df, ["SampleID", "WellName", "X", "Y", "TIME", "Density", "HasFracture", "StrataName"], "real well prediction")
-    out = real_df.copy()
-    out["SampleID"] = out["SampleID"].astype(str)
+def normalize_real(real_df: pd.DataFrame, attr_df: pd.DataFrame) -> pd.DataFrame:
+    required = [
+        "SampleID", "WellName", "X", "Y", "TIME", "DEPT", "StrataName",
+        "Density", "HasFracture", "PredictionValid",
+    ]
+    require_columns(real_df, required, "Step4 merged prediction")
+    if real_df.duplicated(["WellName", "DEPT"]).any():
+        raise RuntimeError("Step4 input is not the unique merged WellName+DEPT table")
+    out = real_df.merge(attr_df.drop(columns=["SampleID"], errors="ignore"), on=["WellName", "DEPT"], how="left", validate="one_to_one")
+    out = out[out["PredictionValid"].eq(1) & out["StrataName"].isin(ALLOWED_LAYERS)].copy()
+    if numeric(out["CurvatureMax"]).isna().any():
+        missing = int(numeric(out["CurvatureMax"]).isna().sum())
+        raise RuntimeError(f"{missing} real rows lack mandatory aligned CurvatureMax")
+    presence = numeric(out["HasFracture"]).gt(0).astype(int)
+    out["PresenceLabel"] = presence
+    out["DensityLabel"] = numeric(out["Density"]).where(presence.eq(1))
     out["SourceKind"] = "real_well"
     out["SourceWellName"] = out["WellName"].astype(str)
     out["TrackWellName"] = out["WellName"].astype(str)
-    out["LayerGroup"] = layer_group_from_strata(out["StrataName"])
+    out["LayerGroup"] = out["StrataName"]
+    out["SampleWeight"] = 1.0
     out["PointConfidence"] = 1.0
-    out["SourceSampleID"] = out["SampleID"]
-    out["VirtualWellName"] = pd.NA
-    out["DistanceToSource"] = 0.0
-    out["AttributeContinuity"] = 1.0
-    out["ValidContinuityAttributeCount"] = len(ATTRIBUTE_COLUMNS)
-    out["SourceDensity"] = safe_numeric(out["Density"])
-    out["DensitySourceLogic"] = "step4_expert_real_well_prediction"
-    out["DistanceConfidenceWeight"] = 1.0
-    out["ConfidenceLogic"] = "real_well_hard_supervision"
-    out["SingleSourceCheck"] = "pass"
-    out["IsRefinedFracturePoint"] = out["SampleID"].isin(refined_point_ids).astype(int)
-    out = normalize_density_columns(out)
-    out = out[out["LayerGroup"].isin(ALLOWED_LAYERS)].copy()
-    return add_missing_output_columns(out)
+    return add_output_columns(out)
 
 
-def normalize_virtual_samples(virtual_df: pd.DataFrame) -> pd.DataFrame:
-    require_columns(
-        virtual_df,
-        ["SampleID", "SourceSampleID", "SourceWellName", "VirtualWellName", "X", "Y", "TIME", "Density", "HasFracture", "PointConfidence", "StrataName"],
-        "virtual well samples",
-    )
-    out = virtual_df.copy()
-    out["SampleID"] = out["SampleID"].astype(str)
+def normalize_virtual(df: pd.DataFrame, real_sample_ids: set[str]) -> pd.DataFrame:
+    required = [
+        "SourceSampleID", "SourceWellName", "VirtualWellName", "X", "Y", "TIME",
+        "StrataName", "PresenceLabel", "DensityLabel", "PointConfidence", "SampleWeight",
+        *ATTRIBUTE_COLUMNS,
+    ]
+    require_columns(df, required, "Step5A virtual training samples")
+    out = df.copy()
+    if "CurvaturePos" in out.columns:
+        raise RuntimeError("CurvaturePos is forbidden in the formal Step5 contract")
+    out = out[numeric(out["PresenceLabel"]).notna() & numeric(out["CurvatureMax"]).notna()].copy()
+    if not set(out["SourceSampleID"].astype(str)).issubset(real_sample_ids):
+        raise RuntimeError("Virtual SourceSampleID contains rows absent from the current Step4 merged table")
+    presence = numeric(out["PresenceLabel"]).gt(0).astype(int)
+    density_label = numeric(out["DensityLabel"])
+    if density_label[presence.eq(1)].isna().any():
+        raise RuntimeError("Positive virtual presence labels require conditional density labels")
+    if density_label[presence.eq(0)].notna().any():
+        raise RuntimeError("Negative virtual presence labels must keep conditional density unknown")
+    out["PresenceLabel"] = presence
+    out["HasFracture"] = presence
+    out["DensityLabel"] = density_label
     out["SourceKind"] = "virtual_well"
-    out["SourceWellName"] = out["SourceWellName"].astype(str)
     out["TrackWellName"] = out["VirtualWellName"].astype(str)
-    out["WellName"] = out["VirtualWellName"].astype(str)
-    out["LayerGroup"] = layer_group_from_strata(out["StrataName"])
-    out["PointConfidence"] = safe_numeric(out["PointConfidence"]).clip(lower=0, upper=1)
-    out["SingleSourceCheck"] = "pass"
-    out["IsRefinedFracturePoint"] = 0
-    out = normalize_density_columns(out)
-    out = out[out["LayerGroup"].isin(ALLOWED_LAYERS)].copy()
-    return add_missing_output_columns(out)
-
-
-def append_csv(df: pd.DataFrame, output_csv: Path, write_header: bool) -> None:
-    mode = "w" if write_header else "a"
-    encoding = "utf-8-sig" if write_header else "utf-8"
-    df.to_csv(output_csv, mode=mode, header=write_header, index=False, encoding=encoding)
-
-
-def density_stats(series: pd.Series) -> dict[str, float | int | None]:
-    numeric = safe_numeric(series).dropna()
-    if numeric.empty:
-        return {"count": 0, "min": None, "max": None, "mean": None, "median": None}
-    return {
-        "count": int(numeric.count()),
-        "min": float(numeric.min()),
-        "max": float(numeric.max()),
-        "mean": float(numeric.mean()),
-        "median": float(numeric.median()),
-    }
-
-
-class SummaryAccumulator:
-    def __init__(self) -> None:
-        self.total_rows = 0
-        self.source_kind_counts: dict[str, int] = {}
-        self.layer_counts: dict[str, int] = {}
-        self.source_wells: dict[str, set[str]] = {}
-        self.track_wells: dict[str, set[str]] = {}
-        self.density_values: list[pd.Series] = []
-        self.density_label_non_null = 0
-        self.has_fracture_sum = 0
-        self.point_confidence_sum = 0.0
-        self.point_confidence_count = 0
-        self.attr_non_null = {attr: 0 for attr in ATTRIBUTE_COLUMNS}
-        self.qc_rows: list[dict[str, Any]] = []
-
-    def add(self, df: pd.DataFrame) -> None:
-        if df.empty:
-            return
-        self.total_rows += int(len(df))
-        for key, value in df["SourceKind"].value_counts(dropna=False).items():
-            self.source_kind_counts[str(key)] = self.source_kind_counts.get(str(key), 0) + int(value)
-        for key, value in df["LayerGroup"].value_counts(dropna=False).items():
-            self.layer_counts[str(key)] = self.layer_counts.get(str(key), 0) + int(value)
-        for source_kind, group in df.groupby("SourceKind", dropna=False):
-            source_kind_str = str(source_kind)
-            self.source_wells.setdefault(source_kind_str, set()).update(group["SourceWellName"].dropna().astype(str).unique().tolist())
-            self.track_wells.setdefault(source_kind_str, set()).update(group["TrackWellName"].dropna().astype(str).unique().tolist())
-        density = safe_numeric(df["Density"])
-        self.density_values.append(density)
-        self.density_label_non_null += int(df["DensityLabel"].notna().sum())
-        self.has_fracture_sum += int(safe_numeric(df["HasFracture"]).fillna(0).sum())
-        confidence = safe_numeric(df["PointConfidence"]).dropna()
-        self.point_confidence_sum += float(confidence.sum())
-        self.point_confidence_count += int(confidence.count())
-        for attr in ATTRIBUTE_COLUMNS:
-            self.attr_non_null[attr] += int(pd.to_numeric(df[attr], errors="coerce").notna().sum())
-
-        grouped = (
-            df.groupby(["SourceKind", "LayerGroup"], dropna=False)
-            .agg(
-                SampleRows=("SampleID", "size"),
-                SourceWellCount=("SourceWellName", "nunique"),
-                TrackWellCount=("TrackWellName", "nunique"),
-                DensityMean=("Density", "mean"),
-                DensityMax=("Density", "max"),
-                HasFractureRows=("HasFracture", "sum"),
-                PointConfidenceMean=("PointConfidence", "mean"),
-            )
-            .reset_index()
-        )
-        self.qc_rows.extend(grouped.to_dict(orient="records"))
-
-    def density_summary(self) -> dict[str, float | int | None]:
-        if not self.density_values:
-            return density_stats(pd.Series(dtype=float))
-        return density_stats(pd.concat(self.density_values, ignore_index=True))
-
-    def qc_frame(self) -> pd.DataFrame:
-        if not self.qc_rows:
-            return pd.DataFrame()
-        raw = pd.DataFrame(self.qc_rows)
-        out = (
-            raw.groupby(["SourceKind", "LayerGroup"], dropna=False)
-            .agg(
-                SampleRows=("SampleRows", "sum"),
-                SourceWellCount=("SourceWellCount", "max"),
-                TrackWellCount=("TrackWellCount", "max"),
-                DensityMean=("DensityMean", "mean"),
-                DensityMax=("DensityMax", "max"),
-                HasFractureRows=("HasFractureRows", "sum"),
-                PointConfidenceMean=("PointConfidenceMean", "mean"),
-            )
-            .reset_index()
-        )
-        return out
-
-    def to_summary(self) -> dict[str, Any]:
-        return {
-            "total_rows": int(self.total_rows),
-            "source_kind_counts": {key: int(value) for key, value in sorted(self.source_kind_counts.items())},
-            "layer_counts": {key: int(value) for key, value in sorted(self.layer_counts.items())},
-            "source_well_counts": {key: int(len(value)) for key, value in sorted(self.source_wells.items())},
-            "track_well_counts": {key: int(len(value)) for key, value in sorted(self.track_wells.items())},
-            "density_stats": self.density_summary(),
-            "density_label_non_null_count": int(self.density_label_non_null),
-            "has_fracture_sum": int(self.has_fracture_sum),
-            "mean_point_confidence": float(self.point_confidence_sum / self.point_confidence_count) if self.point_confidence_count else None,
-            "attribute_non_null_counts": {key: int(value) for key, value in sorted(self.attr_non_null.items())},
-        }
-
-
-def build_field_contract(real_columns: set[str], virtual_columns: set[str], output_csv: Path) -> pd.DataFrame:
-    rows = []
-    for column in OUTPUT_COLUMNS:
-        rows.append(
-            {
-                "Field": column,
-                "Required": column in REQUIRED_OUTPUT_COLUMNS,
-                "PresentInRealInput": column in real_columns,
-                "PresentInVirtualInput": column in virtual_columns,
-                "PresentInUnified": True,
-                "Rule": field_rule(column),
-            }
-        )
-    contract = pd.DataFrame(rows)
-    contract.to_csv(output_csv, index=False, encoding="utf-8-sig")
-    return contract
-
-
-def field_rule(column: str) -> str:
-    rules = {
-        "SourceKind": "real_well or virtual_well",
-        "SourceWellName": "real source well for both real and virtual samples",
-        "TrackWellName": "real well name for real samples; virtual well name for virtual samples",
-        "WellName": "track-facing well name",
-        "LayerGroup": "must be 沙三段 or 沙四段",
-        "Density": "main supervision target",
-        "DensityLabel": "non-null training label derived from Density",
-        "HasFracture": "auxiliary binary flag",
-        "PointConfidence": "1.0 for real samples; Step 5 confidence for virtual samples",
-        "DensitySourceLogic": "Step 4 real prediction or Step 5 single-source attribute continuity",
-        "IsRefinedFracturePoint": "Step 4 refined point membership for real samples",
-    }
-    return rules.get(column, "carried or normalized from formal upstream output")
-
-
-def read_refined_point_ids(path: Path) -> tuple[set[str], int]:
-    if not path.exists():
-        return set(), 0
-    points = pd.read_csv(path, usecols=["SourceSampleID"])
-    ids = set(points["SourceSampleID"].dropna().astype(str).tolist())
-    return ids, int(len(points))
-
-
-def validate_virtual_summary(path: Path) -> dict[str, Any]:
-    if not path.exists():
-        return {"exists": False, "single_source_bad_count": None}
-    summary = pd.read_csv(path)
-    bad = int((summary.get("SingleSourceCheck", pd.Series(index=summary.index, dtype=object)) != "pass").sum())
-    return {
-        "exists": True,
-        "row_count": int(len(summary)),
-        "virtual_well_count": int(summary["VirtualWellName"].nunique()) if "VirtualWellName" in summary.columns else None,
-        "single_source_bad_count": bad,
-    }
-
-
-def validate_summary(summary: dict[str, Any], virtual_summary_check: dict[str, Any], contract: pd.DataFrame) -> dict[str, bool]:
-    return {
-        "has_rows": int(summary["total_rows"]) > 0,
-        "has_real_and_virtual": {"real_well", "virtual_well"}.issubset(set(summary["source_kind_counts"].keys())),
-        "density_label_non_null": int(summary["density_label_non_null_count"]) == int(summary["total_rows"]),
-        "layers_limited_to_sha3_sha4": set(summary["layer_counts"].keys()).issubset(set(ALLOWED_LAYERS)),
-        "required_fields_present": bool(contract.loc[contract["Required"], "PresentInUnified"].all()),
-        "virtual_single_source_pass": virtual_summary_check.get("single_source_bad_count") in (0, None),
-        "has_attribute_coverage": all(int(value) > 0 for value in summary["attribute_non_null_counts"].values()),
-    }
-
-
-def write_json(path: Path, payload: dict[str, Any]) -> None:
-    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    out["LayerGroup"] = out["StrataName"].where(out["StrataName"].isin(ALLOWED_LAYERS))
+    out["PointConfidence"] = numeric(out["PointConfidence"]).clip(0, 1)
+    out["SampleWeight"] = numeric(out["SampleWeight"]).clip(lower=0)
+    out = out[out["LayerGroup"].notna()].copy()
+    return add_output_columns(out)
 
 
 def main() -> int:
     args = parse_args()
-    config_path = Path(args.config)
+    config_path = Path(args.config).resolve()
     config = read_json(config_path)
-    real_csv = Path(config["real_well_prediction_csv"])
-    points_csv = Path(config["real_fracture_points_csv"])
-    virtual_csv = Path(config["virtual_well_training_samples_csv"])
-    virtual_summary_csv = Path(config.get("virtual_well_training_summary_csv", ""))
-    output_dir = Path(config["output_dir"])
-    chunksize = int(config.get("chunksize", 250000))
-    ensure_dir(output_dir)
+    manifest_path = Path(config["step4_manifest"]).resolve()
+    real_csv, _points_csv, manifest = resolve_step4_inputs(manifest_path)
+    virtual_csv = args.virtual_samples_csv or Path(config["virtual_well_training_samples_csv"])
+    output_dir = args.output_dir or Path(config["output_dir"])
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    real_df = pd.read_csv(real_csv)
+    target_wells = set(real_df["WellName"].dropna().astype(str))
+    attr_df = load_real_attributes([Path(path) for path in config["real_well_attribute_roots"]], target_wells)
+    real_ids = set(real_df["SampleID"].dropna().astype(str))
+    real_out = normalize_real(real_df, attr_df)
 
     output_csv = output_dir / "unified_t4_t7_density_samples.csv"
     summary_json = output_dir / "unified_t4_t7_density_samples_summary.json"
-    field_contract_csv = output_dir / "unified_t4_t7_field_contract.csv"
     qc_csv = output_dir / "unified_t4_t7_qc.csv"
-    tmp_paths = {
-        "samples": output_csv.with_name(f"{output_csv.name}.tmp"),
-        "summary": summary_json.with_name(f"{summary_json.name}.tmp"),
-        "contract": field_contract_csv.with_name(f"{field_contract_csv.name}.tmp"),
-        "qc": qc_csv.with_name(f"{qc_csv.name}.tmp"),
-    }
+    contract_csv = output_dir / "unified_t4_t7_field_contract.csv"
+    output_tmp = output_csv.with_name(f"{output_csv.name}.tmp")
+    real_out.to_csv(output_tmp, index=False, encoding="utf-8-sig")
 
-    refined_point_ids, refined_point_count = read_refined_point_ids(points_csv)
-    accumulator = SummaryAccumulator()
-
-    real_df = pd.read_csv(real_csv)
-    real_columns = set(real_df.columns)
-    real_out = normalize_real_samples(real_df, refined_point_ids)
-    append_csv(real_out, tmp_paths["samples"], write_header=True)
-    accumulator.add(real_out)
-    print(f"[step6] real rows={len(real_out)}", flush=True)
-
-    virtual_columns: set[str] | None = None
-    write_header = False
+    chunksize = int(config.get("chunksize", 250000))
     virtual_rows = 0
+    virtual_presence_positive = 0
+    virtual_density_rows = 0
+    virtual_weight = 0.0
+    virtual_source_wells: set[str] = set()
+    virtual_tracks: set[str] = set()
+    virtual_layer_counts: dict[str, int] = {}
+    virtual_checks = {
+        "presence_labels_complete": True,
+        "positive_density_labels_complete": True,
+        "negative_density_labels_null": True,
+        "curvature_max_complete": True,
+        "virtual_rows_training_ready": True,
+    }
     for chunk_idx, chunk in enumerate(pd.read_csv(virtual_csv, chunksize=chunksize), start=1):
-        if virtual_columns is None:
-            virtual_columns = set(chunk.columns)
-        virtual_out = normalize_virtual_samples(chunk)
-        append_csv(virtual_out, tmp_paths["samples"], write_header=write_header)
-        accumulator.add(virtual_out)
-        virtual_rows += int(len(virtual_out))
-        print(f"[step6] virtual chunk={chunk_idx} virtual_rows={virtual_rows}", flush=True)
-    if virtual_columns is None:
-        virtual_columns = set()
+        normalized = normalize_virtual(chunk, real_ids)
+        if not normalized.empty:
+            normalized.to_csv(output_tmp, mode="a", header=False, index=False, encoding="utf-8")
+            presence = numeric(normalized["PresenceLabel"])
+            density = numeric(normalized["DensityLabel"])
+            virtual_rows += int(len(normalized))
+            virtual_presence_positive += int(presence.sum())
+            virtual_density_rows += int(density.notna().sum())
+            virtual_weight += float(numeric(normalized["SampleWeight"]).sum())
+            virtual_source_wells.update(normalized["SourceWellName"].dropna().astype(str).unique())
+            virtual_tracks.update(normalized["TrackWellName"].dropna().astype(str).unique())
+            for layer, count in normalized["LayerGroup"].value_counts().items():
+                virtual_layer_counts[str(layer)] = virtual_layer_counts.get(str(layer), 0) + int(count)
+            virtual_checks["presence_labels_complete"] &= bool(presence.notna().all())
+            virtual_checks["positive_density_labels_complete"] &= bool(density[presence.eq(1)].notna().all())
+            virtual_checks["negative_density_labels_null"] &= bool(density[presence.eq(0)].isna().all())
+            virtual_checks["curvature_max_complete"] &= bool(numeric(normalized["CurvatureMax"]).notna().all())
+            virtual_checks["virtual_rows_training_ready"] &= bool(
+                presence.notna().all() & numeric(normalized["PointConfidence"]).notna().all()
+            )
+        print(f"[step5b] virtual_chunk={chunk_idx} accepted_rows={virtual_rows}", flush=True)
 
-    contract = build_field_contract(real_columns, virtual_columns, tmp_paths["contract"])
-    qc_frame = accumulator.qc_frame()
-    qc_frame.to_csv(tmp_paths["qc"], index=False, encoding="utf-8-sig")
-    virtual_summary_check = validate_virtual_summary(virtual_summary_csv)
-    summary = accumulator.to_summary()
-    checks = validate_summary(summary, virtual_summary_check, contract)
+    real_weight = float(numeric(real_out["SampleWeight"]).sum())
+    max_ratio = float(config.get("max_virtual_to_real_weight_ratio", 1.0))
+    real_presence = numeric(real_out["PresenceLabel"])
+    real_density = numeric(real_out["DensityLabel"])
+    checks = {
+        "uses_current_step4_manifest": manifest.get("step5_input") == manifest.get("prediction_table"),
+        "real_keys_unique": not real_df.duplicated(["WellName", "DEPT"]).any(),
+        "has_real_and_virtual": not real_out.empty and virtual_rows > 0,
+        "presence_labels_complete": bool(real_presence.notna().all()) and virtual_checks["presence_labels_complete"],
+        "positive_density_labels_complete": bool(real_density[real_presence.eq(1)].notna().all()) and virtual_checks["positive_density_labels_complete"],
+        "negative_density_labels_null": bool(real_density[real_presence.eq(0)].isna().all()) and virtual_checks["negative_density_labels_null"],
+        "curvature_max_complete": bool(numeric(real_out["CurvatureMax"]).notna().all()) and virtual_checks["curvature_max_complete"],
+        "virtual_rows_training_ready": virtual_rows > 0 and virtual_checks["virtual_rows_training_ready"],
+        "virtual_weight_bounded": virtual_weight <= real_weight * max_ratio + 1.0e-9,
+        "curvature_pos_excluded": "CurvaturePos" not in OUTPUT_COLUMNS,
+    }
+    status = "pass" if all(checks.values()) else "fail"
+    real_layer_counts = {str(k): int(v) for k, v in real_out["LayerGroup"].value_counts().items()}
+    layer_counts = dict(real_layer_counts)
+    for layer, count in virtual_layer_counts.items():
+        layer_counts[layer] = layer_counts.get(layer, 0) + count
+    source_kind_summary = [
+        {"SourceKind": "real_well", "rows": int(len(real_out)), "presence_positive": int(real_presence.sum()),
+         "density_label_rows": int(real_density.notna().sum()), "sample_weight": real_weight,
+         "source_wells": int(real_out["SourceWellName"].nunique()), "tracks": int(real_out["TrackWellName"].nunique())},
+        {"SourceKind": "virtual_well", "rows": int(virtual_rows), "presence_positive": int(virtual_presence_positive),
+         "density_label_rows": int(virtual_density_rows), "sample_weight": virtual_weight,
+         "source_wells": int(len(virtual_source_wells)), "tracks": int(len(virtual_tracks))},
+    ]
+    pd.DataFrame([
+        {"SourceKind": row["SourceKind"], "Rows": row["rows"], "WeightSum": row["sample_weight"],
+         "PresencePositiveRows": row["presence_positive"], "DensityLabelRows": row["density_label_rows"]}
+        for row in source_kind_summary
+    ]).to_csv(qc_csv, index=False, encoding="utf-8-sig")
+    pd.DataFrame({"Field": OUTPUT_COLUMNS, "RequiredInFormalOutput": True}).to_csv(contract_csv, index=False, encoding="utf-8-sig")
     payload = {
-        "status": "pass" if all(checks.values()) else "fail",
-        "config_path": str(config_path),
+        "status": status,
+        "step4_manifest": str(manifest_path),
+        "step4_manifest_version": manifest.get("version"),
         "real_well_prediction_csv": str(real_csv),
-        "real_fracture_points_csv": str(points_csv),
         "virtual_well_training_samples_csv": str(virtual_csv),
         "output_csv": str(output_csv),
-        "field_contract_csv": str(field_contract_csv),
-        "qc_csv": str(qc_csv),
-        "allowed_layers": ALLOWED_LAYERS,
-        "refined_fracture_point_count": int(refined_point_count),
-        "virtual_summary_check": virtual_summary_check,
-        "summary": summary,
-        "checks": checks,
+        "summary": {
+            "total_rows": int(len(real_out) + virtual_rows),
+            "source_kind": source_kind_summary,
+            "layer_counts": layer_counts,
+            "presence_positive_rows": int(real_presence.sum() + virtual_presence_positive),
+            "density_label_rows": int(real_density.notna().sum() + virtual_density_rows),
+        },
+        "real_weight_sum": real_weight,
+        "virtual_weight_sum": virtual_weight,
+        "virtual_to_real_weight_ratio": virtual_weight / real_weight if real_weight else None,
+        "checks": {key: bool(value) for key, value in checks.items()},
     }
-    write_json(tmp_paths["summary"], payload)
-
-    for key, tmp_path in tmp_paths.items():
-        final_path = {
-            "samples": output_csv,
-            "summary": summary_json,
-            "contract": field_contract_csv,
-            "qc": qc_csv,
-        }[key]
-        tmp_path.replace(final_path)
-    return 0 if payload["status"] == "pass" else 1
+    write_json(summary_json, payload)
+    if status == "pass":
+        output_tmp.replace(output_csv)
+    else:
+        output_tmp.unlink(missing_ok=True)
+    return 0 if status == "pass" else 1
 
 
 if __name__ == "__main__":

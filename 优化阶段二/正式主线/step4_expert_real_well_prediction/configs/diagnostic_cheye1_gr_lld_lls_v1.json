@@ -1,0 +1,15 @@
+{
+  "well_name": "车页1导眼",
+  "pair_type": "LATERLOG_LLD_LLS",
+  "deep_curve": "LLD",
+  "near_curve": "LLS",
+  "gr_curve": "GR",
+  "las_path": "/data/shared/project-oil/wx数据/砂砾岩/测井数据补充-20260723/LLD/车页1HF(导眼)@常规测井评价(2024-11-30)@1@综合.las",
+  "step3_group_paths": [
+    "/home/tyh/projects/petroleum/code/GAN-DFN/优化阶段二/正式主线/step3_imaging_supervision_samples/output/formal_rebuild/groups/车页1导眼_沙三段.csv",
+    "/home/tyh/projects/petroleum/code/GAN-DFN/优化阶段二/正式主线/step3_imaging_supervision_samples/output/formal_rebuild/groups/车页1导眼_沙四段.csv"
+  ],
+  "gr_quantile_bins": 5,
+  "file_stem": "cheye1_lld_lls",
+  "output_dir": "/home/tyh/projects/petroleum/code/GAN-DFN/优化阶段二/正式主线/step4_expert_real_well_prediction/output/gr_resistivity_diagnostic_v1"
+}

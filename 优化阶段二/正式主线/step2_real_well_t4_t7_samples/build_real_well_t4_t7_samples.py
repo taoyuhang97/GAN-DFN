@@ -245,9 +245,9 @@ def read_well_track(file_path: Path) -> pd.DataFrame:
     header = re.split(r"\s+", lines[1].strip("#").strip())
     data = [re.split(r"\s+", line.strip()) for line in lines[2:] if line.strip()]
     df = pd.DataFrame(data, columns=header)
-    for col in ["TVD", "X", "Y"]:
+    for col in ["MD", "TVD", "X", "Y"]:
         df[col] = pd.to_numeric(df[col], errors="coerce")
-    return df[["TVD", "X", "Y"]].dropna().sort_values("TVD").reset_index(drop=True)
+    return df[["MD", "TVD", "X", "Y"]].dropna().sort_values("MD").drop_duplicates("MD").reset_index(drop=True)
 
 
 def read_timedepth_file(file_path: Path) -> pd.DataFrame:
@@ -274,21 +274,31 @@ def read_timedepth_file(file_path: Path) -> pd.DataFrame:
         else:
             renamed.append(col)
     df.columns = renamed
-    df["TVD"] = pd.to_numeric(df["TVD"], errors="coerce")
-    df["TIME"] = pd.to_numeric(df["TIME"], errors="coerce")
-    return df[["TVD", "TIME"]].dropna().sort_values("TVD").drop_duplicates("TVD").reset_index(drop=True)
+    for col in ["MD", "TVD", "TIME"]:
+        if col not in df.columns:
+            df[col] = np.nan
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+    return df[["MD", "TVD", "TIME"]].dropna(subset=["TVD", "TIME"]).sort_values("TVD").drop_duplicates("TVD").reset_index(drop=True)
 
 
-def build_time_mapper(timedepth_df: pd.DataFrame) -> interp1d:
+def build_time_mapper(timedepth_df: pd.DataFrame, depth_axis: str = "TVD") -> interp1d:
+    mapping_df = (
+        timedepth_df[[depth_axis, "TIME"]]
+        .dropna()
+        .sort_values(depth_axis)
+        .drop_duplicates(depth_axis)
+    )
+    if len(mapping_df) < 2:
+        raise ValueError(f"timedepth table needs at least two valid {depth_axis}/TIME rows")
     return interp1d(
-        timedepth_df["TVD"].to_numpy(dtype=float),
-        timedepth_df["TIME"].to_numpy(dtype=float),
+        mapping_df[depth_axis].to_numpy(dtype=float),
+        mapping_df["TIME"].to_numpy(dtype=float),
         bounds_error=False,
         fill_value="extrapolate",
     )
 
 
-def build_xy_mapper(track_df: pd.DataFrame):
+def build_xy_mapper(track_df: pd.DataFrame, depth_axis: str = "TVD"):
     if len(track_df) <= 1:
         x0 = float(track_df["X"].iloc[0])
         y0 = float(track_df["Y"].iloc[0])
@@ -303,9 +313,22 @@ def build_xy_mapper(track_df: pd.DataFrame):
 
         return fx, fy
 
-    fx = interp1d(track_df["TVD"].to_numpy(dtype=float), track_df["X"].to_numpy(dtype=float), bounds_error=False, fill_value="extrapolate")
-    fy = interp1d(track_df["TVD"].to_numpy(dtype=float), track_df["Y"].to_numpy(dtype=float), bounds_error=False, fill_value="extrapolate")
+    mapping_df = track_df[[depth_axis, "X", "Y"]].dropna().sort_values(depth_axis).drop_duplicates(depth_axis)
+    fx = interp1d(mapping_df[depth_axis].to_numpy(dtype=float), mapping_df["X"].to_numpy(dtype=float), bounds_error=False, fill_value="extrapolate")
+    fy = interp1d(mapping_df[depth_axis].to_numpy(dtype=float), mapping_df["Y"].to_numpy(dtype=float), bounds_error=False, fill_value="extrapolate")
     return fx, fy
+
+
+def build_tvd_mapper(track_df: pd.DataFrame) -> interp1d:
+    mapping_df = track_df[["MD", "TVD"]].dropna().sort_values("MD").drop_duplicates("MD")
+    if len(mapping_df) < 2:
+        raise ValueError("well-track table needs at least two valid MD/TVD rows")
+    return interp1d(
+        mapping_df["MD"].to_numpy(dtype=float),
+        mapping_df["TVD"].to_numpy(dtype=float),
+        bounds_error=False,
+        fill_value="extrapolate",
+    )
 
 
 def build_trace_grid(trace_header_csv: Path) -> pd.DataFrame:
@@ -426,24 +449,37 @@ def build_point_rows_for_well(
     time_df: pd.DataFrame,
     surface_tables,
 ) -> tuple[pd.DataFrame, dict[str, Any]]:
-    fx, fy = build_xy_mapper(track_df)
     source_kind = "vertical" if len(track_df) <= 1 else "deviated"
-    time_mapper = build_time_mapper(time_df)
+    if source_kind == "deviated":
+        tvd_mapper = build_tvd_mapper(track_df)
+        fx, fy = build_xy_mapper(track_df, depth_axis="MD")
+        time_mapper = build_time_mapper(time_df, depth_axis="MD")
+    else:
+        tvd_mapper = None
+        fx, fy = build_xy_mapper(track_df)
+        time_mapper = build_time_mapper(time_df)
 
     records = []
     for row_idx, row in las_df.iterrows():
-        tvd = float(row["TVD"]) if np.isfinite(row["TVD"]) else float(row["DEPT"])
-        time_ms = float(time_mapper(tvd))
+        md = float(row["DEPT"])
+        if source_kind == "deviated":
+            tvd = float(tvd_mapper(md))
+            time_ms = float(time_mapper(md))
+            x = float(fx(md))
+            y = float(fy(md))
+        else:
+            tvd = float(row["TVD"]) if np.isfinite(row["TVD"]) else md
+            time_ms = float(time_mapper(tvd))
+            x = float(fx(tvd))
+            y = float(fy(tvd))
         if not np.isfinite(time_ms):
             continue
-        x = float(fx(tvd))
-        y = float(fy(tvd))
         if not np.isfinite(x) or not np.isfinite(y):
             continue
         record = {
             "SampleID": f"{well_name}_{row_idx}",
             "WellName": well_name,
-            "DEPT": float(row["DEPT"]),
+            "DEPT": md,
             "TVD": tvd,
             "TIME": time_ms,
             "X": x,
@@ -816,7 +852,7 @@ def process_single_well(
         x, y = read_well_xy_from_las(las_path)
         if x is None or y is None:
             return {"WellName": well_name, "CanonicalWellName": canonical_name, "Status": "missing_xy"}
-        track_df = pd.DataFrame([{"TVD": 0.0, "X": x, "Y": y}])
+        track_df = pd.DataFrame([{"MD": 0.0, "TVD": 0.0, "X": x, "Y": y}])
 
     las_df = normalize_las_curves(read_las_ascii_block(las_path))
     las_df = thin_rows_by_stride(las_df, max_rows=max_log_rows_per_well)

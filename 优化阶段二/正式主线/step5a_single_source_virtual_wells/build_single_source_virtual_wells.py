@@ -17,8 +17,11 @@ from sklearn.neighbors import KDTree
 CURRENT_DIR = Path(__file__).resolve().parent
 REPO_ROOT = CURRENT_DIR.parents[2]
 STEP2_SCRIPT_DIR = REPO_ROOT / "优化阶段二/正式主线/step2_real_well_t4_t7_samples"
+SURFACE_TOOL_DIR = CURRENT_DIR.parent / "step1_surface_framework"
 if str(STEP2_SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(STEP2_SCRIPT_DIR))
+if str(SURFACE_TOOL_DIR) not in sys.path:
+    sys.path.insert(0, str(SURFACE_TOOL_DIR))
 
 from build_real_well_t4_t7_samples import (  # noqa: E402
     GRID_SPACING,
@@ -29,11 +32,32 @@ from build_real_well_t4_t7_samples import (  # noqa: E402
     offset_to_axis_label,
     sample_trace_at_time,
 )
+from surface_tools import load_surface_tables  # noqa: E402
 
 
-ATTRIBUTE_COLUMNS = ["SeisAmp", "Coherence", "AntTrack", "CurvatureMax", "CurvaturePos"]
+ATTRIBUTE_COLUMNS = ["SeisAmp", "Coherence", "AntTrack", "CurvatureMax"]
+PRIMARY_ATTRIBUTE = "CurvatureMax"
+DEFAULT_ATTRIBUTE_WEIGHTS = {
+    "CurvatureMax": 0.65,
+    "Coherence": 0.15,
+    "AntTrack": 0.15,
+    "SeisAmp": 0.05,
+}
 STAT_SUFFIXES = ["Mean", "Std", "Min", "Max", "ValidCount"]
-MIN_VALID_ATTRIBUTE_COUNT = 3
+VIRTUAL_TRAINING_COLUMNS = [
+    "SourceSampleID",
+    "SourceWellName",
+    "VirtualWellName",
+    "X",
+    "Y",
+    "TIME",
+    "StrataName",
+    "PresenceLabel",
+    "DensityLabel",
+    "PointConfidence",
+    "SampleWeight",
+    *ATTRIBUTE_COLUMNS,
+]
 
 
 @dataclass(frozen=True)
@@ -44,13 +68,58 @@ class VolumeContext:
     trace_at: Any
 
 
+@dataclass(frozen=True)
+class SurfaceContext:
+    code: str
+    time: np.ndarray
+    tree: KDTree
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Build formal Step 5 single-source virtual wells.")
     parser.add_argument("--config", required=True, help="Path to JSON config.")
     parser.add_argument("--max-source-wells", type=int, default=0, help="Optional smoke-test cap; 0 means all source wells.")
     parser.add_argument("--max-points-per-well", type=int, default=0, help="Optional smoke-test cap per source well; 0 means all points.")
     parser.add_argument("--progress-every", type=int, default=25, help="Print progress every N virtual wells.")
+    parser.add_argument("--output-dir", type=Path, help="Optional isolated output directory override.")
     return parser
+
+
+def resolve_step4_inputs(manifest_path: Path) -> tuple[Path, Path, dict[str, Any]]:
+    manifest = read_json(manifest_path)
+    prediction_rel = manifest.get("step5_input") or manifest.get("prediction_table")
+    points_rel = manifest.get("fracture_point_table")
+    if not prediction_rel or not points_rel:
+        raise RuntimeError("Step4 manifest must define prediction_table/step5_input and fracture_point_table")
+    prediction_csv = (manifest_path.parent / str(prediction_rel)).resolve()
+    points_csv = (manifest_path.parent / str(points_rel)).resolve()
+    if not prediction_csv.exists() or not points_csv.exists():
+        raise FileNotFoundError(f"Step4 manifest target missing: {prediction_csv} / {points_csv}")
+    return prediction_csv, points_csv, manifest
+
+
+def load_surface_contexts(layer_dir: Path) -> dict[str, SurfaceContext]:
+    surfaces = load_surface_tables(layer_dir)
+    contexts: dict[str, SurfaceContext] = {}
+    for code in ("T4", "T6", "T7"):
+        if code not in surfaces:
+            raise RuntimeError(f"missing required surface: {code}")
+        table = surfaces[code]["table"]
+        xy = table[["X", "Y"]].apply(pd.to_numeric, errors="coerce").to_numpy(dtype=float)
+        time = pd.to_numeric(table["Z"], errors="coerce").to_numpy(dtype=float)
+        valid = np.isfinite(xy).all(axis=1) & np.isfinite(time)
+        contexts[code] = SurfaceContext(code=code, time=time[valid], tree=KDTree(xy[valid]))
+    return contexts
+
+
+def query_surface_time(context: SurfaceContext, x: np.ndarray, y: np.ndarray) -> np.ndarray:
+    xy = np.column_stack([x, y]).astype(float)
+    out = np.full(len(xy), np.nan, dtype=float)
+    valid = np.isfinite(xy).all(axis=1)
+    if valid.any():
+        _, idx = context.tree.query(xy[valid], k=1)
+        out[valid] = context.time[idx[:, 0]]
+    return out
 
 
 def read_json(path: Path) -> dict[str, Any]:
@@ -286,6 +355,92 @@ def sample_attributes_for_points(
     return center_cols, context_cols, stat_cols
 
 
+def sample_center_attributes_for_points(
+    x: np.ndarray,
+    y: np.ndarray,
+    time_ms: np.ndarray,
+    trace_tree: KDTree,
+    trace_ids: np.ndarray,
+    contexts: list[VolumeContext],
+) -> dict[str, np.ndarray]:
+    query = query_trace_neighbors_batch(x, y, trace_tree, trace_ids)
+    return {
+        ctx.name: clean_attribute_array(
+            ctx.name,
+            batch_sample_neighbor_query_at_time(query, time_ms, ctx.samples, ctx.trace_at),
+        )
+        for ctx in contexts
+    }
+
+
+def robust_scale(values: np.ndarray, floor: float) -> float:
+    finite = np.asarray(values, dtype=float)
+    finite = finite[np.isfinite(finite)]
+    if finite.size == 0:
+        return float(floor)
+    median = float(np.median(finite))
+    mad = float(np.median(np.abs(finite - median)))
+    return max(1.4826 * mad, float(floor))
+
+
+def prepare_source_cache(
+    well_df: pd.DataFrame,
+    trace_tree: KDTree,
+    trace_ids: np.ndarray,
+    contexts: list[VolumeContext],
+    surfaces: dict[str, SurfaceContext],
+    scale_floors: dict[str, float],
+) -> dict[str, Any]:
+    source_x = safe_numeric(well_df["X"]).to_numpy(dtype=float)
+    source_y = safe_numeric(well_df["Y"]).to_numpy(dtype=float)
+    source_time = safe_numeric(well_df["TIME"]).to_numpy(dtype=float)
+    attrs = sample_center_attributes_for_points(
+        source_x, source_y, source_time, trace_tree, trace_ids, contexts
+    )
+    surface_times = {
+        code: query_surface_time(context, source_x, source_y)
+        for code, context in surfaces.items()
+    }
+    strata = well_df["StrataName"].astype(str).to_numpy()
+    top = np.where(strata == "沙三段", surface_times["T4"], surface_times["T6"])
+    base = np.where(strata == "沙三段", surface_times["T6"], surface_times["T7"])
+    thickness = base - top
+    relative = np.divide(
+        source_time - top,
+        thickness,
+        out=np.full(len(well_df), np.nan, dtype=float),
+        where=np.isfinite(thickness) & (thickness > 0),
+    )
+    relative[(relative < 0) | (relative > 1)] = np.nan
+    scales = {
+        attr: robust_scale(values, float(scale_floors.get(attr, 1.0e-6)))
+        for attr, values in attrs.items()
+    }
+    return {
+        "attrs": attrs,
+        "scales": scales,
+        "relative": relative,
+        "source_time": source_time,
+    }
+
+
+def remap_virtual_time(
+    strata: np.ndarray,
+    relative: np.ndarray,
+    virtual_x: np.ndarray,
+    virtual_y: np.ndarray,
+    surfaces: dict[str, SurfaceContext],
+) -> np.ndarray:
+    surface_times = {
+        code: query_surface_time(context, virtual_x, virtual_y)
+        for code, context in surfaces.items()
+    }
+    top = np.where(strata == "沙三段", surface_times["T4"], surface_times["T6"])
+    base = np.where(strata == "沙三段", surface_times["T6"], surface_times["T7"])
+    thickness = base - top
+    return top + relative * thickness
+
+
 def build_trace_axes(trace_df: pd.DataFrame) -> tuple[np.ndarray, np.ndarray]:
     x_coords = np.sort(pd.to_numeric(trace_df["X"], errors="coerce").dropna().unique())
     y_coords = np.sort(pd.to_numeric(trace_df["Y"], errors="coerce").dropna().unique())
@@ -307,6 +462,7 @@ def build_virtual_index(
     window_size: int,
     selected_wells: list[str] | None,
     max_source_wells: int,
+    exclude_source_trace: bool,
 ) -> pd.DataFrame:
     x_coords, y_coords = build_trace_axes(trace_df)
     wells = sorted(prediction_df["WellName"].dropna().unique().tolist())
@@ -327,6 +483,8 @@ def build_virtual_index(
         snapped_center_y = nearest_axis_value(y_coords, center_y)
         for dx in range(-half, half + 1):
             for dy in range(-half, half + 1):
+                if exclude_source_trace and dx == 0 and dy == 0:
+                    continue
                 offset_x = dx * GRID_SPACING
                 offset_y = dy * GRID_SPACING
                 virtual_anchor_x = nearest_axis_value(x_coords, snapped_center_x + offset_x)
@@ -347,173 +505,10 @@ def build_virtual_index(
                         "OffsetX": actual_offset_x,
                         "OffsetY": actual_offset_y,
                         "DistanceToSource": distance,
-                        "IsSourceTrace": int(dx == 0 and dy == 0),
+                        "IsCenterVirtualTrace": int(dx == 0 and dy == 0),
                     }
                 )
     return pd.DataFrame(rows)
-
-
-def sample_attributes_for_point(
-    x: float,
-    y: float,
-    time_ms: float,
-    trace_tree: KDTree,
-    trace_ids: np.ndarray,
-    contexts: list[VolumeContext],
-) -> tuple[dict[str, float], dict[str, float]]:
-    center: dict[str, float] = {}
-    stats: dict[str, float] = {}
-    neighbor_queries: dict[tuple[float, float], tuple[np.ndarray, np.ndarray] | None] = {}
-    for dx in NEIGHBOR_OFFSETS:
-        for dy in NEIGHBOR_OFFSETS:
-            neighbor_queries[(float(dx), float(dy))] = query_trace_neighbors(
-                x=x + float(dx),
-                y=y + float(dy),
-                trace_tree=trace_tree,
-                trace_ids=trace_ids,
-            )
-    for ctx in contexts:
-        center_val = sample_neighbor_query_at_time(
-            neighbor_query=neighbor_queries[(0.0, 0.0)],
-            time_ms=time_ms,
-            samples=ctx.samples,
-            trace_at=ctx.trace_at,
-        )
-        center_val = clean_attribute_value(ctx.name, center_val)
-        center[ctx.name] = center_val
-        vals: list[float] = []
-        for dx in NEIGHBOR_OFFSETS:
-            for dy in NEIGHBOR_OFFSETS:
-                attr_val = sample_neighbor_query_at_time(
-                    neighbor_query=neighbor_queries[(float(dx), float(dy))],
-                    time_ms=time_ms,
-                    samples=ctx.samples,
-                    trace_at=ctx.trace_at,
-                )
-                attr_val = clean_attribute_value(ctx.name, attr_val)
-                center[f"{ctx.name}_{offset_to_axis_label(dx, 'x')}_{offset_to_axis_label(dy, 'y')}"] = attr_val
-                if np.isfinite(attr_val):
-                    vals.append(float(attr_val))
-        arr = np.asarray(vals, dtype=float)
-        stats[f"{ctx.name}Mean"] = float(arr.mean()) if len(arr) else np.nan
-        stats[f"{ctx.name}Std"] = float(arr.std(ddof=0)) if len(arr) else np.nan
-        stats[f"{ctx.name}Min"] = float(arr.min()) if len(arr) else np.nan
-        stats[f"{ctx.name}Max"] = float(arr.max()) if len(arr) else np.nan
-        stats[f"{ctx.name}ValidCount"] = int(len(arr))
-    return center, stats
-
-
-def normalized_similarity(source_val: float, virtual_val: float) -> float:
-    if not np.isfinite(source_val) or not np.isfinite(virtual_val):
-        return np.nan
-    denom = max(abs(float(source_val)), abs(float(virtual_val)), 1.0)
-    return float(np.clip(1.0 - abs(float(source_val) - float(virtual_val)) / denom, 0.0, 1.0))
-
-
-def attribute_continuity(source_row: pd.Series, virtual_center: dict[str, float]) -> tuple[float, int]:
-    scores: list[float] = []
-    for attr in ATTRIBUTE_COLUMNS:
-        if attr not in source_row or attr not in virtual_center:
-            continue
-        score = normalized_similarity(float(source_row[attr]), float(virtual_center[attr]))
-        if np.isfinite(score):
-            scores.append(score)
-    if not scores:
-        return 0.0, 0
-    return float(np.mean(scores)), int(len(scores))
-
-
-def build_virtual_samples(
-    prediction_df: pd.DataFrame,
-    index_df: pd.DataFrame,
-    trace_df: pd.DataFrame,
-    volume_paths: dict[str, str],
-    max_points_per_well: int,
-    min_continuity_for_density: float,
-    confidence_distance_scale: float,
-    min_confidence: float,
-) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-    trace_tree, trace_ids = build_trace_tree(trace_df)
-    contexts = [open_volume_context(name, Path(path)) for name, path in volume_paths.items()]
-    attr_rows: list[dict[str, Any]] = []
-    density_rows: list[dict[str, Any]] = []
-    confidence_rows: list[dict[str, Any]] = []
-    context_rows: list[dict[str, Any]] = []
-
-    try:
-        for item in index_df.to_dict(orient="records"):
-            source_well = item["SourceWellName"]
-            well_df = prediction_df[prediction_df["WellName"] == source_well].copy()
-            if max_points_per_well > 0 and len(well_df) > max_points_per_well:
-                idx = np.linspace(0, len(well_df) - 1, max_points_per_well, dtype=int)
-                well_df = well_df.iloc[idx].copy()
-            for row in well_df.itertuples(index=False):
-                source_row = pd.Series(row._asdict())
-                virtual_x = float(source_row["X"]) + float(item["OffsetX"])
-                virtual_y = float(source_row["Y"]) + float(item["OffsetY"])
-                time_ms = float(source_row["TIME"])
-                center, stats = sample_attributes_for_point(
-                    x=virtual_x,
-                    y=virtual_y,
-                    time_ms=time_ms,
-                    trace_tree=trace_tree,
-                    trace_ids=trace_ids,
-                    contexts=contexts,
-                )
-                continuity, valid_count = attribute_continuity(source_row, center)
-                source_density = float(source_row["Density"]) if np.isfinite(float(source_row["Density"])) else np.nan
-                if np.isfinite(source_density) and valid_count >= MIN_VALID_ATTRIBUTE_COUNT and continuity >= min_continuity_for_density:
-                    density = max(source_density * continuity, 0.0)
-                    density_status = "single_source_attribute_continuity"
-                else:
-                    density = 0.0
-                    density_status = "attribute_continuity_below_threshold_or_invalid_source"
-                distance_weight = math.exp(-float(item["DistanceToSource"]) / max(confidence_distance_scale, 1e-6))
-                point_confidence = float(np.clip(max(min_confidence, distance_weight) * max(continuity, 0.0), 0.0, 1.0))
-                sample_id = f"{item['VirtualWellName']}_{source_row['SampleID']}"
-                common = {
-                    "SampleID": sample_id,
-                    "SourceSampleID": source_row["SampleID"],
-                    "SourceWellName": source_well,
-                    "VirtualWellName": item["VirtualWellName"],
-                    "X": virtual_x,
-                    "Y": virtual_y,
-                    "TIME": time_ms,
-                    "TVD": source_row.get("TVD", np.nan),
-                    "DEPT": source_row.get("DEPT", np.nan),
-                    "StrataName": source_row.get("StrataName", pd.NA),
-                    "DistanceToSource": float(item["DistanceToSource"]),
-                    "AttributeContinuity": continuity,
-                    "ValidContinuityAttributeCount": valid_count,
-                }
-                attr_rows.append({**common, **{k: v for k, v in center.items() if k in ATTRIBUTE_COLUMNS}, **stats})
-                context_rows.append({**common, **center})
-                density_rows.append(
-                    {
-                        **common,
-                        "SourceDensity": source_density,
-                        "Density": density,
-                        "HasFracture": int(density > 0.0),
-                        "DensitySourceLogic": density_status,
-                    }
-                )
-                confidence_rows.append(
-                    {
-                        **common,
-                        "DistanceConfidenceWeight": distance_weight,
-                        "PointConfidence": point_confidence,
-                        "ConfidenceLogic": "distance_controls_confidence_only_attribute_continuity_controls_density",
-                    }
-                )
-    finally:
-        close_contexts(contexts)
-
-    return (
-        pd.DataFrame(attr_rows),
-        pd.DataFrame(context_rows),
-        pd.DataFrame(density_rows),
-        pd.DataFrame(confidence_rows),
-    )
 
 
 def build_virtual_samples_for_item(
@@ -522,22 +517,39 @@ def build_virtual_samples_for_item(
     trace_tree: KDTree,
     trace_ids: np.ndarray,
     contexts: list[VolumeContext],
+    surfaces: dict[str, SurfaceContext],
+    source_cache: dict[str, Any],
     max_points_per_well: int,
-    min_continuity_for_density: float,
+    attribute_weights: dict[str, float],
+    primary_min_similarity: float,
+    min_support_attribute_count: int,
+    similarity_scale_multiplier: float,
+    max_virtual_time_shift_ms: float,
     confidence_distance_scale: float,
-    min_confidence: float,
+    min_label_confidence: float,
+    virtual_weight_divisor: float,
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     source_well = item["SourceWellName"]
     well_df = prediction_df[prediction_df["WellName"] == source_well].copy()
+    cache = source_cache
     if max_points_per_well > 0 and len(well_df) > max_points_per_well:
         idx = np.linspace(0, len(well_df) - 1, max_points_per_well, dtype=int)
         well_df = well_df.iloc[idx].copy()
+        cache = {
+            **source_cache,
+            "attrs": {key: np.asarray(value)[idx] for key, value in source_cache["attrs"].items()},
+            "relative": np.asarray(source_cache["relative"])[idx],
+            "source_time": np.asarray(source_cache["source_time"])[idx],
+        }
     if well_df.empty:
         return pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
 
     virtual_x = safe_numeric(well_df["X"]).to_numpy(dtype=np.float64) + float(item["OffsetX"])
     virtual_y = safe_numeric(well_df["Y"]).to_numpy(dtype=np.float64) + float(item["OffsetY"])
-    time_ms = safe_numeric(well_df["TIME"]).to_numpy(dtype=np.float64)
+    source_time = np.asarray(cache["source_time"], dtype=float)
+    relative_time = np.asarray(cache["relative"], dtype=float)
+    strata = well_df["StrataName"].astype(str).to_numpy()
+    time_ms = remap_virtual_time(strata, relative_time, virtual_x, virtual_y, surfaces)
     center_cols, context_cols, stat_cols = sample_attributes_for_points(
         x=virtual_x,
         y=virtual_y,
@@ -548,35 +560,63 @@ def build_virtual_samples_for_item(
     )
 
     score_sum = np.zeros(len(well_df), dtype=np.float64)
+    score_weight = np.zeros(len(well_df), dtype=np.float64)
     score_count = np.zeros(len(well_df), dtype=np.int64)
+    primary_similarity = np.full(len(well_df), np.nan, dtype=float)
     for attr in ATTRIBUTE_COLUMNS:
-        if attr not in well_df.columns or attr not in center_cols:
+        if attr not in cache["attrs"] or attr not in center_cols:
             continue
-        source_vals = safe_numeric(well_df[attr]).to_numpy(dtype=np.float64)
+        source_vals = np.asarray(cache["attrs"][attr], dtype=float)
         virtual_vals = center_cols[attr]
         valid = np.isfinite(source_vals) & np.isfinite(virtual_vals)
         if not valid.any():
             continue
-        denom = np.maximum.reduce([np.abs(source_vals[valid]), np.abs(virtual_vals[valid]), np.ones(int(valid.sum()), dtype=np.float64)])
-        scores = np.clip(1.0 - np.abs(source_vals[valid] - virtual_vals[valid]) / denom, 0.0, 1.0)
-        score_sum[valid] += scores
+        scale = max(
+            float(cache["scales"].get(attr, 1.0e-6)) * float(similarity_scale_multiplier),
+            1.0e-9,
+        )
+        scores = np.exp(-np.abs(source_vals[valid] - virtual_vals[valid]) / scale)
+        weight = float(attribute_weights.get(attr, 0.0))
+        score_sum[valid] += weight * scores
+        score_weight[valid] += weight
         score_count[valid] += 1
-    continuity = np.divide(score_sum, score_count, out=np.zeros(len(well_df), dtype=np.float64), where=score_count > 0)
+        if attr == PRIMARY_ATTRIBUTE:
+            primary_similarity[valid] = scores
+    continuity = np.divide(
+        score_sum,
+        score_weight,
+        out=np.full(len(well_df), np.nan, dtype=np.float64),
+        where=score_weight > 0,
+    )
 
     source_density = safe_numeric(well_df["Density"]).to_numpy(dtype=np.float64)
-    density_mask = (
-        np.isfinite(source_density)
-        & (score_count >= MIN_VALID_ATTRIBUTE_COUNT)
-        & (continuity >= float(min_continuity_for_density))
-    )
-    density = np.where(density_mask, np.maximum(source_density * continuity, 0.0), 0.0)
-    density_status = np.where(
-        density_mask,
-        "single_source_attribute_continuity",
-        "attribute_continuity_below_threshold_or_invalid_source",
-    )
+    source_presence = safe_numeric(well_df["HasFracture"]).to_numpy(dtype=float)
+    time_shift = time_ms - source_time
+    support_count = score_count - np.isfinite(primary_similarity).astype(int)
     distance_weight = math.exp(-float(item["DistanceToSource"]) / max(confidence_distance_scale, 1e-6))
-    point_confidence = np.clip(max(min_confidence, distance_weight) * np.maximum(continuity, 0.0), 0.0, 1.0)
+    label_confidence = distance_weight * np.nan_to_num(continuity, nan=0.0)
+    label_mask = (
+        np.isfinite(source_density)
+        & np.isfinite(source_presence)
+        & np.isfinite(relative_time)
+        & np.isfinite(time_ms)
+        & np.isfinite(primary_similarity)
+        & (primary_similarity >= float(primary_min_similarity))
+        & (support_count >= int(min_support_attribute_count))
+        & (np.abs(time_shift) <= float(max_virtual_time_shift_ms))
+        & (label_confidence >= float(min_label_confidence))
+    )
+    presence_label = np.where(label_mask, (source_presence > 0).astype(float), np.nan)
+    positive_mask = label_mask & (source_presence > 0)
+    density_label = np.where(positive_mask, np.maximum(source_density * continuity, 0.0), np.nan)
+    density = np.where(label_mask & (source_presence <= 0), 0.0, density_label)
+    density_status = np.where(label_mask, "curvature_led_transfer", "unlabelled_low_confidence")
+    point_confidence = np.where(label_mask, np.clip(label_confidence, 0.0, 1.0), np.nan)
+    sample_weight = np.where(
+        label_mask,
+        np.clip(label_confidence, 0.0, 1.0) / max(float(virtual_weight_divisor), 1.0),
+        np.nan,
+    )
     sample_ids = [f"{item['VirtualWellName']}_{sample_id}" for sample_id in well_df["SampleID"].astype(str).tolist()]
 
     common = {
@@ -587,11 +627,16 @@ def build_virtual_samples_for_item(
         "X": virtual_x,
         "Y": virtual_y,
         "TIME": time_ms,
+        "SourceTIME": source_time,
+        "VirtualTIME": time_ms,
+        "TimeShiftMs": time_shift,
+        "RelativeTimeInLayer": relative_time,
         "TVD": safe_numeric(well_df["TVD"]).to_numpy(dtype=np.float64) if "TVD" in well_df.columns else np.full(len(well_df), np.nan),
         "DEPT": safe_numeric(well_df["DEPT"]).to_numpy(dtype=np.float64) if "DEPT" in well_df.columns else np.full(len(well_df), np.nan),
         "StrataName": well_df["StrataName"].to_numpy() if "StrataName" in well_df.columns else np.full(len(well_df), pd.NA, dtype=object),
         "DistanceToSource": np.full(len(well_df), float(item["DistanceToSource"]), dtype=np.float64),
         "AttributeContinuity": continuity,
+        "PrimaryCurvatureSimilarity": primary_similarity,
         "ValidContinuityAttributeCount": score_count,
     }
 
@@ -602,7 +647,10 @@ def build_virtual_samples_for_item(
             **common,
             "SourceDensity": source_density,
             "Density": density,
-            "HasFracture": (density > 0.0).astype(int),
+            "DensityLabel": density_label,
+            "PresenceLabel": presence_label,
+            "HasFracture": presence_label,
+            "LabelStatus": density_status,
             "DensitySourceLogic": density_status,
         }
     )
@@ -611,9 +659,11 @@ def build_virtual_samples_for_item(
             **common,
             "DistanceConfidenceWeight": np.full(len(well_df), distance_weight, dtype=np.float64),
             "PointConfidence": point_confidence,
+            "LabelConfidence": point_confidence,
+            "SampleWeight": sample_weight,
             "ConfidenceLogic": np.full(
                 len(well_df),
-                "distance_controls_confidence_only_attribute_continuity_controls_density",
+                "curvature_required_weighted_attribute_transfer",
                 dtype=object,
             ),
         }
@@ -625,14 +675,19 @@ def build_virtual_samples_for_item(
 def build_training_package(attr_df: pd.DataFrame, density_df: pd.DataFrame, confidence_df: pd.DataFrame) -> pd.DataFrame:
     if density_df.empty:
         return pd.DataFrame()
-    merge_keys = ["SampleID", "SourceSampleID", "SourceWellName", "VirtualWellName", "X", "Y", "TIME", "TVD", "DEPT", "StrataName", "DistanceToSource", "AttributeContinuity", "ValidContinuityAttributeCount"]
-    out = density_df.merge(
-        confidence_df[[col for col in [*merge_keys, "DistanceConfidenceWeight", "PointConfidence", "ConfidenceLogic"] if col in confidence_df.columns]],
-        on=[col for col in merge_keys if col in density_df.columns and col in confidence_df.columns],
-        how="left",
-    )
-    attr_keep = [col for col in [*merge_keys, *ATTRIBUTE_COLUMNS, *[f"{a}{s}" for a in ATTRIBUTE_COLUMNS for s in STAT_SUFFIXES]] if col in attr_df.columns]
-    out = out.merge(attr_df[attr_keep], on=[col for col in merge_keys if col in out.columns and col in attr_df.columns], how="left")
+    # These frames are produced from one source array in the same order.  An
+    # index-aligned join avoids floating-point coordinate merge keys and keeps
+    # duplicate sample IDs impossible to introduce accidentally.
+    out = density_df.reset_index(drop=True).copy()
+    for frame in (confidence_df, attr_df):
+        extra = frame.reset_index(drop=True).drop(columns=[c for c in out.columns if c in frame.columns], errors="ignore")
+        out = pd.concat([out, extra], axis=1)
+    training_mask = out["LabelStatus"].eq("curvature_led_transfer") & out["PresenceLabel"].notna()
+    out = out.loc[training_mask].copy()
+    missing = [column for column in VIRTUAL_TRAINING_COLUMNS if column not in out.columns]
+    if missing:
+        raise RuntimeError(f"compact virtual training contract missing columns: {missing}")
+    out = out[VIRTUAL_TRAINING_COLUMNS]
     out = out.sort_values(["SourceWellName", "VirtualWellName", "TIME"]).reset_index(drop=True)
     return out
 
@@ -645,11 +700,10 @@ def write_summary(training_df: pd.DataFrame, output_csv: Path) -> None:
         training_df.groupby(["SourceWellName", "VirtualWellName"], as_index=False)
         .agg(
             NumSamples=("TIME", "size"),
-            NumFractureSamples=("HasFracture", "sum"),
-            MeanDensity=("Density", "mean"),
-            MaxDensity=("Density", "max"),
+            NumFractureSamples=("PresenceLabel", "sum"),
+            MeanPositiveDensity=("DensityLabel", "mean"),
+            MaxPositiveDensity=("DensityLabel", "max"),
             MeanPointConfidence=("PointConfidence", "mean"),
-            MeanAttributeContinuity=("AttributeContinuity", "mean"),
             UniqueSourceWellCount=("SourceWellName", "nunique"),
         )
     )
@@ -670,11 +724,10 @@ def summarize_training_chunk(training_df: pd.DataFrame) -> pd.DataFrame:
         training_df.groupby(["SourceWellName", "VirtualWellName"], as_index=False)
         .agg(
             NumSamples=("TIME", "size"),
-            NumFractureSamples=("HasFracture", "sum"),
-            MeanDensity=("Density", "mean"),
-            MaxDensity=("Density", "max"),
+            NumFractureSamples=("PresenceLabel", "sum"),
+            MeanPositiveDensity=("DensityLabel", "mean"),
+            MaxPositiveDensity=("DensityLabel", "max"),
             MeanPointConfidence=("PointConfidence", "mean"),
-            MeanAttributeContinuity=("AttributeContinuity", "mean"),
             UniqueSourceWellCount=("SourceWellName", "nunique"),
         )
     )
@@ -690,17 +743,27 @@ def finalize_tmp_outputs(tmp_paths: dict[str, Path], final_paths: dict[str, Path
 def main() -> int:
     args = build_parser().parse_args()
     config = read_json(Path(args.config))
-    output_dir = Path(config["output_dir"])
+    output_dir = args.output_dir or Path(config["output_dir"])
     ensure_dir(output_dir)
 
-    prediction_csv = Path(config["real_well_prediction_csv"])
+    manifest_path = Path(config["step4_manifest"]).resolve()
+    prediction_csv, _points_csv, manifest = resolve_step4_inputs(manifest_path)
     trace_header_csv = Path(config["trace_header_csv"])
     prediction_df = pd.read_csv(prediction_csv)
-    required_prediction_cols = {"SampleID", "WellName", "X", "Y", "TIME", "Density"}
+    required_prediction_cols = {
+        "SampleID", "WellName", "X", "Y", "TIME", "TVD", "DEPT", "StrataName",
+        "Density", "HasFracture", "PredictionValid",
+    }
     missing = sorted(required_prediction_cols - set(prediction_df.columns))
     if missing:
         raise RuntimeError(f"Step 4 prediction csv missing required columns: {missing}")
-    prediction_df = prediction_df[prediction_df["Density"].notna()].copy()
+    prediction_df = prediction_df[
+        prediction_df["PredictionValid"].eq(1)
+        & prediction_df["Density"].notna()
+        & prediction_df["HasFracture"].notna()
+    ].copy()
+    if prediction_df.duplicated(["WellName", "DEPT"]).any():
+        raise RuntimeError("Step5 requires the Step4 merged table: duplicate WellName+DEPT rows found")
     selected_wells = config.get("selected_wells")
     trace_df = build_trace_grid(trace_header_csv)
 
@@ -710,6 +773,7 @@ def main() -> int:
         window_size=int(config.get("virtual_grid_window_size", 5)),
         selected_wells=selected_wells,
         max_source_wells=args.max_source_wells,
+        exclude_source_trace=bool(config.get("exclude_source_trace", False)),
     )
     final_paths = {
         "index": output_dir / "virtual_well_index.csv",
@@ -726,6 +790,15 @@ def main() -> int:
 
     trace_tree, trace_ids = build_trace_tree(trace_df)
     contexts = [open_volume_context(name, Path(path)) for name, path in dict(config["volume_paths"]).items()]
+    surfaces = load_surface_contexts(Path(config["layer_dir"]))
+    source_caches = {
+        well: prepare_source_cache(
+            prediction_df[prediction_df["WellName"] == well].reset_index(drop=True),
+            trace_tree, trace_ids, contexts, surfaces,
+            dict(config.get("similarity_scale_floors", {})),
+        )
+        for well in index_df["SourceWellName"].drop_duplicates().tolist()
+    }
     write_headers = {
         "attributes": True,
         "context": True,
@@ -741,6 +814,12 @@ def main() -> int:
     continuity_sum = 0.0
     continuity_count = 0
     attribute_non_null_counts = {attr: 0 for attr in ATTRIBUTE_COLUMNS}
+    candidate_sample_count = 0
+    accepted_positive_count = 0
+    accepted_negative_count = 0
+    unknown_sample_count = 0
+    time_shift_rejection_count = 0
+    curvature_rejection_count = 0
     progress_every = max(int(args.progress_every), 1)
 
     try:
@@ -751,12 +830,27 @@ def main() -> int:
                 trace_tree=trace_tree,
                 trace_ids=trace_ids,
                 contexts=contexts,
+                surfaces=surfaces,
+                source_cache=source_caches[item["SourceWellName"]],
                 max_points_per_well=args.max_points_per_well,
-                min_continuity_for_density=float(config.get("min_continuity_for_density", 0.35)),
+                attribute_weights=dict(config.get("attribute_weights", DEFAULT_ATTRIBUTE_WEIGHTS)),
+                primary_min_similarity=float(config.get("primary_curvature_min_similarity", 0.5)),
+                min_support_attribute_count=int(config.get("min_support_attribute_count", 2)),
+                similarity_scale_multiplier=float(config.get("similarity_scale_multiplier", 2.0)),
+                max_virtual_time_shift_ms=float(config.get("max_virtual_time_shift_ms", 30.0)),
                 confidence_distance_scale=float(config.get("confidence_distance_scale", 75.0)),
-                min_confidence=float(config.get("min_confidence", 0.05)),
+                min_label_confidence=float(config.get("min_label_confidence", 0.2)),
+                virtual_weight_divisor=float(config.get("virtual_weight_divisor", 25.0)),
             )
             training_df = build_training_package(attr_df=attr_df, density_df=density_df, confidence_df=confidence_df)
+            candidate_sample_count += int(len(density_df))
+            unknown_sample_count += int(density_df["PresenceLabel"].isna().sum())
+            accepted_positive_count += int(pd.to_numeric(training_df.get("PresenceLabel"), errors="coerce").eq(1).sum())
+            accepted_negative_count += int(pd.to_numeric(training_df.get("PresenceLabel"), errors="coerce").eq(0).sum())
+            shifts = pd.to_numeric(density_df.get("TimeShiftMs"), errors="coerce")
+            time_shift_rejection_count += int((shifts.isna() | shifts.abs().gt(float(config.get("max_virtual_time_shift_ms", 30.0)))).sum())
+            primary = pd.to_numeric(density_df.get("PrimaryCurvatureSimilarity"), errors="coerce")
+            curvature_rejection_count += int((primary.isna() | primary.lt(float(config.get("primary_curvature_min_similarity", 0.5)))).sum())
             for key, frame in [
                 ("attributes", attr_df),
                 ("context", context_df),
@@ -764,8 +858,9 @@ def main() -> int:
                 ("confidence", confidence_df),
                 ("training", training_df),
             ]:
-                append_csv_chunk(frame, tmp_paths[key], write_headers[key])
-                write_headers[key] = False
+                if not frame.empty and (bool(config.get("write_intermediate_tables", False)) or key == "training"):
+                    append_csv_chunk(frame, tmp_paths[key], write_headers[key])
+                    write_headers[key] = False
 
             summary_chunk = summarize_training_chunk(training_df)
             if not summary_chunk.empty:
@@ -802,15 +897,23 @@ def main() -> int:
         pd.DataFrame().to_csv(tmp_paths["summary"], index=False, encoding="utf-8-sig")
 
     audit = {
+        "step4_manifest": str(manifest_path),
+        "step4_manifest_version": manifest.get("version"),
         "real_well_prediction_csv": str(prediction_csv),
         "trace_header_csv": str(trace_header_csv),
         "virtual_grid_window_size": int(config.get("virtual_grid_window_size", 5)),
-        "density_logic": "single_source_attribute_continuity",
+        "density_logic": "curvature_led_transfer_with_presence_and_conditional_density_labels",
         "distance_role": "candidate_range_and_confidence_only",
         "source_mixing": "forbidden",
         "candidate_virtual_well_count": int(index_df["VirtualWellName"].nunique()) if not index_df.empty else 0,
         "source_well_count": int(index_df["SourceWellName"].nunique()) if not index_df.empty else 0,
         "training_sample_count": int(training_sample_count),
+        "candidate_sample_count": int(candidate_sample_count),
+        "accepted_positive_count": int(accepted_positive_count),
+        "accepted_negative_count": int(accepted_negative_count),
+        "unknown_rejected_count": int(unknown_sample_count),
+        "time_shift_rejection_count": int(time_shift_rejection_count),
+        "curvature_rejection_count": int(curvature_rejection_count),
         "max_source_wells": int(args.max_source_wells),
         "max_points_per_well": int(args.max_points_per_well),
         "output_write_mode": "streaming_tmp_then_replace",
@@ -818,12 +921,20 @@ def main() -> int:
         "mean_point_confidence": float(point_confidence_sum / point_confidence_count) if point_confidence_count else None,
         "mean_attribute_continuity": float(continuity_sum / continuity_count) if continuity_count else None,
         "attribute_non_null_counts": attribute_non_null_counts,
+        "primary_attribute": PRIMARY_ATTRIBUTE,
+        "curvature_pos_formal": False,
     }
     tmp_paths["audit"].write_text(
         json.dumps(audit, ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
-    finalize_tmp_outputs(tmp_paths, final_paths)
+    publish_keys = ["index", "training", "summary", "audit"]
+    if bool(config.get("write_intermediate_tables", False)):
+        publish_keys.extend(["attributes", "context", "density", "confidence"])
+    finalize_tmp_outputs(
+        {key: tmp_paths[key] for key in publish_keys},
+        {key: final_paths[key] for key in publish_keys},
+    )
     return 0
 
 

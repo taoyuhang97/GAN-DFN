@@ -7,6 +7,8 @@ import pandas as pd
 
 from build_formal_rebuild_groups import (
     CONTEXT_COLUMNS,
+    GR_RESISTIVITY_PAIR_COLUMNS,
+    GR_RESISTIVITY_TABLE_COLUMNS,
     GROUP_COLUMNS,
     INNER_SEGMENTS,
     MANUAL_STRATA,
@@ -15,6 +17,8 @@ from build_formal_rebuild_groups import (
     STEP2_MAIN_COLUMNS,
     STEP2_OUTER_ROOT,
     STEP3_OUTPUT_ROOT,
+    gr_resistivity_path,
+    group_gr_resistivity_coverage,
 )
 
 
@@ -118,12 +122,73 @@ def validate_step2_like_contract() -> tuple[pd.DataFrame, list[str]]:
     return pd.DataFrame(rows), errors
 
 
+def base_main_path(well_segment: str) -> Path:
+    if well_segment in INNER_SEGMENTS:
+        return Path(INNER_SEGMENTS[well_segment]["main"])
+    return STEP2_OUTER_ROOT / well_segment / f"{well_segment}_t4_t7_real_well_main.csv"
+
+
+def validate_gr_resistivity_contract(groups_dir: Path) -> tuple[pd.DataFrame, list[str]]:
+    rows: list[dict[str, object]] = []
+    errors: list[str] = []
+    manifest_path = STEP3_OUTPUT_ROOT / "sample_group_manifest.csv"
+    manifest = pd.read_csv(manifest_path) if manifest_path.exists() else pd.DataFrame()
+    for well_segment, strata_name, _, _ in MANUAL_STRATA:
+        group_id = f"{well_segment}_{strata_name}"
+        group_path = groups_dir / f"{group_id}.csv"
+        main_path = base_main_path(well_segment)
+        enrichment_path = gr_resistivity_path(well_segment)
+        if not group_path.exists() or not main_path.exists() or not enrichment_path.exists():
+            errors.append(f"missing GR/resistivity contract input: {group_id}")
+            rows.append({"GroupID": group_id, "Status": "missing"})
+            continue
+        group_df = pd.read_csv(group_path)
+        main_df = pd.read_csv(main_path, usecols=["DEPT"])
+        enrichment = pd.read_csv(enrichment_path)
+        schema_ok = enrichment.columns.tolist() == GR_RESISTIVITY_TABLE_COLUMNS
+        depth_ok = len(main_df) == len(enrichment) and pd.to_numeric(main_df["DEPT"], errors="coerce").equals(
+            pd.to_numeric(enrichment["DEPT"], errors="coerce")
+        )
+        triple_ok = True
+        for columns in GR_RESISTIVITY_PAIR_COLUMNS.values():
+            count = enrichment[columns].notna().sum(axis=1) if set(columns).issubset(enrichment.columns) else pd.Series([-1])
+            triple_ok = triple_ok and count.isin([0, len(columns)]).all()
+        joined = group_df[["DEPT"]].merge(enrichment[["DEPT"]], on="DEPT", how="left", indicator=True)
+        group_depth_ok = joined["_merge"].eq("both").all()
+        actual = group_gr_resistivity_coverage(group_df, enrichment)
+        manifest_row = manifest[manifest["GroupID"].astype(str).eq(group_id)] if "GroupID" in manifest else pd.DataFrame()
+        manifest_ok = len(manifest_row) == 1 and all(
+            int(manifest_row.iloc[0][column]) == int(value) for column, value in actual.items() if column in manifest_row.columns
+        ) and all(column in manifest_row.columns for column in actual)
+        checks = [schema_ok, depth_ok, triple_ok, group_depth_ok, manifest_ok]
+        row = {
+            "GroupID": group_id,
+            "WellSegment": well_segment,
+            "StrataName": strata_name,
+            "MainPath": str(main_path),
+            "GRResistivityPath": str(enrichment_path),
+            "Status": "pass" if all(checks) else "fail",
+            "SchemaOK": bool_status(schema_ok),
+            "MainDepthContractOK": bool_status(depth_ok),
+            "TripleCompletenessOK": bool_status(triple_ok),
+            "GroupDepthLookupOK": bool_status(group_depth_ok),
+            "ManifestCountsOK": bool_status(manifest_ok),
+            **actual,
+        }
+        rows.append(row)
+        if row["Status"] != "pass":
+            errors.append(f"GR/resistivity validation failed: {group_id}")
+    return pd.DataFrame(rows), errors
+
+
 def write_contract_columns(output_root: Path) -> None:
     rows = []
     for idx, column in enumerate(STEP2_MAIN_COLUMNS):
         rows.append({"TableKind": "step2_like_main", "Order": idx + 1, "Column": column})
     for idx, column in enumerate(CONTEXT_COLUMNS):
         rows.append({"TableKind": "step2_like_3x3_context", "Order": idx + 1, "Column": column})
+    for idx, column in enumerate(GR_RESISTIVITY_TABLE_COLUMNS):
+        rows.append({"TableKind": "step2_gr_resistivity", "Order": idx + 1, "Column": column})
     for idx, column in enumerate(GROUP_COLUMNS):
         rows.append({"TableKind": "step3_group_csv", "Order": idx + 1, "Column": column})
     pd.DataFrame(rows).to_csv(output_root / "formal_data_contract_columns.csv", index=False, encoding="utf-8-sig")
@@ -136,20 +201,23 @@ def main() -> int:
 
     group_qc, group_errors = validate_group_files(groups_dir)
     outer_qc, outer_errors = validate_step2_like_contract()
+    gr_resistivity_qc, gr_resistivity_errors = validate_gr_resistivity_contract(groups_dir)
     write_contract_columns(output_root)
 
     group_qc.to_csv(output_root / "delivery_group_qc.csv", index=False, encoding="utf-8-sig")
     outer_qc.to_csv(output_root / "delivery_outer_step2_contract_qc.csv", index=False, encoding="utf-8-sig")
+    gr_resistivity_qc.to_csv(output_root / "delivery_gr_resistivity_qc.csv", index=False, encoding="utf-8-sig")
 
     formal_rebuild_files = sorted(path.name for path in output_root.glob("*.csv"))
     summary = {
-        "status": "pass" if not group_errors and not outer_errors else "fail",
+        "status": "pass" if not group_errors and not outer_errors and not gr_resistivity_errors else "fail",
         "expected_group_count": len(EXPECTED_GROUP_IDS),
         "actual_group_count": int(sum((groups_dir / f"{group_id}.csv").exists() for group_id in EXPECTED_GROUP_IDS)),
         "outer_step2_like_well_count": len(OUTER_SEGMENTS),
         "inner_formal_step2_wells": sorted(INNER_SEGMENTS.keys()),
         "group_errors": group_errors,
         "outer_step2_contract_errors": outer_errors,
+        "gr_resistivity_errors": gr_resistivity_errors,
         "forbidden_group_columns": sorted(FORBIDDEN_GROUP_COLUMNS),
         "formal_rebuild_top_level_csvs": formal_rebuild_files,
         "no_redundant_total_training_table": "imaging_supervision_main.csv" not in formal_rebuild_files,

@@ -3,6 +3,7 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass
 from pathlib import Path
+import sys
 from typing import Iterable
 
 import numpy as np
@@ -14,8 +15,14 @@ DATA_ROOT = Path("/data/shared/project-oil/wx数据/砂砾岩")
 
 STEP2_FORMAL_ROOT = REPO_ROOT / "优化阶段二/正式主线/step2_real_well_t4_t7_samples/output/formal_all_wells"
 STEP2_OUTER_ROOT = REPO_ROOT / "优化阶段二/正式主线/step2_real_well_t4_t7_samples/output/formal_imaging_outer_wells"
+STEP2_SCRIPT_ROOT = REPO_ROOT / "优化阶段二/正式主线/step2_real_well_t4_t7_samples"
 STEP3_OUTPUT_ROOT = Path(__file__).resolve().parent / "output/formal_rebuild"
 GROUP_OUTPUT_ROOT = STEP3_OUTPUT_ROOT / "groups"
+if str(STEP2_SCRIPT_ROOT) not in sys.path:
+    sys.path.insert(0, str(STEP2_SCRIPT_ROOT))
+
+from build_gr_resistivity_samples import OUTPUT_COLUMNS as GR_RESISTIVITY_TABLE_COLUMNS  # noqa: E402
+from build_gr_resistivity_samples import run_enrichment  # noqa: E402
 
 AROUND_DIR = DATA_ROOT / "研究内容一/成像测井/测井-地震时窗"
 AROUND_REBUILD_DIR = DATA_ROOT / "优化阶段一/研究内容一/成像测井/测井-地震时窗"
@@ -29,6 +36,11 @@ INVALID_SENTINELS = (-999.25, -9999.0, -99999.0, 9999.0, 99999.0)
 STANDARD_LOG_COLUMNS = ["AC", "CAL", "CNL", "DEN", "GR", "RFOC", "RILD", "RILM", "SP"]
 MAIN_ATTRIBUTE_COLUMNS = ["SeisAmp", "Coherence", "AntTrack", "CurvatureMax", "CurvaturePos"]
 STAT_SUFFIXES = ["Mean", "Std", "Min", "Max", "ValidCount"]
+GR_RESISTIVITY_PAIR_COLUMNS = {
+    "LLD_LLS": ["GR_LLD_LLS", "LLD", "LLS"],
+    "RD_RS": ["GR_RD_RS", "RD", "RS"],
+    "RILD_RILM": ["GR_RILD_RILM", "RILD", "RILM"],
+}
 GRID_AXIS_LABELS = ("x0_y0", "x0_y1", "x0_y2", "x1_y0", "x1_y1", "x1_y2", "x2_y0", "x2_y1", "x2_y2")
 CONTEXT_COLUMNS = [
     "SampleID",
@@ -186,6 +198,28 @@ def finite_or_nan(value: object) -> float:
     except Exception:
         return float("nan")
     return out if math.isfinite(out) else float("nan")
+
+
+def gr_resistivity_path(well_segment: str) -> Path:
+    root = STEP2_FORMAL_ROOT if well_segment in INNER_SEGMENTS else STEP2_OUTER_ROOT
+    return root / well_segment / f"{well_segment}_t4_t7_real_well_gr_resistivity.csv"
+
+
+def load_aligned_gr_resistivity(base_df: pd.DataFrame, path: Path) -> pd.DataFrame:
+    if not path.exists():
+        raise FileNotFoundError(f"missing GR/resistivity enrichment: {path}")
+    enrichment = pd.read_csv(path)
+    if enrichment.columns.tolist() != GR_RESISTIVITY_TABLE_COLUMNS:
+        raise ValueError(f"unexpected GR/resistivity schema: {path}")
+    base_depth = clean_numeric(base_df["DEPT"]).to_numpy(dtype=float)
+    enrichment_depth = clean_numeric(enrichment["DEPT"]).to_numpy(dtype=float)
+    if len(base_depth) != len(enrichment_depth) or not np.allclose(base_depth, enrichment_depth, atol=1.0e-9, rtol=0.0):
+        raise ValueError(f"GR/resistivity DEPT does not match base main table: {path}")
+    for columns in GR_RESISTIVITY_PAIR_COLUMNS.values():
+        count = enrichment[columns].notna().sum(axis=1)
+        if not count.isin([0, len(columns)]).all():
+            raise ValueError(f"partial GR/resistivity triple found: {path} columns={columns}")
+    return enrichment
 
 
 def interpolate_series(source_depth: pd.Series, source_value: pd.Series, target_depth: pd.Series) -> pd.Series:
@@ -513,8 +547,11 @@ def attach_point_labels(sample_df: pd.DataFrame, point_df: pd.DataFrame) -> pd.D
     return out
 
 
-def load_base_samples(outer_results: list[OuterBuildResult]) -> tuple[dict[str, pd.DataFrame], list[dict[str, object]]]:
+def load_base_samples(
+    outer_results: list[OuterBuildResult],
+) -> tuple[dict[str, pd.DataFrame], dict[str, pd.DataFrame], list[dict[str, object]]]:
     samples: dict[str, pd.DataFrame] = {}
+    gr_resistivity_tables: dict[str, pd.DataFrame] = {}
     source_rows: list[dict[str, object]] = []
 
     for well_segment, cfg in INNER_SEGMENTS.items():
@@ -525,6 +562,8 @@ def load_base_samples(outer_results: list[OuterBuildResult]) -> tuple[dict[str, 
         df = attach_point_labels(df, points)
         df["HasFracture"] = clean_numeric(df["Density"]).fillna(0.0).gt(0.0).astype(int)
         samples[well_segment] = df
+        enrichment_path = gr_resistivity_path(well_segment)
+        gr_resistivity_tables[well_segment] = load_aligned_gr_resistivity(df, enrichment_path)
         source_rows.append(
             {
                 "WellSegment": well_segment,
@@ -533,6 +572,8 @@ def load_base_samples(outer_results: list[OuterBuildResult]) -> tuple[dict[str, 
                 "DensityKind": "old_labeled_sample_P10_only",
                 "DensityPath": str(cfg["old_label"]),
                 "PointPath": str(cfg["points"]),
+                "GRResistivityPath": str(enrichment_path),
+                "GRResistivitySourceKind": "formal_step2_enrichment",
             }
         )
 
@@ -546,6 +587,8 @@ def load_base_samples(outer_results: list[OuterBuildResult]) -> tuple[dict[str, 
         df = attach_point_labels(df, points)
         df["HasFracture"] = clean_numeric(df["Density"]).fillna(0.0).gt(0.0).astype(int)
         samples[well_segment] = df
+        enrichment_path = gr_resistivity_path(well_segment)
+        gr_resistivity_tables[well_segment] = load_aligned_gr_resistivity(df, enrichment_path)
         source_rows.append(
             {
                 "WellSegment": well_segment,
@@ -554,12 +597,32 @@ def load_base_samples(outer_results: list[OuterBuildResult]) -> tuple[dict[str, 
                 "DensityKind": "fracture_density_txt_FVDC",
                 "DensityPath": str(cfg["density"]),
                 "PointPath": str(cfg["points"]),
+                "GRResistivityPath": str(enrichment_path),
+                "GRResistivitySourceKind": "outer_step2_enrichment",
             }
         )
-    return samples, source_rows
+    return samples, gr_resistivity_tables, source_rows
 
 
-def write_group_samples(samples: dict[str, pd.DataFrame]) -> pd.DataFrame:
+def group_gr_resistivity_coverage(group_df: pd.DataFrame, enrichment: pd.DataFrame) -> dict[str, int]:
+    joined = group_df[["DEPT", "HasFracture"]].merge(
+        enrichment,
+        on="DEPT",
+        how="left",
+        validate="many_to_one",
+    )
+    result: dict[str, int] = {}
+    any_pair = pd.Series(False, index=joined.index)
+    for pair_key, columns in GR_RESISTIVITY_PAIR_COLUMNS.items():
+        valid = joined[columns].notna().all(axis=1)
+        result[f"{pair_key}_ValidRows"] = int(valid.sum())
+        any_pair |= valid
+    result["GRResistivityValidRows"] = int(any_pair.sum())
+    result["GRResistivityPositiveRows"] = int((any_pair & joined["HasFracture"].gt(0)).sum())
+    return result
+
+
+def write_group_samples(samples: dict[str, pd.DataFrame], gr_resistivity_tables: dict[str, pd.DataFrame]) -> pd.DataFrame:
     ensure_dir(GROUP_OUTPUT_ROOT)
     manifest_rows = []
     for well_segment, strata_name, top_depth, base_depth in MANUAL_STRATA:
@@ -581,6 +644,7 @@ def write_group_samples(samples: dict[str, pd.DataFrame]) -> pd.DataFrame:
             if col not in group_df.columns:
                 group_df[col] = np.nan
         group_df = group_df[GROUP_COLUMNS].copy()
+        gr_coverage = group_gr_resistivity_coverage(group_df, gr_resistivity_tables[well_segment])
 
         group_id = f"{well_segment}_{strata_name}"
         out_path = GROUP_OUTPUT_ROOT / f"{group_id}.csv"
@@ -604,6 +668,7 @@ def write_group_samples(samples: dict[str, pd.DataFrame]) -> pd.DataFrame:
                 "CurvatureMaxNonNullRows": int(group_df["CurvatureMax"].notna().sum()),
                 "CurvaturePosNonNullRows": int(group_df["CurvaturePos"].notna().sum()),
                 "AllStandardLogNonNullRows": int(group_df[STANDARD_LOG_COLUMNS].notna().all(axis=1).sum()),
+                **gr_coverage,
             }
         )
     return pd.DataFrame(manifest_rows)
@@ -612,9 +677,15 @@ def write_group_samples(samples: dict[str, pd.DataFrame]) -> pd.DataFrame:
 def main() -> None:
     ensure_dir(STEP3_OUTPUT_ROOT)
     outer_results = build_outer_step2_like_samples()
-    samples, source_rows = load_base_samples(outer_results)
+    outer_enrichment_summary, _ = run_enrichment(
+        output_root=STEP2_OUTER_ROOT,
+        selected_wells=set(OUTER_SEGMENTS),
+    )
+    if outer_enrichment_summary["Status"].eq("failed").any():
+        raise RuntimeError("outer imaging GR/resistivity enrichment failed")
+    samples, gr_resistivity_tables, source_rows = load_base_samples(outer_results)
 
-    group_manifest = write_group_samples(samples)
+    group_manifest = write_group_samples(samples, gr_resistivity_tables)
     group_manifest.to_csv(STEP3_OUTPUT_ROOT / "sample_group_manifest.csv", index=False, encoding="utf-8-sig")
     pd.DataFrame(source_rows).to_csv(STEP3_OUTPUT_ROOT / "source_manifest.csv", index=False, encoding="utf-8-sig")
 

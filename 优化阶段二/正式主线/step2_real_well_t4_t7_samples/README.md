@@ -27,6 +27,22 @@
   - 每井一行
   - 保留：目标井段点数、裁头裁尾点数、是否有内部非法点、最终主表点数、最终可建模点数
 
+GR/电阻率补充输出：
+
+- `*_t4_t7_real_well_gr_resistivity.csv`
+  - 由独立脚本读取现有主表的 `DEPT` 网格生成，不修改上述四张正式表
+  - 固定字段：`DEPT/GR_LLD_LLS/LLD/LLS/GR_RD_RS/RD/RS/GR_RILD_RILM/RILD/RILM`
+  - 同一曲线对的多个 LAS 可分段补充；重叠区按覆盖与采样质量择一，不取平均
+  - 单个 LAS 内和拼接边界只允许跨越不超过 `0.5m` 的小空缺，大空缺保留为空值
+  - 不按数值大小删除电阻率，不使用饱和值阈值；仅将非数值、NaN 和 LAS 明确声明的 `NULL` 视为缺失
+  - 数值截断、对数变换和模型侧异常值处理在 Step4 完成
+
+- `gr_resistivity_build_summary.csv`
+  - 根目录井级汇总，记录每组曲线使用的文件、有效行、缺失行、重叠行和冲突行
+
+- `gr_resistivity_read_errors.csv`
+  - 原始 LAS 读取错误；无错误时保留固定表头的空表
+
 当前正式口径：
 
 - 只处理 `T4-T7`
@@ -42,4 +58,10 @@
 python 优化阶段二/正式主线/step2_real_well_t4_t7_samples/build_real_well_t4_t7_samples.py \
   --config 优化阶段二/正式主线/step2_real_well_t4_t7_samples/configs/formal_all_wells.json \
   --max-workers 4
+```
+
+GR/电阻率全井补充命令：
+
+```bash
+bash 优化阶段二/正式主线/step2_real_well_t4_t7_samples/run_formal_gr_resistivity_enrichment.sh
 ```

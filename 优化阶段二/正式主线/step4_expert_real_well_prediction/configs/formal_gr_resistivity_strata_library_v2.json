@@ -1,0 +1,50 @@
+{
+  "step3_groups_dir": "/home/tyh/projects/petroleum/code/GAN-DFN/优化阶段二/正式主线/step3_imaging_supervision_samples/output/formal_rebuild/groups",
+  "step2_output_root": "/home/tyh/projects/petroleum/code/GAN-DFN/优化阶段二/正式主线/step2_real_well_t4_t7_samples/output/formal_all_wells",
+  "step2_outer_output_root": "/home/tyh/projects/petroleum/code/GAN-DFN/优化阶段二/正式主线/step2_real_well_t4_t7_samples/output/formal_imaging_outer_wells",
+  "output_dir": "/home/tyh/projects/petroleum/code/GAN-DFN/优化阶段二/正式主线/step4_expert_real_well_prediction/output/formal_gr_resistivity_strata_library_v2",
+  "training_sources": [
+    {"well_name": "车页1导眼", "pair_type": "LLD_LLS"},
+    {"well_name": "车151HF", "pair_type": "RD_RS"},
+    {"well_name": "车662", "pair_type": "RD_RS"},
+    {"well_name": "车663", "pair_type": "RD_RS"}
+  ],
+  "bridge_wells": ["车55", "车63"],
+  "formal_pair_priority": ["RD_RS", "LLD_LLS"],
+  "experimental_pair_type": "RILD_RILM",
+  "max_support_gap_m": 0.5,
+  "depth_weight_bin_m": 1.0,
+  "threshold_strategy": "match_oof_prevalence",
+  "random_state": 42,
+  "xgb_n_jobs": 2,
+  "stage1_params": {
+    "n_estimators": 360,
+    "max_depth": 3,
+    "learning_rate": 0.035,
+    "min_child_weight": 8,
+    "subsample": 0.8,
+    "colsample_bytree": 0.85,
+    "reg_alpha": 0.15,
+    "reg_lambda": 2.0
+  },
+  "stage2_params": {
+    "n_estimators": 420,
+    "max_depth": 3,
+    "learning_rate": 0.03,
+    "min_child_weight": 6,
+    "subsample": 0.8,
+    "colsample_bytree": 0.85,
+    "reg_alpha": 0.1,
+    "reg_lambda": 2.0
+  },
+  "transfer_params": {
+    "n_estimators": 260,
+    "max_depth": 3,
+    "learning_rate": 0.04,
+    "min_child_weight": 8,
+    "subsample": 0.85,
+    "colsample_bytree": 0.9,
+    "reg_alpha": 0.1,
+    "reg_lambda": 2.0
+  }
+}

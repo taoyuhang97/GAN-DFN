@@ -1,0 +1,9 @@
+{
+  "input_manifest": "/home/tyh/projects/petroleum/code/GAN-DFN/优化阶段二/正式主线/step3_imaging_supervision_samples/output/md_v2_analysis/md_analysis_manifest.csv",
+  "output_dir": "/home/tyh/projects/petroleum/code/GAN-DFN/优化阶段二/正式主线/step4_expert_real_well_prediction/output/gr_resistivity_diagnostic_md_v2",
+  "gr_quantile_bins": 5,
+  "depth_bin_m": 1.0,
+  "bootstrap_block_m": 10.0,
+  "bootstrap_iterations": 1000,
+  "random_state": 42
+}
