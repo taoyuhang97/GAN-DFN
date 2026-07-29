@@ -12,7 +12,7 @@ from build_all_area_section_visualization import SurfaceSectionCurve
 HORIZON_CODES = ("T4", "T5", "T6", "T7")
 DEFAULT_HORIZON_TRACE_TABLE = (
     Path(__file__).resolve().parents[1]
-    / "common/horizon_trace_table/output/formal_horizon_trace_table_v1/horizon_trace_table.npy"
+    / "common/horizon_trace_table/output/formal_horizon_trace_table_v2/horizon_trace_table.npy"
 )
 
 

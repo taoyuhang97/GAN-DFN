@@ -1,0 +1,374 @@
+{
+  "trace_mapping_npz": "/home/tyh/projects/petroleum/code/GAN-DFN/优化阶段二/正式主线/step6b_demo_density_volume_3d/output/formal_demo_10km_curvature_led_2ms_v1/base_density/trace_mapping.npz",
+  "layer_dir": "/data/shared/project-oil/wx数据/砂砾岩/层位",
+  "output_dir": "/home/tyh/projects/petroleum/code/GAN-DFN/优化阶段二/正式主线/step7a_small_scale_dfn/output/formal_demo_10km_multiscale_flow_v2",
+  "target_block": {
+    "name": "formal_demo_10km_multiscale_flow_v2",
+    "x_min": 571250,
+    "x_max": 581250,
+    "y_min": 4196500,
+    "y_max": 4206500
+  },
+  "random_seed": 20260716,
+  "orientation_random_seed": 20260716,
+  "step7a_sampling_mode": "v2_weighted_probability",
+  "domain_sampling_mode": "v2_weighted_probability",
+  "min_candidate_density": 1e-06,
+  "min_component_voxels": 6,
+  "trace_spacing_x_m": 12.5,
+  "trace_spacing_y_m": 12.5,
+  "orientation_window_xy_cells": 4,
+  "orientation_window_time_samples": 15,
+  "orientation_time_scale_m_per_ms": 1.0,
+  "orientation_local_quantile": 0.7,
+  "min_orientation_points": 10,
+  "min_orientation_planarity": 0.05,
+  "min_dip_deg": 30.0,
+  "max_dip_deg": 89.0,
+  "fallback_azimuth_deg": {
+    "沙三段": 55.0,
+    "沙四段": 125.0
+  },
+  "fallback_dip_deg": {
+    "沙三段": 70.0,
+    "沙四段": 68.0
+  },
+  "geometry_time_scale_m_per_ms": 1.0,
+  "display_z_scale": 5.0,
+  "max_small_length_check_m": 120.0,
+  "max_small_height_check_ms": 45.0,
+  "small_domain_generation": {
+    "background": {
+      "domain_code": 1,
+      "source_type": "small_background_density",
+      "structural_relation": "small_background",
+      "band_continuity_mode": "regional_background_small_fracture_v2_weighted_sampling_v4_orientation",
+      "action_reason": "background_small_fracture_from_step6d_background_density_v2_weighted_sampling_v4_orientation",
+      "candidate_density_quantile": {
+        "沙三段": 0.82,
+        "沙四段": 0.82
+      },
+      "probability_basis_column": "SamplingWeight",
+      "weighted_probability_scale": 0.0029834415,
+      "weighted_probability_density_power": 1.0,
+      "weighted_probability_reference": "raw",
+      "max_cell_probability": 0.12,
+      "fail_fast_patch_count_limit": 120000,
+      "orientation_prior": {
+        "enabled": true,
+        "rule_name": "background_small_fracture_statistical_orientation_family",
+        "global_min_dip_deg": 30.0,
+        "global_max_dip_deg": 86.0,
+        "families": [
+          {
+            "name": "regional_primary_background",
+            "code": 11,
+            "weight": 0.45,
+            "base": "layer_template",
+            "azimuth_offset_deg": [
+              -18.0,
+              18.0
+            ],
+            "azimuth_jitter_std_deg": 5.0,
+            "dip_mean_deg": {
+              "沙三段": 62.0,
+              "沙四段": 60.0
+            },
+            "dip_std_deg": 9.0,
+            "dip_min_deg": 35.0,
+            "dip_max_deg": 82.0
+          },
+          {
+            "name": "regional_conjugate_background",
+            "code": 12,
+            "weight": 0.25,
+            "base": "layer_template",
+            "azimuth_offset_deg": [
+              50.0,
+              70.0
+            ],
+            "azimuth_jitter_std_deg": 5.0,
+            "dip_mean_deg": 68.0,
+            "dip_std_deg": 8.0,
+            "dip_min_deg": 45.0,
+            "dip_max_deg": 85.0
+          },
+          {
+            "name": "local_density_adjusted_background",
+            "code": 13,
+            "weight": 0.3,
+            "base": "local_pca_if_planar",
+            "azimuth_offset_deg": [
+              -20.0,
+              20.0
+            ],
+            "azimuth_jitter_std_deg": 6.0,
+            "dip_base": "base",
+            "dip_jitter_std_deg": 8.0,
+            "dip_min_deg": 35.0,
+            "dip_max_deg": 82.0
+          }
+        ]
+      },
+      "base_length_m": {
+        "沙三段": 30.0,
+        "沙四段": 34.0
+      },
+      "base_height_time_ms": {
+        "沙三段": 10.0,
+        "沙四段": 12.0
+      },
+      "length_density_gain": 0.65,
+      "height_density_gain": 0.45,
+      "max_density_norm": 1.6,
+      "length_jitter_min": 0.82,
+      "length_jitter_max": 1.18,
+      "height_jitter_min": 0.85,
+      "height_jitter_max": 1.15,
+      "max_height_fraction_of_layer": 0.35,
+      "min_height_time_ms": 5.0
+    },
+    "medium_damage": {
+      "domain_code": 2,
+      "source_type": "small_medium_damage_density",
+      "structural_relation": "small_derivative_near_medium_corridor",
+      "band_continuity_mode": "medium_corridor_damage_small_fracture_v2_weighted_sampling_v4_orientation",
+      "action_reason": "medium_corridor_damage_small_fracture_from_step6d_damage_density_v2_weighted_sampling_v4_orientation",
+      "candidate_density_quantile": {
+        "沙三段": 0.82,
+        "沙四段": 0.82
+      },
+      "probability_basis_column": "SamplingWeight",
+      "weighted_probability_scale": 0.006383571299999999,
+      "weighted_probability_density_power": 1.0,
+      "weighted_probability_reference": "raw",
+      "max_cell_probability": 0.12,
+      "fail_fast_patch_count_limit": 120000,
+      "orientation_prior": {
+        "enabled": true,
+        "rule_name": "medium_damage_small_fracture_associated_orientation_family",
+        "global_min_dip_deg": 35.0,
+        "global_max_dip_deg": 89.0,
+        "families": [
+          {
+            "name": "medium_corridor_subparallel",
+            "code": 21,
+            "weight": 0.3,
+            "base": "local_pca_if_planar",
+            "azimuth_offset_deg": [
+              -18.0,
+              18.0
+            ],
+            "azimuth_jitter_std_deg": 5.0,
+            "dip_mean_deg": 65.0,
+            "dip_std_deg": 8.0,
+            "dip_min_deg": 45.0,
+            "dip_max_deg": 85.0
+          },
+          {
+            "name": "medium_corridor_oblique_synthetic",
+            "code": 22,
+            "weight": 0.28,
+            "base": "local_pca_if_planar",
+            "azimuth_offset_deg": [
+              25.0,
+              45.0
+            ],
+            "azimuth_jitter_std_deg": 5.0,
+            "dip_mean_deg": 70.0,
+            "dip_std_deg": 7.0,
+            "dip_min_deg": 50.0,
+            "dip_max_deg": 88.0
+          },
+          {
+            "name": "medium_corridor_oblique_antithetic",
+            "code": 23,
+            "weight": 0.28,
+            "base": "local_pca_if_planar",
+            "azimuth_offset_deg": [
+              -45.0,
+              -25.0
+            ],
+            "azimuth_jitter_std_deg": 5.0,
+            "dip_mean_deg": 70.0,
+            "dip_std_deg": 7.0,
+            "dip_min_deg": 50.0,
+            "dip_max_deg": 88.0
+          },
+          {
+            "name": "medium_damage_background_relict",
+            "code": 24,
+            "weight": 0.14,
+            "base": "layer_template",
+            "azimuth_offset_deg": [
+              -25.0,
+              25.0
+            ],
+            "azimuth_jitter_std_deg": 6.0,
+            "dip_mean_deg": 62.0,
+            "dip_std_deg": 9.0,
+            "dip_min_deg": 35.0,
+            "dip_max_deg": 82.0
+          }
+        ]
+      },
+      "base_length_m": {
+        "沙三段": 36.0,
+        "沙四段": 40.0
+      },
+      "base_height_time_ms": {
+        "沙三段": 12.0,
+        "沙四段": 14.0
+      },
+      "length_density_gain": 0.7,
+      "height_density_gain": 0.5,
+      "max_density_norm": 1.8,
+      "length_jitter_min": 0.8,
+      "length_jitter_max": 1.2,
+      "height_jitter_min": 0.84,
+      "height_jitter_max": 1.16,
+      "max_height_fraction_of_layer": 0.38,
+      "min_height_time_ms": 6.0,
+      "max_selected_fraction_of_background": 0.5,
+      "max_selected_count": 40000
+    },
+    "large_damage": {
+      "domain_code": 3,
+      "source_type": "small_large_fault_damage_density",
+      "structural_relation": "small_derivative_near_large_fault",
+      "band_continuity_mode": "large_fault_damage_small_fracture_v2_weighted_sampling_v4_orientation",
+      "action_reason": "large_fault_damage_small_fracture_from_step6d_damage_density_v2_weighted_sampling_v4_orientation",
+      "candidate_density_quantile": {
+        "沙三段": 0.84,
+        "沙四段": 0.84
+      },
+      "probability_basis_column": "SamplingWeight",
+      "weighted_probability_scale": 0.0028823292,
+      "weighted_probability_density_power": 1.0,
+      "weighted_probability_reference": "raw",
+      "max_cell_probability": 0.12,
+      "fail_fast_patch_count_limit": 120000,
+      "orientation_prior": {
+        "enabled": true,
+        "rule_name": "large_fault_damage_small_fracture_associated_orientation_family",
+        "global_min_dip_deg": 35.0,
+        "global_max_dip_deg": 89.0,
+        "families": [
+          {
+            "name": "fault_damage_subparallel",
+            "code": 31,
+            "weight": 0.28,
+            "base": "local_pca_if_planar",
+            "azimuth_offset_deg": [
+              -15.0,
+              15.0
+            ],
+            "azimuth_jitter_std_deg": 5.0,
+            "dip_mean_deg": 75.0,
+            "dip_std_deg": 7.0,
+            "dip_min_deg": 58.0,
+            "dip_max_deg": 89.0
+          },
+          {
+            "name": "fault_damage_oblique_synthetic",
+            "code": 32,
+            "weight": 0.27,
+            "base": "local_pca_if_planar",
+            "azimuth_offset_deg": [
+              25.0,
+              45.0
+            ],
+            "azimuth_jitter_std_deg": 5.0,
+            "dip_mean_deg": 72.0,
+            "dip_std_deg": 7.0,
+            "dip_min_deg": 55.0,
+            "dip_max_deg": 89.0
+          },
+          {
+            "name": "fault_damage_oblique_antithetic",
+            "code": 33,
+            "weight": 0.27,
+            "base": "local_pca_if_planar",
+            "azimuth_offset_deg": [
+              -45.0,
+              -25.0
+            ],
+            "azimuth_jitter_std_deg": 5.0,
+            "dip_mean_deg": 72.0,
+            "dip_std_deg": 7.0,
+            "dip_min_deg": 55.0,
+            "dip_max_deg": 89.0
+          },
+          {
+            "name": "fault_damage_transverse",
+            "code": 34,
+            "weight": 0.1,
+            "base": "local_pca_if_planar",
+            "azimuth_offset_deg": [
+              65.0,
+              85.0
+            ],
+            "azimuth_jitter_std_deg": 5.0,
+            "dip_mean_deg": 68.0,
+            "dip_std_deg": 8.0,
+            "dip_min_deg": 50.0,
+            "dip_max_deg": 86.0
+          },
+          {
+            "name": "fault_damage_background_edge",
+            "code": 35,
+            "weight": 0.08,
+            "base": "layer_template",
+            "azimuth_offset_deg": [
+              -25.0,
+              25.0
+            ],
+            "azimuth_jitter_std_deg": 6.0,
+            "dip_mean_deg": 62.0,
+            "dip_std_deg": 9.0,
+            "dip_min_deg": 35.0,
+            "dip_max_deg": 82.0
+          }
+        ]
+      },
+      "base_length_m": {
+        "沙三段": 40.0,
+        "沙四段": 44.0
+      },
+      "base_height_time_ms": {
+        "沙三段": 13.0,
+        "沙四段": 15.0
+      },
+      "length_density_gain": 0.75,
+      "height_density_gain": 0.55,
+      "max_density_norm": 1.8,
+      "length_jitter_min": 0.8,
+      "length_jitter_max": 1.2,
+      "height_jitter_min": 0.84,
+      "height_jitter_max": 1.16,
+      "max_height_fraction_of_layer": 0.4,
+      "min_height_time_ms": 6.0,
+      "max_selected_fraction_of_background": 0.25,
+      "max_selected_count": 20000
+    }
+  },
+  "density_sgy": "/home/tyh/projects/petroleum/code/GAN-DFN/优化阶段二/正式主线/step6b_demo_density_volume_3d/output/formal_demo_10km_multiscale_flow_v2/step6a_small/small_background_score.sgy",
+  "small_score_sgy": "/home/tyh/projects/petroleum/code/GAN-DFN/优化阶段二/正式主线/step6b_demo_density_volume_3d/output/formal_demo_10km_multiscale_flow_v2/step6a_small/small_background_score.sgy",
+  "small_qc_json": "/home/tyh/projects/petroleum/code/GAN-DFN/优化阶段二/正式主线/step6b_demo_density_volume_3d/output/formal_demo_10km_multiscale_flow_v2/step6a_small/small_background_qc.json",
+  "damage_context_npz": "/home/tyh/projects/petroleum/code/GAN-DFN/优化阶段二/正式主线/step6b_demo_density_volume_3d/output/formal_demo_10km_multiscale_flow_v2/step6d_bundle/multiscale_damage_context_10ms.npz",
+  "compact_step7_sampling": true,
+  "compact_sampling_chunk_samples": 20,
+  "orientation_cache_xy_cells": 3,
+  "orientation_cache_time_samples": 5,
+  "step7a_fail_fast_patch_count_limit": 120000,
+  "max_damage_selected_fraction_of_background": 0.75,
+  "nearest_neighbor_time_scale_m_per_ms": 2.0,
+  "write_intermediate_vtk": false,
+  "horizon_contract_table": "/home/tyh/projects/petroleum/code/GAN-DFN/优化阶段二/正式主线/common/horizon_trace_table/output/formal_horizon_trace_table_v2/horizon_trace_table.npy",
+  "horizon_trace_table_path": "/home/tyh/projects/petroleum/code/GAN-DFN/优化阶段二/正式主线/common/horizon_trace_table/output/formal_horizon_trace_table_v2/horizon_trace_table.npy",
+  "horizon_window_contracts": {
+    "2ms": "/home/tyh/projects/petroleum/code/GAN-DFN/优化阶段二/正式主线/common/horizon_trace_table/output/formal_horizon_trace_table_v2/horizon_windows_2ms.npz",
+    "10ms": "/home/tyh/projects/petroleum/code/GAN-DFN/优化阶段二/正式主线/common/horizon_trace_table/output/formal_horizon_trace_table_v2/horizon_windows_10ms.npz"
+  },
+  "trace_header_csv": "/home/tyh/projects/petroleum/code/GAN-DFN/数据精简/trace_header_xy.csv"
+}

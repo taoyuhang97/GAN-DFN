@@ -321,22 +321,66 @@ def steep_large_mask(
 
 
 def write_sgy_like(output_path: Path, template_path: Path, data: np.ndarray, samples: np.ndarray) -> None:
+    sample_axis = np.asarray(samples, dtype=np.float64)
+    if sample_axis.ndim != 1 or len(sample_axis) == 0:
+        raise ValueError("SGY sample axis must be a non-empty one-dimensional array")
+    if data.shape != (data.shape[0], len(sample_axis)):
+        raise ValueError(f"SGY data/sample shape mismatch: data={data.shape}, samples={len(sample_axis)}")
+    if len(sample_axis) > 1:
+        intervals = np.diff(sample_axis)
+        interval_ms = float(np.median(intervals))
+        if interval_ms <= 0.0 or not np.allclose(intervals, interval_ms, atol=1.0e-6, rtol=0.0):
+            raise ValueError("SGY output requires a positive regular sample axis")
+    else:
+        interval_ms = 1.0
+    interval_us = int(round(interval_ms * 1000.0))
+    delay_ms = int(round(float(sample_axis[0])))
     with segyio.open(str(template_path), "r", ignore_geometry=True) as src:
+        if data.shape[0] > int(src.tracecount):
+            raise ValueError(f"template trace count {src.tracecount} is smaller than output trace count {data.shape[0]}")
         spec = segyio.spec()
         spec.sorting = segyio.TraceSortingFormat.UNKNOWN_SORTING
         spec.format = int(src.bin[segyio.BinField.Format]) or 5
-        spec.samples = np.asarray(samples, dtype=np.float32)
+        spec.samples = sample_axis.astype(np.float32)
         spec.tracecount = int(data.shape[0])
         with segyio.create(str(output_path), spec) as dst:
             dst.text[0] = src.text[0]
             dst.bin.update(src.bin)
+            dst.bin[segyio.BinField.Interval] = interval_us
             dst.bin[segyio.BinField.Samples] = int(len(samples))
             dst.bin[segyio.BinField.Format] = 5
             for trace_idx in range(data.shape[0]):
                 dst.header[trace_idx] = dict(src.header[trace_idx])
+                dst.header[trace_idx][segyio.TraceField.TRACE_SAMPLE_INTERVAL] = interval_us
+                dst.header[trace_idx][segyio.TraceField.TRACE_SAMPLE_COUNT] = int(len(sample_axis))
+                dst.header[trace_idx][segyio.TraceField.DelayRecordingTime] = delay_ms
                 dst.trace[trace_idx] = np.nan_to_num(data[trace_idx], nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32)
                 if (trace_idx + 1) % 10000 == 0:
                     print(f"[step6-multiscale] wrote {output_path.name} traces={trace_idx + 1}/{data.shape[0]}", flush=True)
+            dst.flush()
+
+    with segyio.open(str(output_path), "r", ignore_geometry=True) as check:
+        written_samples = np.asarray(check.samples, dtype=np.float64)
+        binary_interval_us = int(check.bin[segyio.BinField.Interval])
+        trace_intervals = {
+            int(check.header[index][segyio.TraceField.TRACE_SAMPLE_INTERVAL])
+            for index in sorted({0, max(0, int(check.tracecount) - 1)})
+        }
+        if int(check.tracecount) != int(data.shape[0]):
+            raise RuntimeError(f"SGY trace count verification failed for {output_path}")
+        if len(written_samples) != len(sample_axis) or not np.allclose(
+            written_samples, sample_axis, atol=1.0e-6, rtol=0.0
+        ):
+            raise RuntimeError(
+                f"SGY sample axis verification failed for {output_path}: "
+                f"written=({written_samples[0]}, {written_samples[-1]}, {len(written_samples)}) "
+                f"expected=({sample_axis[0]}, {sample_axis[-1]}, {len(sample_axis)})"
+            )
+        if binary_interval_us != interval_us or trace_intervals != {interval_us}:
+            raise RuntimeError(
+                f"SGY interval verification failed for {output_path}: "
+                f"binary={binary_interval_us}, trace={sorted(trace_intervals)}, expected={interval_us}"
+            )
 
 
 def copy_mapping(src: Path, dst: Path) -> None:

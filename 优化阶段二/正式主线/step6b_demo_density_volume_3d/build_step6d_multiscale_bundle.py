@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -14,6 +15,17 @@ from build_multiscale_density_bundle import ensure_dir, finite_stats, flat_to_gr
 
 
 CURRENT_DIR = Path(__file__).resolve().parent
+FORMAL_ROOT = CURRENT_DIR.parent
+if str(FORMAL_ROOT) not in sys.path:
+    sys.path.insert(0, str(FORMAL_ROOT))
+
+from common.horizon_trace_table.horizon_contract import (  # noqa: E402
+    apply_window_inplace,
+    contract_summary,
+    load_contract_for_mapping,
+    validate_window_contract,
+)
+
 DEFAULT_CONFIG = CURRENT_DIR / "configs/formal_candidate_cheye1_multiscale_density_v1.json"
 DEFAULT_ROOT = CURRENT_DIR / "output/candidate_cheye1_multiscale_rebalance_v1"
 DEFAULT_OUTPUT_DIR = DEFAULT_ROOT / "step6d_bundle"
@@ -36,6 +48,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--large-damage-time-samples", type=int, default=3)
     parser.add_argument("--medium-damage-boost", type=float, default=0.35)
     parser.add_argument("--large-damage-boost", type=float, default=0.50)
+    parser.add_argument("--medium-damage-outer-decay", type=float, default=0.45)
+    parser.add_argument("--large-damage-outer-decay", type=float, default=0.35)
     parser.add_argument("--medium-core-attenuation", type=float, default=0.35)
     parser.add_argument("--large-core-attenuation", type=float, default=0.65)
     parser.add_argument("--final-small-candidate-quantile", type=float, default=0.82)
@@ -85,6 +99,7 @@ def build_damage_shell(
     mapping: dict[str, np.ndarray],
     xy_cells: int,
     time_samples: int,
+    outer_decay: float,
 ) -> tuple[np.ndarray, np.ndarray]:
     prior_grid, _, _ = flat_to_grid(prior_flat.astype(np.float32), mapping)
     mask_grid, _, _ = flat_to_grid(mask_flat.astype(np.float32), mapping)
@@ -95,8 +110,13 @@ def build_damage_shell(
     size = (2 * int(xy_cells) + 1, 2 * int(xy_cells) + 1, 2 * int(time_samples) + 1)
     dilated = ndimage.binary_dilation(mask_grid, structure=np.ones(size, dtype=bool))
     shell = dilated & (~mask_grid)
+    inner_xy = max(int(np.ceil(int(xy_cells) / 2.0)), 1)
+    inner_time = max(int(np.ceil(int(time_samples) / 2.0)), 1)
+    inner_size = (2 * inner_xy + 1, 2 * inner_xy + 1, 2 * inner_time + 1)
+    inner_shell = ndimage.binary_dilation(mask_grid, structure=np.ones(inner_size, dtype=bool)) & (~mask_grid)
+    taper = np.where(inner_shell, 1.0, float(np.clip(outer_decay, 0.0, 1.0))).astype(np.float32)
     local_strength = ndimage.maximum_filter(prior_grid, size=size, mode="nearest")
-    damage_grid = np.where(shell, local_strength, 0.0).astype(np.float32)
+    damage_grid = np.where(shell, local_strength * taper, 0.0).astype(np.float32)
     return grid_to_flat(damage_grid, mapping), grid_to_flat(shell.astype(np.float32), mapping).astype(bool)
 
 
@@ -121,6 +141,8 @@ def run_compact_context(
     large_samples = step6c["samples"].astype(np.float32)
     if medium_samples.shape != large_samples.shape or not np.allclose(medium_samples, large_samples, atol=1.0e-6):
         raise ValueError("compact Step6D requires matching medium and large 10 ms sample axes")
+    horizon_contract = load_contract_for_mapping(config, mapping)
+    horizon_axis_qc = validate_window_contract(config, horizon_contract, medium_samples)
 
     medium_prior = step6b["medium_prior"].astype(np.float32)
     medium_mask = step6b["medium_mask"].astype(bool)
@@ -135,6 +157,12 @@ def run_compact_context(
     }.items():
         if values.shape != expected_shape:
             raise ValueError(f"{name} shape {values.shape} != {expected_shape}")
+    upstream_horizon_qc = {
+        "medium_prior": apply_window_inplace(medium_prior, horizon_contract, medium_samples, fill_value=0.0),
+        "medium_mask": apply_window_inplace(medium_mask, horizon_contract, medium_samples, fill_value=False),
+        "large_prior": apply_window_inplace(large_prior, horizon_contract, medium_samples, fill_value=0.0),
+        "large_mask": apply_window_inplace(large_mask, horizon_contract, medium_samples, fill_value=False),
+    }
 
     medium_damage, medium_damage_mask = build_damage_shell(
         medium_prior,
@@ -142,6 +170,7 @@ def run_compact_context(
         mapping,
         xy_cells=int(args.medium_damage_xy_cells),
         time_samples=int(args.medium_damage_time_samples),
+        outer_decay=float(args.medium_damage_outer_decay),
     )
     large_damage, large_damage_mask = build_damage_shell(
         large_prior,
@@ -149,7 +178,18 @@ def run_compact_context(
         mapping,
         xy_cells=int(args.large_damage_xy_cells),
         time_samples=int(args.large_damage_time_samples),
+        outer_decay=float(args.large_damage_outer_decay),
     )
+    damage_horizon_qc = {
+        "medium_damage": apply_window_inplace(medium_damage, horizon_contract, medium_samples, fill_value=0.0),
+        "medium_damage_mask": apply_window_inplace(
+            medium_damage_mask, horizon_contract, medium_samples, fill_value=False
+        ),
+        "large_damage": apply_window_inplace(large_damage, horizon_contract, medium_samples, fill_value=0.0),
+        "large_damage_mask": apply_window_inplace(
+            large_damage_mask, horizon_contract, medium_samples, fill_value=False
+        ),
+    }
     context_path = output_dir / "multiscale_damage_context_10ms.npz"
     np.savez_compressed(
         context_path,
@@ -160,6 +200,12 @@ def run_compact_context(
         large_damage=(float(args.large_damage_boost) * large_damage).astype(np.float16),
         large_damage_mask=large_damage_mask.astype(np.uint8),
         large_core_mask=large_mask.astype(np.uint8),
+        source_trace_idx=horizon_contract.trace_idx.astype(np.int32),
+        t4_time=horizon_contract.t4.astype(np.float32),
+        t6_time=horizon_contract.t6.astype(np.float32),
+        t7_time=horizon_contract.t7.astype(np.float32),
+        shasan_present=horizon_contract.shasan_present.astype(np.uint8),
+        shasi_present=horizon_contract.shasi_present.astype(np.uint8),
     )
     summary = {
         "status": "pass",
@@ -171,6 +217,10 @@ def run_compact_context(
         "sample_interval_ms": float(np.median(np.diff(medium_samples))) if len(medium_samples) > 1 else None,
         "sample_count": int(len(medium_samples)),
         "trace_count": int(len(mapping["x"])),
+        "horizon_contract": contract_summary(horizon_contract),
+        "horizon_axis_qc": horizon_axis_qc,
+        "upstream_horizon_qc": upstream_horizon_qc,
+        "damage_horizon_qc": damage_horizon_qc,
         "medium": {
             "core_voxel_count": int(medium_mask.sum()),
             "damage_voxel_count": int(medium_damage_mask.sum()),
@@ -188,6 +238,8 @@ def run_compact_context(
             "large_damage_time_samples": int(args.large_damage_time_samples),
             "medium_damage_boost": float(args.medium_damage_boost),
             "large_damage_boost": float(args.large_damage_boost),
+            "medium_damage_outer_decay": float(args.medium_damage_outer_decay),
+            "large_damage_outer_decay": float(args.large_damage_outer_decay),
             "medium_core_attenuation": float(args.medium_core_attenuation),
             "large_core_attenuation": float(args.large_core_attenuation),
             "background_floor": float(args.background_floor),
@@ -262,6 +314,7 @@ def main() -> int:
         mapping,
         xy_cells=int(args.medium_damage_xy_cells),
         time_samples=int(args.medium_damage_time_samples),
+        outer_decay=float(args.medium_damage_outer_decay),
     )
     large_damage, large_damage_mask = build_damage_shell(
         large_prior,
@@ -269,6 +322,7 @@ def main() -> int:
         mapping,
         xy_cells=int(args.large_damage_xy_cells),
         time_samples=int(args.large_damage_time_samples),
+        outer_decay=float(args.large_damage_outer_decay),
     )
     background_valid = small_score > 0
     background_small_density = np.where(
@@ -389,6 +443,8 @@ def main() -> int:
             "large_damage_time_samples": int(args.large_damage_time_samples),
             "medium_damage_boost": float(args.medium_damage_boost),
             "large_damage_boost": float(args.large_damage_boost),
+            "medium_damage_outer_decay": float(args.medium_damage_outer_decay),
+            "large_damage_outer_decay": float(args.large_damage_outer_decay),
             "medium_core_attenuation": float(args.medium_core_attenuation),
             "large_core_attenuation": float(args.large_core_attenuation),
             "background_floor": float(args.background_floor),

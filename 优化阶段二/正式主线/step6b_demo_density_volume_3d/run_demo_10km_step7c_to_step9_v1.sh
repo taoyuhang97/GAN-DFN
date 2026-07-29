@@ -4,7 +4,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 FORMAL_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 PYTHON_BIN="${PYTHON_BIN:-python3}"
-VERSION="formal_demo_10km_multiscale_flow_v1"
+VERSION="${VERSION:-formal_demo_10km_multiscale_flow_v2}"
 STEP6_ROOT="${SCRIPT_DIR}/output/${VERSION}"
 LOG_DIR="${FORMAL_ROOT}/logs/${VERSION}"
 RUN_STAMP="$(date +%Y%m%d_%H%M%S)"
@@ -53,6 +53,7 @@ for name, path in summaries.items():
 required = [
     step6 / "step6c_large/large_fault_prior_components.npz",
     step6 / "step6c_large/large_fault_component_summary.csv",
+    step6 / "step6c_large/original_fault_panels_selected_raw_time.vtk",
     step7a / "small_dfn_patches.csv",
     step7b / "medium_dfn_patches.csv",
 ]
@@ -99,6 +100,24 @@ for path in summaries:
     if payload.get("status") != "pass":
         raise RuntimeError(f"continuation stage failed: {path}")
     rows.append({"path": str(path), "status": "pass"})
+step7c_dir = formal / f"step7c_large_fault_dfn/output/{version}"
+step7c_products = [
+    step7c_dir / "large_original_fault_merged_surface_raw_time.vtk",
+    step7c_dir / "large_fault_surface_raw_time.vtk",
+    step7c_dir / "large_fault_surface_patches.csv",
+    step7c_dir / "large_inferred_fault_surfaces_raw_time.vtk",
+    step7c_dir / "large_inferred_fault_surface_patches.csv",
+    step7c_dir / "large_fault_damage_zone_raw_time.vtk",
+    step7c_dir / "large_fault_damage_zone_patches.csv",
+    step7c_dir / "large_fault_dfn_raw_time.vtk",
+    step7c_dir / "large_fault_dfn_patches.csv",
+]
+missing_step7c = [str(path) for path in step7c_products if not path.exists() or path.stat().st_size <= 0]
+if missing_step7c:
+    raise FileNotFoundError("missing Step7C products:\n" + "\n".join(missing_step7c))
+step7c_summary = json.loads((step7c_dir / "large_fault_dfn_summary.json").read_text(encoding="utf-8"))
+if step7c_summary.get("damage_zone_included_in_formal_dfn") is not False:
+    raise RuntimeError("Step7C formal DFN unexpectedly includes damage-zone patches")
 image_dir = formal / f"step9_section_visualize/output/{version}/cheye1_dfn_multibackground_sections"
 pngs = sorted(image_dir.glob("*.png"))
 if len(pngs) != 20 or any(path.stat().st_size < 10000 for path in pngs):
@@ -107,6 +126,7 @@ payload = {
     "status": "pass",
     "scope": "step7c_to_step9_continuation",
     "summaries": rows,
+    "step7c_products": [str(path) for path in step7c_products],
     "image_count": len(pngs),
     "images": [path.name for path in pngs],
 }

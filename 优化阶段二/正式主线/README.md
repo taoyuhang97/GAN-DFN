@@ -1,5 +1,16 @@
 # 优化阶段二 正式主线
 
+## 当前10 km修改入口（2026-07-28）
+
+`formal_demo_10km_multiscale_flow_v1`已经完成工程跑通，但诊断发现时间轴、逐道T4-T7层窗、中尺度证据权重、大尺度成面和Step9全区过滤问题，当前结果不得作为最终地质DFN或对外图件。
+
+下一轮唯一问题台账和执行入口：
+
+- `DFN_10KM_ISSUES_AND_REFACTOR_PLAN_20260728.md`
+- `CHECKPOINT_20260728_10KM_MULTISCALE_FLOW.md`
+
+当前计划从层位合同修正开始，使用新版本`formal_demo_10km_multiscale_flow_v2`重跑，不覆盖v1问题节点。
+
 本目录保留第二轮优化当前确认的正式代码。当前主线已经从早期“二维密度 + 三维密度再融合”的试验路径，整理为多尺度地震解释约束流程：
 
 ```text
@@ -127,8 +138,11 @@ step7a_small_scale_dfn/output/candidate_cheye1_final_lowcoh_vertical_v1/
 
 当前口径：
 
-- 原始单元断层面是硬约束，倾向倾角应尽量保持原始断层 patch/panel 的局部几何。
-- 自识别低相干大尺度候选仅作为补充断裂带候选，不替代原始断层解释。
+- `large_original_fault_merged_surface_raw_time.vtk` 保存 Step6C 选中单元断层直接拼接后的曲面，仅用于原始地质解释对比。
+- `large_fault_surface_raw_time.vtk` 与 `large_fault_surface_patches.csv` 保存逐道 T4-T7 内的原始断层 surface fragments，作为最终 DFN 中的原始断层硬约束。
+- `large_inferred_fault_surfaces_raw_time.vtk` 保存 Step6C 相干体主导、自主识别的补充小断层，不替代原始断层解释。
+- `large_fault_damage_zone_raw_time.vtk` 仅为损伤带诊断结果，不进入 Step7D；损伤带衍生小裂缝由 Step6D/Step7A 表达。
+- Step7D 正式读取 `large_fault_dfn_patches.csv`，其中只包含原始断层 fragments 和自主识别断层。
 
 ### Step7D 大中小尺度融合
 

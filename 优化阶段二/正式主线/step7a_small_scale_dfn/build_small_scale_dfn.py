@@ -9,15 +9,24 @@ from typing import Any
 
 import numpy as np
 import pandas as pd
+from scipy.spatial import cKDTree
 
 
 CURRENT_DIR = Path(__file__).resolve().parent
+FORMAL_ROOT = CURRENT_DIR.parent
 LEGACY_STEP7B_DIR = CURRENT_DIR.parent / "step7b_initial_dfn_3d"
 DEFAULT_CONFIG = CURRENT_DIR / "configs/formal_candidate_cheye1_step7a_small_v1.json"
+if str(FORMAL_ROOT) not in sys.path:
+    sys.path.insert(0, str(FORMAL_ROOT))
 if str(LEGACY_STEP7B_DIR) not in sys.path:
     sys.path.insert(0, str(LEGACY_STEP7B_DIR))
 
 import build_initial_dfn_from_3d_density_sgy as legacy  # noqa: E402
+from common.horizon_trace_table.horizon_contract import (  # noqa: E402
+    load_contract_for_mapping,
+    surface_grids_from_contract,
+    validate_window_contract,
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -482,10 +491,6 @@ def build_compact_selected_candidates(
                     continue
                 selected_total += int(len(trace_pos))
                 selected_counts[domain_name] += int(len(trace_pos))
-                if selected_total > fail_limit:
-                    raise RuntimeError(
-                        f"compact Step7A selected {selected_total} patches, exceeding configured limit {fail_limit}"
-                    )
                 it = local_t + t0
                 frame = pd.DataFrame(
                     {
@@ -520,6 +525,33 @@ def build_compact_selected_candidates(
     if not rows:
         raise RuntimeError("compact Step7A sampling produced no patches")
     selected = pd.concat(rows, ignore_index=True)
+    pre_limit_counts = {str(k): int(v) for k, v in selected["SmallDomain"].value_counts().items()}
+    background_count = int((selected["SmallDomain"].astype(str) == "background").sum())
+    keep_index = selected.index.to_numpy(dtype=np.int64)
+    for domain_name in ("medium_damage", "large_damage"):
+        domain_cfg = dict(generation.get(domain_name, {}))
+        domain_index = selected.index[selected["SmallDomain"].astype(str).eq(domain_name)].to_numpy(dtype=np.int64)
+        absolute_limit = int(domain_cfg.get("max_selected_count", len(domain_index)))
+        fraction_limit = float(domain_cfg.get("max_selected_fraction_of_background", 1.0))
+        relative_limit = int(np.floor(background_count * fraction_limit)) if background_count > 0 else absolute_limit
+        limit = max(min(absolute_limit, relative_limit, len(domain_index)), 0)
+        if len(domain_index) > limit:
+            selected_drop = rng.choice(domain_index, size=len(domain_index) - limit, replace=False)
+            keep_index = np.setdiff1d(keep_index, selected_drop, assume_unique=False)
+    selected = selected.loc[np.sort(keep_index)].reset_index(drop=True)
+
+    max_damage_fraction = float(config.get("max_damage_selected_fraction_of_background", 0.75))
+    background_count = int((selected["SmallDomain"].astype(str) == "background").sum())
+    damage_index = selected.index[~selected["SmallDomain"].astype(str).eq("background")].to_numpy(dtype=np.int64)
+    combined_limit = int(np.floor(background_count * max_damage_fraction)) if background_count > 0 else len(damage_index)
+    if len(damage_index) > combined_limit:
+        drop = rng.choice(damage_index, size=len(damage_index) - combined_limit, replace=False)
+        selected = selected.drop(index=drop).reset_index(drop=True)
+    if len(selected) > fail_limit:
+        raise RuntimeError(
+            f"compact Step7A retained {len(selected)} patches after source limits, exceeding configured limit {fail_limit}"
+        )
+    post_limit_counts = {str(k): int(v) for k, v in selected["SmallDomain"].value_counts().items()}
     return selected, {
         "mode": "compact_array_sampling",
         "candidate_threshold": candidate_threshold,
@@ -527,9 +559,33 @@ def build_compact_selected_candidates(
         "expected_counts": {str(k): float(v) for k, v in expected_counts.items()},
         "selected_counts": {str(k): int(v) for k, v in selected_counts.items()},
         "selected_total": int(len(selected)),
+        "pre_source_limit_selected_counts": pre_limit_counts,
+        "post_source_limit_selected_counts": post_limit_counts,
+        "max_damage_selected_fraction_of_background": max_damage_fraction,
         "fail_fast_patch_count_limit": fail_limit,
         "chunk_samples": chunk_samples,
         "damage_context_npz": str(context_path),
+    }
+
+
+def nearest_neighbor_stats(frame: pd.DataFrame, time_scale_m_per_ms: float) -> dict[str, Any]:
+    if len(frame) < 2:
+        return {"count": int(len(frame)), "nearest_distance_stats": legacy.finite_stats([])}
+    points = np.column_stack(
+        [
+            pd.to_numeric(frame["CenterX"], errors="coerce"),
+            pd.to_numeric(frame["CenterY"], errors="coerce"),
+            pd.to_numeric(frame["CenterTime"], errors="coerce") * float(time_scale_m_per_ms),
+        ]
+    )
+    valid = np.isfinite(points).all(axis=1)
+    points = points[valid]
+    if len(points) < 2:
+        return {"count": int(len(points)), "nearest_distance_stats": legacy.finite_stats([])}
+    distances, _ = cKDTree(points).query(points, k=2)
+    return {
+        "count": int(len(points)),
+        "nearest_distance_stats": legacy.finite_stats(distances[:, 1]),
     }
 
 
@@ -768,6 +824,13 @@ def build_summary(
     source_counts = legacy.layer_distribution(patch_df["SourceType"]) if "SourceType" in patch_df.columns else {}
     orientation_family_counts = legacy.layer_distribution(patch_df["OrientationFamily"]) if "OrientationFamily" in patch_df.columns else {}
     orientation_rule_counts = legacy.layer_distribution(patch_df["OrientationRule"]) if "OrientationRule" in patch_df.columns else {}
+    source_total = max(int(len(patch_df)), 1)
+    source_fractions = {str(key): float(value / source_total) for key, value in source_counts.items()}
+    nn_time_scale = float(config.get("nearest_neighbor_time_scale_m_per_ms", 2.0))
+    nearest_by_domain = {
+        str(domain): nearest_neighbor_stats(group, nn_time_scale)
+        for domain, group in patch_df.groupby("SmallDomain", dropna=False)
+    } if "SmallDomain" in patch_df.columns else {}
     return {
         "status": "pass" if all(checks.values()) else "fail",
         "config_path": str(config_path),
@@ -790,6 +853,9 @@ def build_summary(
         "patch_build_summary": patch_summary,
         "small_domain_counts": domain_counts,
         "source_type_counts": source_counts,
+        "source_type_fractions": source_fractions,
+        "nearest_neighbor_time_scale_m_per_ms": nn_time_scale,
+        "nearest_neighbor_by_domain": nearest_by_domain,
         "orientation_family_counts": orientation_family_counts,
         "orientation_rule_counts": orientation_rule_counts,
         "patch_stats": {
@@ -824,7 +890,11 @@ def main() -> int:
     else:
         raise ValueError("config must define density_sgy or small_domain_density_sgys")
     axis_grid = legacy.load_density_grid(density_for_axis, trace_mapping_npz)
-    surfaces = legacy.attach_surface_grids(Path(config["layer_dir"]).resolve(), axis_grid["x_values"], axis_grid["y_values"])
+    with np.load(trace_mapping_npz) as mapping_npz:
+        mapping = {key: mapping_npz[key] for key in mapping_npz.files}
+    horizon_contract = load_contract_for_mapping(config, mapping)
+    validate_window_contract(config, horizon_contract, axis_grid["samples"])
+    surfaces = surface_grids_from_contract(mapping, horizon_contract)
 
     if bool(config.get("compact_step7_sampling", False)):
         selected, compact_summary = build_compact_selected_candidates(axis_grid, surfaces, config, rng)

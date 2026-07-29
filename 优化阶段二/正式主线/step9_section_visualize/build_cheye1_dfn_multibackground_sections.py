@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -10,7 +11,6 @@ from typing import Any, Callable
 
 import numpy as np
 
-from build_all_area_section_visualization import load_surface_lookups
 from build_cheye1_dfn_coherence_sections import (
     aligned_local_axis,
     build_imaging_fracture_patch_segments,
@@ -40,6 +40,11 @@ from well_curved_section_common import (
     save_section_pair_npz,
     write_json,
 )
+
+FORMAL_ROOT = Path(__file__).resolve().parent.parent
+if str(FORMAL_ROOT) not in sys.path:
+    sys.path.insert(0, str(FORMAL_ROOT))
+from common.horizon_trace_table.horizon_contract import build_spatial_lookup  # noqa: E402
 
 
 ATTRIBUTE_ORDER = ["AntTrack", "Coherence", "CurvatureMax"]
@@ -181,7 +186,7 @@ def build_overlay_contexts(
     fracture_df = load_step3_imaging_fracture_labels(group_paths, overview.well_name, dict(config.get("target_block") or {}))
     imaging_df = load_step3_imaging_segment_track(group_paths, overview.well_name, dict(config.get("target_block") or {}))
     imaging_patches = build_imaging_fracture_patch_segments(fracture_df)
-    surfaces = load_surface_lookups(standard_args.surface_dir)
+    surfaces = build_spatial_lookup(config)
     print("[multi-background] scanning overview DFN", flush=True)
     standard_segments, standard_scan = scan_vtk_intersections(standard_args, surfaces, overview.well_df)
     print("[multi-background] scanning local 200m DFN", flush=True)
@@ -208,6 +213,7 @@ def build_overlay_contexts(
             overview.well_df,
             float(config.get("fault_trace_half_width_m", standard_args.half_width)),
             overview_display,
+            surfaces,
             context_padding_m=float(config.get("original_fault_context_padding_m", 10000.0)),
         )
         local_faults, local_fault_scan = scan_original_fault_stick_traces(
@@ -216,6 +222,7 @@ def build_overlay_contexts(
             overview.well_df,
             float(config.get("local_fault_trace_half_width_m", local_args.half_width)),
             local_display,
+            surfaces,
             context_padding_m=float(config.get("original_fault_context_padding_m", 10000.0)),
         )
     else:
@@ -386,6 +393,22 @@ def render_all(config_path: Path, config: dict[str, Any]) -> dict[str, Any]:
         print(f"[multi-background] rendered {filename}", flush=True)
 
     png_files = sorted(path.name for path in output_dir.glob("*.png"))
+    scan_accounting: dict[str, dict[str, Any]] = {}
+    for scan_name in ("overview_scan", "local_200m_scan"):
+        scan = dict(overlay_summary[scan_name])
+        rejected_before_projection = int(scan["skipped_by_interval"]) + int(scan["skipped_by_area"]) + int(scan["skipped_by_geometry"])
+        scan_accounting[scan_name] = {
+            "input_polygon_count": int(scan["polygon_count"]),
+            "processed_polygon_count": int(scan["processed_polygon_count"]),
+            "layer_and_geometry_eligible_patch_count": int(scan["processed_polygon_count"] - rejected_before_projection),
+            "selected_patch_count": int(scan["selected_patch_count"]),
+            "true_intersection_segment_count": int(scan["selected_intersection_count"]),
+            "small_projection_segment_count": int(scan["selected_small_projection_count"]),
+            "rejected_before_projection_count": rejected_before_projection,
+            "rejected_by_section_distance_or_no_intersection_count": int(scan["skipped_by_surface_distance"]),
+            "accounting_total": int(scan["patch_accounting_total"]),
+            "accounting_closed": bool(scan["patch_accounting_closed"]),
+        }
     overlay_consistent = True
     for scope_name in scopes:
         for projection in ("XZ", "YZ"):
@@ -406,6 +429,13 @@ def render_all(config_path: Path, config: dict[str, Any]) -> dict[str, Any]:
             for key in ("overview_scan", "local_200m_scan")
             for projection in ("XZ", "YZ")
         ),
+        "overview_and_local_patch_accounting_closed": all(
+            bool(item["accounting_closed"]) for item in scan_accounting.values()
+        ),
+        "vtk_polygon_count_matches_dfn_csv": all(
+            int(item["input_polygon_count"]) == int(overlay_summary["dfn_patch_count"])
+            for item in scan_accounting.values()
+        ),
     }
     summary = {
         "status": "pass" if all(checks.values()) else "fail",
@@ -419,6 +449,7 @@ def render_all(config_path: Path, config: dict[str, Any]) -> dict[str, Any]:
         "well_name": overview.well_name,
         "scope_geometry": {name: geometry.summary for name, geometry in scopes.items()},
         "overlay_source": overlay_summary,
+        "projection_accounting": scan_accounting,
         "display": {
             "attributes": {name: info for name, (*_, info) in attribute_scales.items()},
             "seismic_symmetric_limit": float(seis_limit),

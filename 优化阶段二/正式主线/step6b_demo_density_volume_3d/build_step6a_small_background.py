@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -17,6 +18,17 @@ from build_multiscale_density_bundle import (
 
 
 CURRENT_DIR = Path(__file__).resolve().parent
+FORMAL_ROOT = CURRENT_DIR.parent
+if str(FORMAL_ROOT) not in sys.path:
+    sys.path.insert(0, str(FORMAL_ROOT))
+
+from common.horizon_trace_table.horizon_contract import (  # noqa: E402
+    apply_validity_inplace,
+    contract_summary,
+    load_contract_for_mapping,
+    validate_window_contract,
+)
+
 DEFAULT_CONFIG = CURRENT_DIR / "configs/formal_candidate_cheye1_multiscale_density_v1.json"
 DEFAULT_OUTPUT_DIR = CURRENT_DIR / "output/candidate_cheye1_multiscale_rebalance_v1/step6a_small"
 
@@ -76,8 +88,12 @@ def main() -> int:
     trace_mapping_npz = Path(config["trace_mapping_npz"]).resolve()
     mapping = load_mapping(trace_mapping_npz)
     density, samples, density_load = load_trace_matrix(input_density_sgy, None, None, "Step6A density")
+    horizon_contract = load_contract_for_mapping(config, mapping)
+    horizon_axis_qc = validate_window_contract(config, horizon_contract, samples)
     density_valid = np.isfinite(density)
+    horizon_mask_qc = apply_validity_inplace(density_valid, horizon_contract, samples)
     density = np.clip(np.nan_to_num(density, nan=0.0, posinf=0.0, neginf=0.0), 0.0, None).astype(np.float32)
+    density[~density_valid] = 0.0
     if density.shape[0] != len(mapping["x"]):
         raise ValueError(f"density tracecount {density.shape[0]} != mapping rows {len(mapping['x'])}")
 
@@ -90,7 +106,9 @@ def main() -> int:
     density_weight /= weight_total
     curvature_weight /= weight_total
 
-    density_score, density_norm_summary = robust_normalize(density, args.clip_low_q, args.clip_high_q)
+    density_for_score = density.copy()
+    density_for_score[~density_valid] = np.nan
+    density_score, density_norm_summary = robust_normalize(density_for_score, args.clip_low_q, args.clip_high_q)
     curvature_path = Path(config["volume_paths"]["CurvatureMax"]).resolve()
     curvature, _, curvature_load = load_trace_matrix(
         curvature_path,
@@ -99,6 +117,7 @@ def main() -> int:
         "Step6A CurvatureMax",
     )
     curvature_valid = np.isfinite(curvature) & (np.abs(curvature) < 1.0e6)
+    apply_validity_inplace(curvature_valid, horizon_contract, samples)
     curvature_transform = str(evidence_cfg.get("curvature_transform", "absolute"))
     if curvature_transform == "absolute":
         curvature_for_score = np.abs(curvature)
@@ -142,8 +161,11 @@ def main() -> int:
         "sample_count": int(density.shape[1]),
         "sample_min_ms": float(samples[0]),
         "sample_max_ms": float(samples[-1]),
-        "density_stats": finite_stats(density),
-        "density_quantiles": quantiles(density, [0.02, 0.50, 0.88, 0.95, 0.995]),
+        "horizon_contract": contract_summary(horizon_contract),
+        "horizon_axis_qc": horizon_axis_qc,
+        "horizon_mask_qc": horizon_mask_qc,
+        "density_stats": finite_stats(density[density_valid]),
+        "density_quantiles": quantiles(density[density_valid], [0.02, 0.50, 0.88, 0.95, 0.995]),
         "small_score_stats": finite_stats(small_score),
         "small_evidence": {
             "density_weight": density_weight,

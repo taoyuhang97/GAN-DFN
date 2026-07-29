@@ -9,15 +9,24 @@ from typing import Any
 import numpy as np
 import pandas as pd
 from scipy import ndimage
+from scipy.spatial import cKDTree
 
 
 CURRENT_DIR = Path(__file__).resolve().parent
+FORMAL_ROOT = CURRENT_DIR.parent
 LEGACY_STEP7B_DIR = CURRENT_DIR.parent / "step7b_initial_dfn_3d"
+if str(FORMAL_ROOT) not in sys.path:
+    sys.path.insert(0, str(FORMAL_ROOT))
 DEFAULT_CONFIG = CURRENT_DIR / "configs/formal_candidate_cheye1_step7b_medium_v4.json"
 if str(LEGACY_STEP7B_DIR) not in sys.path:
     sys.path.insert(0, str(LEGACY_STEP7B_DIR))
 
 import build_initial_dfn_from_3d_density_sgy as legacy  # noqa: E402
+from common.horizon_trace_table.horizon_contract import (  # noqa: E402
+    load_contract_for_mapping,
+    surface_grids_from_contract,
+    validate_window_contract,
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -415,6 +424,8 @@ def select_medium_patches(candidates: pd.DataFrame, grid: dict[str, Any], config
     adjust_dip_to = float(config.get("adjust_dip_to_deg", adjust_dip_below))
     low_dip_rejected_count = 0
     low_dip_adjusted_count = 0
+    min_center_separation = float(config.get("min_patch_center_separation_m", 25.0))
+    time_scale = float(config.get("orientation_time_scale_m_per_ms", 1.0))
     component_items = []
     for (layer, component_id), group in candidates.groupby(["LayerGroup", "ComponentID"], dropna=False):
         mass = float(group["SamplingWeight"].sum())
@@ -451,6 +462,7 @@ def select_medium_patches(candidates: pd.DataFrame, grid: dict[str, Any], config
                 weights = weights / weights.sum()
                 order = rng.choice(np.arange(len(group)), size=len(group), replace=False, p=weights)
         selected_rows = []
+        selected_coords: list[np.ndarray] = []
         used_cells: set[tuple[int, int, int]] = set()
         for local_idx in order:
             if len(selected_rows) >= target:
@@ -459,6 +471,18 @@ def select_medium_patches(candidates: pd.DataFrame, grid: dict[str, Any], config
             key = (int(row["IY"]), int(row["IX"]), int(row["IT"]))
             if key in used_cells:
                 continue
+            center_coord = np.asarray(
+                [
+                    float(grid["x_values"][int(row["IX"])]),
+                    float(grid["y_values"][int(row["IY"])]),
+                    float(row["CenterTime"]) * time_scale,
+                ],
+                dtype=float,
+            )
+            if selected_coords and min_center_separation > 0.0:
+                distances = np.linalg.norm(np.vstack(selected_coords) - center_coord, axis=1)
+                if float(np.min(distances)) < min_center_separation:
+                    continue
             used_cells.add(key)
             geom = local_geometry(group, int(local_idx), grid, config)
             raw_dip = float(geom["dip_deg"])
@@ -508,6 +532,7 @@ def select_medium_patches(candidates: pd.DataFrame, grid: dict[str, Any], config
             row["PatchShapeMode"] = "rectangular_local_medium_band_pca_v4"
             row["OrientationSourceOverride"] = str(geom["reason"])
             selected_rows.append(row)
+            selected_coords.append(center_coord)
         for ordinal, row in enumerate(selected_rows, start=1):
             row["BandPatchOrdinal"] = ordinal
         if selected_rows:
@@ -584,6 +609,33 @@ def build_summary(config_path: Path, config: dict[str, Any], paths: dict[str, Pa
     selected_components = selected[["LayerGroup", "ComponentID"]].drop_duplicates() if len(selected) else pd.DataFrame()
     candidate_component_count = int(len(candidate_components))
     selected_component_count = int(len(selected_components))
+    upstream_summary_path = Path(config["medium_component_summary_csv"]).resolve() if config.get("medium_component_summary_csv") else None
+    upstream_df = pd.read_csv(upstream_summary_path) if upstream_summary_path is not None and upstream_summary_path.exists() else pd.DataFrame()
+    upstream_component_ids = set(pd.to_numeric(upstream_df.get("component_id", pd.Series(dtype=float)), errors="coerce").dropna().astype(int))
+    selected_component_ids = set(pd.to_numeric(selected.get("ComponentID", pd.Series(dtype=float)), errors="coerce").dropna().astype(int))
+    upstream_component_count = int(len(upstream_component_ids))
+    upstream_component_coverage = float(len(upstream_component_ids & selected_component_ids) / max(upstream_component_count, 1))
+    target = dict(config.get("target_block") or {})
+    x_mid = 0.5 * (float(target.get("x_min", patch_df["CenterX"].min())) + float(target.get("x_max", patch_df["CenterX"].max())))
+    y_mid = 0.5 * (float(target.get("y_min", patch_df["CenterY"].min())) + float(target.get("y_max", patch_df["CenterY"].max())))
+    quadrant_labels = np.where(
+        patch_df["CenterY"].to_numpy(dtype=float) >= y_mid,
+        np.where(patch_df["CenterX"].to_numpy(dtype=float) >= x_mid, "NE", "NW"),
+        np.where(patch_df["CenterX"].to_numpy(dtype=float) >= x_mid, "SE", "SW"),
+    )
+    quadrant_counts = {str(key): int(value) for key, value in pd.Series(quadrant_labels).value_counts().items()}
+    layer_counts = {str(key): int(value) for key, value in patch_df["LayerGroup"].value_counts().items()}
+    coords = np.column_stack(
+        [
+            patch_df["CenterX"].to_numpy(dtype=float),
+            patch_df["CenterY"].to_numpy(dtype=float),
+            patch_df["CenterTime"].to_numpy(dtype=float) * float(config.get("orientation_time_scale_m_per_ms", 1.0)),
+        ]
+    )
+    if len(coords) > 1:
+        nearest = cKDTree(coords).query(coords, k=2)[0][:, 1]
+    else:
+        nearest = np.asarray([], dtype=float)
     checks = {
         "has_patches": len(patch_df) > 0,
         "all_medium_scale": bool(patch_df["FractureScale"].astype(str).eq("medium").all()),
@@ -593,6 +645,9 @@ def build_summary(config_path: Path, config: dict[str, Any], paths: dict[str, Pa
         "orientation_varies": bool(patch_df["AzimuthDeg"].round(2).nunique() > 10 and patch_df["DipDeg"].round(2).nunique() > 10),
         "size_varies": bool(patch_df["LengthM"].std(ddof=0) > 5.0 and patch_df["HeightTimeMs"].std(ddof=0) > 1.0),
         "covers_candidate_components": bool(candidate_component_count == 0 or selected_component_count / candidate_component_count >= float(config.get("min_component_coverage_fraction", 0.70))),
+        "covers_upstream_components": bool(upstream_component_count == 0 or upstream_component_coverage >= float(config.get("min_upstream_component_coverage_fraction", 0.65))),
+        "covers_spatial_quadrants": bool(len(quadrant_counts) >= int(config.get("min_quadrants_covered", 3))),
+        "centers_respect_minimum_spacing": bool(nearest.size == 0 or float(np.quantile(nearest, 0.05)) >= 0.5 * float(config.get("min_patch_center_separation_m", 25.0))),
     }
     return {
         "status": "pass" if all(checks.values()) else "fail",
@@ -613,6 +668,12 @@ def build_summary(config_path: Path, config: dict[str, Any], paths: dict[str, Pa
         "candidate_component_count": candidate_component_count,
         "selected_component_count": selected_component_count,
         "selected_component_fraction": float(selected_component_count / max(candidate_component_count, 1)),
+        "upstream_component_count": upstream_component_count,
+        "upstream_selected_component_count": int(len(upstream_component_ids & selected_component_ids)),
+        "upstream_component_coverage_fraction": upstream_component_coverage,
+        "quadrant_counts": quadrant_counts,
+        "layer_counts": layer_counts,
+        "nearest_center_distance": legacy.finite_stats(nearest),
         "band_examples": bands[:30],
         "patch_stats": {
             "length_m": legacy.finite_stats(patch_df["LengthM"]),
@@ -647,9 +708,14 @@ def main() -> int:
     rng = np.random.default_rng(int(config.get("random_seed", 20260715)))
 
     print("[step7b-medium-v4] loading medium prior", flush=True)
-    grid = legacy.load_density_grid(Path(config["medium_prior_sgy"]).resolve(), Path(config["trace_mapping_npz"]).resolve())
+    trace_mapping_path = Path(config["trace_mapping_npz"]).resolve()
+    grid = legacy.load_density_grid(Path(config["medium_prior_sgy"]).resolve(), trace_mapping_path)
     print("[step7b-medium-v4] loading surfaces", flush=True)
-    surfaces = legacy.attach_surface_grids(Path(config["layer_dir"]).resolve(), grid["x_values"], grid["y_values"])
+    with np.load(trace_mapping_path) as mapping_npz:
+        mapping = {key: mapping_npz[key] for key in mapping_npz.files}
+    horizon_contract = load_contract_for_mapping(config, mapping)
+    validate_window_contract(config, horizon_contract, grid["samples"])
+    surfaces = surface_grids_from_contract(mapping, horizon_contract)
     print("[step7b-medium-v4] building candidate components", flush=True)
     if config.get("medium_components_npz"):
         candidates, component_rows = component_candidates_from_step6b(config, grid, surfaces)

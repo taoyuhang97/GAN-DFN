@@ -13,10 +13,13 @@ from scipy import ndimage
 
 
 CURRENT_DIR = Path(__file__).resolve().parent
+FORMAL_ROOT = CURRENT_DIR.parent
 REPO_ROOT = CURRENT_DIR.parents[2]
 LEGACY_STEP7B_DIR = CURRENT_DIR.parent / "step7b_initial_dfn_3d"
 OLD_FAULT_POSTFUSION_DIR = REPO_ROOT / "研究内容三/优化阶段一/单元DFN融合/区域断层后融合"
 DEFAULT_CONFIG = CURRENT_DIR / "configs/formal_candidate_cheye1_step7c_large_v1.json"
+if str(FORMAL_ROOT) not in sys.path:
+    sys.path.insert(0, str(FORMAL_ROOT))
 if str(LEGACY_STEP7B_DIR) not in sys.path:
     sys.path.insert(0, str(LEGACY_STEP7B_DIR))
 if str(OLD_FAULT_POSTFUSION_DIR) not in sys.path:
@@ -25,6 +28,13 @@ if str(OLD_FAULT_POSTFUSION_DIR) not in sys.path:
 import build_initial_dfn_from_3d_density_sgy as legacy  # noqa: E402
 from build_fault_surface_fragments_from_raw_patches import run_build_fault_surface_fragments  # noqa: E402
 from build_regional_fault_panels import run_build_regional_fault_panels  # noqa: E402
+from common.horizon_trace_table.horizon_contract import (  # noqa: E402
+    HorizonSpatialLookup,
+    build_spatial_lookup,
+    load_contract_for_mapping,
+    surface_grids_from_contract,
+    validate_window_contract,
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -35,6 +45,50 @@ def parse_args() -> argparse.Namespace:
 
 def read_json(path: Path) -> dict[str, Any]:
     return json.loads(path.read_text(encoding="utf-8"))
+
+
+def contract_layer_for_center(config: dict[str, Any], center: np.ndarray) -> str | None:
+    lookup = config.get("_horizon_spatial_lookup")
+    if not isinstance(lookup, HorizonSpatialLookup):
+        raise RuntimeError("Step7C horizon spatial lookup is not initialized")
+    return lookup.layer_group(float(center[0]), float(center[1]), float(center[2]))
+
+
+def enforce_center_horizon_contract(
+    frame: pd.DataFrame,
+    lookup: HorizonSpatialLookup,
+) -> tuple[pd.DataFrame, dict[str, int]]:
+    if frame.empty:
+        return frame.copy(), {"input_count": 0, "kept_count": 0, "rejected_count": 0}
+    rows: list[pd.Series] = []
+    rejected = 0
+    for _, source_row in frame.iterrows():
+        row = source_row.copy()
+        local = lookup.query(float(row["CenterX"]), float(row["CenterY"]))
+        interval = lookup.interval(float(row["CenterX"]), float(row["CenterY"]), float(row["CenterTime"]))
+        if interval is None:
+            rejected += 1
+            continue
+        row["LayerGroup"] = "沙三段" if interval == "T4->T6" else "沙四段"
+        row["LayerCode"] = 1 if interval == "T4->T6" else 2
+        row["SourceTraceIdx"] = int(local["TraceIdx"])
+        row["LocalT4Time"] = float(local["T4"])
+        row["LocalT6Time"] = float(local["T6"])
+        row["LocalT7Time"] = float(local["T7"])
+        row["LocalShasanPresent"] = int(local["ShasanPresent"])
+        row["LocalShasiPresent"] = int(local["ShasiPresent"])
+        rows.append(row)
+    output = pd.DataFrame(rows, columns=list(frame.columns) + [
+        name for name in [
+            "SourceTraceIdx", "LocalT4Time", "LocalT6Time", "LocalT7Time",
+            "LocalShasanPresent", "LocalShasiPresent",
+        ] if name not in frame.columns
+    ])
+    return output.reset_index(drop=True), {
+        "input_count": int(len(frame)),
+        "kept_count": int(len(output)),
+        "rejected_count": int(rejected),
+    }
 
 
 def ensure_dir(path: Path) -> None:
@@ -53,14 +107,16 @@ def read_csv_flexible(path: Path) -> pd.DataFrame:
 
 def output_paths(output_dir: Path) -> dict[str, Path]:
     return {
+        "original_merged_surface_vtk": output_dir / "large_original_fault_merged_surface_raw_time.vtk",
         "fault_surface_vtk": output_dir / "large_fault_surface_raw_time.vtk",
+        "fault_surface_csv": output_dir / "large_fault_surface_patches.csv",
         "fault_panel_csv": output_dir / "large_original_fault_panel_patches.csv",
-        "fault_only_csv": output_dir / "large_fault_only_and_influence_patches.csv",
-        "fault_only_vtk": output_dir / "large_fault_only_and_influence_raw_time.vtk",
-        "lowcoh_csv": output_dir / "large_lowcoh_component_panel_patches.csv",
-        "lowcoh_vtk": output_dir / "large_lowcoh_component_panels_raw_time.vtk",
-        "dfn_csv": output_dir / "large_fault_and_damage_patches.csv",
-        "raw_vtk": output_dir / "large_fault_and_damage_raw_time.vtk",
+        "damage_csv": output_dir / "large_fault_damage_zone_patches.csv",
+        "damage_vtk": output_dir / "large_fault_damage_zone_raw_time.vtk",
+        "lowcoh_csv": output_dir / "large_inferred_fault_surface_patches.csv",
+        "lowcoh_vtk": output_dir / "large_inferred_fault_surfaces_raw_time.vtk",
+        "dfn_csv": output_dir / "large_fault_dfn_patches.csv",
+        "raw_vtk": output_dir / "large_fault_dfn_raw_time.vtk",
         "audit_csv": output_dir / "large_generation_audit.csv",
         "summary_json": output_dir / "large_fault_dfn_summary.json",
     }
@@ -88,6 +144,29 @@ def add_vertex_columns(row: dict[str, Any], vertices: np.ndarray) -> dict[str, A
         row[f"V{idx}Y"] = float(verts[idx - 1, 1])
         row[f"V{idx}Z"] = float(verts[idx - 1, 2])
     return row
+
+
+def filter_target_block_centers(frame: pd.DataFrame, config: dict[str, Any]) -> tuple[pd.DataFrame, dict[str, int]]:
+    if frame.empty:
+        return frame.copy(), {"input_count": 0, "kept_count": 0, "rejected_count": 0}
+    block = dict(config.get("target_block", {}))
+    required = {"x_min", "x_max", "y_min", "y_max"}
+    if not required.issubset(block):
+        return frame.reset_index(drop=True), {
+            "input_count": int(len(frame)),
+            "kept_count": int(len(frame)),
+            "rejected_count": 0,
+        }
+    mask = (
+        pd.to_numeric(frame["CenterX"], errors="coerce").between(float(block["x_min"]), float(block["x_max"]), inclusive="both")
+        & pd.to_numeric(frame["CenterY"], errors="coerce").between(float(block["y_min"]), float(block["y_max"]), inclusive="both")
+    )
+    output = frame.loc[mask].copy().reset_index(drop=True)
+    return output, {
+        "input_count": int(len(frame)),
+        "kept_count": int(len(output)),
+        "rejected_count": int((~mask).sum()),
+    }
 
 
 def finite_stats(values: Any) -> dict[str, float | int | None]:
@@ -749,7 +828,9 @@ def build_large_lowcoh_supplements(config: dict[str, Any]) -> pd.DataFrame:
                     float(config.get("max_lowcoh_height_ms", 180.0)),
                 )
             )
-            layer = "沙三段" if center[2] < float(config.get("shasi_time_split_ms", 2820.0)) else "沙四段"
+            layer = contract_layer_for_center(config, center)
+            if layer is None:
+                continue
             rows.append(
                 make_patch(
                     f"large_lowcoh_supplement_{ordinal:05d}",
@@ -776,7 +857,12 @@ def build_large_lowcoh_supplements(config: dict[str, Any]) -> pd.DataFrame:
         return pd.DataFrame()
     grid = legacy.load_density_grid(Path(config["large_prior_sgy"]).resolve(), Path(config["trace_mapping_npz"]).resolve())
     mask_grid = legacy.load_density_grid(Path(config["large_mask_sgy"]).resolve(), Path(config["trace_mapping_npz"]).resolve())["density"]
-    surfaces = legacy.attach_surface_grids(Path(config["layer_dir"]).resolve(), grid["x_values"], grid["y_values"])
+    trace_mapping_path = Path(config["trace_mapping_npz"]).resolve()
+    with np.load(trace_mapping_path) as mapping_npz:
+        mapping = {key: mapping_npz[key] for key in mapping_npz.files}
+    horizon_contract = load_contract_for_mapping(config, mapping)
+    validate_window_contract(config, horizon_contract, grid["samples"])
+    surfaces = surface_grids_from_contract(mapping, horizon_contract)
     structure = np.ones((3, 3, 3), dtype=np.uint8)
     labels, count = ndimage.label(mask_grid > 0.5, structure=structure)
     rows: list[dict[str, Any]] = []
@@ -967,7 +1053,9 @@ def build_lowcoh_component_panels(config: dict[str, Any]) -> pd.DataFrame:
                 seg_axis1, seg_axis2, _, seg_azimuth, seg_dip = axes_from_strike_dip(seg_azimuth, seg_dip)
             else:
                 seg_axis1, seg_axis2 = axis1, axis2
-            layer = "沙三段" if seg_center[2] < float(config.get("shasi_time_split_ms", 2820.0)) else "沙四段"
+            layer = contract_layer_for_center(config, seg_center)
+            if layer is None:
+                continue
             patch_idx += 1
             panel_rows.append(
                 make_patch(
@@ -1006,6 +1094,76 @@ def build_lowcoh_component_panels(config: dict[str, Any]) -> pd.DataFrame:
                 }
             )
             rows.append(row)
+    return pd.DataFrame(rows)
+
+
+def build_inferred_surface_panels(config: dict[str, Any]) -> pd.DataFrame:
+    summary_path = Path(config["large_component_summary_csv"]).resolve()
+    if not summary_path.exists():
+        raise FileNotFoundError(f"large_component_summary_csv not found: {summary_path}")
+    surface_df = read_csv_flexible(summary_path)
+    if surface_df.empty:
+        return pd.DataFrame()
+    missing = [column for column in vertex_columns() if column not in surface_df.columns]
+    if missing:
+        return build_lowcoh_component_panels(config)
+
+    rows: list[dict[str, Any]] = []
+    for ordinal, surface_row in surface_df.iterrows():
+        vertices = vertices_from_row(surface_row)
+        center, vertex_length, vertex_height, vertex_azimuth, vertex_dip = row_geometry_from_vertices(vertices)
+        layer = contract_layer_for_center(config, center)
+        if layer is None:
+            continue
+        surface_id = int(surface_row.get("surface_id", surface_row.get("component_id", ordinal + 1)))
+        raw_component_id = int(surface_row.get("raw_component_id", surface_id))
+        length = float(max(surface_row.get("surface_length_m", vertex_length), vertex_length, 1.0))
+        height = float(max(surface_row.get("surface_height_time_ms", vertex_height), vertex_height, 1.0))
+        azimuth = float(surface_row.get("pca_azimuth_deg", vertex_azimuth))
+        dip = float(surface_row.get("pca_dip_deg", vertex_dip))
+        score_mean = float(surface_row.get("score_mean", 0.0))
+        confidence = float(np.clip(0.55 + 0.35 * score_mean, 0.55, 0.90))
+        out = make_patch(
+            patch_id=f"large_inferred_fault_surface_{surface_id:05d}",
+            center=center,
+            axis1=vertices[1] - vertices[0],
+            axis2=vertices[3] - vertices[0],
+            length=length,
+            height=height,
+            azimuth=azimuth,
+            dip=dip,
+            layer=layer,
+            source_type="large_inferred_fault_surface",
+            constraint="seismic_prior",
+            confidence=confidence,
+            source_density=score_mean,
+            fault_name=f"inferred_fault_surface_{surface_id}",
+            component_id=surface_id,
+            ordinal=ordinal + 1,
+        )
+        add_vertex_columns(out, vertices)
+        out.update(
+            {
+                "ComponentID": surface_id,
+                "RawComponentID": raw_component_id,
+                "ComponentVoxelCount": int(surface_row.get("voxel_count", 0)),
+                "RawComponentVoxelCount": int(surface_row.get("raw_component_voxel_count", 0)),
+                "SurfaceOrdinalInRawComponent": int(surface_row.get("surface_ordinal_in_raw_component", 1)),
+                "SurfacePlanarity": float(surface_row.get("surface_planarity", np.nan)),
+                "SupportMean": float(surface_row.get("support_mean", np.nan)),
+                "SupportMax": float(surface_row.get("support_max", np.nan)),
+                "DominantLayer": str(surface_row.get("dominant_layer", layer)),
+                "DominantLayerFraction": float(surface_row.get("dominant_layer_fraction", np.nan)),
+                "RelativePositionStd": float(surface_row.get("relative_position_std", np.nan)),
+                "RelativePositionSpan": float(surface_row.get("relative_position_span", np.nan)),
+                "OrientationSource": "step6c_surface_ransac_vertices",
+                "SizeRule": "step6c_surface_ransac_vertices",
+                "BandContinuityMode": "continuous_inferred_fault_surface",
+                "PatchAreaM2": float(surface_row.get("surface_area_m2", out["PatchAreaM2"])),
+                "PatchArea": float(surface_row.get("surface_area_m2", out["PatchAreaM2"])),
+            }
+        )
+        rows.append(out)
     return pd.DataFrame(rows)
 
 
@@ -1081,11 +1239,25 @@ def main() -> int:
     args = parse_args()
     config_path = Path(args.config).resolve()
     config = read_json(config_path)
+    horizon_lookup = build_spatial_lookup(config)
+    config["_horizon_spatial_lookup"] = horizon_lookup
     output_dir = Path(config["output_dir"]).resolve()
     ensure_dir(output_dir)
     workspace = output_dir / "surface_panel_workspace"
     ensure_dir(workspace)
     paths = output_paths(output_dir)
+    for legacy_path in [
+        output_dir / "large_fault_only_and_influence_patches.csv",
+        output_dir / "large_fault_only_and_influence_raw_time.vtk",
+        output_dir / "large_fault_and_damage_patches.csv",
+        output_dir / "large_fault_and_damage_raw_time.vtk",
+    ]:
+        legacy_path.unlink(missing_ok=True)
+
+    original_merged_surface = Path(config["original_fault_merged_surface_vtk"]).resolve()
+    if not original_merged_surface.exists():
+        raise FileNotFoundError(f"original stitched fault surface not found: {original_merged_surface}")
+    shutil.copy2(original_merged_surface, paths["original_merged_surface_vtk"])
     fault_df = read_fault_sticks(Path(config["fault_stick_dat"]).resolve(), config)
     print(f"[step7c-large] clipped fault stick rows={len(fault_df)}", flush=True)
 
@@ -1124,27 +1296,30 @@ def main() -> int:
         surface_display_offset_ms=float(config.get("surface_display_offset_ms", 0.6)),
         surface_max_fragment_area_ratio=float(config.get("surface_max_fragment_area_ratio", 1500.0)),
     )
-    shutil.copy2(Path(surface_summary["surface_vtk"]), paths["fault_surface_vtk"])
     surface_fragment_df = standard_surface_fragment_rows(Path(surface_summary["summary_csv"]))
+    surface_fragment_df, surface_block_qc = filter_target_block_centers(surface_fragment_df, config)
+    surface_fragment_df, surface_horizon_qc = enforce_center_horizon_contract(surface_fragment_df, horizon_lookup)
+    if surface_fragment_df.empty:
+        raise RuntimeError("no original fault surface fragments remain inside target block and local T4-T7 window")
     panel_influence_df = build_fault_panel_and_influence_rows(Path(panel_summary["panel_csv"]), config)
     if panel_influence_df.empty:
         raise RuntimeError("no real segmented fault panel rows generated from raw fault patches")
     fault_panels_only = panel_influence_df[panel_influence_df["SourceType"].astype(str).eq("large_original_fault_panel")].copy()
     damage_patches = panel_influence_df[panel_influence_df["SourceType"].astype(str).eq("large_original_fault_damage_zone")].copy()
-    fault_patches = pd.concat([surface_fragment_df, damage_patches], ignore_index=True)
-    if fault_patches.empty:
-        fault_patches = panel_influence_df.copy()
-    lowcoh_patches = build_lowcoh_component_panels(config)
-    fault_patches.to_csv(paths["fault_only_csv"], index=False, encoding="utf-8-sig")
+    lowcoh_patches = build_inferred_surface_panels(config)
+    fault_panels_only, fault_panel_horizon_qc = enforce_center_horizon_contract(fault_panels_only, horizon_lookup)
+    damage_patches, damage_horizon_qc = enforce_center_horizon_contract(damage_patches, horizon_lookup)
+    lowcoh_patches, lowcoh_horizon_qc = enforce_center_horizon_contract(lowcoh_patches, horizon_lookup)
+    surface_fragment_df.to_csv(paths["fault_surface_csv"], index=False, encoding="utf-8-sig")
     fault_panels_only.to_csv(paths["fault_panel_csv"], index=False, encoding="utf-8-sig")
+    damage_patches.to_csv(paths["damage_csv"], index=False, encoding="utf-8-sig")
     lowcoh_patches.to_csv(paths["lowcoh_csv"], index=False, encoding="utf-8-sig")
-    write_intermediate_vtk = bool(config.get("write_intermediate_vtk", False))
-    if write_intermediate_vtk:
-        write_patch_vtk(paths["fault_only_vtk"], fault_patches, "step7c_large_original_fault_and_influence_raw_time")
-        write_patch_vtk(paths["lowcoh_vtk"], lowcoh_patches, "step7c_large_lowcoh_component_panels_raw_time")
-    parts = [df for df in [fault_patches, lowcoh_patches] if not df.empty]
+    write_patch_vtk(paths["fault_surface_vtk"], surface_fragment_df, "step7c_large_original_fault_surface_fragments_raw_time")
+    write_patch_vtk(paths["damage_vtk"], damage_patches, "step7c_large_fault_damage_zone_diagnostic_raw_time")
+    write_patch_vtk(paths["lowcoh_vtk"], lowcoh_patches, "step7c_large_inferred_fault_surfaces_raw_time")
+    parts = [df for df in [surface_fragment_df, lowcoh_patches] if not df.empty]
     if not parts:
-        raise RuntimeError("no large fault/fault-zone patches generated")
+        raise RuntimeError("no formal original or inferred large fault patches generated")
     patch_df = pd.concat(parts, ignore_index=True)
     patch_df.to_csv(paths["dfn_csv"], index=False, encoding="utf-8-sig")
     audit_cols = [
@@ -1168,15 +1343,15 @@ def main() -> int:
         "ComponentPanelCount",
     ]
     patch_df[[col for col in audit_cols if col in patch_df.columns]].to_csv(paths["audit_csv"], index=False, encoding="utf-8-sig")
-    if write_intermediate_vtk:
-        write_patch_vtk(paths["raw_vtk"], patch_df, "step7c_large_fault_and_damage_raw_time")
+    write_patch_vtk(paths["raw_vtk"], patch_df, "step7c_large_fault_dfn_raw_time")
     summary = {
         "status": "pass",
         "config_path": str(config_path),
-        "generation_logic": "step7c_real_fault_surface_fragments_and_regional_panels_plus_lowcoh_component_panel_groups",
+        "generation_logic": "step7c_exact_stitched_surface_reference_plus_surface_fragment_dfn_and_step6c_inferred_faults",
         "inputs": {
             "fault_stick_dat": str(Path(config["fault_stick_dat"]).resolve()),
             "fault_patches_root": str(fault_patches_root),
+            "original_fault_merged_surface_vtk": str(original_merged_surface),
             "fault_patch_overlap_csv": str(Path(config["fault_patch_overlap_csv"]).resolve()),
             "large_prior_sgy": str(Path(config["large_prior_sgy"]).resolve()),
             "large_mask_sgy": str(Path(config["large_mask_sgy"]).resolve()) if config.get("large_mask_sgy") else "",
@@ -1186,15 +1361,23 @@ def main() -> int:
         "outputs": {key: str(value) for key, value in paths.items()},
         "clipped_fault_stick_rows": int(len(fault_df)),
         "selected_fault_cell_range": cell_range,
-        "original_fault_source_mode": "raw_fault_patch_surface_fragments_and_regional_panels",
+        "original_fault_source_mode": "stitched_unit_fault_surface_for_comparison; surface_fragments_for_formal_dfn",
         "regional_fault_panel_summary": {key: str(value) for key, value in panel_summary.items()},
         "surface_fragment_summary": {key: str(value) for key, value in surface_summary.items() if key in {"surface_vtk", "summary_csv", "fragment_count", "selected_patch_count"}},
         "regional_fault_panel_count": int(len(fault_panels_only)),
-        "fault_damage_zone_patch_count": int(len(damage_patches)),
-        "fault_only_patch_count": int(len(fault_patches)),
-        "raw_fault_surface_fragment_count": int(len(surface_fragment_df)),
-        "lowcoh_supplement_patch_count": int(len(lowcoh_patches)),
+        "fault_damage_zone_diagnostic_patch_count": int(len(damage_patches)),
+        "formal_original_fault_patch_count": int(len(surface_fragment_df)),
+        "raw_fault_surface_fragment_count": int(surface_summary.get("fragment_count", len(surface_fragment_df))),
+        "inferred_fault_surface_patch_count": int(len(lowcoh_patches)),
         "patch_count": int(len(patch_df)),
+        "damage_zone_included_in_formal_dfn": False,
+        "target_block_filter_qc": {"original_fault_surface_fragments": surface_block_qc},
+        "horizon_contract_qc": {
+            "original_fault_surface_fragments": surface_horizon_qc,
+            "fault_panels": fault_panel_horizon_qc,
+            "damage_zone_diagnostic": damage_horizon_qc,
+            "inferred_lowcoh": lowcoh_horizon_qc,
+        },
         "source_type_counts": {str(k): int(v) for k, v in patch_df["SourceType"].value_counts(dropna=False).items()},
         "patch_stats": {
             "length_m": finite_stats(patch_df["LengthM"]),
@@ -1203,7 +1386,7 @@ def main() -> int:
             "azimuth_deg": finite_stats(patch_df["AzimuthDeg"]),
             "dip_deg": finite_stats(patch_df["DipDeg"]),
         },
-        "lowcoh_panel_group_stats": {
+        "inferred_surface_stats": {
             "component_count": int(lowcoh_patches["ComponentID"].nunique()) if "ComponentID" in lowcoh_patches.columns and len(lowcoh_patches) else 0,
             "panel_count": int(len(lowcoh_patches)),
             "panel_count_per_component": {
@@ -1215,11 +1398,15 @@ def main() -> int:
         },
         "checks": {
             "has_large_patches": len(patch_df) > 0,
+            "original_merged_surface_vtk_exists": paths["original_merged_surface_vtk"].exists(),
             "fault_surface_vtk_exists": paths["fault_surface_vtk"].exists(),
-            "fault_only_vtk_exists": bool(not write_intermediate_vtk or paths["fault_only_vtk"].exists()),
-            "lowcoh_vtk_exists": bool(not write_intermediate_vtk or paths["lowcoh_vtk"].exists()),
-            "raw_vtk_exists": bool(not write_intermediate_vtk or paths["raw_vtk"].exists()),
+            "fault_surface_csv_exists": paths["fault_surface_csv"].exists(),
+            "damage_vtk_exists": paths["damage_vtk"].exists(),
+            "damage_csv_exists": paths["damage_csv"].exists(),
+            "lowcoh_vtk_exists": paths["lowcoh_vtk"].exists(),
+            "raw_vtk_exists": paths["raw_vtk"].exists(),
             "csv_exists": paths["dfn_csv"].exists(),
+            "formal_dfn_excludes_damage_zone": not patch_df["SourceType"].astype(str).eq("large_original_fault_damage_zone").any(),
         },
     }
     summary["status"] = "pass" if all(bool(v) for v in summary["checks"].values()) else "fail"

@@ -35,6 +35,15 @@ def main() -> int:
     block = dict(master["target_block"])
     step6_root = Path(master["output_dir"]).resolve()
     mapping = str(Path(master["trace_mapping_npz"]).resolve())
+    horizon_common = {
+        "horizon_contract_table": str(Path(master["horizon_contract_table"]).resolve()),
+        "horizon_trace_table_path": str(Path(master["horizon_contract_table"]).resolve()),
+        "horizon_window_contracts": {
+            str(key): str(Path(value).resolve())
+            for key, value in dict(master["horizon_window_contracts"]).items()
+        },
+        "trace_header_csv": str(Path(master["trace_header_csv"]).resolve()),
+    }
 
     generated: dict[str, str] = {}
     step6_config = copy.deepcopy(master)
@@ -58,8 +67,11 @@ def main() -> int:
             "orientation_cache_xy_cells": int(master.get("step7a_orientation_cache_xy_cells", 3)),
             "orientation_cache_time_samples": int(master.get("step7a_orientation_cache_time_samples", 5)),
             "step7a_fail_fast_patch_count_limit": int(master.get("step7a_fail_fast_patch_count_limit", 120000)),
+            "max_damage_selected_fraction_of_background": float(master.get("step7a_max_damage_fraction_of_background", 0.75)),
+            "nearest_neighbor_time_scale_m_per_ms": float(master.get("step7a_nearest_neighbor_time_scale_m_per_ms", 2.0)),
             "write_intermediate_vtk": False,
             "orientation_window_time_samples": 15,
+            **horizon_common,
         }
     )
     step7a_template.pop("small_domain_density_sgys", None)
@@ -68,6 +80,18 @@ def main() -> int:
     for domain in step7a_template["small_domain_generation"].values():
         domain["weighted_probability_scale"] = float(domain["weighted_probability_scale"]) * scale_multiplier
         domain["fail_fast_patch_count_limit"] = fail_limit
+    step7a_template["small_domain_generation"]["medium_damage"].update(
+        {
+            "max_selected_fraction_of_background": float(master.get("step7a_medium_damage_fraction_of_background", 0.50)),
+            "max_selected_count": int(master.get("step7a_medium_damage_max_count", 40000)),
+        }
+    )
+    step7a_template["small_domain_generation"]["large_damage"].update(
+        {
+            "max_selected_fraction_of_background": float(master.get("step7a_large_damage_fraction_of_background", 0.25)),
+            "max_selected_count": int(master.get("step7a_large_damage_max_count", 20000)),
+        }
+    )
     step7a_path = FORMAL_ROOT / f"step7a_small_scale_dfn/configs/{version}.json"
     write_json(step7a_path, step7a_template)
     generated["step7a"] = str(step7a_path)
@@ -86,6 +110,9 @@ def main() -> int:
             "max_patches_per_component": 36,
             "orientation_window_time_samples": 4,
             "component_selection_mode": "spatial_farthest",
+            "min_patch_center_separation_m": 25.0,
+            "min_upstream_component_coverage_fraction": 0.65,
+            "min_quadrants_covered": 3,
             "use_global_component_orientation_fallback": True,
             "local_pca_min_planarity": 0.03,
             "local_geometry_min_dip_deg": 30.0,
@@ -94,6 +121,7 @@ def main() -> int:
             "global_extent_length_fraction": 0.16,
             "global_extent_height_fraction": 0.10,
             "write_intermediate_vtk": False,
+            **horizon_common,
         }
     )
     step7b.pop("medium_mask_sgy", None)
@@ -105,6 +133,7 @@ def main() -> int:
     step7c.update(
         {
             "original_fault_rasterization_audit_csv": str(step6_root / "step6c_large/original_fault_rasterization_audit.csv"),
+            "original_fault_merged_surface_vtk": str(step6_root / "step6c_large/original_fault_panels_selected_raw_time.vtk"),
             "fault_patch_overlap_csv": str(step6_root / "input_qc/fault_patch_demo_overlap.csv"),
             "large_prior_sgy": str(step6_root / "step6c_large/large_fault_prior.sgy"),
             "large_prior_components_npz": str(step6_root / "step6c_large/large_fault_prior_components.npz"),
@@ -116,7 +145,9 @@ def main() -> int:
             "time_max_ms": 3626.0,
             "min_lowcoh_component_voxels": 900,
             "lowcoh_min_panel_voxels": 120,
+            "inferred_geometry_mode": "step6c_surface_ransac_vertices",
             "write_intermediate_vtk": False,
+            **horizon_common,
         }
     )
     step7c.pop("large_mask_sgy", None)
@@ -129,7 +160,7 @@ def main() -> int:
         {
             "small_dfn_csv": str(FORMAL_ROOT / f"step7a_small_scale_dfn/output/{version}/small_dfn_patches.csv"),
             "medium_dfn_csv": str(FORMAL_ROOT / f"step7b_multiscale_initial_dfn/output/{version}/medium_dfn_patches.csv"),
-            "large_dfn_csv": str(FORMAL_ROOT / f"step7c_large_fault_dfn/output/{version}/large_fault_and_damage_patches.csv"),
+            "large_dfn_csv": str(FORMAL_ROOT / f"step7c_large_fault_dfn/output/{version}/large_fault_dfn_patches.csv"),
             "output_dir": str(FORMAL_ROOT / f"step7d_multiscale_fused_dfn/output/{version}"),
             "write_vtk": False,
         }
@@ -147,6 +178,7 @@ def main() -> int:
             "output_dir": str(FORMAL_ROOT / f"step8_dfn_well_correction/output/{version}"),
             "target_block": block,
             "export_debug_step_vtks": False,
+            **horizon_common,
         }
     )
     step8_path = FORMAL_ROOT / f"step8_dfn_well_correction/configs/{version}.json"
@@ -168,6 +200,7 @@ def main() -> int:
             "product_title": "车页1导眼：10 km Demo多尺度DFN",
             "overview_product_title": "车页1导眼：10 km Demo整体DFN",
             "local_product_title": "车页1导眼：井周DFN与成像测井裂缝对比",
+            **horizon_common,
         }
     )
     step9_path = FORMAL_ROOT / f"step9_section_visualize/configs/{version}.json"

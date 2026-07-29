@@ -13,12 +13,19 @@ from scipy.spatial import cKDTree
 
 
 CURRENT_DIR = Path(__file__).resolve().parent
+FORMAL_ROOT = CURRENT_DIR.parent
 DEFAULT_CONFIG = CURRENT_DIR / "configs/formal_well_control_correction.json"
 SURFACE_TOOL_DIR = CURRENT_DIR.parent / "step1_surface_framework"
+if str(FORMAL_ROOT) not in sys.path:
+    sys.path.insert(0, str(FORMAL_ROOT))
 if str(SURFACE_TOOL_DIR) not in sys.path:
     sys.path.insert(0, str(SURFACE_TOOL_DIR))
 
 from surface_tools import load_surface_tables  # noqa: E402
+from common.horizon_trace_table.horizon_contract import (  # noqa: E402
+    HorizonSpatialLookup,
+    build_spatial_lookup,
+)
 
 ALLOWED_LAYERS = ["沙三段", "沙四段"]
 LAYER_CODE = {"沙三段": 3, "沙四段": 4}
@@ -428,36 +435,74 @@ def query_surface_time(surface_lookup: dict[str, Any], code: str, x: float, y: f
     return float(item["time"][int(idx[0])])
 
 
-def update_layer_window_from_surfaces(row: pd.Series | dict[str, Any], surface_lookup: dict[str, Any] | None) -> dict[str, float]:
+def update_layer_window_from_surfaces(
+    row: pd.Series | dict[str, Any],
+    surface_lookup: HorizonSpatialLookup | None,
+) -> dict[str, float | int]:
     if surface_lookup is None:
         return {}
     layer = str(row["LayerGroup"])
     x = float(row["CenterX"])
     y = float(row["CenterY"])
+    local = surface_lookup.query(x, y)
     if layer == "沙三段":
-        top = query_surface_time(surface_lookup, "T4", x, y)
-        base = query_surface_time(surface_lookup, "T6", x, y)
+        top = float(local["T4"])
+        base = float(local["T6"])
+        present = bool(local["ShasanPresent"])
     elif layer == "沙四段":
-        top = query_surface_time(surface_lookup, "T6", x, y)
-        base = query_surface_time(surface_lookup, "T7", x, y)
+        top = float(local["T6"])
+        base = float(local["T7"])
+        present = bool(local["ShasiPresent"])
     else:
         return {}
-    if not np.isfinite(top) or not np.isfinite(base):
-        return {}
-    surface_order_repaired = int(base <= top)
-    if surface_order_repaired:
-        top, base = min(top, base), max(top, base)
+    valid_window = bool(present and np.isfinite(top) and np.isfinite(base) and base > top)
     center_time = float(row["CenterTime"])
-    if np.isfinite(center_time):
-        top = min(top, center_time)
-        base = max(base, center_time)
-    if base <= top:
-        return {}
+    center_inside = bool(valid_window and np.isfinite(center_time) and top <= center_time <= base)
     return {
-        "TimeWindowMin": top,
-        "TimeWindowMax": base,
-        "LayerThickness": base - top,
-        "LayerWindowSurfaceOrderRepaired": surface_order_repaired,
+        "TimeWindowMin": top if valid_window else np.nan,
+        "TimeWindowMax": base if valid_window else np.nan,
+        "LayerThickness": base - top if valid_window else np.nan,
+        "LayerWindowSurfaceOrderRepaired": 0,
+        "HorizonContractValid": int(valid_window),
+        "HorizonCenterInside": int(center_inside),
+        "SourceTraceIdx": int(local["TraceIdx"]),
+        "LocalT4Time": float(local["T4"]),
+        "LocalT6Time": float(local["T6"]),
+        "LocalT7Time": float(local["T7"]),
+        "LocalShasanPresent": int(local["ShasanPresent"]),
+        "LocalShasiPresent": int(local["ShasiPresent"]),
+    }
+
+
+def enforce_final_center_horizon_contract(
+    frame: pd.DataFrame,
+    lookup: HorizonSpatialLookup,
+) -> tuple[pd.DataFrame, dict[str, int]]:
+    rows: list[pd.Series] = []
+    rejected = 0
+    reassigned = 0
+    for _, source_row in frame.iterrows():
+        row = source_row.copy()
+        x = float(row["CenterX"])
+        y = float(row["CenterY"])
+        time = float(row["CenterTime"])
+        interval = lookup.interval(x, y, time)
+        if interval is None:
+            rejected += 1
+            continue
+        expected_layer = "沙三段" if interval == "T4->T6" else "沙四段"
+        if str(row["LayerGroup"]) != expected_layer:
+            reassigned += 1
+        row["LayerGroup"] = expected_layer
+        row["LayerCode"] = LAYER_CODE[expected_layer]
+        row.update(update_layer_window_from_surfaces(row, lookup))
+        rows.append(row)
+    output = pd.DataFrame(rows)
+    return output.reset_index(drop=True), {
+        "input_count": int(len(frame)),
+        "kept_count": int(len(output)),
+        "rejected_outside_local_t4_t7_count": int(rejected),
+        "layer_reassigned_from_local_t6_count": int(reassigned),
     }
 
 
@@ -1088,6 +1133,123 @@ def refresh_well_control_vertices(
     return out
 
 
+def materialize_and_clip_vertices_to_horizon_contract(
+    patch_df: pd.DataFrame,
+    lookup: HorizonSpatialLookup,
+    use_dip_geometry: bool,
+    geometry_time_scale_m_per_ms: float,
+) -> tuple[pd.DataFrame, dict[str, Any]]:
+    out = patch_df.reset_index(drop=True).copy()
+    vertex_cols = [f"V{vertex_idx}{axis}" for vertex_idx in range(1, 5) for axis in ("X", "Y", "Z")]
+    for column in vertex_cols:
+        if column not in out.columns:
+            out[column] = np.nan
+
+    all_vertices = np.empty((len(out), 4, 3), dtype=np.float64)
+    for row_idx, row in out.iterrows():
+        all_vertices[row_idx] = np.asarray(
+            patch_vertices(
+                row,
+                display=False,
+                display_z_scale=1.0,
+                use_dip_geometry=use_dip_geometry,
+                geometry_time_scale_m_per_ms=geometry_time_scale_m_per_ms,
+            ),
+            dtype=np.float64,
+        )
+
+    flat_vertices = all_vertices.reshape(-1, 3)
+    original_vertices = flat_vertices.copy()
+    _, positions = lookup.tree.query(flat_vertices[:, :2], k=1)
+    trace_idx = lookup.trace_idx[np.asarray(positions, dtype=np.int64)]
+    horizon_rows = lookup.table[trace_idx]
+    vertex_layers = np.repeat(out["LayerGroup"].astype(str).to_numpy(), 4)
+    is_shasi = vertex_layers == "沙四段"
+    top = np.where(is_shasi, horizon_rows["T6"], horizon_rows["T4"]).astype(np.float64)
+    base = np.where(is_shasi, horizon_rows["T7"], horizon_rows["T6"]).astype(np.float64)
+    present = np.where(is_shasi, horizon_rows["ShasiPresent"], horizon_rows["ShasanPresent"]).astype(bool)
+    valid = present & np.isfinite(top) & np.isfinite(base) & (base >= top)
+
+    # A hard fault center remains fixed. If a corner reaches a local trace without a
+    # valid T4-T7 interval, shorten only that corner along the center-to-corner edge.
+    for flat_idx in np.where(~valid)[0]:
+        patch_idx = int(flat_idx // 4)
+        patch_layer = str(out.loc[patch_idx, "LayerGroup"])
+        center_xy = out.loc[patch_idx, ["CenterX", "CenterY"]].to_numpy(dtype=np.float64)
+        vertex_xy = flat_vertices[flat_idx, :2].copy()
+        low = 0.0
+        high = 1.0
+        best: tuple[np.ndarray, dict[str, Any]] | None = None
+        for _ in range(24):
+            fraction = 0.5 * (low + high)
+            candidate_xy = center_xy + fraction * (vertex_xy - center_xy)
+            local = lookup.query(float(candidate_xy[0]), float(candidate_xy[1]))
+            if patch_layer == "沙四段":
+                local_present = bool(local["ShasiPresent"])
+                local_top = float(local["T6"])
+                local_base = float(local["T7"])
+            else:
+                local_present = bool(local["ShasanPresent"])
+                local_top = float(local["T4"])
+                local_base = float(local["T6"])
+            local_valid = bool(local_present and np.isfinite(local_top) and np.isfinite(local_base) and local_base >= local_top)
+            if local_valid:
+                low = fraction
+                best = (candidate_xy, local)
+            else:
+                high = fraction
+        if best is None:
+            local = lookup.query(float(center_xy[0]), float(center_xy[1]))
+            best = (center_xy, local)
+        candidate_xy, local = best
+        flat_vertices[flat_idx, :2] = candidate_xy
+        if patch_layer == "沙四段":
+            top[flat_idx] = float(local["T6"])
+            base[flat_idx] = float(local["T7"])
+            local_present = bool(local["ShasiPresent"])
+        else:
+            top[flat_idx] = float(local["T4"])
+            base[flat_idx] = float(local["T6"])
+            local_present = bool(local["ShasanPresent"])
+        valid[flat_idx] = bool(
+            local_present
+            and np.isfinite(top[flat_idx])
+            and np.isfinite(base[flat_idx])
+            and base[flat_idx] >= top[flat_idx]
+        )
+    original_z = flat_vertices[:, 2].copy()
+    clipped_z = np.where(valid, np.clip(original_z, top, base), original_z)
+    flat_vertices[:, 2] = clipped_z
+    all_vertices = flat_vertices.reshape(len(out), 4, 3)
+    delta = np.abs(clipped_z - original_z).reshape(len(out), 4)
+    xy_delta = np.linalg.norm(flat_vertices[:, :2] - original_vertices[:, :2], axis=1).reshape(len(out), 4)
+
+    for vertex_idx in range(1, 5):
+        out[f"V{vertex_idx}X"] = all_vertices[:, vertex_idx - 1, 0]
+        out[f"V{vertex_idx}Y"] = all_vertices[:, vertex_idx - 1, 1]
+        out[f"V{vertex_idx}Z"] = all_vertices[:, vertex_idx - 1, 2]
+    out["HorizonClippedVertexCount"] = (delta > 1.0e-6).sum(axis=1).astype(np.int16)
+    out["HorizonVertexMaxClipMs"] = delta.max(axis=1)
+    out["HorizonHorizontallyClippedVertexCount"] = (xy_delta > 1.0e-6).sum(axis=1).astype(np.int16)
+    out["HorizonVertexMaxHorizontalClipM"] = xy_delta.max(axis=1)
+    out["HorizonVerticesInsideT4T7"] = valid.reshape(len(out), 4).all(axis=1).astype(np.uint8)
+    out["PatchAreaM2"] = [polygon_area([tuple(point) for point in vertices]) for vertices in all_vertices]
+    return out, {
+        "patch_count": int(len(out)),
+        "vertex_count": int(len(flat_vertices)),
+        "clipped_patch_count": int((out["HorizonClippedVertexCount"] > 0).sum()),
+        "clipped_vertex_count": int((delta > 1.0e-6).sum()),
+        "horizontally_clipped_patch_count": int((out["HorizonHorizontallyClippedVertexCount"] > 0).sum()),
+        "horizontally_clipped_vertex_count": int((xy_delta > 1.0e-6).sum()),
+        "invalid_local_window_vertex_count": int((~valid).sum()),
+        "all_vertices_inside_local_layer_window": bool(valid.all()),
+        "all_vertices_inside_local_t4_t7": bool(valid.all()),
+        "max_clip_ms": float(delta.max()) if delta.size else 0.0,
+        "max_horizontal_clip_m": float(xy_delta.max()) if xy_delta.size else 0.0,
+        "hard_constraint_center_or_xy_shifted": False,
+    }
+
+
 def write_legacy_vtk(
     path: Path,
     patch_df: pd.DataFrame,
@@ -1516,7 +1678,7 @@ def main() -> int:
         control_df = step4_control_df
     tracks = load_real_well_tracks(samples_root, set(control_df["WellName"].astype(str).unique()))
     time_scale = float(config.get("time_scale_m_per_ms", 2.0))
-    surface_lookup = load_surface_time_lookup(surface_dir)
+    surface_lookup = build_spatial_lookup(config)
     track_dist = nearest_track_distances(control_df, tracks, time_scale=time_scale)
     before_dist = nearest_patch_distances(initial_df, control_df, time_scale=time_scale)
     corrected_df, audit_df = apply_well_controls(
@@ -1526,6 +1688,7 @@ def main() -> int:
         config=config,
         surface_lookup=surface_lookup,
     )
+    corrected_df, final_horizon_qc = enforce_final_center_horizon_contract(corrected_df, surface_lookup)
     after_dist = nearest_patch_distances(corrected_df, control_df, time_scale=time_scale)
 
     display_z_scale = float(config.get("display_z_scale", 5.0))
@@ -1536,6 +1699,13 @@ def main() -> int:
         use_dip_geometry=use_dip_geometry,
         geometry_time_scale_m_per_ms=geometry_time_scale,
     )
+    corrected_df, vertex_horizon_qc = materialize_and_clip_vertices_to_horizon_contract(
+        corrected_df,
+        lookup=surface_lookup,
+        use_dip_geometry=use_dip_geometry,
+        geometry_time_scale_m_per_ms=geometry_time_scale,
+    )
+    final_horizon_qc["vertex_geometry"] = vertex_horizon_qc
     corrected_df.to_csv(paths["corrected_csv"], index=False, encoding="utf-8-sig")
     audit_df.to_csv(paths["audit_csv"], index=False, encoding="utf-8-sig")
     write_legacy_vtk(
@@ -1575,6 +1745,11 @@ def main() -> int:
     )
     if debug_vtks:
         summary["debug_step_vtks"] = debug_vtks
+    summary["horizon_contract_qc"] = final_horizon_qc
+    summary.setdefault("checks", {})["all_patch_vertices_inside_local_t4_t7"] = bool(
+        vertex_horizon_qc["all_vertices_inside_local_t4_t7"]
+    )
+    summary["status"] = "pass" if all(bool(value) for value in summary["checks"].values()) else "fail"
     paths["summary_json"].write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
 
     print(f"Corrected DFN CSV: {paths['corrected_csv']}")

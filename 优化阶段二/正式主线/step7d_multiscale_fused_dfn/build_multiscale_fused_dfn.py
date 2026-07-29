@@ -150,6 +150,12 @@ def add_render_columns(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def patch_vertices(row: pd.Series) -> list[tuple[float, float, float]]:
+    vertex_cols = [f"V{vertex_idx}{axis}" for vertex_idx in range(1, 5) for axis in ("X", "Y", "Z")]
+    if all(col in row.index and pd.notna(row.get(col)) for col in vertex_cols):
+        return [
+            (float(row[f"V{vertex_idx}X"]), float(row[f"V{vertex_idx}Y"]), float(row[f"V{vertex_idx}Z"]))
+            for vertex_idx in range(1, 5)
+        ]
     azimuth = np.deg2rad(float(row["AzimuthDeg"]))
     dip = np.deg2rad(float(np.clip(row["DipDeg"], 1.0, 89.9)))
     half_length = 0.5 * float(row["LengthM"])

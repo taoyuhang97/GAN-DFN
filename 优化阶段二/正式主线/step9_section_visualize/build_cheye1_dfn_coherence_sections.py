@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -21,7 +22,7 @@ from build_all_area_section_visualization import (
     ProjectionSegment,
     SurfaceSectionCurve,
     configure_matplotlib_fonts,
-    interval_for_center,
+    interval_for_center as legacy_interval_for_center,
     next_nonempty,
     load_surface_lookups,
     polygon_area,
@@ -42,6 +43,14 @@ from build_well_attribute_section_visualization import (
     select_time_samples,
 )
 from trace_horizon_section import build_trace_horizon_section_curves, resolve_horizon_trace_table
+
+FORMAL_ROOT = Path(__file__).resolve().parent.parent
+if str(FORMAL_ROOT) not in sys.path:
+    sys.path.insert(0, str(FORMAL_ROOT))
+from common.horizon_trace_table.horizon_contract import (  # noqa: E402
+    HorizonSpatialLookup,
+    build_spatial_lookup,
+)
 
 
 WELL_NAME = "车页1导眼"
@@ -78,6 +87,12 @@ IMAGING_PATCH_ASPECT_RATIO = 1.5
 IMAGING_PATCH_SIZE_POWER = 1.25
 IMAGING_PATCH_LINE_WIDTH = 2.2
 IMAGING_PATCH_GEOMETRY_TIME_SCALE_M_PER_MS = 1.0
+
+
+def interval_for_center(center: np.ndarray, surfaces: Any) -> str | None:
+    if isinstance(surfaces, HorizonSpatialLookup):
+        return surfaces.interval(float(center[0]), float(center[1]), float(center[2]))
+    return legacy_interval_for_center(center, surfaces)
 SECTION_INTERSECTION_EPS_M = 1.0e-6
 
 
@@ -394,8 +409,6 @@ def scan_vtk_intersections(args: SimpleNamespace, surfaces: dict[str, Any], well
     well_time = well_df["TIME"].to_numpy(dtype=float)
     well_x = well_df["X"].to_numpy(dtype=float)
     well_y = well_df["Y"].to_numpy(dtype=float)
-    well_time_min = float(np.nanmin(well_time))
-    well_time_max = float(np.nanmax(well_time))
     segments: list[ProjectionSegment] = []
     skipped_by_curve_time = 0
     skipped_by_interval = 0
@@ -410,6 +423,8 @@ def scan_vtk_intersections(args: SimpleNamespace, surfaces: dict[str, Any], well
     selected_intersection_yz = 0
     selected_small_projection_xz = 0
     selected_small_projection_yz = 0
+    selected_patch_count = 0
+    processed_polygon_count = 0
     skipped_small_projection_well_control_xz = 0
     skipped_small_projection_well_control_yz = 0
     scanned_scale_counts: dict[str, int] = {}
@@ -434,6 +449,7 @@ def scan_vtk_intersections(args: SimpleNamespace, surfaces: dict[str, Any], well
         print(f"[cheye1-section] intersection scanning polygons: {total_to_scan}/{polygon_count}", flush=True)
 
         for polygon_index in range(total_to_scan):
+            processed_polygon_count += 1
             parts = next_nonempty(handle).split()
             vertex_count = int(parts[0])
             vertex_indices = [int(value) for value in parts[1:]]
@@ -446,9 +462,6 @@ def scan_vtk_intersections(args: SimpleNamespace, surfaces: dict[str, Any], well
                 continue
             center = vertices.mean(axis=0)
             center_time = float(center[2])
-            if center_time < well_time_min or center_time > well_time_max:
-                skipped_by_curve_time += 1
-                continue
             area = polygon_area(vertices)
             if area < float(args.min_patch_area) or (float(args.max_patch_area) > 0.0 and area > float(args.max_patch_area)):
                 skipped_by_area += 1
@@ -591,6 +604,8 @@ def scan_vtk_intersections(args: SimpleNamespace, surfaces: dict[str, Any], well
 
             if not selected_this_patch:
                 skipped_by_surface_distance += 1
+            else:
+                selected_patch_count += 1
             if int(args.max_selected) > 0 and len(segments) >= int(args.max_selected):
                 print(f"[cheye1-section] stopped early by max_selected={args.max_selected}", flush=True)
                 break
@@ -609,6 +624,8 @@ def scan_vtk_intersections(args: SimpleNamespace, surfaces: dict[str, Any], well
         "point_count": int(point_count),
         "polygon_count": int(polygon_count),
         "scanned_polygon_count": int(total_to_scan),
+        "processed_polygon_count": int(processed_polygon_count),
+        "selected_patch_count": int(selected_patch_count),
         "selected_segment_count": int(len(segments)),
         "selected_segment_count_xz": int(sum(segment.projection == "XZ" for segment in segments)),
         "selected_segment_count_yz": int(sum(segment.projection == "YZ" for segment in segments)),
@@ -631,6 +648,13 @@ def scan_vtk_intersections(args: SimpleNamespace, surfaces: dict[str, Any], well
         "skipped_by_interval": int(skipped_by_interval),
         "skipped_by_area": int(skipped_by_area),
         "skipped_by_geometry": int(skipped_by_geometry),
+        "patch_accounting_total": int(
+            selected_patch_count + skipped_by_surface_distance + skipped_by_interval + skipped_by_area + skipped_by_geometry
+        ),
+        "patch_accounting_closed": bool(
+            processed_polygon_count
+            == selected_patch_count + skipped_by_surface_distance + skipped_by_interval + skipped_by_area + skipped_by_geometry
+        ),
         "bounds_x_min": float(bounds_min[0]),
         "bounds_x_max": float(bounds_max[0]),
         "bounds_y_min": float(bounds_min[1]),
@@ -663,8 +687,6 @@ def scan_fault_surface_csv_intersections(
     well_time = well_df["TIME"].to_numpy(dtype=float)
     well_x = well_df["X"].to_numpy(dtype=float)
     well_y = well_df["Y"].to_numpy(dtype=float)
-    well_time_min = float(np.nanmin(well_time))
-    well_time_max = float(np.nanmax(well_time))
     segments: list[ProjectionSegment] = []
     skipped_by_time = 0
     skipped_by_interval = 0
@@ -684,10 +706,10 @@ def scan_fault_surface_csv_intersections(
             continue
         center = vertices.mean(axis=0)
         center_time = float(center[2])
-        if center_time < well_time_min or center_time > well_time_max:
-            skipped_by_time += 1
+        interval = interval_for_center(center, surfaces)
+        if interval is None:
+            skipped_by_interval += 1
             continue
-        interval = interval_for_center(center, surfaces) or "fault_surface"
         area = polygon_area(vertices)
         y_on_well_curve = float(np.interp(center_time, well_time, well_y))
         x_on_well_curve = float(np.interp(center_time, well_time, well_x))
@@ -803,13 +825,21 @@ def raw_fault_segments_for_projection(
     well_df: pd.DataFrame,
     half_width: float,
     display: dict[str, float],
+    surfaces: Any,
 ) -> tuple[list[ProjectionSegment], dict[str, int]]:
     well_time = well_df["TIME"].to_numpy(dtype=float)
     well_x = well_df["X"].to_numpy(dtype=float)
     well_y = well_df["Y"].to_numpy(dtype=float)
-    well_time_min = float(np.nanmin(well_time))
-    well_time_max = float(np.nanmax(well_time))
-    work = fault_df[fault_df["TIME"].between(well_time_min, well_time_max)].copy()
+    work = fault_df.copy()
+    if isinstance(surfaces, HorizonSpatialLookup):
+        inside = np.asarray(
+            [
+                surfaces.interval(float(x), float(y), float(time)) is not None
+                for x, y, time in work[["X", "Y", "TIME"]].to_numpy(dtype=float)
+            ],
+            dtype=bool,
+        )
+        work = work[inside].copy()
     if work.empty:
         return [], {"selected_point_count": 0, "segment_count": 0, "selected_group_count": 0}
     if projection == "XZ":
@@ -886,14 +916,15 @@ def scan_original_fault_stick_traces(
     well_df: pd.DataFrame,
     half_width: float,
     display: dict[str, float],
+    surfaces: Any,
     *,
     context_padding_m: float = 10000.0,
 ) -> tuple[list[ProjectionSegment], dict[str, Any]]:
     if fault_dat is None:
         return [], {"enabled": False, "segment_count": 0}
     fault_df = load_original_fault_sticks(fault_dat, target_block, context_padding_m=context_padding_m)
-    xz_segments, xz_summary = raw_fault_segments_for_projection(fault_df, "XZ", well_df, half_width, display)
-    yz_segments, yz_summary = raw_fault_segments_for_projection(fault_df, "YZ", well_df, half_width, display)
+    xz_segments, xz_summary = raw_fault_segments_for_projection(fault_df, "XZ", well_df, half_width, display, surfaces)
+    yz_segments, yz_summary = raw_fault_segments_for_projection(fault_df, "YZ", well_df, half_width, display, surfaces)
     segments = xz_segments + yz_segments
     return segments, {
         "enabled": True,
@@ -1317,7 +1348,7 @@ def main() -> None:
 
     trace_df = build_trace_grid(path_from_config(config, "trace_header_csv"), dict(config.get("target_block") or {}))
     trace_tree, trace_ids = build_trace_tree(trace_df)
-    surfaces = load_surface_lookups(standard_args.surface_dir)
+    surfaces = build_spatial_lookup(config)
     horizon_trace_table_path = resolve_horizon_trace_table(config)
     x_values = np.sort(trace_df["X"].unique()).astype(np.float64)
     y_values = np.sort(trace_df["Y"].unique()).astype(np.float64)
@@ -1377,6 +1408,7 @@ def main() -> None:
             well_df,
             float(config.get("fault_trace_half_width_m", config.get("dfn_half_width_m", 50.0))),
             full_display,
+            surfaces,
             context_padding_m=float(config.get("original_fault_context_padding_m", 10000.0)),
         )
         local_fault_segments, local_fault_scan = scan_original_fault_stick_traces(
@@ -1385,6 +1417,7 @@ def main() -> None:
             well_df,
             float(config.get("local_fault_trace_half_width_m", config.get("local_dfn_half_width_m", 200.0))),
             local_display,
+            surfaces,
             context_padding_m=float(config.get("original_fault_context_padding_m", 10000.0)),
         )
     else:

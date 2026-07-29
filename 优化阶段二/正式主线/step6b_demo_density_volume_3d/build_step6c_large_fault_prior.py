@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -28,6 +29,19 @@ from build_multiscale_density_bundle import (
 
 
 CURRENT_DIR = Path(__file__).resolve().parent
+FORMAL_ROOT = CURRENT_DIR.parent
+if str(FORMAL_ROOT) not in sys.path:
+    sys.path.insert(0, str(FORMAL_ROOT))
+
+from common.horizon_trace_table.horizon_contract import (  # noqa: E402
+    apply_validity_inplace,
+    apply_window_inplace,
+    contract_summary,
+    load_contract_for_mapping,
+    surface_grids_from_contract,
+    validate_window_contract,
+)
+
 REPO_ROOT = Path(__file__).resolve().parents[3]
 DEFAULT_CONFIG = CURRENT_DIR / "configs/formal_candidate_cheye1_multiscale_density_v1.json"
 DEFAULT_OUTPUT_DIR = CURRENT_DIR / "output/candidate_cheye1_multiscale_rebalance_v1/step6c_large"
@@ -47,7 +61,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-component-voxels-before-split", type=int, default=25000)
     parser.add_argument("--split-tile-cells", type=int, default=32)
     parser.add_argument("--split-time-samples", type=int, default=20)
-    parser.add_argument("--inferred-extraction-mode", choices=["component_tiles", "surface_ransac"], default="component_tiles")
+    parser.add_argument("--inferred-extraction-mode", choices=["component_tiles", "surface_ransac"], default="surface_ransac")
     parser.add_argument("--orientation-time-scale-m-per-ms", type=float, default=2.0)
     parser.add_argument("--min-vertical-extent-ms", type=float, default=24.0)
     parser.add_argument("--min-dip-deg", type=float, default=45.0)
@@ -71,14 +85,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--surface-ransac-distance-m", type=float, default=45.0)
     parser.add_argument("--surface-ransac-max-points", type=int, default=60000)
     parser.add_argument("--surface-ransac-max-surfaces-per-component", type=int, default=5)
-    parser.add_argument("--surface-ransac-min-inlier-voxels", type=int, default=800)
+    parser.add_argument("--surface-ransac-min-inlier-voxels", type=int, default=400)
     parser.add_argument("--surface-ransac-min-inlier-fraction", type=float, default=0.04)
-    parser.add_argument("--surface-ransac-max-raw-components", type=int, default=20)
+    parser.add_argument("--surface-ransac-max-raw-components", type=int, default=96)
     parser.add_argument("--surface-ransac-min-cluster-voxels", type=int, default=350)
     parser.add_argument("--surface-max-panel-length-m", type=float, default=1200.0)
     parser.add_argument("--surface-max-panel-height-ms", type=float, default=360.0)
     parser.add_argument("--surface-max-horizontal-extent-m", type=float, default=1800.0)
     parser.add_argument("--surface-max-time-extent-ms", type=float, default=520.0)
+    parser.add_argument("--strat-following-min-horizontal-extent-m", type=float, default=600.0)
+    parser.add_argument("--strat-following-max-relative-position-std", type=float, default=0.035)
+    parser.add_argument("--strat-following-max-relative-position-span", type=float, default=0.12)
+    parser.add_argument("--strat-following-min-dominant-layer-fraction", type=float, default=0.80)
     parser.add_argument("--irregular-surface-max-points", type=int, default=3500)
     parser.add_argument("--irregular-surface-max-edge-m", type=float, default=220.0)
     parser.add_argument("--random-state", type=int, default=42)
@@ -314,6 +332,62 @@ def build_local_support_grid(ant_grid: np.ndarray, curv_grid: np.ndarray, radius
     return ndimage.maximum_filter(support, size=(size, size, size), mode="nearest").astype(np.float32)
 
 
+def longest_true_run_per_column(mask: np.ndarray) -> np.ndarray:
+    values = np.asarray(mask, dtype=bool)
+    current = np.zeros(values.shape[:2], dtype=np.int16)
+    longest = np.zeros(values.shape[:2], dtype=np.int16)
+    for time_idx in range(values.shape[2]):
+        current = np.where(values[:, :, time_idx], current + 1, 0).astype(np.int16, copy=False)
+        longest = np.maximum(longest, current)
+    return longest
+
+
+def local_layer_relative_position(
+    yy: np.ndarray,
+    xx: np.ndarray,
+    time_ms: np.ndarray,
+    surfaces: dict[str, np.ndarray],
+) -> tuple[np.ndarray, np.ndarray]:
+    t4 = surfaces["T4_TIME"][yy, xx].astype(np.float64)
+    t6 = surfaces["T6_TIME"][yy, xx].astype(np.float64)
+    t7 = surfaces["T7_TIME"][yy, xx].astype(np.float64)
+    shasan = surfaces["ShasanPresent"][yy, xx].astype(bool) & (time_ms >= t4) & (time_ms <= t6)
+    shasi = surfaces["ShasiPresent"][yy, xx].astype(bool) & (time_ms >= t6) & (time_ms <= t7)
+    layer_code = np.zeros(len(time_ms), dtype=np.uint8)
+    layer_code[shasan] = 1
+    layer_code[shasi] = 2
+    relative = np.full(len(time_ms), np.nan, dtype=np.float64)
+    relative[shasan] = (time_ms[shasan] - t4[shasan]) / np.maximum(t6[shasan] - t4[shasan], 1.0e-6)
+    relative[shasi] = (time_ms[shasi] - t6[shasi]) / np.maximum(t7[shasi] - t6[shasi], 1.0e-6)
+    return layer_code, relative
+
+
+def layer_relative_stats(
+    yy: np.ndarray,
+    xx: np.ndarray,
+    time_ms: np.ndarray,
+    surfaces: dict[str, np.ndarray],
+) -> dict[str, Any]:
+    layer_code, relative = local_layer_relative_position(yy, xx, time_ms, surfaces)
+    counts = np.bincount(layer_code, minlength=3)
+    dominant_code = int(np.argmax(counts[1:]) + 1) if int(counts[1:].sum()) else 0
+    dominant_mask = layer_code == dominant_code
+    dominant_values = relative[dominant_mask & np.isfinite(relative)]
+    dominant_fraction = float(dominant_mask.mean()) if len(layer_code) else 0.0
+    if len(dominant_values):
+        relative_std = float(np.std(dominant_values))
+        relative_span = float(np.percentile(dominant_values, 95) - np.percentile(dominant_values, 5))
+    else:
+        relative_std = float("nan")
+        relative_span = float("nan")
+    return {
+        "dominant_layer": {0: "unknown", 1: "沙三段", 2: "沙四段"}[dominant_code],
+        "dominant_layer_fraction": dominant_fraction,
+        "relative_position_std": relative_std,
+        "relative_position_span": relative_span,
+    }
+
+
 def filter_faultlike_evidence_grid(
     candidate_grid: np.ndarray,
     support_grid: np.ndarray,
@@ -339,11 +413,12 @@ def filter_faultlike_evidence_grid(
         mode="nearest",
     ) > 0
     column_hits = local_candidate.sum(axis=2)
+    longest_column_run = longest_true_run_per_column(local_candidate)
     nt = raw.shape[2]
     dt = float(np.median(np.diff(samples))) if len(samples) > 1 else 1.0
     min_hits_from_extent = int(np.ceil(float(args.faultlike_min_vertical_extent_ms) / max(abs(dt), 1.0e-6))) + 1
     min_hits = max(int(args.faultlike_min_column_hits), min_hits_from_extent)
-    vertical_column = column_hits >= min_hits
+    vertical_column = longest_column_run >= min_hits
     vertical_grid = np.repeat(vertical_column[:, :, None], nt, axis=2)
 
     slice_fraction = raw.mean(axis=(0, 1))
@@ -372,6 +447,9 @@ def filter_faultlike_evidence_grid(
         "max_horizontal_slice_fraction": float(args.faultlike_max_horizontal_slice_fraction),
         "raw_voxel_count": raw_count,
         "vertical_column_count": int(vertical_column.sum()),
+        "column_total_hit_stats": finite_stats(column_hits),
+        "column_longest_contiguous_run_stats": finite_stats(longest_column_run),
+        "column_rejected_total_hits_without_contiguous_run_count": int(((column_hits >= min_hits) & ~vertical_column).sum()),
         "removed_by_vertical_or_support_or_layer_filter": int(raw_count - int((raw & vertical_grid & local_support & non_layer_grid).sum())),
         "raw_component_count_after_prefilter": int(count),
         "kept_component_count_after_size_filter": int(len(keep_ids)),
@@ -568,6 +646,7 @@ def extract_inferred_fault_surfaces(
     support_grid: np.ndarray,
     mapping: dict[str, np.ndarray],
     samples: np.ndarray,
+    surfaces: dict[str, np.ndarray],
     args: argparse.Namespace,
     rng: np.random.Generator,
 ) -> tuple[np.ndarray, pd.DataFrame, dict[str, Any], list[np.ndarray]]:
@@ -591,6 +670,7 @@ def extract_inferred_fault_surfaces(
     rejected_short_xy = 0
     rejected_low_dip = 0
     rejected_layer_like = 0
+    rejected_strat_following = 0
     rejected_low_inlier = 0
     rejected_too_broad = 0
     next_surface_id = 1
@@ -669,6 +749,23 @@ def extract_inferred_fault_surfaces(
                 max_length_m=float(args.surface_max_panel_length_m),
                 max_height_ms=float(args.surface_max_panel_height_ms),
             )
+            relative_stats = layer_relative_stats(
+                iyy,
+                ixx,
+                inlier_points_unscaled[:, 2],
+                surfaces,
+            )
+            strat_following = bool(
+                horizontal_extent >= float(args.strat_following_min_horizontal_extent_m)
+                and relative_stats["dominant_layer_fraction"] >= float(args.strat_following_min_dominant_layer_fraction)
+                and np.isfinite(relative_stats["relative_position_std"])
+                and relative_stats["relative_position_std"] <= float(args.strat_following_max_relative_position_std)
+                and relative_stats["relative_position_span"] <= float(args.strat_following_max_relative_position_span)
+            )
+            if strat_following:
+                rejected_strat_following += 1
+                remaining[active_idx[inliers_local]] = False
+                continue
             layer_like = bool(
                 geom["dip_deg"] <= float(args.layer_like_max_dip_deg)
                 and horizontal_extent >= float(args.layer_like_min_horizontal_extent_m)
@@ -715,6 +812,8 @@ def extract_inferred_fault_surfaces(
                 "pca_linearity": np.nan,
                 "surface_planarity": geom["planarity"],
                 "layer_like": layer_like,
+                "strat_following": strat_following,
+                **relative_stats,
             }
             for vertex_idx in range(1, 5):
                 row[f"V{vertex_idx}X"] = float(vertices[vertex_idx - 1, 0])
@@ -749,6 +848,7 @@ def extract_inferred_fault_surfaces(
         "rejected_thin_surface_count": int(rejected_thin),
         "rejected_short_xy_surface_count": int(rejected_short_xy),
         "rejected_layer_like_surface_count": int(rejected_layer_like),
+        "rejected_strat_following_surface_count": int(rejected_strat_following),
         "rejected_low_dip_surface_count": int(rejected_low_dip),
         "rejected_low_inlier_surface_count": int(rejected_low_inlier),
         "rejected_too_broad_surface_count": int(rejected_too_broad),
@@ -759,6 +859,10 @@ def extract_inferred_fault_surfaces(
         "surface_ransac_max_surfaces_per_component": int(args.surface_ransac_max_surfaces_per_component),
         "surface_max_horizontal_extent_m": float(args.surface_max_horizontal_extent_m),
         "surface_max_time_extent_ms": float(args.surface_max_time_extent_ms),
+        "strat_following_min_horizontal_extent_m": float(args.strat_following_min_horizontal_extent_m),
+        "strat_following_max_relative_position_std": float(args.strat_following_max_relative_position_std),
+        "strat_following_max_relative_position_span": float(args.strat_following_max_relative_position_span),
+        "strat_following_min_dominant_layer_fraction": float(args.strat_following_min_dominant_layer_fraction),
         "orientation_time_scale_m_per_ms": time_scale,
     }
     return surface_id_grid, pd.DataFrame(rows), summary, surface_point_sets
@@ -976,10 +1080,22 @@ def main() -> int:
     samples = regular_sample_axis(source_samples, interval_ms)
     density_load["target_sample_count"] = int(len(samples))
     density_load["target_sample_interval_ms"] = interval_ms
+    horizon_contract = load_contract_for_mapping(config, mapping)
+    horizon_axis_qc = validate_window_contract(config, horizon_contract, samples)
+    horizon_surfaces = surface_grids_from_contract(mapping, horizon_contract)
 
     selected_faults = load_fault_overlap(args.input_qc_dir.resolve())
     selected_faults = selected_faults[selected_faults["intersects_demo_xy_t"].astype(bool)].copy()
     original_fault_grid, original_fault_mask, fault_audit = rasterize_original_faults(selected_faults, mapping, samples, args)
+    original_fault_flat = grid_to_flat(original_fault_grid.astype(np.float32), mapping)
+    original_fault_mask_flat = grid_to_flat(original_fault_mask.astype(np.uint8), mapping).astype(bool)
+    original_fault_horizon_qc = apply_window_inplace(
+        original_fault_flat, horizon_contract, samples, fill_value=0.0
+    )
+    apply_window_inplace(original_fault_mask_flat, horizon_contract, samples, fill_value=False)
+    original_fault_grid, _, _ = flat_to_grid(original_fault_flat, mapping)
+    original_fault_mask_grid, _, _ = flat_to_grid(original_fault_mask_flat.astype(np.float32), mapping)
+    original_fault_mask = original_fault_mask_grid > 0.5
     fault_audit.to_csv(output_dir / "original_fault_rasterization_audit.csv", index=False, encoding="utf-8-sig")
     original_vtk_summary = merge_fault_vtps(
         selected_faults,
@@ -1006,6 +1122,11 @@ def main() -> int:
     ant_valid = valid_values(anttrack, ant_cfg)
     curvmax_valid = valid_values(curvmax, curvmax_cfg)
     curvpos_valid = valid_values(curvpos, curvpos_cfg) if curvpos is not None else None
+    horizon_mask_qc = apply_validity_inplace(coh_valid, horizon_contract, samples)
+    apply_validity_inplace(ant_valid, horizon_contract, samples)
+    apply_validity_inplace(curvmax_valid, horizon_contract, samples)
+    if curvpos_valid is not None:
+        apply_validity_inplace(curvpos_valid, horizon_contract, samples)
     lowcoh_score, lowcoh_summary = low_score(coherence, coh_valid, coh_cfg)
     ant_score, ant_summary = high_score(anttrack, ant_valid, ant_cfg)
     curvmax_score, curvmax_summary = high_score(curvmax, curvmax_valid, curvmax_cfg)
@@ -1073,6 +1194,7 @@ def main() -> int:
             support_grid,
             mapping,
             samples,
+            horizon_surfaces,
             args,
             rng,
         )
@@ -1134,6 +1256,12 @@ def main() -> int:
         y=mapping["y"].astype(np.float64),
         ix=mapping["ix"].astype(np.int32),
         iy=mapping["iy"].astype(np.int32),
+        source_trace_idx=horizon_contract.trace_idx.astype(np.int32),
+        t4_time=horizon_contract.t4.astype(np.float32),
+        t6_time=horizon_contract.t6.astype(np.float32),
+        t7_time=horizon_contract.t7.astype(np.float32),
+        shasan_present=horizon_contract.shasan_present.astype(np.uint8),
+        shasi_present=horizon_contract.shasi_present.astype(np.uint8),
     )
 
     summary = {
@@ -1142,6 +1270,10 @@ def main() -> int:
         "output_dir": str(output_dir),
         "sample_interval_ms": interval_ms,
         "sample_count": int(len(samples)),
+        "horizon_contract": contract_summary(horizon_contract),
+        "horizon_axis_qc": horizon_axis_qc,
+        "horizon_mask_qc": horizon_mask_qc,
+        "original_fault_horizon_mask_qc": original_fault_horizon_qc,
         "output_contract": {
             "large_prior_sgy": str(output_dir / "large_fault_prior.sgy"),
             "component_npz": str(output_dir / "large_fault_prior_components.npz"),
@@ -1186,6 +1318,11 @@ def main() -> int:
                 "surface_ransac_distance_m": float(args.surface_ransac_distance_m),
                 "surface_ransac_min_inlier_voxels": int(args.surface_ransac_min_inlier_voxels),
                 "surface_ransac_min_inlier_fraction": float(args.surface_ransac_min_inlier_fraction),
+                "surface_ransac_max_raw_components": int(args.surface_ransac_max_raw_components),
+                "strat_following_min_horizontal_extent_m": float(args.strat_following_min_horizontal_extent_m),
+                "strat_following_max_relative_position_std": float(args.strat_following_max_relative_position_std),
+                "strat_following_max_relative_position_span": float(args.strat_following_max_relative_position_span),
+                "strat_following_min_dominant_layer_fraction": float(args.strat_following_min_dominant_layer_fraction),
                 "faultlike_filter_mode": str(args.faultlike_filter_mode),
                 "faultlike_xy_radius_cells": int(args.faultlike_xy_radius_cells),
                 "faultlike_min_vertical_extent_ms": float(args.faultlike_min_vertical_extent_ms),

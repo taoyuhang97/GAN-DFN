@@ -1,1 +1,1 @@
-"""Common helpers for the stage-2 production pipeline."""
+"""Shared contracts and utilities for the formal workflow."""

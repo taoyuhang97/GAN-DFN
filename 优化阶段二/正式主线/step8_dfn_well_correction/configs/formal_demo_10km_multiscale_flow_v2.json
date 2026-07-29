@@ -1,0 +1,75 @@
+{
+  "initial_dfn_csv": "/home/tyh/projects/petroleum/code/GAN-DFN/优化阶段二/正式主线/step7d_multiscale_fused_dfn/output/formal_demo_10km_multiscale_flow_v2/fused_multiscale_dfn_patches.csv",
+  "fracture_points_csv": "/home/tyh/projects/petroleum/code/GAN-DFN/优化阶段二/正式主线/step4_expert_real_well_prediction/output/formal_six_expert_library_v3/predictions/all_wells_t4_t7_merged_fracture_points.csv",
+  "real_well_samples_root": "/home/tyh/projects/petroleum/code/GAN-DFN/优化阶段二/正式主线/step2_real_well_t4_t7_samples/output/formal_all_wells",
+  "surface_dir": "/data/shared/project-oil/wx数据/砂砾岩/层位",
+  "initial_dfn_summary_json": "/home/tyh/projects/petroleum/code/GAN-DFN/优化阶段二/正式主线/step7d_multiscale_fused_dfn/output/formal_demo_10km_multiscale_flow_v2/fused_multiscale_summary.json",
+  "output_dir": "/home/tyh/projects/petroleum/code/GAN-DFN/优化阶段二/正式主线/step8_dfn_well_correction/output/formal_demo_10km_multiscale_flow_v2",
+  "export_debug_step_vtks": false,
+  "target_block": {
+    "name": "formal_demo_10km_multiscale_flow_v2",
+    "x_min": 571250,
+    "x_max": 581250,
+    "y_min": 4196500,
+    "y_max": 4206500
+  },
+  "xy_search_radius_m": 80.0,
+  "time_search_radius_ms": 30.0,
+  "time_scale_m_per_ms": 2.0,
+  "max_query_candidates": 30,
+  "use_dip_geometry": true,
+  "geometry_time_scale_m_per_ms": 1.0,
+  "display_z_scale": 5.0,
+  "step3_imaging_well_name": "车页1导眼",
+  "step3_imaging_group_csvs": [
+    "/home/tyh/projects/petroleum/code/GAN-DFN/优化阶段二/正式主线/step3_imaging_supervision_samples/output/formal_rebuild/groups/车页1导眼_沙三段.csv",
+    "/home/tyh/projects/petroleum/code/GAN-DFN/优化阶段二/正式主线/step3_imaging_supervision_samples/output/formal_rebuild/groups/车页1导眼_沙四段.csv"
+  ],
+  "replace_step4_inside_step3_imaging_windows": true,
+  "step3_imaging_window_time_padding_ms": 1.0,
+  "enable_step4_event_aggregation": true,
+  "step4_event_gap_ms": 6.0,
+  "step4_event_max_span_ms": 18.0,
+  "step4_event_min_points": 1,
+  "step4_event_density_aggregation": "max",
+  "enable_well_control_center_offset": true,
+  "well_control_center_offset_min_m": 20.0,
+  "well_control_center_offset_max_m": 70.0,
+  "well_control_center_offset_max_fraction": 0.7,
+  "well_control_center_offset_dip_fraction": 0.7,
+  "well_control_center_offset_target_fraction": 0.75,
+  "well_control_size": {
+    "min_length_m": 35.0,
+    "max_length_m": 120.0,
+    "min_height_time_ms": 8.0,
+    "max_height_time_ms": 28.0,
+    "imaging_gt_size_multiplier": 1.0
+  },
+  "force_well_control_small_scale": true,
+  "well_control_match_scales": [
+    "small"
+  ],
+  "well_control_template_scales": [
+    "small"
+  ],
+  "step4_small_orientation_policy": {
+    "enabled": true,
+    "target_dip_deg": {
+      "沙三段": 62.0,
+      "沙四段": 60.0
+    },
+    "min_dip_deg": 35.0,
+    "max_dip_deg": 78.0,
+    "template_blend_to_target": 0.45,
+    "steep_template_blend_to_target": 0.65,
+    "azimuth_jitter_deg": 10.0,
+    "dip_jitter_deg": 6.0
+  },
+  "horizon_contract_table": "/home/tyh/projects/petroleum/code/GAN-DFN/优化阶段二/正式主线/common/horizon_trace_table/output/formal_horizon_trace_table_v2/horizon_trace_table.npy",
+  "horizon_trace_table_path": "/home/tyh/projects/petroleum/code/GAN-DFN/优化阶段二/正式主线/common/horizon_trace_table/output/formal_horizon_trace_table_v2/horizon_trace_table.npy",
+  "horizon_window_contracts": {
+    "2ms": "/home/tyh/projects/petroleum/code/GAN-DFN/优化阶段二/正式主线/common/horizon_trace_table/output/formal_horizon_trace_table_v2/horizon_windows_2ms.npz",
+    "10ms": "/home/tyh/projects/petroleum/code/GAN-DFN/优化阶段二/正式主线/common/horizon_trace_table/output/formal_horizon_trace_table_v2/horizon_windows_10ms.npz"
+  },
+  "trace_header_csv": "/home/tyh/projects/petroleum/code/GAN-DFN/数据精简/trace_header_xy.csv"
+}

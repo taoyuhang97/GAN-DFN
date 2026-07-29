@@ -1,0 +1,9 @@
+{
+  "small_dfn_csv": "/home/tyh/projects/petroleum/code/GAN-DFN/优化阶段二/正式主线/step7a_small_scale_dfn/output/formal_demo_10km_multiscale_flow_v2/small_dfn_patches.csv",
+  "medium_dfn_csv": "/home/tyh/projects/petroleum/code/GAN-DFN/优化阶段二/正式主线/step7b_multiscale_initial_dfn/output/formal_demo_10km_multiscale_flow_v2/medium_dfn_patches.csv",
+  "large_dfn_csv": "/home/tyh/projects/petroleum/code/GAN-DFN/优化阶段二/正式主线/step7c_large_fault_dfn/output/formal_demo_10km_multiscale_flow_v2/large_fault_dfn_patches.csv",
+  "output_dir": "/home/tyh/projects/petroleum/code/GAN-DFN/优化阶段二/正式主线/step7d_multiscale_fused_dfn/output/formal_demo_10km_multiscale_flow_v2",
+  "random_seed": 20260717,
+  "small_downsample_near_major_radius_m": 70.0,
+  "write_vtk": false
+}

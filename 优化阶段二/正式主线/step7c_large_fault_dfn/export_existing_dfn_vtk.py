@@ -17,9 +17,10 @@ def main() -> int:
     output_dir = Path(config["output_dir"]).resolve()
     paths = step7c.output_paths(output_dir)
     products = [
-        (paths["fault_only_csv"], paths["fault_only_vtk"], "step7c_large_original_fault_and_influence_raw_time"),
-        (paths["lowcoh_csv"], paths["lowcoh_vtk"], "step7c_large_lowcoh_component_panels_raw_time"),
-        (paths["dfn_csv"], paths["raw_vtk"], "step7c_large_fault_and_damage_raw_time"),
+        (paths["fault_surface_csv"], paths["fault_surface_vtk"], "step7c_large_original_fault_surface_fragments_raw_time"),
+        (paths["damage_csv"], paths["damage_vtk"], "step7c_large_fault_damage_zone_diagnostic_raw_time"),
+        (paths["lowcoh_csv"], paths["lowcoh_vtk"], "step7c_large_inferred_fault_surfaces_raw_time"),
+        (paths["dfn_csv"], paths["raw_vtk"], "step7c_large_fault_dfn_raw_time"),
     ]
     for csv_path, vtk_path, title in products:
         patch_df = pd.read_csv(csv_path, low_memory=False)
@@ -28,16 +29,18 @@ def main() -> int:
     summary = json.loads(paths["summary_json"].read_text(encoding="utf-8"))
     summary.setdefault("checks", {}).update(
         {
-            "fault_only_vtk_exists": paths["fault_only_vtk"].exists(),
+            "fault_surface_vtk_exists": paths["fault_surface_vtk"].exists(),
+            "damage_vtk_exists": paths["damage_vtk"].exists(),
             "lowcoh_vtk_exists": paths["lowcoh_vtk"].exists(),
             "raw_vtk_exists": paths["raw_vtk"].exists(),
         }
     )
     summary["standalone_3d_vtks"] = {
-        "fault_and_influence": str(paths["fault_only_vtk"]),
-        "lowcoh_supplement": str(paths["lowcoh_vtk"]),
+        "stitched_original_fault_surface": str(paths["original_merged_surface_vtk"]),
+        "original_fault_surface_fragments": str(paths["fault_surface_vtk"]),
+        "fault_damage_zone_diagnostic": str(paths["damage_vtk"]),
+        "inferred_fault_surfaces": str(paths["lowcoh_vtk"]),
         "combined_large_dfn": str(paths["raw_vtk"]),
-        "fault_surface_fragments": str(paths["fault_surface_vtk"]),
     }
     summary["status"] = "pass" if all(bool(value) for value in summary["checks"].values()) else "fail"
     paths["summary_json"].write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
