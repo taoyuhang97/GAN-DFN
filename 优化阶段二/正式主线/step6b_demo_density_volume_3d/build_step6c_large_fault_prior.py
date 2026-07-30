@@ -57,6 +57,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
     parser.add_argument("--coherence-low-quantile", type=float, default=0.20)
     parser.add_argument("--large-candidate-quantile", type=float, default=0.85)
+    parser.add_argument("--lowcoh-weight", type=float, default=0.75)
+    parser.add_argument("--anttrack-weight", type=float, default=0.15)
+    parser.add_argument("--curvature-weight", type=float, default=0.10)
+    parser.add_argument("--lowcoh-candidate-floor", type=float, default=0.55)
+    parser.add_argument("--large-score-threshold", type=float, default=0.58)
     parser.add_argument("--min-component-voxels", type=int, default=40)
     parser.add_argument("--max-component-voxels-before-split", type=int, default=25000)
     parser.add_argument("--split-tile-cells", type=int, default=32)
@@ -72,6 +77,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--layer-like-max-time-extent-ms", type=float, default=80.0)
     parser.add_argument("--layer-like-min-horizontal-extent-m", type=float, default=600.0)
     parser.add_argument("--min-ant-or-curv-support", type=float, default=0.08)
+    parser.add_argument("--surface-support-score-threshold", type=float, default=0.35)
+    parser.add_argument("--surface-min-support-fraction", type=float, default=0.18)
+    parser.add_argument("--surface-min-lowcoh-mean", type=float, default=0.58)
+    parser.add_argument("--surface-min-planarity", type=float, default=0.08)
     parser.add_argument("--support-neighborhood-cells", type=int, default=1)
     parser.add_argument("--faultlike-filter-mode", choices=["none", "vertical_continuity"], default="vertical_continuity")
     parser.add_argument("--faultlike-xy-radius-cells", type=int, default=1)
@@ -88,12 +97,25 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--surface-ransac-min-inlier-voxels", type=int, default=400)
     parser.add_argument("--surface-ransac-min-inlier-fraction", type=float, default=0.04)
     parser.add_argument("--surface-ransac-max-raw-components", type=int, default=96)
+    parser.add_argument("--surface-component-tile-cells", type=int, default=32)
+    parser.add_argument("--enable-lowcoh-structure-rescue", action="store_true")
+    parser.add_argument("--lowcoh-rescue-min-score", type=float, default=0.78)
+    parser.add_argument("--lowcoh-rescue-local-score-threshold", type=float, default=0.70)
+    parser.add_argument("--lowcoh-rescue-min-local-fraction", type=float, default=0.18)
+    parser.add_argument("--lowcoh-rescue-min-vertical-extent-ms", type=float, default=60.0)
+    parser.add_argument("--lowcoh-rescue-max-raw-components", type=int, default=128)
+    parser.add_argument("--lowcoh-rescue-spatial-tile-cells", type=int, default=32)
+    parser.add_argument("--lowcoh-rescue-bridge-iterations", type=int, default=1)
+    parser.add_argument("--lowcoh-rescue-bridge-min-large-score", type=float, default=0.50)
     parser.add_argument("--surface-ransac-min-cluster-voxels", type=int, default=350)
-    parser.add_argument("--surface-max-panel-length-m", type=float, default=1200.0)
-    parser.add_argument("--surface-max-panel-height-ms", type=float, default=360.0)
+    parser.add_argument("--surface-panel-target-length-m", type=float, default=350.0)
+    parser.add_argument("--surface-min-panel-length-m", type=float, default=150.0)
+    parser.add_argument("--surface-max-panel-length-m", type=float, default=500.0)
+    parser.add_argument("--surface-max-panel-height-ms", type=float, default=240.0)
+    parser.add_argument("--surface-min-panel-voxels", type=int, default=120)
     parser.add_argument("--surface-max-horizontal-extent-m", type=float, default=1800.0)
     parser.add_argument("--surface-max-time-extent-ms", type=float, default=520.0)
-    parser.add_argument("--strat-following-min-horizontal-extent-m", type=float, default=600.0)
+    parser.add_argument("--strat-following-min-horizontal-extent-m", type=float, default=180.0)
     parser.add_argument("--strat-following-max-relative-position-std", type=float, default=0.035)
     parser.add_argument("--strat-following-max-relative-position-span", type=float, default=0.12)
     parser.add_argument("--strat-following-min-dominant-layer-fraction", type=float, default=0.80)
@@ -324,12 +346,23 @@ def surface_vertices_from_inliers(
     return vertices, stats
 
 
-def build_local_support_grid(ant_grid: np.ndarray, curv_grid: np.ndarray, radius: int) -> np.ndarray:
+def build_local_support_grids(
+    ant_grid: np.ndarray,
+    curv_grid: np.ndarray,
+    radius: int,
+    score_threshold: float,
+) -> tuple[np.ndarray, np.ndarray]:
     support = np.maximum(ant_grid, curv_grid).astype(np.float32)
     if radius <= 0:
-        return support
+        return support, (support >= float(score_threshold)).astype(np.float32)
     size = 2 * int(radius) + 1
-    return ndimage.maximum_filter(support, size=(size, size, size), mode="nearest").astype(np.float32)
+    support_max = ndimage.maximum_filter(support, size=(size, size, size), mode="nearest").astype(np.float32)
+    support_fraction = ndimage.uniform_filter(
+        (support >= float(score_threshold)).astype(np.float32),
+        size=(size, size, size),
+        mode="nearest",
+    ).astype(np.float32)
+    return support_max, support_fraction
 
 
 def longest_true_run_per_column(mask: np.ndarray) -> np.ndarray:
@@ -394,6 +427,10 @@ def filter_faultlike_evidence_grid(
     score_grid: np.ndarray,
     samples: np.ndarray,
     args: argparse.Namespace,
+    *,
+    require_attribute_support: bool = True,
+    min_vertical_extent_ms: float | None = None,
+    continuity_mode: str = "vertical_column",
 ) -> tuple[np.ndarray, dict[str, Any]]:
     raw = np.asarray(candidate_grid, dtype=bool)
     if str(args.faultlike_filter_mode) == "none":
@@ -416,7 +453,12 @@ def filter_faultlike_evidence_grid(
     longest_column_run = longest_true_run_per_column(local_candidate)
     nt = raw.shape[2]
     dt = float(np.median(np.diff(samples))) if len(samples) > 1 else 1.0
-    min_hits_from_extent = int(np.ceil(float(args.faultlike_min_vertical_extent_ms) / max(abs(dt), 1.0e-6))) + 1
+    required_extent_ms = (
+        float(args.faultlike_min_vertical_extent_ms)
+        if min_vertical_extent_ms is None
+        else float(min_vertical_extent_ms)
+    )
+    min_hits_from_extent = int(np.ceil(required_extent_ms / max(abs(dt), 1.0e-6))) + 1
     min_hits = max(int(args.faultlike_min_column_hits), min_hits_from_extent)
     vertical_column = longest_column_run >= min_hits
     vertical_grid = np.repeat(vertical_column[:, :, None], nt, axis=2)
@@ -426,7 +468,32 @@ def filter_faultlike_evidence_grid(
     non_layer_grid = np.repeat(non_layer_slice[None, None, :], raw.shape[0], axis=0)
     non_layer_grid = np.repeat(non_layer_grid, raw.shape[1], axis=1)
 
-    filtered = raw & vertical_grid & local_support & non_layer_grid
+    if continuity_mode == "connected_3d":
+        exact = raw & non_layer_grid
+        labels, count = ndimage.label(exact, structure=np.ones((3, 3, 3), dtype=np.uint8))
+        sizes = np.bincount(labels.ravel())
+        keep_ids = np.where(sizes >= int(args.min_component_voxels))[0]
+        keep_ids = keep_ids[keep_ids > 0]
+        filtered = np.isin(labels, keep_ids)
+        raw_count = int(raw.sum())
+        filtered_count = int(filtered.sum())
+        return filtered, {
+            "mode": "connected_3d",
+            "candidate_dilation_iterations": 0,
+            "connectivity": 26,
+            "require_attribute_support": False,
+            "raw_voxel_count": raw_count,
+            "exact_prefilter_voxel_count": int(exact.sum()),
+            "raw_component_count_after_prefilter": int(count),
+            "kept_component_count_after_size_filter": int(len(keep_ids)),
+            "filtered_voxel_count": filtered_count,
+            "filtered_voxel_fraction_of_raw": float(filtered_count / raw_count) if raw_count else 0.0,
+            "filtered_score_stats": finite_stats(score_grid[filtered]) if filtered_count else finite_stats([]),
+            "filtered_support_stats": finite_stats(support_grid[filtered]) if filtered_count else finite_stats([]),
+        }
+
+    support_gate = local_support if require_attribute_support else np.ones_like(raw, dtype=bool)
+    filtered = raw & vertical_grid & support_gate & non_layer_grid
     if filtered.any():
         labels, count = ndimage.label(filtered, structure=np.ones((3, 3, 3), dtype=np.uint8))
         sizes = np.bincount(labels.ravel())
@@ -443,14 +510,15 @@ def filter_faultlike_evidence_grid(
         "mode": "vertical_continuity",
         "xy_radius_cells": int(radius),
         "min_column_hits": int(min_hits),
-        "min_vertical_extent_ms": float(args.faultlike_min_vertical_extent_ms),
+        "min_vertical_extent_ms": required_extent_ms,
+        "require_attribute_support": bool(require_attribute_support),
         "max_horizontal_slice_fraction": float(args.faultlike_max_horizontal_slice_fraction),
         "raw_voxel_count": raw_count,
         "vertical_column_count": int(vertical_column.sum()),
         "column_total_hit_stats": finite_stats(column_hits),
         "column_longest_contiguous_run_stats": finite_stats(longest_column_run),
         "column_rejected_total_hits_without_contiguous_run_count": int(((column_hits >= min_hits) & ~vertical_column).sum()),
-        "removed_by_vertical_or_support_or_layer_filter": int(raw_count - int((raw & vertical_grid & local_support & non_layer_grid).sum())),
+        "removed_by_vertical_or_support_or_layer_filter": int(raw_count - int((raw & vertical_grid & support_gate & non_layer_grid).sum())),
         "raw_component_count_after_prefilter": int(count),
         "kept_component_count_after_size_filter": int(len(keep_ids)),
         "filtered_voxel_count": filtered_count,
@@ -640,29 +708,92 @@ def fit_plane_ransac(
     return normal, all_inliers
 
 
+def split_inliers_into_local_panels(
+    points_scaled: np.ndarray,
+    target_length_m: float,
+    min_voxels: int,
+) -> list[np.ndarray]:
+    """Split one fitted sheet along strike so Step7C receives local evidence panels."""
+    points = np.asarray(points_scaled, dtype=np.float64)
+    if len(points) < max(int(min_voxels), 3):
+        return []
+    axis1, _, _, _, _, _ = plane_axes_from_points(points)
+    projection = (points - points.mean(axis=0, keepdims=True)) @ axis1
+    span = float(projection.max() - projection.min())
+    panel_count = max(int(np.ceil(span / max(float(target_length_m), 1.0))), 1)
+    if panel_count == 1:
+        return [np.arange(len(points), dtype=np.int64)]
+    edges = np.linspace(float(projection.min()), float(projection.max()) + 1.0e-9, panel_count + 1)
+    groups = [np.where((projection >= edges[idx]) & (projection < edges[idx + 1]))[0] for idx in range(panel_count)]
+    groups = [group for group in groups if len(group)]
+    merged: list[np.ndarray] = []
+    pending: np.ndarray | None = None
+    for group in groups:
+        if pending is not None:
+            group = np.concatenate([pending, group])
+            pending = None
+        if len(group) < int(min_voxels):
+            pending = group
+        else:
+            merged.append(group)
+    if pending is not None:
+        if merged:
+            merged[-1] = np.concatenate([merged[-1], pending])
+        elif len(pending) >= int(min_voxels):
+            merged.append(pending)
+    return merged
+
+
 def extract_inferred_fault_surfaces(
     score_grid: np.ndarray,
+    lowcoh_grid: np.ndarray,
+    anttrack_grid: np.ndarray,
+    curvature_grid: np.ndarray,
     candidate_grid: np.ndarray,
     support_grid: np.ndarray,
+    support_fraction_grid: np.ndarray,
     mapping: dict[str, np.ndarray],
     samples: np.ndarray,
     surfaces: dict[str, np.ndarray],
     args: argparse.Namespace,
     rng: np.random.Generator,
-) -> tuple[np.ndarray, pd.DataFrame, dict[str, Any], list[np.ndarray]]:
+) -> tuple[np.ndarray, pd.DataFrame, dict[str, Any], list[dict[str, Any]]]:
     structure = np.ones((3, 3, 3), dtype=np.uint8)
     labels, count = ndimage.label(candidate_grid, structure=structure)
     x_values, y_values = grid_axis_values(mapping)
     surface_id_grid = np.zeros(candidate_grid.shape, dtype=np.int32)
     rows: list[dict[str, Any]] = []
-    surface_vertices: list[np.ndarray] = []
     surface_point_sets: list[dict[str, Any]] = []
     time_scale = float(args.orientation_time_scale_m_per_ms)
     sizes = np.bincount(labels.ravel())
-    raw_ids = [idx for idx in range(1, count + 1) if int(sizes[idx]) >= int(args.min_component_voxels)]
-    raw_ids.sort(key=lambda idx: int(sizes[idx]), reverse=True)
-    raw_ids = raw_ids[: int(args.surface_ransac_max_raw_components)]
     component_slices = ndimage.find_objects(labels, max_label=count)
+    eligible_ids = [idx for idx in range(1, count + 1) if int(sizes[idx]) >= int(args.min_component_voxels)]
+    eligible_ids.sort(key=lambda idx: int(sizes[idx]), reverse=True)
+    max_raw_components = int(args.surface_ransac_max_raw_components)
+    tile_cells = max(int(args.surface_component_tile_cells), 1)
+    spatial_ids: list[int] = []
+    seen_tiles: set[tuple[int, int]] = set()
+    for raw_id in eligible_ids:
+        component_slice = component_slices[raw_id - 1]
+        if component_slice is None:
+            continue
+        tile_x = int((component_slice[1].start + component_slice[1].stop) // 2) // tile_cells
+        tile_y = int((component_slice[0].start + component_slice[0].stop) // 2) // tile_cells
+        tile_key = (tile_x, tile_y)
+        if tile_key in seen_tiles:
+            continue
+        spatial_ids.append(raw_id)
+        seen_tiles.add(tile_key)
+        if len(spatial_ids) >= max_raw_components:
+            break
+    if len(spatial_ids) < max_raw_components:
+        for raw_id in eligible_ids:
+            if raw_id in spatial_ids:
+                continue
+            spatial_ids.append(raw_id)
+            if len(spatial_ids) >= max_raw_components:
+                break
+    raw_ids = spatial_ids
 
     rejected_small = 0
     rejected_low_support = 0
@@ -673,6 +804,7 @@ def extract_inferred_fault_surfaces(
     rejected_strat_following = 0
     rejected_low_inlier = 0
     rejected_too_broad = 0
+    rejected_low_planarity = 0
     next_surface_id = 1
 
     for raw_component_id in raw_ids:
@@ -720,127 +852,143 @@ def extract_inferred_fault_surfaces(
             itt = att[inliers_local]
             inlier_points_unscaled = points_unscaled[inliers_local]
             inlier_points_scaled = points_scaled[inliers_local]
-            support_mean = float(np.mean(support_grid[iyy, ixx, itt]))
-            support_max = float(np.max(support_grid[iyy, ixx, itt]))
-            if support_max < float(args.min_ant_or_curv_support):
-                rejected_low_support += 1
-                remaining[active_idx[inliers_local]] = False
-                continue
-            x_extent = float(inlier_points_unscaled[:, 0].max() - inlier_points_unscaled[:, 0].min())
-            y_extent = float(inlier_points_unscaled[:, 1].max() - inlier_points_unscaled[:, 1].min())
-            t_extent = float(inlier_points_unscaled[:, 2].max() - inlier_points_unscaled[:, 2].min())
-            horizontal_extent = max(x_extent, y_extent)
-            if horizontal_extent > float(args.surface_max_horizontal_extent_m) or t_extent > float(args.surface_max_time_extent_ms):
-                rejected_too_broad += 1
-                remaining[active_idx[inliers_local]] = False
-                continue
-            if t_extent < float(args.min_vertical_extent_ms):
-                rejected_thin += 1
-                remaining[active_idx[inliers_local]] = False
-                continue
-            if horizontal_extent < float(args.min_horizontal_extent_m):
-                rejected_short_xy += 1
-                remaining[active_idx[inliers_local]] = False
-                continue
-            vertices, geom = surface_vertices_from_inliers(
-                inlier_points_unscaled,
+            panel_groups = split_inliers_into_local_panels(
                 inlier_points_scaled,
-                time_scale=time_scale,
-                max_length_m=float(args.surface_max_panel_length_m),
-                max_height_ms=float(args.surface_max_panel_height_ms),
+                target_length_m=float(args.surface_panel_target_length_m),
+                min_voxels=int(args.surface_min_panel_voxels),
             )
-            relative_stats = layer_relative_stats(
-                iyy,
-                ixx,
-                inlier_points_unscaled[:, 2],
-                surfaces,
-            )
-            strat_following = bool(
-                horizontal_extent >= float(args.strat_following_min_horizontal_extent_m)
-                and relative_stats["dominant_layer_fraction"] >= float(args.strat_following_min_dominant_layer_fraction)
-                and np.isfinite(relative_stats["relative_position_std"])
-                and relative_stats["relative_position_std"] <= float(args.strat_following_max_relative_position_std)
-                and relative_stats["relative_position_span"] <= float(args.strat_following_max_relative_position_span)
-            )
-            if strat_following:
-                rejected_strat_following += 1
-                remaining[active_idx[inliers_local]] = False
-                continue
-            layer_like = bool(
-                geom["dip_deg"] <= float(args.layer_like_max_dip_deg)
-                and horizontal_extent >= float(args.layer_like_min_horizontal_extent_m)
-                and t_extent <= float(args.layer_like_max_time_extent_ms)
-            )
-            if layer_like:
-                rejected_layer_like += 1
-                remaining[active_idx[inliers_local]] = False
-                continue
-            if geom["dip_deg"] < float(args.min_dip_deg):
-                rejected_low_dip += 1
-                remaining[active_idx[inliers_local]] = False
-                continue
-            surface_id_grid[iyy, ixx, itt] = next_surface_id
-            row = {
-                "component_id": int(next_surface_id),
-                "surface_id": int(next_surface_id),
-                "raw_component_id": int(raw_component_id),
-                "raw_component_voxel_count": int(sizes[raw_component_id]),
-                "surface_ordinal_in_raw_component": int(surface_ord + 1),
-                "voxel_count": int(inlier_count),
-                "inlier_fraction_of_remaining": float(inlier_count / max(len(active_idx), 1)),
-                "score_mean": float(np.mean(score_grid[iyy, ixx, itt])),
-                "score_max": float(np.max(score_grid[iyy, ixx, itt])),
-                "support_mean": support_mean,
-                "support_max": support_max,
-                "x_min": geom["x_min"],
-                "x_max": geom["x_max"],
-                "y_min": geom["y_min"],
-                "y_max": geom["y_max"],
-                "time_min_ms": geom["time_min_ms"],
-                "time_max_ms": geom["time_max_ms"],
-                "x_extent_m": x_extent,
-                "y_extent_m": y_extent,
-                "time_extent_ms": t_extent,
-                "center_x": geom["center_x"],
-                "center_y": geom["center_y"],
-                "center_time_ms": geom["center_time_ms"],
-                "surface_length_m": geom["length_m"],
-                "surface_height_time_ms": geom["height_time_ms"],
-                "surface_area_m2": geom["area_m2"],
-                "pca_azimuth_deg": geom["azimuth_deg"],
-                "pca_dip_deg": geom["dip_deg"],
-                "pca_linearity": np.nan,
-                "surface_planarity": geom["planarity"],
-                "layer_like": layer_like,
-                "strat_following": strat_following,
-                **relative_stats,
-            }
-            for vertex_idx in range(1, 5):
-                row[f"V{vertex_idx}X"] = float(vertices[vertex_idx - 1, 0])
-                row[f"V{vertex_idx}Y"] = float(vertices[vertex_idx - 1, 1])
-                row[f"V{vertex_idx}Z"] = float(vertices[vertex_idx - 1, 2])
-            rows.append(row)
-            surface_vertices.append(vertices)
-            surface_point_sets.append(
-                {
+            chain_id = f"raw_{raw_component_id:05d}_sheet_{surface_ord + 1:03d}"
+            for panel_ordinal, panel_idx in enumerate(panel_groups, start=1):
+                pyy, pxx, ptt = iyy[panel_idx], ixx[panel_idx], itt[panel_idx]
+                panel_unscaled = inlier_points_unscaled[panel_idx]
+                panel_scaled = inlier_points_scaled[panel_idx]
+                x_extent = float(panel_unscaled[:, 0].max() - panel_unscaled[:, 0].min())
+                y_extent = float(panel_unscaled[:, 1].max() - panel_unscaled[:, 1].min())
+                t_extent = float(panel_unscaled[:, 2].max() - panel_unscaled[:, 2].min())
+                horizontal_extent = max(x_extent, y_extent)
+                if horizontal_extent > float(args.surface_max_horizontal_extent_m) or t_extent > float(args.surface_max_time_extent_ms):
+                    rejected_too_broad += 1
+                    continue
+                if t_extent < float(args.min_vertical_extent_ms):
+                    rejected_thin += 1
+                    continue
+                if horizontal_extent < float(args.min_horizontal_extent_m):
+                    rejected_short_xy += 1
+                    continue
+                vertices, geom = surface_vertices_from_inliers(
+                    panel_unscaled,
+                    panel_scaled,
+                    time_scale=time_scale,
+                    max_length_m=float(args.surface_max_panel_length_m),
+                    max_height_ms=float(args.surface_max_panel_height_ms),
+                )
+                if geom["length_m"] < float(args.surface_min_panel_length_m):
+                    rejected_short_xy += 1
+                    continue
+                if geom["planarity"] < float(args.surface_min_planarity):
+                    rejected_low_planarity += 1
+                    continue
+                support_values = np.maximum(anttrack_grid[pyy, pxx, ptt], curvature_grid[pyy, pxx, ptt])
+                support_fraction = float(np.mean(support_values >= float(args.surface_support_score_threshold)))
+                local_support_fraction = float(np.mean(support_fraction_grid[pyy, pxx, ptt]))
+                lowcoh_mean = float(np.mean(lowcoh_grid[pyy, pxx, ptt]))
+                if support_fraction < float(args.surface_min_support_fraction) or lowcoh_mean < float(args.surface_min_lowcoh_mean):
+                    rejected_low_support += 1
+                    continue
+                relative_stats = layer_relative_stats(pyy, pxx, panel_unscaled[:, 2], surfaces)
+                strat_following = bool(
+                    horizontal_extent >= float(args.strat_following_min_horizontal_extent_m)
+                    and relative_stats["dominant_layer_fraction"] >= float(args.strat_following_min_dominant_layer_fraction)
+                    and np.isfinite(relative_stats["relative_position_std"])
+                    and relative_stats["relative_position_std"] <= float(args.strat_following_max_relative_position_std)
+                    and relative_stats["relative_position_span"] <= float(args.strat_following_max_relative_position_span)
+                )
+                if strat_following:
+                    rejected_strat_following += 1
+                    continue
+                layer_like = bool(
+                    geom["dip_deg"] <= float(args.layer_like_max_dip_deg)
+                    and horizontal_extent >= float(args.layer_like_min_horizontal_extent_m)
+                    and t_extent <= float(args.layer_like_max_time_extent_ms)
+                )
+                if layer_like:
+                    rejected_layer_like += 1
+                    continue
+                if geom["dip_deg"] < float(args.min_dip_deg):
+                    rejected_low_dip += 1
+                    continue
+                support_mean = float(np.mean(support_values))
+                support_max = float(np.max(support_values))
+                _, _, panel_normal, _, _, _ = plane_axes_from_points(panel_scaled)
+                panel_center_scaled = panel_scaled.mean(axis=0, keepdims=True)
+                evidence_distances = np.abs((panel_scaled - panel_center_scaled) @ panel_normal)
+                surface_id_grid[pyy, pxx, ptt] = next_surface_id
+                row = {
+                    "component_id": int(next_surface_id),
                     "surface_id": int(next_surface_id),
+                    "panel_chain_id": chain_id,
+                    "panel_ordinal_in_chain": int(panel_ordinal),
+                    "panel_count_in_chain": int(len(panel_groups)),
                     "raw_component_id": int(raw_component_id),
-                    "points_unscaled": inlier_points_unscaled.copy(),
-                    "points_scaled": inlier_points_scaled.copy(),
-                    "score": score_grid[iyy, ixx, itt].astype(np.float32).copy(),
-                    "support": support_grid[iyy, ixx, itt].astype(np.float32).copy(),
-                    "azimuth_deg": float(geom["azimuth_deg"]),
-                    "dip_deg": float(geom["dip_deg"]),
-                    "surface_area_m2": float(geom["area_m2"]),
-                    "surface_planarity": float(geom["planarity"]),
+                    "raw_component_voxel_count": int(sizes[raw_component_id]),
+                    "surface_ordinal_in_raw_component": int(surface_ord + 1),
+                    "voxel_count": int(len(panel_idx)),
+                    "inlier_fraction_of_remaining": float(inlier_count / max(len(active_idx), 1)),
+                    "score_mean": float(np.mean(score_grid[pyy, pxx, ptt])),
+                    "score_max": float(np.max(score_grid[pyy, pxx, ptt])),
+                    "lowcoh_mean": lowcoh_mean,
+                    "anttrack_mean": float(np.mean(anttrack_grid[pyy, pxx, ptt])),
+                    "curvature_mean": float(np.mean(curvature_grid[pyy, pxx, ptt])),
+                    "support_mean": support_mean,
+                    "support_max": support_max,
+                    "auxiliary_support_fraction": support_fraction,
+                    "local_auxiliary_support_fraction_mean": local_support_fraction,
+                    "evidence_distance_mean_m": float(np.mean(evidence_distances)),
+                    "evidence_distance_max_m": float(np.max(evidence_distances)),
+                    "candidate_branch": "lowcoherence_weighted_local_sheet",
+                    "x_min": geom["x_min"], "x_max": geom["x_max"],
+                    "y_min": geom["y_min"], "y_max": geom["y_max"],
+                    "time_min_ms": geom["time_min_ms"], "time_max_ms": geom["time_max_ms"],
+                    "x_extent_m": x_extent, "y_extent_m": y_extent, "time_extent_ms": t_extent,
+                    "center_x": geom["center_x"], "center_y": geom["center_y"], "center_time_ms": geom["center_time_ms"],
+                    "surface_length_m": geom["length_m"], "surface_height_time_ms": geom["height_time_ms"],
+                    "surface_area_m2": geom["area_m2"], "pca_azimuth_deg": geom["azimuth_deg"],
+                    "pca_dip_deg": geom["dip_deg"], "pca_linearity": np.nan,
+                    "surface_planarity": geom["planarity"], "layer_like": layer_like,
+                    "strat_following": strat_following, **relative_stats,
                 }
-            )
-            next_surface_id += 1
+                for vertex_idx in range(1, 5):
+                    row[f"V{vertex_idx}X"] = float(vertices[vertex_idx - 1, 0])
+                    row[f"V{vertex_idx}Y"] = float(vertices[vertex_idx - 1, 1])
+                    row[f"V{vertex_idx}Z"] = float(vertices[vertex_idx - 1, 2])
+                rows.append(row)
+                surface_point_sets.append(
+                    {
+                        "surface_id": int(next_surface_id), "raw_component_id": int(raw_component_id),
+                        "points_unscaled": panel_unscaled.copy(), "points_scaled": panel_scaled.copy(),
+                        "score": score_grid[pyy, pxx, ptt].astype(np.float32).copy(),
+                        "support": support_values.astype(np.float32).copy(),
+                        "candidate_branch": "lowcoherence_weighted_local_sheet",
+                        "azimuth_deg": float(geom["azimuth_deg"]), "dip_deg": float(geom["dip_deg"]),
+                        "surface_area_m2": float(geom["area_m2"]), "surface_planarity": float(geom["planarity"]),
+                    }
+                )
+                next_surface_id += 1
             remaining[active_idx[inliers_local]] = False
+
+    rows_by_chain: dict[str, list[dict[str, Any]]] = {}
+    for row in rows:
+        rows_by_chain.setdefault(str(row["panel_chain_id"]), []).append(row)
+    for chain_rows in rows_by_chain.values():
+        chain_rows.sort(key=lambda item: int(item["panel_ordinal_in_chain"]))
+        for ordinal, row in enumerate(chain_rows, start=1):
+            row["panel_ordinal_in_chain"] = ordinal
+            row["panel_count_in_chain"] = len(chain_rows)
 
     summary = {
         "raw_component_count": int(count),
         "candidate_raw_component_count": int(len(raw_ids)),
+        "spatially_distributed_raw_component_count": int(len(raw_ids)),
         "kept_component_count": int(next_surface_id - 1),
         "kept_surface_count": int(next_surface_id - 1),
         "rejected_small_component_count": int(rejected_small),
@@ -852,10 +1000,12 @@ def extract_inferred_fault_surfaces(
         "rejected_low_dip_surface_count": int(rejected_low_dip),
         "rejected_low_inlier_surface_count": int(rejected_low_inlier),
         "rejected_too_broad_surface_count": int(rejected_too_broad),
+        "rejected_low_planarity_panel_count": int(rejected_low_planarity),
         "surface_extraction_mode": "surface_ransac",
         "surface_ransac_iterations": int(args.surface_ransac_iterations),
         "surface_ransac_distance_m": float(args.surface_ransac_distance_m),
         "surface_ransac_max_raw_components": int(args.surface_ransac_max_raw_components),
+        "spatial_component_tile_cells": int(tile_cells),
         "surface_ransac_max_surfaces_per_component": int(args.surface_ransac_max_surfaces_per_component),
         "surface_max_horizontal_extent_m": float(args.surface_max_horizontal_extent_m),
         "surface_max_time_extent_ms": float(args.surface_max_time_extent_ms),
@@ -1138,13 +1288,27 @@ def main() -> int:
         curv_score = curvmax_score.astype(np.float32)
     ant_grid, _, _ = flat_to_grid(ant_score, mapping)
     curv_grid, _, _ = flat_to_grid(curv_score, mapping)
-    support_grid = build_local_support_grid(ant_grid, curv_grid, int(args.support_neighborhood_cells))
-    large_score = lowcoh_score * (0.75 + 0.15 * ant_score + 0.10 * curv_score)
+    support_grid, support_fraction_grid = build_local_support_grids(
+        ant_grid,
+        curv_grid,
+        int(args.support_neighborhood_cells),
+        float(args.surface_support_score_threshold),
+    )
+    weights = np.asarray(
+        [float(args.lowcoh_weight), float(args.anttrack_weight), float(args.curvature_weight)],
+        dtype=np.float64,
+    )
+    if np.any(weights < 0.0) or float(weights.sum()) <= 0.0:
+        raise ValueError("Step6C evidence weights must be non-negative and have a positive sum")
+    weights /= float(weights.sum())
+    large_score = weights[0] * lowcoh_score + weights[1] * ant_score + weights[2] * curv_score
     large_score[~coh_valid] = 0.0
     large_score = np.clip(large_score, 0.0, 1.0).astype(np.float32)
     lowcoh_cut = float(np.quantile(lowcoh_score[coh_valid], 1.0 - float(args.coherence_low_quantile)))
-    large_cut = float(np.quantile(large_score[large_score > 0], float(args.large_candidate_quantile)))
-    candidate_flat = (lowcoh_score >= lowcoh_cut) & (large_score >= large_cut) & coh_valid
+    large_cut = float(args.large_score_threshold)
+    effective_lowcoh_cut = max(float(args.lowcoh_candidate_floor), lowcoh_cut)
+    candidate_flat = (lowcoh_score >= effective_lowcoh_cut) & (large_score >= large_cut) & coh_valid
+    lowcoh_grid, _, _ = flat_to_grid(lowcoh_score, mapping)
 
     score_grid, _, _ = flat_to_grid(large_score, mapping)
     candidate_grid, _, _ = flat_to_grid(candidate_flat.astype(np.float32), mapping)
@@ -1170,7 +1334,11 @@ def main() -> int:
         score_grid,
         samples,
         args,
+        require_attribute_support=False,
+        continuity_mode="connected_3d",
     )
+    faultlike_branch_code_grid = np.zeros_like(faultlike_candidate_grid, dtype=np.uint8)
+    faultlike_branch_code_grid[faultlike_candidate_grid] = 1
     faultlike_evidence_vtk_summary = (
         write_candidate_evidence_vtk(
             output_dir / "inferred_faultlike_evidence_points_raw_time.vtk",
@@ -1190,8 +1358,12 @@ def main() -> int:
     if args.inferred_extraction_mode == "surface_ransac":
         inferred_id_grid, inferred_df, inferred_summary, surface_point_sets = extract_inferred_fault_surfaces(
             score_grid,
+            lowcoh_grid,
+            ant_grid,
+            curv_grid,
             faultlike_candidate_grid,
             support_grid,
+            support_fraction_grid,
             mapping,
             samples,
             horizon_surfaces,
@@ -1251,6 +1423,7 @@ def main() -> int:
         large_prior=large_prior_flat.astype(np.float32),
         large_mask=large_mask_flat.astype(np.uint8),
         inferred_component_id=inferred_id_flat.astype(np.int32),
+        inferred_candidate_branch_code=grid_to_flat(faultlike_branch_code_grid.astype(np.float32), mapping).astype(np.uint8),
         samples=samples.astype(np.float32),
         x=mapping["x"].astype(np.float64),
         y=mapping["y"].astype(np.float64),
@@ -1298,7 +1471,12 @@ def main() -> int:
             "parameters": {
                 "inferred_extraction_mode": str(args.inferred_extraction_mode),
                 "coherence_low_quantile": float(args.coherence_low_quantile),
-                "large_candidate_quantile": float(args.large_candidate_quantile),
+                "large_candidate_quantile_deprecated": float(args.large_candidate_quantile),
+                "lowcoh_weight": float(weights[0]),
+                "anttrack_weight": float(weights[1]),
+                "curvature_weight": float(weights[2]),
+                "lowcoh_candidate_floor": float(args.lowcoh_candidate_floor),
+                "large_score_threshold": float(args.large_score_threshold),
                 "min_component_voxels": int(args.min_component_voxels),
                 "max_component_voxels_before_split": int(args.max_component_voxels_before_split),
                 "split_tile_cells": int(args.split_tile_cells),
@@ -1313,12 +1491,23 @@ def main() -> int:
                 "layer_like_max_time_extent_ms": float(args.layer_like_max_time_extent_ms),
                 "layer_like_min_horizontal_extent_m": float(args.layer_like_min_horizontal_extent_m),
                 "min_ant_or_curv_support": float(args.min_ant_or_curv_support),
+                "surface_support_score_threshold": float(args.surface_support_score_threshold),
+                "surface_min_support_fraction": float(args.surface_min_support_fraction),
+                "surface_min_lowcoh_mean": float(args.surface_min_lowcoh_mean),
+                "surface_min_planarity": float(args.surface_min_planarity),
                 "support_neighborhood_cells": int(args.support_neighborhood_cells),
                 "surface_ransac_iterations": int(args.surface_ransac_iterations),
                 "surface_ransac_distance_m": float(args.surface_ransac_distance_m),
                 "surface_ransac_min_inlier_voxels": int(args.surface_ransac_min_inlier_voxels),
                 "surface_ransac_min_inlier_fraction": float(args.surface_ransac_min_inlier_fraction),
                 "surface_ransac_max_raw_components": int(args.surface_ransac_max_raw_components),
+                "surface_component_tile_cells": int(args.surface_component_tile_cells),
+                "candidate_dilation_iterations": 0,
+                "deprecated_lowcoh_rescue_flag_ignored": bool(args.enable_lowcoh_structure_rescue),
+                "surface_panel_target_length_m": float(args.surface_panel_target_length_m),
+                "surface_min_panel_length_m": float(args.surface_min_panel_length_m),
+                "surface_max_panel_length_m": float(args.surface_max_panel_length_m),
+                "surface_min_panel_voxels": int(args.surface_min_panel_voxels),
                 "strat_following_min_horizontal_extent_m": float(args.strat_following_min_horizontal_extent_m),
                 "strat_following_max_relative_position_std": float(args.strat_following_max_relative_position_std),
                 "strat_following_max_relative_position_span": float(args.strat_following_max_relative_position_span),
@@ -1331,10 +1520,14 @@ def main() -> int:
                 "irregular_surface_max_points": int(args.irregular_surface_max_points),
                 "irregular_surface_max_edge_m": float(args.irregular_surface_max_edge_m),
             },
-            "lowcoh_score_threshold": lowcoh_cut,
+            "lowcoh_quantile_threshold": lowcoh_cut,
+            "effective_lowcoh_score_threshold": effective_lowcoh_cut,
             "large_score_threshold": large_cut,
             "raw_candidate_voxel_count": int(candidate_flat.sum()),
             "raw_candidate_voxel_fraction": float(candidate_flat.mean()),
+            "raw_candidate_branch_counts": {
+                "lowcoherence_weighted_exact_candidate": int(candidate_flat.sum()),
+            },
             "faultlike_filter": faultlike_filter_summary,
             "faultlike_candidate_voxel_count": int(faultlike_candidate_grid.sum()),
             "faultlike_candidate_voxel_fraction": float(faultlike_candidate_grid.mean()),
@@ -1363,8 +1556,8 @@ def main() -> int:
             "curvaturepos": curvpos_summary,
         },
         "reflection": (
-            "Step6C uses segmented original fault panels as hard prior and only adds inferred faults from steep, vertically continuous low-coherence components. "
-            "This prevents large-scale DFN from depending only on sparse fault-stick points inside the demo."
+            "Step6C preserves original fault panels as hard prior and adds inferred faults only from exact, 26-connected, "
+            "low-coherence-led sheet evidence. RANSAC sheets are split into locally supported panels before Step7C."
         ),
     }
     if len(selected_faults) <= 0:

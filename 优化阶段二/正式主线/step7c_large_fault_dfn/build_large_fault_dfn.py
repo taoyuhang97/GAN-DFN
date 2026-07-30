@@ -1117,6 +1117,9 @@ def build_inferred_surface_panels(config: dict[str, Any]) -> pd.DataFrame:
             continue
         surface_id = int(surface_row.get("surface_id", surface_row.get("component_id", ordinal + 1)))
         raw_component_id = int(surface_row.get("raw_component_id", surface_id))
+        panel_chain_id = str(surface_row.get("panel_chain_id", f"raw_{raw_component_id:05d}"))
+        panel_ordinal = int(surface_row.get("panel_ordinal_in_chain", 1))
+        panel_count = int(surface_row.get("panel_count_in_chain", 1))
         length = float(max(surface_row.get("surface_length_m", vertex_length), vertex_length, 1.0))
         height = float(max(surface_row.get("surface_height_time_ms", vertex_height), vertex_height, 1.0))
         azimuth = float(surface_row.get("pca_azimuth_deg", vertex_azimuth))
@@ -1133,11 +1136,11 @@ def build_inferred_surface_panels(config: dict[str, Any]) -> pd.DataFrame:
             azimuth=azimuth,
             dip=dip,
             layer=layer,
-            source_type="large_inferred_fault_surface",
+            source_type="large_inferred_fault_local_panel",
             constraint="seismic_prior",
             confidence=confidence,
             source_density=score_mean,
-            fault_name=f"inferred_fault_surface_{surface_id}",
+            fault_name=panel_chain_id,
             component_id=surface_id,
             ordinal=ordinal + 1,
         )
@@ -1149,16 +1152,31 @@ def build_inferred_surface_panels(config: dict[str, Any]) -> pd.DataFrame:
                 "ComponentVoxelCount": int(surface_row.get("voxel_count", 0)),
                 "RawComponentVoxelCount": int(surface_row.get("raw_component_voxel_count", 0)),
                 "SurfaceOrdinalInRawComponent": int(surface_row.get("surface_ordinal_in_raw_component", 1)),
+                "PanelChainID": panel_chain_id,
+                "PanelOrdinalInChain": panel_ordinal,
+                "PanelCountInChain": panel_count,
                 "SurfacePlanarity": float(surface_row.get("surface_planarity", np.nan)),
                 "SupportMean": float(surface_row.get("support_mean", np.nan)),
                 "SupportMax": float(surface_row.get("support_max", np.nan)),
+                "AuxiliarySupportFraction": float(surface_row.get("auxiliary_support_fraction", np.nan)),
+                "LocalAuxiliarySupportFractionMean": float(surface_row.get("local_auxiliary_support_fraction_mean", np.nan)),
+                "LowCoherenceMean": float(surface_row.get("lowcoh_mean", np.nan)),
+                "AntTrackMean": float(surface_row.get("anttrack_mean", np.nan)),
+                "CurvatureMean": float(surface_row.get("curvature_mean", np.nan)),
+                "EvidenceDistanceMeanM": float(surface_row.get("evidence_distance_mean_m", np.nan)),
+                "EvidenceDistanceMaxM": float(surface_row.get("evidence_distance_max_m", np.nan)),
                 "DominantLayer": str(surface_row.get("dominant_layer", layer)),
                 "DominantLayerFraction": float(surface_row.get("dominant_layer_fraction", np.nan)),
                 "RelativePositionStd": float(surface_row.get("relative_position_std", np.nan)),
                 "RelativePositionSpan": float(surface_row.get("relative_position_span", np.nan)),
-                "OrientationSource": "step6c_surface_ransac_vertices",
-                "SizeRule": "step6c_surface_ransac_vertices",
-                "BandContinuityMode": "continuous_inferred_fault_surface",
+                "CandidateBranch": str(surface_row.get("candidate_branch", "lowcoherence_weighted_local_sheet")),
+                "OrientationSource": "step6c_local_supported_sheet_panel_vertices",
+                "SizeRule": "step6c_local_evidence_extent_150_to_500m",
+                "BandID": panel_chain_id,
+                "BandPatchOrdinal": panel_ordinal,
+                "BandContinuityMode": "local_supported_panel_chain",
+                "ComponentPanelCount": panel_count,
+                "ComponentPanelOrdinal": panel_ordinal,
                 "PatchAreaM2": float(surface_row.get("surface_area_m2", out["PatchAreaM2"])),
                 "PatchArea": float(surface_row.get("surface_area_m2", out["PatchAreaM2"])),
             }
@@ -1307,9 +1325,22 @@ def main() -> int:
     fault_panels_only = panel_influence_df[panel_influence_df["SourceType"].astype(str).eq("large_original_fault_panel")].copy()
     damage_patches = panel_influence_df[panel_influence_df["SourceType"].astype(str).eq("large_original_fault_damage_zone")].copy()
     lowcoh_patches = build_inferred_surface_panels(config)
+    upstream_inferred_df = read_csv_flexible(Path(config["large_component_summary_csv"]).resolve())
+    upstream_inferred_ids = set(
+        pd.to_numeric(
+            upstream_inferred_df.get("surface_id", upstream_inferred_df.get("component_id", pd.Series(dtype=float))),
+            errors="coerce",
+        ).dropna().astype(int)
+    )
     fault_panels_only, fault_panel_horizon_qc = enforce_center_horizon_contract(fault_panels_only, horizon_lookup)
     damage_patches, damage_horizon_qc = enforce_center_horizon_contract(damage_patches, horizon_lookup)
     lowcoh_patches, lowcoh_horizon_qc = enforce_center_horizon_contract(lowcoh_patches, horizon_lookup)
+    step7c_inferred_ids = set(
+        pd.to_numeric(lowcoh_patches.get("ComponentID", pd.Series(dtype=float)), errors="coerce").dropna().astype(int)
+    )
+    inferred_component_coverage_fraction = float(
+        len(upstream_inferred_ids & step7c_inferred_ids) / max(len(upstream_inferred_ids), 1)
+    )
     surface_fragment_df.to_csv(paths["fault_surface_csv"], index=False, encoding="utf-8-sig")
     fault_panels_only.to_csv(paths["fault_panel_csv"], index=False, encoding="utf-8-sig")
     damage_patches.to_csv(paths["damage_csv"], index=False, encoding="utf-8-sig")
@@ -1389,6 +1420,14 @@ def main() -> int:
         "inferred_surface_stats": {
             "component_count": int(lowcoh_patches["ComponentID"].nunique()) if "ComponentID" in lowcoh_patches.columns and len(lowcoh_patches) else 0,
             "panel_count": int(len(lowcoh_patches)),
+            "upstream_component_count": int(len(upstream_inferred_ids)),
+            "covered_upstream_component_count": int(len(upstream_inferred_ids & step7c_inferred_ids)),
+            "upstream_component_coverage_fraction": inferred_component_coverage_fraction,
+            "candidate_branch_counts": (
+                {str(k): int(v) for k, v in lowcoh_patches["CandidateBranch"].value_counts(dropna=False).items()}
+                if "CandidateBranch" in lowcoh_patches.columns
+                else {}
+            ),
             "panel_count_per_component": {
                 str(k): int(v)
                 for k, v in lowcoh_patches.groupby("ComponentID").size().items()
@@ -1407,6 +1446,9 @@ def main() -> int:
             "raw_vtk_exists": paths["raw_vtk"].exists(),
             "csv_exists": paths["dfn_csv"].exists(),
             "formal_dfn_excludes_damage_zone": not patch_df["SourceType"].astype(str).eq("large_original_fault_damage_zone").any(),
+            "covers_all_step6c_inferred_components": bool(
+                not upstream_inferred_ids or inferred_component_coverage_fraction >= 1.0
+            ),
         },
     }
     summary["status"] = "pass" if all(bool(v) for v in summary["checks"].values()) else "fail"

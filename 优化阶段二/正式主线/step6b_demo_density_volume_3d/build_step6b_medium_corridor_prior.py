@@ -48,21 +48,36 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Step6B medium-scale fracture corridor prior.")
     parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
-    parser.add_argument("--candidate-quantile", type=float, default=0.95)
+    parser.add_argument("--candidate-quantile", type=float, default=0.0, help=argparse.SUPPRESS)
     parser.add_argument("--anttrack-high-quantile", type=float, default=0.90)
-    parser.add_argument("--ant-weight-base", type=float, default=0.62)
-    parser.add_argument("--lowcoh-support-weight", type=float, default=0.20)
-    parser.add_argument("--curvature-support-weight", type=float, default=0.18)
-    parser.add_argument("--min-direct-support-score", type=float, default=0.35)
+    parser.add_argument("--anttrack-weight", type=float, default=0.70)
+    parser.add_argument("--lowcoh-weight", type=float, default=0.20)
+    parser.add_argument("--curvature-weight", type=float, default=0.10)
+    parser.add_argument("--seed-medium-score-threshold", type=float, default=0.62)
+    parser.add_argument("--growth-anttrack-floor", type=float, default=0.28)
+    parser.add_argument("--growth-medium-score-threshold", type=float, default=0.52)
     parser.add_argument("--support-score-threshold", type=float, default=0.35)
-    parser.add_argument("--min-local-support-score", type=float, default=0.35)
-    parser.add_argument("--min-local-support-fraction", type=float, default=0.20)
     parser.add_argument("--support-neighborhood-cells", type=int, default=1)
+    # Retained only so older runners remain callable. These switches no longer
+    # activate a separate rescue branch.
     parser.add_argument("--enable-supported-rescue-branch", action="store_true")
     parser.add_argument("--rescue-min-anttrack-score", type=float, default=0.42)
     parser.add_argument("--rescue-min-lowcoh-score", type=float, default=0.72)
     parser.add_argument("--rescue-min-curvature-score", type=float, default=0.62)
     parser.add_argument("--rescue-min-local-support-fraction", type=float, default=0.22)
+    parser.add_argument("--enable-lowcoh-structure-rescue", action="store_true")
+    parser.add_argument("--lowcoh-rescue-min-lowcoh-score", type=float, default=0.78)
+    parser.add_argument("--lowcoh-rescue-min-anttrack-score", type=float, default=0.18)
+    parser.add_argument("--lowcoh-rescue-min-curvature-score", type=float, default=0.48)
+    parser.add_argument("--lowcoh-rescue-local-score-threshold", type=float, default=0.70)
+    parser.add_argument("--lowcoh-rescue-min-local-support-fraction", type=float, default=0.20)
+    parser.add_argument("--lowcoh-rescue-score-base", type=float, default=0.82)
+    parser.add_argument("--lowcoh-rescue-attribute-weight", type=float, default=0.12)
+    parser.add_argument("--lowcoh-rescue-continuity-weight", type=float, default=0.06)
+    parser.add_argument("--lowcoh-rescue-min-component-score-mean", type=float, default=0.64)
+    parser.add_argument("--lowcoh-rescue-bridge-iterations", type=int, default=1)
+    parser.add_argument("--lowcoh-rescue-bridge-min-lowcoh-score", type=float, default=0.62)
+    parser.add_argument("--lowcoh-rescue-bridge-min-combined-score", type=float, default=0.58)
     parser.add_argument("--min-component-voxels", type=int, default=120)
     parser.add_argument("--max-component-voxels-before-split", type=int, default=12000)
     parser.add_argument("--split-tile-cells", type=int, default=16)
@@ -71,7 +86,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--min-vertical-extent-ms", type=float, default=30.0)
     parser.add_argument("--min-component-dip-deg", type=float, default=25.0)
     parser.add_argument("--min-component-linearity", type=float, default=1.20)
-    parser.add_argument("--min-component-score-mean", type=float, default=0.70)
+    parser.add_argument("--min-component-score-mean", type=float, default=0.55)
     parser.add_argument("--max-horizontal-layer-thickness-ms", type=float, default=8.0)
     parser.add_argument("--horizontal-layer-min-extent-m", type=float, default=700.0)
     parser.add_argument("--layer-like-max-dip-deg", type=float, default=18.0)
@@ -145,6 +160,23 @@ def build_local_support_grids(
         mode="nearest",
     ).astype(np.float32)
     return support_max, support_fraction
+
+
+def retain_seeded_growth(seed_grid: np.ndarray, growth_grid: np.ndarray) -> tuple[np.ndarray, dict[str, Any]]:
+    """Keep 26-connected growth components that contain at least one strong AntTrack seed."""
+    growth = np.asarray(growth_grid, dtype=bool)
+    seeds = np.asarray(seed_grid, dtype=bool) & growth
+    labels, component_count = ndimage.label(growth, structure=np.ones((3, 3, 3), dtype=np.uint8))
+    seed_labels = np.unique(labels[seeds])
+    seed_labels = seed_labels[seed_labels > 0]
+    retained = np.isin(labels, seed_labels)
+    return retained, {
+        "growth_component_count": int(component_count),
+        "seed_voxel_count": int(seeds.sum()),
+        "seeded_component_count": int(len(seed_labels)),
+        "retained_growth_voxel_count": int(retained.sum()),
+        "discarded_unseeded_growth_voxel_count": int(growth.sum() - retained.sum()),
+    }
 
 
 def build_medium_components(
@@ -228,7 +260,9 @@ def build_medium_components(
             points = np.column_stack([x_values[gxx], y_values[gyy], samples[gtt] * time_scale]).astype(np.float64)
             azimuth, dip, linearity = pca_orientation(points)
             score_mean = float(np.mean(score[gyy, gxx, gtt]))
-            if score_mean < float(args.min_component_score_mean):
+            branch_values = branch_code[gyy, gxx, gtt].astype(np.uint8)
+            required_score_mean = float(args.min_component_score_mean)
+            if score_mean < required_score_mean:
                 rejected_low_score += 1
                 continue
             if dip is not None and dip < float(args.min_component_dip_deg):
@@ -272,9 +306,8 @@ def build_medium_components(
             if strat_following:
                 rejected_strat_following += 1
                 continue
-            branch_values = branch_code[gyy, gxx, gtt].astype(np.uint8)
-            primary_fraction = float(np.mean((branch_values == 1) | (branch_values == 3)))
-            rescue_fraction = float(np.mean((branch_values == 2) | (branch_values == 3)))
+            seed_fraction = float(np.mean((branch_values & 1) > 0))
+            growth_fraction = float(np.mean((branch_values & 2) > 0))
             dominant_layer = "沙三段" if int(is_shasan.sum()) >= int(is_shasi.sum()) else "沙四段"
             component_id_grid[gyy, gxx, gtt] = next_id
             rows.append(
@@ -284,6 +317,7 @@ def build_medium_components(
                     "voxel_count": voxel_count,
                     "score_mean": score_mean,
                     "score_max": float(np.max(score[gyy, gxx, gtt])),
+                    "required_score_mean": required_score_mean,
                     "x_min": float(x_values[gxx].min()),
                     "x_max": float(x_values[gxx].max()),
                     "y_min": float(y_values[gyy].min()),
@@ -303,8 +337,9 @@ def build_medium_components(
                     "anttrack_score_mean": float(np.mean(ant_score[gyy, gxx, gtt])),
                     "lowcoh_score_mean": float(np.mean(lowcoh_score[gyy, gxx, gtt])),
                     "curvature_score_mean": float(np.mean(curvature_score[gyy, gxx, gtt])),
-                    "primary_branch_fraction": primary_fraction,
-                    "supported_rescue_fraction": rescue_fraction,
+                    "anttrack_seed_fraction": seed_fraction,
+                    "weighted_growth_fraction": growth_fraction,
+                    "dominant_candidate_branch": "anttrack_seeded_weighted_growth",
                 }
             )
             next_id += 1
@@ -414,6 +449,7 @@ def main() -> int:
         curvpos_summary = {"status": "not_configured"}
         curv_score = curvmax_score.astype(np.float32)
 
+    ant_grid, _, _ = flat_to_grid(ant_score, mapping)
     lowcoh_grid, _, _ = flat_to_grid(lowcoh_score, mapping)
     curv_grid, _, _ = flat_to_grid(curv_score, mapping)
     local_support_grid, local_support_fraction_grid = build_local_support_grids(
@@ -424,42 +460,40 @@ def main() -> int:
     )
     local_support = grid_to_flat(local_support_grid, mapping)
     local_support_fraction = grid_to_flat(local_support_fraction_grid, mapping)
-    direct_support = np.maximum(lowcoh_score, curv_score).astype(np.float32)
-    medium_score = ant_score * (
-        float(args.ant_weight_base)
-        + float(args.lowcoh_support_weight) * lowcoh_score
-        + float(args.curvature_support_weight) * curv_score
+    weights = np.asarray(
+        [float(args.anttrack_weight), float(args.lowcoh_weight), float(args.curvature_weight)],
+        dtype=np.float64,
+    )
+    if np.any(weights < 0.0) or float(weights.sum()) <= 0.0:
+        raise ValueError("Step6B evidence weights must be non-negative and have a positive sum")
+    weights /= float(weights.sum())
+    medium_score = (
+        weights[0] * ant_score
+        + weights[1] * lowcoh_score
+        + weights[2] * curv_score
     )
     medium_score[~valid] = 0.0
     medium_score = np.clip(medium_score, 0.0, 1.0).astype(np.float32)
-    ant_branch_score = medium_score.copy()
-    score_threshold = quantile(medium_score[medium_score > 0], float(args.candidate_quantile))
     ant_threshold = quantile(ant_score[ant_score > 0], float(args.anttrack_high_quantile))
-    ant_branch_mask = (
-        (medium_score >= score_threshold)
-        & (ant_score >= ant_threshold)
-        & (direct_support >= float(args.min_direct_support_score))
-        & (local_support >= float(args.min_local_support_score))
-        & (local_support_fraction >= float(args.min_local_support_fraction))
+    seed_flat = (
+        (ant_score >= ant_threshold)
+        & (medium_score >= float(args.seed_medium_score_threshold))
         & valid
     )
-    rescue_branch_mask = np.zeros_like(valid, dtype=bool)
-    if bool(args.enable_supported_rescue_branch):
-        rescue_branch_mask = (
-            (ant_score >= float(args.rescue_min_anttrack_score))
-            & (lowcoh_score >= float(args.rescue_min_lowcoh_score))
-            & (curv_score >= float(args.rescue_min_curvature_score))
-            & (local_support_fraction >= float(args.rescue_min_local_support_fraction))
-            & valid
-        )
-    raw_mask_flat = ant_branch_mask | rescue_branch_mask
+    growth_flat = (
+        (ant_score >= float(args.growth_anttrack_floor))
+        & (medium_score >= float(args.growth_medium_score_threshold))
+        & valid
+    )
+    seed_grid, _, _ = flat_to_grid(seed_flat.astype(np.float32), mapping)
+    growth_grid, _, _ = flat_to_grid(growth_flat.astype(np.float32), mapping)
+    retained_growth_grid, seeded_growth_summary = retain_seeded_growth(seed_grid > 0.5, growth_grid > 0.5)
+    raw_mask_flat = grid_to_flat(retained_growth_grid.astype(np.float32), mapping) > 0.5
     branch_code_flat = np.zeros_like(raw_mask_flat, dtype=np.uint8)
-    branch_code_flat[ant_branch_mask] = 1
-    branch_code_flat[rescue_branch_mask] = np.maximum(branch_code_flat[rescue_branch_mask], 2)
-    branch_code_flat[ant_branch_mask & rescue_branch_mask] = 3
+    branch_code_flat[seed_flat & raw_mask_flat] |= 1
+    branch_code_flat[raw_mask_flat] |= 2
 
     medium_grid, _, _ = flat_to_grid(medium_score, mapping)
-    ant_grid, _, _ = flat_to_grid(ant_score, mapping)
     surfaces = surface_grids_from_contract(mapping, horizon_contract)
     branch_code_grid, _, _ = flat_to_grid(branch_code_flat.astype(np.float32), mapping)
     support_grid, _, _ = flat_to_grid(local_support.astype(np.float32), mapping)
@@ -500,8 +534,13 @@ def main() -> int:
     np.savez_compressed(
         output_dir / "medium_corridor_components.npz",
         medium_prior=medium_score_filtered.astype(np.float32),
+        medium_score=medium_score.astype(np.float32),
+        anttrack_score=ant_score.astype(np.float32),
+        lowcoh_score=lowcoh_score.astype(np.float32),
+        curvature_score=curv_score.astype(np.float32),
         medium_mask=kept_mask_flat.astype(np.uint8),
         medium_component_id=component_id_flat.astype(np.int32),
+        candidate_branch_code=branch_code_flat.astype(np.uint8),
         samples=samples.astype(np.float32),
         x=mapping["x"].astype(np.float64),
         y=mapping["y"].astype(np.float64),
@@ -539,41 +578,38 @@ def main() -> int:
             "curvaturemax": curvmax_load,
             "curvaturepos": curvpos_load,
         },
-        "score_threshold": score_threshold,
         "ant_score_threshold": ant_threshold,
-        "direct_support_threshold": float(args.min_direct_support_score),
-        "local_support_threshold": float(args.min_local_support_score),
-        "local_support_fraction_threshold": float(args.min_local_support_fraction),
+        "seed_medium_score_threshold": float(args.seed_medium_score_threshold),
+        "growth_anttrack_floor": float(args.growth_anttrack_floor),
+        "growth_medium_score_threshold": float(args.growth_medium_score_threshold),
+        "seeded_growth": seeded_growth_summary,
         "score_formula": {
-            "formula": "AntTrackPrimaryBranch plus optional AntTrack-constrained rescue branch",
-            "anttrack_branch": "AntTrackScore * (ant_weight_base + lowcoh_support_weight * LowCoherenceScore + curvature_support_weight * CurvatureScore)",
-            "supported_rescue_branch": "AntTrack >= minimum AND strong LowCoherence AND strong Curvature",
-            "ant_weight_base": float(args.ant_weight_base),
-            "lowcoh_support_weight": float(args.lowcoh_support_weight),
-            "curvature_support_weight": float(args.curvature_support_weight),
-            "enable_supported_rescue_branch": bool(args.enable_supported_rescue_branch),
-            "rescue_min_anttrack_score": float(args.rescue_min_anttrack_score),
-            "rescue_min_lowcoh_score": float(args.rescue_min_lowcoh_score),
-            "rescue_min_curvature_score": float(args.rescue_min_curvature_score),
-            "direct_support": "max(LowCoherenceScore, CurvatureScore)",
-            "local_support": "max_filter(max(LowCoherenceScore, CurvatureScore))",
-            "local_support_fraction": "local fraction of max(LowCoherenceScore, CurvatureScore) >= support_score_threshold",
+            "formula": "normalized weighted sum with AntTrack dominant",
+            "expression": "MediumScore = a*AntTrackScore + b*LowCoherenceScore + c*CurvatureScore",
+            "anttrack_weight": float(weights[0]),
+            "lowcoh_weight": float(weights[1]),
+            "curvature_weight": float(weights[2]),
+            "candidate_logic": "strong AntTrack seeds plus lower-threshold weighted growth; retain only growth components containing seeds",
+            "anttrack_polarity": "high normalized AntTrack response is fracture evidence",
             "support_score_threshold": float(args.support_score_threshold),
             "support_neighborhood_cells": int(args.support_neighborhood_cells),
+            "deprecated_rescue_flags_ignored": bool(
+                args.enable_supported_rescue_branch or args.enable_lowcoh_structure_rescue
+            ),
         },
         "raw_candidate_voxel_count": int(raw_mask_flat.sum()),
         "raw_candidate_voxel_fraction": float(raw_mask_flat.mean()),
         "raw_candidate_branch_counts": {
-            "anttrack_only": int(np.sum(branch_code_flat == 1)),
-            "supported_rescue_only": int(np.sum(branch_code_flat == 2)),
-            "both": int(np.sum(branch_code_flat == 3)),
+            "anttrack_seed": int(np.sum((branch_code_flat & 1) > 0)),
+            "weighted_growth": int(np.sum((branch_code_flat & 2) > 0)),
+            "growth_only": int(np.sum(branch_code_flat == 2)),
         },
         "kept_candidate_voxel_count": int(kept_mask_grid.sum()),
         "kept_candidate_voxel_fraction": float(kept_mask_grid.mean()),
         "kept_candidate_branch_counts": {
-            "anttrack_only": int(np.sum((component_id_grid > 0) & (branch_code_grid == 1))),
-            "supported_rescue_only": int(np.sum((component_id_grid > 0) & (branch_code_grid == 2))),
-            "both": int(np.sum((component_id_grid > 0) & (branch_code_grid == 3))),
+            "anttrack_seed": int(np.sum((component_id_grid > 0) & ((branch_code_grid.astype(np.uint8) & 1) > 0))),
+            "weighted_growth": int(np.sum((component_id_grid > 0) & ((branch_code_grid.astype(np.uint8) & 2) > 0))),
+            "growth_only": int(np.sum((component_id_grid > 0) & (branch_code_grid == 2))),
         },
         "max_component_fraction": max_component_fraction,
         "component_summary": component_summary,
@@ -585,13 +621,13 @@ def main() -> int:
             "anttrack_score_mean": finite_stats(component_df["anttrack_score_mean"]) if len(component_df) else finite_stats([]),
             "lowcoh_score_mean": finite_stats(component_df["lowcoh_score_mean"]) if len(component_df) else finite_stats([]),
             "curvature_score_mean": finite_stats(component_df["curvature_score_mean"]) if len(component_df) else finite_stats([]),
-            "primary_branch_fraction": finite_stats(component_df["primary_branch_fraction"]) if len(component_df) else finite_stats([]),
-            "supported_rescue_fraction": finite_stats(component_df["supported_rescue_fraction"]) if len(component_df) else finite_stats([]),
+            "anttrack_seed_fraction": finite_stats(component_df["anttrack_seed_fraction"]) if len(component_df) else finite_stats([]),
+            "weighted_growth_fraction": finite_stats(component_df["weighted_growth_fraction"]) if len(component_df) else finite_stats([]),
         },
         "medium_prior_stats": finite_stats(medium_score_filtered[medium_score_filtered > 0]),
         "local_support_stats_in_raw_candidates": finite_stats(local_support[raw_mask_flat]),
         "local_support_fraction_stats_in_raw_candidates": finite_stats(local_support_fraction[raw_mask_flat]),
-        "direct_support_stats_in_raw_candidates": finite_stats(direct_support[raw_mask_flat]),
+        "anttrack_score_stats_in_raw_candidates": finite_stats(ant_score[raw_mask_flat]),
         "local_support_stats_in_kept_candidates": finite_stats(support_grid[kept_mask_grid]),
         "local_support_fraction_stats_in_kept_candidates": finite_stats(local_support_fraction_grid[kept_mask_grid]),
         "attribute_score_summaries": {
@@ -602,8 +638,9 @@ def main() -> int:
         },
         "vtk": vtk_summary,
         "reflection": (
-            "Step6B is AntTrack-led. The optional rescue branch still requires minimum AntTrack plus strong low-coherence and curvature. "
-            "Components record attribute contributions and reject both low-dip and stratigraphically conformable anomalies."
+            "Step6B uses AntTrack-dominant additive evidence. Strong AntTrack voxels seed lower-threshold weighted growth, "
+            "and coherence or curvature cannot veto a strong AntTrack response. Components still reject low-dip and "
+            "stratigraphically conformable anomalies."
         ),
     }
     if max_component_fraction > 0.40:

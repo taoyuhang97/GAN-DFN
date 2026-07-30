@@ -109,7 +109,9 @@ CURRENT_STAGE="step6b"
 write_state "running"
 "${PYTHON_BIN}" "${SCRIPT_DIR}/build_step6b_medium_corridor_prior.py" \
   --config "${STEP6_CONFIG}" --output-dir "${STEP6_ROOT}/step6b_medium" \
-  --enable-supported-rescue-branch --min-component-voxels 120 \
+  --anttrack-weight 0.70 --lowcoh-weight 0.20 --curvature-weight 0.10 \
+  --seed-medium-score-threshold 0.62 --growth-anttrack-floor 0.28 \
+  --growth-medium-score-threshold 0.52 --min-component-voxels 120 \
   --max-component-voxels-before-split 12000 --split-time-samples 8
 
 CURRENT_STAGE="step6c"
@@ -117,10 +119,14 @@ write_state "running"
 "${PYTHON_BIN}" "${SCRIPT_DIR}/build_step6c_large_fault_prior.py" \
   --config "${STEP6_CONFIG}" --input-qc-dir "${STEP6_ROOT}/input_qc" \
   --output-dir "${STEP6_ROOT}/step6c_large" --inferred-extraction-mode surface_ransac \
+  --lowcoh-weight 0.75 --anttrack-weight 0.15 --curvature-weight 0.10 \
+  --lowcoh-candidate-floor 0.55 --large-score-threshold 0.58 \
+  --surface-support-score-threshold 0.35 --surface-min-support-fraction 0.18 \
   --faultlike-min-vertical-extent-ms 80 --surface-ransac-min-inlier-voxels 300 \
   --surface-ransac-min-inlier-fraction 0.025 --surface-ransac-max-raw-components 128 \
   --surface-ransac-iterations 120 --surface-ransac-max-points 15000 \
-  --surface-ransac-max-surfaces-per-component 4 --surface-max-horizontal-extent-m 3000
+  --surface-ransac-max-surfaces-per-component 4 --surface-panel-target-length-m 350 \
+  --surface-min-panel-length-m 150 --surface-max-panel-length-m 500
 
 CURRENT_STAGE="step6d"
 write_state "running"

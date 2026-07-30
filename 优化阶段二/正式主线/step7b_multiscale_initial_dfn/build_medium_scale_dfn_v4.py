@@ -148,13 +148,21 @@ def component_candidates_from_step6b(
     summary_path = Path(config["medium_component_summary_csv"]).resolve()
     component_npz = np.load(component_path)
     component_flat = component_npz["medium_component_id"].astype(np.int32)
+    anttrack_flat = component_npz["anttrack_score"].astype(np.float32)
+    medium_score_flat = component_npz.get("medium_score", component_npz["medium_prior"]).astype(np.float32)
     if component_flat.shape != (grid["tracecount"], grid["sample_count"]):
         raise ValueError(f"medium component shape {component_flat.shape} does not match prior SGY")
+    if anttrack_flat.shape != component_flat.shape or medium_score_flat.shape != component_flat.shape:
+        raise ValueError("Step6B AntTrack/medium score arrays do not match component shape")
     mapping = np.load(Path(config["trace_mapping_npz"]).resolve())
     ix = mapping["ix"].astype(np.int32)
     iy = mapping["iy"].astype(np.int32)
     component_grid = np.zeros_like(grid["density"], dtype=np.int32)
+    anttrack_grid = np.zeros_like(grid["density"], dtype=np.float32)
+    medium_score_grid = np.zeros_like(grid["density"], dtype=np.float32)
     component_grid[iy, ix, :] = component_flat
+    anttrack_grid[iy, ix, :] = anttrack_flat
+    medium_score_grid[iy, ix, :] = medium_score_flat
     summary = pd.read_csv(summary_path)
     if summary.empty:
         raise RuntimeError("Step6B component summary is empty")
@@ -182,14 +190,16 @@ def component_candidates_from_step6b(
         yy += int(component_slice[0].start)
         xx += int(component_slice[1].start)
         tt += int(component_slice[2].start)
-        scores = grid["density"][yy, xx, tt]
+        scores = medium_score_grid[yy, xx, tt]
+        ant_scores = anttrack_grid[yy, xx, tt]
         valid = np.isfinite(scores) & (scores >= min_score)
-        yy, xx, tt, scores = yy[valid], xx[valid], tt[valid], scores[valid]
+        yy, xx, tt, scores, ant_scores = yy[valid], xx[valid], tt[valid], scores[valid], ant_scores[valid]
         if len(scores) == 0:
             continue
         if len(scores) > max_points:
-            keep = np.argpartition(scores, -max_points)[-max_points:]
-            yy, xx, tt, scores = yy[keep], xx[keep], tt[keep], scores[keep]
+            geometry_priority = 0.8 * ant_scores + 0.2 * scores
+            keep = np.argpartition(geometry_priority, -max_points)[-max_points:]
+            yy, xx, tt, scores, ant_scores = yy[keep], xx[keep], tt[keep], scores[keep], ant_scores[keep]
         for layer in legacy.ALLOWED_LAYERS:
             top = surfaces["T4_TIME"][yy, xx] if layer == "沙三段" else surfaces["T6_TIME"][yy, xx]
             base = surfaces["T6_TIME"][yy, xx] if layer == "沙三段" else surfaces["T7_TIME"][yy, xx]
@@ -198,7 +208,7 @@ def component_candidates_from_step6b(
             if not in_layer.any():
                 continue
             lyy, lxx, ltt = yy[in_layer], xx[in_layer], tt[in_layer]
-            lscore, ltop, lbase = scores[in_layer], top[in_layer], base[in_layer]
+            lscore, lant, ltop, lbase = scores[in_layer], ant_scores[in_layer], top[in_layer], base[in_layer]
             frame = pd.DataFrame(
                 {
                     "LayerGroup": layer,
@@ -214,7 +224,9 @@ def component_candidates_from_step6b(
                     "SourceDensity": lscore.astype(float),
                     "GuidedDensityScore": lscore.astype(float),
                     "CandidateScore": lscore.astype(float),
-                    "SamplingWeight": lscore.astype(float),
+                    "SamplingWeight": (0.7 * lant + 0.3 * lscore).astype(float),
+                    "AntTrackScore": lant.astype(float),
+                    "MediumScore": lscore.astype(float),
                     "ComponentID": component_id,
                     "ComponentVoxelCount": int(comp_row.voxel_count),
                     "GlobalComponentAzimuthDeg": float(comp_row.pca_azimuth_deg),
@@ -223,6 +235,9 @@ def component_candidates_from_step6b(
                     "GlobalComponentXExtentM": float(comp_row.x_extent_m),
                     "GlobalComponentYExtentM": float(comp_row.y_extent_m),
                     "GlobalComponentTimeExtentMs": float(comp_row.time_extent_ms),
+                    "CandidateBranch": str(getattr(comp_row, "dominant_candidate_branch", "unknown")),
+                    "AntTrackSeedFraction": float(getattr(comp_row, "anttrack_seed_fraction", np.nan)),
+                    "WeightedGrowthFraction": float(getattr(comp_row, "weighted_growth_fraction", np.nan)),
                     "LayerDensityThreshold": min_score,
                     "FractureScale": "medium",
                     "FractureScaleCode": 2,
@@ -244,6 +259,9 @@ def component_candidates_from_step6b(
                     "GlobalXExtentM": float(comp_row.x_extent_m),
                     "GlobalYExtentM": float(comp_row.y_extent_m),
                     "GlobalTimeExtentMs": float(comp_row.time_extent_ms),
+                    "CandidateBranch": str(getattr(comp_row, "dominant_candidate_branch", "unknown")),
+                    "AntTrackScoreMean": float(np.mean(lant)),
+                    "AntTrackSeedFraction": float(getattr(comp_row, "anttrack_seed_fraction", np.nan)),
                 }
             )
     if not rows:
@@ -412,6 +430,130 @@ def spatially_distributed_order(group: pd.DataFrame, time_scale: float, limit: i
     return np.asarray(selected, dtype=np.int64)
 
 
+def anttrack_ridge_order(group: pd.DataFrame, config: dict[str, Any]) -> tuple[np.ndarray, dict[str, float | int]]:
+    """Return local AntTrack maxima, ordered by direct evidence strength."""
+    iy = group["IY"].to_numpy(dtype=np.int32)
+    ix = group["IX"].to_numpy(dtype=np.int32)
+    it = group["IT"].to_numpy(dtype=np.int32)
+    ant = np.clip(group["AntTrackScore"].to_numpy(dtype=float), 0.0, 1.0)
+    medium = np.clip(group["MediumScore"].to_numpy(dtype=float), 0.0, 1.0)
+    radius = max(int(config.get("anttrack_ridge_nms_radius_cells", 1)), 0)
+    quantile_value = float(config.get("anttrack_ridge_quantile", 0.72))
+    threshold = max(
+        float(config.get("anttrack_ridge_min_score", 0.45)),
+        float(np.quantile(ant[np.isfinite(ant)], quantile_value)) if np.isfinite(ant).any() else 1.0,
+    )
+    if radius > 0:
+        coords = np.column_stack([iy, ix, it]).astype(float)
+        tree = cKDTree(coords)
+        ridge = np.zeros(len(group), dtype=bool)
+        for idx in np.where(ant >= threshold)[0]:
+            neighbors = tree.query_ball_point(coords[idx], r=radius, p=np.inf)
+            ridge[idx] = bool(ant[idx] >= np.max(ant[np.asarray(neighbors, dtype=np.int64)]) - 1.0e-7)
+    else:
+        ridge = ant >= threshold
+    ridge_idx = np.where(ridge)[0]
+    if not len(ridge_idx):
+        ridge_idx = np.argsort(ant)[::-1][:1]
+    priority = 0.8 * ant[ridge_idx] + 0.2 * medium[ridge_idx]
+    order = ridge_idx[np.argsort(priority)[::-1]]
+    return order.astype(np.int64), {
+        "ridge_candidate_count": int(len(order)),
+        "ridge_anttrack_threshold": float(threshold),
+        "ridge_anttrack_score_mean": float(np.mean(ant[order])) if len(order) else 0.0,
+    }
+
+
+def ridge_extent_m(group: pd.DataFrame, order: np.ndarray, grid: dict[str, Any], time_scale: float) -> float:
+    if not len(order):
+        return 0.0
+    ridge = group.iloc[order]
+    coords = np.column_stack(
+        [
+            grid["x_values"][ridge["IX"].to_numpy(dtype=int)],
+            grid["y_values"][ridge["IY"].to_numpy(dtype=int)],
+            ridge["CenterTime"].to_numpy(dtype=float) * time_scale,
+        ]
+    )
+    if len(coords) < 2:
+        return 0.0
+    centered = coords - coords.mean(axis=0, keepdims=True)
+    _, _, vh = np.linalg.svd(centered, full_matrices=False)
+    projection = centered @ vh[0]
+    return float(np.quantile(projection, 0.95) - np.quantile(projection, 0.05))
+
+
+def global_spacing_nms(
+    frame: pd.DataFrame,
+    grid: dict[str, Any],
+    min_separation_m: float,
+    time_scale: float,
+) -> tuple[pd.DataFrame, dict[str, Any]]:
+    """Apply physical 3-D spacing across component boundaries using a sparse spatial hash."""
+    if frame.empty or min_separation_m <= 0.0:
+        return frame.reset_index(drop=True), {
+            "input_count": int(len(frame)),
+            "kept_count": int(len(frame)),
+            "removed_count": 0,
+        }
+    work = frame.reset_index(drop=True)
+    coords = np.column_stack(
+        [
+            grid["x_values"][work["IX"].to_numpy(dtype=int)],
+            grid["y_values"][work["IY"].to_numpy(dtype=int)],
+            work["CenterTime"].to_numpy(dtype=float) * float(time_scale),
+        ]
+    )
+    priority = (
+        0.8 * np.clip(work["AntTrackScore"].to_numpy(dtype=float), 0.0, 1.0)
+        + 0.2 * np.clip(work["MediumScore"].to_numpy(dtype=float), 0.0, 1.0)
+    )
+    component_best = (
+        work.assign(_priority=priority)
+        .sort_values("_priority", ascending=False)
+        .groupby(["LayerGroup", "ComponentID"], sort=False)
+        .head(1)
+        .index.to_numpy(dtype=np.int64)
+    )
+    best_set = set(component_best.tolist())
+    remaining = np.asarray([idx for idx in np.argsort(priority)[::-1] if int(idx) not in best_set], dtype=np.int64)
+    order = np.concatenate([component_best, remaining])
+    cell_size = float(min_separation_m)
+    min_distance_sq = cell_size * cell_size
+    buckets: dict[tuple[int, int, int], list[int]] = {}
+    kept: list[int] = []
+    for idx in order:
+        point = coords[int(idx)]
+        cell = tuple(np.floor(point / cell_size).astype(np.int64).tolist())
+        conflict = False
+        for dy in (-1, 0, 1):
+            for dx in (-1, 0, 1):
+                for dt in (-1, 0, 1):
+                    for kept_idx in buckets.get((cell[0] + dy, cell[1] + dx, cell[2] + dt), []):
+                        delta = coords[kept_idx] - point
+                        if float(delta @ delta) < min_distance_sq:
+                            conflict = True
+                            break
+                    if conflict:
+                        break
+                if conflict:
+                    break
+            if conflict:
+                break
+        if conflict:
+            continue
+        kept.append(int(idx))
+        buckets.setdefault(cell, []).append(int(idx))
+    output = work.iloc[kept].copy().reset_index(drop=True)
+    return output, {
+        "input_count": int(len(work)),
+        "kept_count": int(len(output)),
+        "removed_count": int(len(work) - len(output)),
+        "min_separation_m": float(min_separation_m),
+        "covered_component_count": int(output[["LayerGroup", "ComponentID"]].drop_duplicates().shape[0]),
+    }
+
+
 def select_medium_patches(candidates: pd.DataFrame, grid: dict[str, Any], config: dict[str, Any], rng: np.random.Generator) -> tuple[pd.DataFrame, list[dict[str, Any]]]:
     parts: list[pd.DataFrame] = []
     summaries: list[dict[str, Any]] = []
@@ -428,18 +570,22 @@ def select_medium_patches(candidates: pd.DataFrame, grid: dict[str, Any], config
     time_scale = float(config.get("orientation_time_scale_m_per_ms", 1.0))
     component_items = []
     for (layer, component_id), group in candidates.groupby(["LayerGroup", "ComponentID"], dropna=False):
-        mass = float(group["SamplingWeight"].sum())
+        mass = float(group["AntTrackScore"].sum())
         component_items.append((mass, str(layer), int(component_id), group.copy()))
     component_items.sort(key=lambda item: item[0], reverse=True)
     if max_components > 0:
         component_items = component_items[:max_components]
     total_mass = max(sum(item[0] for item in component_items), 1.0e-9)
     for rank, (mass, layer, component_id, group) in enumerate(component_items, start=1):
+        ridge_order, ridge_summary = anttrack_ridge_order(group, config)
+        ridge_length = ridge_extent_m(group, ridge_order, grid, time_scale)
         if max_total > 0:
             target = int(round(max_total * mass / total_mass))
         else:
-            score_factor = 0.65 + 0.70 * float(np.clip(group["SamplingWeight"].mean(), 0.0, 1.0))
-            target = int(round(len(group) * score_factor / component_voxels_per_patch))
+            spacing = max(float(config.get("ridge_patch_spacing_m", 85.0)), 1.0)
+            target = int(np.ceil(ridge_length / spacing)) + 1
+            if ridge_length <= 0.0:
+                target = int(np.ceil(len(group) / component_voxels_per_patch))
         min_per_component = int(config.get("min_patches_per_component", 8))
         max_per_component = int(config.get("max_patches_per_component", 180))
         target = max(target, min_per_component)
@@ -448,20 +594,9 @@ def select_medium_patches(candidates: pd.DataFrame, grid: dict[str, Any], config
         target = min(target, len(group))
         if target <= 0:
             continue
-        if str(config.get("component_selection_mode", "spatial_farthest")) == "spatial_farthest":
-            order = spatially_distributed_order(
-                group,
-                time_scale=float(config.get("orientation_time_scale_m_per_ms", 1.0)),
-                limit=target,
-            )
-        else:
-            weights = np.clip(group["SamplingWeight"].to_numpy(dtype=float), 0.0, None)
-            if weights.sum() <= 0:
-                order = rng.permutation(np.arange(len(group)))
-            else:
-                weights = weights / weights.sum()
-                order = rng.choice(np.arange(len(group)), size=len(group), replace=False, p=weights)
+        order = ridge_order
         selected_rows = []
+        selected_local_indices: list[int] = []
         selected_coords: list[np.ndarray] = []
         used_cells: set[tuple[int, int, int]] = set()
         for local_idx in order:
@@ -532,6 +667,7 @@ def select_medium_patches(candidates: pd.DataFrame, grid: dict[str, Any], config
             row["PatchShapeMode"] = "rectangular_local_medium_band_pca_v4"
             row["OrientationSourceOverride"] = str(geom["reason"])
             selected_rows.append(row)
+            selected_local_indices.append(int(local_idx))
             selected_coords.append(center_coord)
         for ordinal, row in enumerate(selected_rows, start=1):
             row["BandPatchOrdinal"] = ordinal
@@ -552,6 +688,11 @@ def select_medium_patches(candidates: pd.DataFrame, grid: dict[str, Any], config
                     "AzimuthMedianDeg": float(selected["OverrideAzimuthDeg"].median()),
                     "LengthMedianM": float(selected["OverrideLengthM"].median()),
                     "HeightMedianMs": float(selected["OverrideHeightTimeMs"].median()),
+                    "CandidateBranch": str(group["CandidateBranch"].iloc[0]) if "CandidateBranch" in group.columns else "unknown",
+                    "AntTrackRidgeCandidateCount": int(ridge_summary["ridge_candidate_count"]),
+                    "AntTrackRidgeSelectedCount": int(len(selected_local_indices)),
+                    "AntTrackRidgeThreshold": float(ridge_summary["ridge_anttrack_threshold"]),
+                    "AntTrackRidgeLengthM": float(ridge_length),
                     "LocalBandWidthMedianM": float(selected["LocalBandWidthM"].median()),
                     "LocalBandThicknessMedianMs": float(selected["LocalBandThicknessMs"].median()),
                 }
@@ -559,6 +700,12 @@ def select_medium_patches(candidates: pd.DataFrame, grid: dict[str, Any], config
     if not parts:
         raise RuntimeError("no medium patches selected")
     out = pd.concat(parts, ignore_index=True)
+    out, global_nms_summary = global_spacing_nms(
+        out,
+        grid,
+        min_separation_m=min_center_separation,
+        time_scale=time_scale,
+    )
     if max_total > 0 and len(out) > max_total:
         weights = np.clip(out["SamplingWeight"].to_numpy(dtype=float), 0.0, None)
         weights = weights / weights.sum() if weights.sum() > 0 else None
@@ -571,6 +718,7 @@ def select_medium_patches(candidates: pd.DataFrame, grid: dict[str, Any], config
     out = out.reset_index(drop=True)
     out.attrs["low_dip_rejected_count"] = int(low_dip_rejected_count)
     out.attrs["low_dip_adjusted_count"] = int(low_dip_adjusted_count)
+    out.attrs["global_spacing_nms"] = global_nms_summary
     return out, summaries
 
 
@@ -625,6 +773,11 @@ def build_summary(config_path: Path, config: dict[str, Any], paths: dict[str, Pa
     )
     quadrant_counts = {str(key): int(value) for key, value in pd.Series(quadrant_labels).value_counts().items()}
     layer_counts = {str(key): int(value) for key, value in patch_df["LayerGroup"].value_counts().items()}
+    branch_counts = (
+        {str(key): int(value) for key, value in patch_df["CandidateBranch"].value_counts(dropna=False).items()}
+        if "CandidateBranch" in patch_df.columns
+        else {}
+    )
     coords = np.column_stack(
         [
             patch_df["CenterX"].to_numpy(dtype=float),
@@ -652,7 +805,7 @@ def build_summary(config_path: Path, config: dict[str, Any], paths: dict[str, Pa
     return {
         "status": "pass" if all(checks.values()) else "fail",
         "config_path": str(config_path),
-        "generation_logic": "step7b_medium_local_candidate_band_voxel_pca_v4",
+        "generation_logic": "step7b_anttrack_ridge_nms_with_local_geometry_pca_v5",
         "inputs": {
             "medium_prior_sgy": str(Path(config["medium_prior_sgy"]).resolve()),
             "medium_mask_sgy": str(Path(config["medium_mask_sgy"]).resolve()) if config.get("medium_mask_sgy") else "",
@@ -673,7 +826,9 @@ def build_summary(config_path: Path, config: dict[str, Any], paths: dict[str, Pa
         "upstream_component_coverage_fraction": upstream_component_coverage,
         "quadrant_counts": quadrant_counts,
         "layer_counts": layer_counts,
+        "candidate_branch_counts": branch_counts,
         "nearest_center_distance": legacy.finite_stats(nearest),
+        "global_spacing_nms": selected.attrs.get("global_spacing_nms", {}),
         "band_examples": bands[:30],
         "patch_stats": {
             "length_m": legacy.finite_stats(patch_df["LengthM"]),
@@ -739,18 +894,23 @@ def main() -> int:
         "OrientationAdjusted",
         "LowDipRejected",
         "LowDipPolicy",
+        "CandidateBranch",
+        "AntTrackScore",
+        "MediumScore",
+        "AntTrackSeedFraction",
+        "WeightedGrowthFraction",
     ]:
         if column in selected.columns:
             patch_df[column] = selected[column].to_numpy()
-    patch_df["GenerationStage"] = "step7b_medium_local_candidate_band_voxel_pca_v4"
+    patch_df["GenerationStage"] = "step7b_medium_anttrack_ridge_local_pca_v5"
     patch_df["FractureScale"] = "medium"
     patch_df["FractureScaleCode"] = 2
     patch_df["SourceType"] = "medium_anttrack_fracture_corridor"
     patch_df["ConstraintLevel"] = "seismic_prior"
-    patch_df.loc[:, "OrientationSource"] = "local_medium_candidate_band_pca"
+    patch_df.loc[:, "OrientationSource"] = "local_anttrack_ridge_geometry_pca"
     patch_df["Confidence"] = np.clip(pd.to_numeric(patch_df["SamplingWeight"], errors="coerce").fillna(0.0), 0.0, 1.0)
     audit_df = legacy.build_audit(patch_df)
-    audit_df["ActionReason"] = "medium_scale_local_band_voxel_geometry_from_step6b"
+    audit_df["ActionReason"] = "medium_scale_patch_centered_on_step6b_anttrack_ridge"
 
     patch_df.to_csv(paths["dfn_csv"], index=False, encoding="utf-8-sig")
     audit_df.to_csv(paths["audit_csv"], index=False, encoding="utf-8-sig")
