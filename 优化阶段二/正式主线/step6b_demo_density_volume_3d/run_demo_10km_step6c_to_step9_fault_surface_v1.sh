@@ -90,7 +90,7 @@ required = [
     Path(config["trace_mapping_npz"]),
     *(Path(value) for value in config["volume_paths"].values()),
     step6 / "step6a_small/small_background_qc.json",
-    step6 / "step6a_small/small_background_evidence.npz",
+    step6 / "step6a_small/small_background_score.sgy",
     step6 / "step6b_medium/medium_corridor_qc.json",
     step6 / "step6b_medium/medium_corridor_components.npz",
 ]
