@@ -15,6 +15,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
+import pyvista as pv
 from matplotlib.collections import LineCollection
 
 from build_all_area_section_visualization import (
@@ -205,6 +206,10 @@ def validate_inputs(config: dict[str, Any]) -> None:
         path = path_from_config(config, "original_fault_stick_dat")
         if not path.exists():
             raise FileNotFoundError(f"original_fault_stick_dat not found: {path}")
+    if config.get("original_fault_surface_vtk"):
+        path = path_from_config(config, "original_fault_surface_vtk")
+        if not path.exists():
+            raise FileNotFoundError(f"original_fault_surface_vtk not found: {path}")
 
 
 def reset_output_images(output_dir: Path) -> None:
@@ -780,6 +785,110 @@ def scan_fault_surface_csv_intersections(
         "skipped_by_distance": int(skipped_by_distance),
         "skipped_by_no_intersection": int(skipped_by_no_intersection),
         "skipped_by_geometry": int(skipped_by_geometry),
+    }
+
+
+def curved_section_triangle_line(
+    vertices: np.ndarray,
+    projection: str,
+    well_time: np.ndarray,
+    well_x: np.ndarray,
+    well_y: np.ndarray,
+) -> tuple[tuple[float, float], tuple[float, float]] | None:
+    if projection == "XZ":
+        signed = vertices[:, 1] - np.interp(vertices[:, 2], well_time, well_y)
+        horizontal_axis = 0
+    else:
+        signed = vertices[:, 0] - np.interp(vertices[:, 2], well_time, well_x)
+        horizontal_axis = 1
+    points: list[np.ndarray] = []
+    for idx in range(len(vertices)):
+        p1 = vertices[idx]
+        p2 = vertices[(idx + 1) % len(vertices)]
+        d1 = float(signed[idx])
+        d2 = float(signed[(idx + 1) % len(vertices)])
+        if abs(d1) <= SECTION_INTERSECTION_EPS_M:
+            points.append(p1.copy())
+        if d1 * d2 < 0.0:
+            ratio = abs(d1) / (abs(d1) + abs(d2))
+            points.append(p1 + ratio * (p2 - p1))
+        elif abs(d2) <= SECTION_INTERSECTION_EPS_M:
+            points.append(p2.copy())
+    unique: list[np.ndarray] = []
+    for point in points:
+        if not any(float(np.linalg.norm(point - other)) <= 1.0e-5 for other in unique):
+            unique.append(point)
+    if len(unique) < 2:
+        return None
+    coords = np.asarray(unique, dtype=float)[:, [horizontal_axis, 2]]
+    if len(coords) == 2:
+        p1, p2 = coords
+    else:
+        line = representative_line_2d(coords)
+        if line is None:
+            return None
+        p1, p2 = np.asarray(line[0], dtype=float), np.asarray(line[1], dtype=float)
+    return (float(p1[0]), float(p1[1])), (float(p2[0]), float(p2[1]))
+
+
+def scan_original_fault_surface_intersections(
+    fault_vtk: Path | None,
+    well_df: pd.DataFrame,
+    display: dict[str, float],
+) -> tuple[list[ProjectionSegment], dict[str, Any]]:
+    if fault_vtk is None:
+        return [], {"enabled": False, "segment_count": 0}
+    loaded = pv.read(fault_vtk)
+    mesh = loaded if isinstance(loaded, pv.PolyData) else loaded.extract_surface(algorithm="dataset_surface")
+    mesh = mesh.triangulate()
+    faces = np.asarray(mesh.faces, dtype=np.int64).reshape(-1, 4)
+    well_time = well_df["TIME"].to_numpy(dtype=float)
+    well_x = well_df["X"].to_numpy(dtype=float)
+    well_y = well_df["Y"].to_numpy(dtype=float)
+    segments: list[ProjectionSegment] = []
+    counts = {"XZ": 0, "YZ": 0}
+    for cell_index, face in enumerate(faces):
+        if int(face[0]) != 3:
+            continue
+        vertices = np.asarray(mesh.points[face[1:4]], dtype=float)
+        center = vertices.mean(axis=0)
+        area = polygon_area(vertices)
+        for projection in ("XZ", "YZ"):
+            line = curved_section_triangle_line(vertices, projection, well_time, well_x, well_y)
+            if line is None:
+                continue
+            h_min = float(display["display_x_min"] if projection == "XZ" else display["display_y_min"])
+            h_max = float(display["display_x_max"] if projection == "XZ" else display["display_y_max"])
+            if max(line[0][0], line[1][0]) < h_min or min(line[0][0], line[1][0]) > h_max:
+                continue
+            segments.append(
+                ProjectionSegment(
+                    polygon_index=int(cell_index),
+                    projection=projection,
+                    interval="original_fault",
+                    center_x=float(center[0]),
+                    center_y=float(center[1]),
+                    center_z=float(center[2]),
+                    surface_distance=0.0,
+                    patch_area=float(area),
+                    h1=float(line[0][0]),
+                    z1=float(line[0][1]),
+                    h2=float(line[1][0]),
+                    z2=float(line[1][1]),
+                )
+            )
+            counts[projection] += 1
+    return segments, {
+        "enabled": True,
+        "fault_trace_source": "step7c_original_fault_surface_triangles",
+        "original_fault_surface_vtk": str(fault_vtk),
+        "surface_point_count": int(mesh.n_points),
+        "surface_triangle_count": int(mesh.n_cells),
+        "segment_count": int(len(segments)),
+        "segment_count_xz": int(counts["XZ"]),
+        "segment_count_yz": int(counts["YZ"]),
+        "horizon_filter_applied": False,
+        "intersection_mode": "triangle_vs_well_curved_section",
     }
 
 
@@ -1399,9 +1508,17 @@ def main() -> None:
     print("[cheye1-section] scanning DFN local 200m band as section intersections + small-scale band projection", flush=True)
     local_segments, local_scan = scan_vtk_intersections(local_args, surfaces, well_df)
     print("[cheye1-section] scanning fault surface traces", flush=True)
+    fault_surface_vtk = path_from_config(config, "original_fault_surface_vtk") if config.get("original_fault_surface_vtk") else None
     fault_dat = path_from_config(config, "original_fault_stick_dat") if config.get("original_fault_stick_dat") else None
     fault_csv = path_from_config(config, "fault_surface_csv") if config.get("fault_surface_csv") else None
-    if fault_dat is not None:
+    if fault_surface_vtk is not None:
+        standard_fault_segments, standard_fault_scan = scan_original_fault_surface_intersections(
+            fault_surface_vtk, well_df, full_display
+        )
+        local_fault_segments, local_fault_scan = scan_original_fault_surface_intersections(
+            fault_surface_vtk, well_df, local_display
+        )
+    elif fault_dat is not None:
         standard_fault_segments, standard_fault_scan = scan_original_fault_stick_traces(
             fault_dat,
             dict(config.get("target_block") or {}),
@@ -1552,7 +1669,16 @@ def main() -> None:
             "local_has_xz_yz_segments": int(image_counts["local_overlay_xz"] or 0) > 0 and int(image_counts["local_overlay_yz"] or 0) > 0,
             "fault_trace_loaded": bool(
                 not standard_fault_scan.get("enabled", False)
-                or int(standard_fault_scan.get("raw_point_count_in_target_with_padding", standard_fault_scan.get("fault_surface_patch_count", 0))) > 0
+                or int(
+                    standard_fault_scan.get(
+                        "surface_triangle_count",
+                        standard_fault_scan.get(
+                            "raw_point_count_in_target_with_padding",
+                            standard_fault_scan.get("fault_surface_patch_count", 0),
+                        ),
+                    )
+                )
+                > 0
             ),
             "coherence_samples_nonempty": int(np.isfinite(full_xz).sum()) > 0 and int(np.isfinite(full_yz).sum()) > 0,
             "step3_gt_point_labels_loaded": int(len(fracture_df)) > 0,

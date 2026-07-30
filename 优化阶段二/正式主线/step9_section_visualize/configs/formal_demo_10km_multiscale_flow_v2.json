@@ -1,7 +1,6 @@
 {
   "input_vtk": "/home/tyh/projects/petroleum/code/GAN-DFN/优化阶段二/正式主线/step8_dfn_well_correction/output/formal_demo_10km_multiscale_flow_v2/well_corrected_dfn_raw_time.vtk",
   "dfn_patch_csv": "/home/tyh/projects/petroleum/code/GAN-DFN/优化阶段二/正式主线/step8_dfn_well_correction/output/formal_demo_10km_multiscale_flow_v2/well_corrected_dfn_fracture_patches.csv",
-  "original_fault_stick_dat": "/data/shared/project-oil/wx数据/砂砾岩/断层/FaultStick-GeoEast.dat",
   "trace_header_csv": "/home/tyh/projects/petroleum/code/GAN-DFN/数据精简/trace_header_xy.csv",
   "real_well_samples_root": "/home/tyh/projects/petroleum/code/GAN-DFN/优化阶段二/正式主线/step2_real_well_t4_t7_samples/output/formal_all_wells",
   "surface_dir": "/data/shared/project-oil/wx数据/砂砾岩/层位",
@@ -94,6 +93,7 @@
   "amplitude_clip_quantile": 0.99,
   "wiggle_max_trace_count": 0,
   "wiggle_lateral_scale_fraction": 0.42,
+  "original_fault_surface_vtk": "/home/tyh/projects/petroleum/code/GAN-DFN/优化阶段二/正式主线/step7c_large_fault_dfn/output/formal_demo_10km_multiscale_flow_v2/original_fault_units_demo_raw_time.vtk",
   "horizon_contract_table": "/home/tyh/projects/petroleum/code/GAN-DFN/优化阶段二/正式主线/common/horizon_trace_table/output/formal_horizon_trace_table_v2/horizon_trace_table.npy",
   "horizon_window_contracts": {
     "2ms": "/home/tyh/projects/petroleum/code/GAN-DFN/优化阶段二/正式主线/common/horizon_trace_table/output/formal_horizon_trace_table_v2/horizon_windows_2ms.npz",

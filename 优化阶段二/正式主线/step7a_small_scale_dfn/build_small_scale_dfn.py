@@ -401,6 +401,9 @@ def build_compact_selected_candidates(
     medium_core = context["medium_core_mask"]
     large_damage = context["large_damage"]
     large_core = context["large_core_mask"]
+    large_damage_source_code = context.get(
+        "large_damage_source_code", np.zeros_like(large_damage, dtype=np.uint8)
+    ).astype(np.uint8)
     mapping = np.load(Path(config["trace_mapping_npz"]).resolve())
     iy = mapping["iy"].astype(np.int32)
     ix = mapping["ix"].astype(np.int32)
@@ -412,6 +415,7 @@ def build_compact_selected_candidates(
         "medium_core": medium_core,
         "large_damage": large_damage,
         "large_core": large_core,
+        "large_damage_source_code": large_damage_source_code,
     }.items():
         if values.shape != expected_context_shape:
             raise ValueError(f"{name} shape {values.shape} != {expected_context_shape}")
@@ -460,6 +464,7 @@ def build_compact_selected_candidates(
         small = score_flat[:, t0:t1]
         medium = medium_damage[:, context_idx].astype(np.float32)
         large = large_damage[:, context_idx].astype(np.float32)
+        large_source = large_damage_source_code[:, context_idx].astype(np.uint8)
         background = np.where(small > 0.0, background_floor + background_dynamic_weight * small, 0.0).astype(np.float32)
         background *= 1.0 - medium_core[:, context_idx].astype(np.float32) * medium_core_attenuation
         background *= 1.0 - large_core[:, context_idx].astype(np.float32) * large_core_attenuation
@@ -492,6 +497,24 @@ def build_compact_selected_candidates(
                 selected_total += int(len(trace_pos))
                 selected_counts[domain_name] += int(len(trace_pos))
                 it = local_t + t0
+                influence_codes = (
+                    large_source[trace_pos, local_t]
+                    if str(domain_name) == "large_damage"
+                    else np.zeros(len(trace_pos), dtype=np.uint8)
+                )
+                influence_labels = np.asarray(
+                    [
+                        "original_and_inferred_fault"
+                        if value == 3
+                        else "inferred_fault"
+                        if value == 2
+                        else "original_fault"
+                        if value == 1
+                        else "not_large_fault_damage"
+                        for value in influence_codes
+                    ],
+                    dtype=object,
+                )
                 frame = pd.DataFrame(
                     {
                         "LayerGroup": layer,
@@ -519,6 +542,8 @@ def build_compact_selected_candidates(
                         "FractureScaleCode": 1,
                         "SmallDomain": domain_name,
                         "SmallDomainCode": code + 1,
+                        "LargeFaultInfluenceCode": influence_codes,
+                        "LargeFaultInfluenceSource": influence_labels,
                     }
                 )
                 rows.append(frame)
@@ -936,6 +961,9 @@ def main() -> int:
             patch_i = attach_selected_orientation_columns(patch_i, oriented)
             patch_i["SmallDomain"] = str(domain_name)
             patch_i["SmallDomainCode"] = int(domain_cfg.get("domain_code", oriented["SmallDomainCode"].iloc[0]))
+            if "LargeFaultInfluenceCode" in oriented.columns:
+                patch_i["LargeFaultInfluenceCode"] = oriented["LargeFaultInfluenceCode"].to_numpy(dtype=np.uint8)
+                patch_i["LargeFaultInfluenceSource"] = oriented["LargeFaultInfluenceSource"].astype(str).to_numpy()
             patch_i["GenerationStage"] = "step7a_compact_array_sampling"
             patch_i["SourceType"] = str(domain_cfg.get("source_type", f"small_{domain_name}_density"))
             patch_i["StructuralRelation"] = str(domain_cfg.get("structural_relation", f"small_{domain_name}"))

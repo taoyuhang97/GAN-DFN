@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import sys
 from pathlib import Path
@@ -87,8 +88,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--faultlike-min-vertical-extent-ms", type=float, default=120.0)
     parser.add_argument("--faultlike-min-column-hits", type=int, default=8)
     parser.add_argument("--faultlike-max-horizontal-slice-fraction", type=float, default=0.35)
-    parser.add_argument("--fault-time-padding-ms", type=float, default=20.0)
-    parser.add_argument("--fault-xy-padding-m", type=float, default=25.0)
+    parser.add_argument("--fault-time-padding-ms", type=float, default=10.0)
+    parser.add_argument("--fault-xy-padding-m", type=float, default=12.5)
     parser.add_argument("--vtk-max-points", type=int, default=250000)
     parser.add_argument("--surface-ransac-iterations", type=int, default=180)
     parser.add_argument("--surface-ransac-distance-m", type=float, default=45.0)
@@ -159,37 +160,116 @@ def vtp_path_for_row(root: Path, row: pd.Series) -> Path:
     return root / fault_name / f"{fault_name}__i{int(row['cell_i'])}_j{int(row['cell_j'])}.vtp"
 
 
-def merge_fault_vtps(selected: pd.DataFrame, root: Path, output_path: Path) -> dict[str, Any]:
+def geometry_hash(mesh: pv.PolyData) -> str:
+    digest = hashlib.sha256()
+    digest.update(np.ascontiguousarray(np.asarray(mesh.points, dtype=np.float64)).tobytes())
+    digest.update(np.ascontiguousarray(np.asarray(mesh.faces, dtype=np.int64)).tobytes())
+    return digest.hexdigest()
+
+
+def read_triangular_surface(path: Path) -> pv.PolyData:
+    loaded = pv.read(path)
+    surface = loaded if isinstance(loaded, pv.PolyData) else loaded.extract_surface(algorithm="dataset_surface")
+    return surface.triangulate()
+
+
+def merge_fault_vtps(
+    selected: pd.DataFrame,
+    root: Path,
+    output_path: Path,
+    manifest_path: Path,
+) -> dict[str, Any]:
     meshes = []
     missing = 0
-    for _, row in selected.iterrows():
+    manifest_rows: list[dict[str, Any]] = []
+    fault_names = sorted(selected["fault_name"].astype(str).unique().tolist())
+    fault_ids = {name: idx + 1 for idx, name in enumerate(fault_names)}
+    source_point_count = 0
+    source_cell_count = 0
+    for unit_id, (_, row) in enumerate(selected.reset_index(drop=True).iterrows(), start=1):
         path = vtp_path_for_row(root, row)
         if not path.exists():
             missing += 1
             continue
-        mesh = pv.read(path)
+        mesh = read_triangular_surface(path)
         if mesh.n_points > 0:
             mesh = mesh.copy()
-            mesh["FaultPatchArea"] = np.full(mesh.n_points, float(row.get("area_3d", 0.0)), dtype=np.float32)
+            fault_id = int(fault_ids[str(row["fault_name"])])
+            mesh.point_data["FaultPatchArea"] = np.full(mesh.n_points, float(row.get("area_3d", 0.0)), dtype=np.float32)
+            mesh.cell_data["FaultID"] = np.full(mesh.n_cells, fault_id, dtype=np.int32)
+            mesh.cell_data["FaultUnitID"] = np.full(mesh.n_cells, unit_id, dtype=np.int32)
+            mesh.cell_data["CellI"] = np.full(mesh.n_cells, int(row["cell_i"]), dtype=np.int32)
+            mesh.cell_data["CellJ"] = np.full(mesh.n_cells, int(row["cell_j"]), dtype=np.int32)
             meshes.append(mesh)
+            bounds = mesh.bounds
+            source_point_count += int(mesh.n_points)
+            source_cell_count += int(mesh.n_cells)
+            manifest_rows.append(
+                {
+                    "FaultUnitID": unit_id,
+                    "FaultID": fault_id,
+                    "FaultName": str(row["fault_name"]),
+                    "CellI": int(row["cell_i"]),
+                    "CellJ": int(row["cell_j"]),
+                    "SourceVTP": str(path),
+                    "PointCount": int(mesh.n_points),
+                    "CellCount": int(mesh.n_cells),
+                    "XMin": float(bounds[0]),
+                    "XMax": float(bounds[1]),
+                    "YMin": float(bounds[2]),
+                    "YMax": float(bounds[3]),
+                    "TimeMinMs": float(bounds[4]),
+                    "TimeMaxMs": float(bounds[5]),
+                    "GeometrySHA256": geometry_hash(mesh),
+                }
+            )
+    pd.DataFrame(manifest_rows).to_csv(manifest_path, index=False, encoding="utf-8-sig")
     if not meshes:
         pv.PolyData().save(output_path)
         return {"selected_patch_count": int(len(selected)), "written_patch_count": 0, "missing_patch_count": int(missing)}
-    merged = meshes[0]
-    for mesh in meshes[1:]:
-        merged = merged.merge(mesh)
+    merged = pv.merge(meshes, merge_points=False)
     merged.save(output_path)
     return {
         "selected_patch_count": int(len(selected)),
         "written_patch_count": int(len(meshes)),
         "missing_patch_count": int(missing),
+        "fault_count": int(len(fault_names)),
+        "source_point_count": int(source_point_count),
+        "source_cell_count": int(source_cell_count),
         "n_points": int(merged.n_points),
         "n_cells": int(merged.n_cells),
+        "geometry_preserved_without_point_welding": bool(
+            int(merged.n_points) == source_point_count and int(merged.n_cells) == source_cell_count
+        ),
+        "manifest_csv": str(manifest_path),
     }
+
+
+def nearest_axis_indices(axis: np.ndarray, values: np.ndarray) -> np.ndarray:
+    upper = np.searchsorted(axis, values, side="left")
+    upper = np.clip(upper, 0, len(axis) - 1)
+    lower = np.clip(upper - 1, 0, len(axis) - 1)
+    choose_lower = np.abs(values - axis[lower]) <= np.abs(axis[upper] - values)
+    return np.where(choose_lower, lower, upper).astype(np.int32)
+
+
+def sample_triangle_points(triangle: np.ndarray, spacing: np.ndarray) -> np.ndarray:
+    scaled = triangle / spacing[None, :]
+    edge_lengths = [np.linalg.norm(scaled[(idx + 1) % 3] - scaled[idx]) for idx in range(3)]
+    subdivisions = max(1, int(np.ceil(max(edge_lengths))))
+    weights: list[tuple[float, float, float]] = []
+    for i in range(subdivisions + 1):
+        for j in range(subdivisions + 1 - i):
+            a = float(i) / subdivisions
+            b = float(j) / subdivisions
+            weights.append((a, b, 1.0 - a - b))
+    bary = np.asarray(weights, dtype=np.float64)
+    return bary @ triangle
 
 
 def rasterize_original_faults(
     selected: pd.DataFrame,
+    root: Path,
     mapping: dict[str, np.ndarray],
     samples: np.ndarray,
     args: argparse.Namespace,
@@ -201,23 +281,49 @@ def rasterize_original_faults(
     prior = np.zeros((ny, nx, nt), dtype=np.float32)
     mask = np.zeros((ny, nx, nt), dtype=bool)
     audit_rows: list[dict[str, Any]] = []
+    dx = float(np.median(np.diff(x_values)))
+    dy = float(np.median(np.diff(y_values)))
+    dt = float(np.median(np.diff(samples)))
+    spacing = np.asarray([abs(dx), abs(dy), abs(dt)], dtype=np.float64)
     for _, row in selected.iterrows():
-        x0 = float(row["bbox_xmin"]) - float(args.fault_xy_padding_m)
-        x1 = float(row["bbox_xmax"]) + float(args.fault_xy_padding_m)
-        y0 = float(row["bbox_ymin"]) - float(args.fault_xy_padding_m)
-        y1 = float(row["bbox_ymax"]) + float(args.fault_xy_padding_m)
-        t0 = float(row["bbox_zmin"]) - float(args.fault_time_padding_ms)
-        t1 = float(row["bbox_zmax"]) + float(args.fault_time_padding_ms)
-        xx = np.where((x_values >= x0) & (x_values <= x1))[0]
-        yy = np.where((y_values >= y0) & (y_values <= y1))[0]
-        tt = np.where((samples >= t0) & (samples <= t1))[0]
-        if len(xx) == 0 or len(yy) == 0 or len(tt) == 0:
-            voxels = 0
+        path = vtp_path_for_row(root, row)
+        sampled_point_count = 0
+        triangle_count = 0
+        unit_flat_indices: list[np.ndarray] = []
+        if path.exists():
+            mesh = read_triangular_surface(path)
+            faces = np.asarray(mesh.faces, dtype=np.int64).reshape(-1, 4)
+            for face in faces:
+                if int(face[0]) != 3:
+                    continue
+                triangle = np.asarray(mesh.points[face[1:4]], dtype=np.float64)
+                points = sample_triangle_points(triangle, spacing)
+                sampled_point_count += int(len(points))
+                triangle_count += 1
+                xx = nearest_axis_indices(x_values, points[:, 0])
+                yy = nearest_axis_indices(y_values, points[:, 1])
+                tt = nearest_axis_indices(samples, points[:, 2])
+                in_volume = (
+                    (points[:, 0] >= x_values[0] - 0.5 * abs(dx))
+                    & (points[:, 0] <= x_values[-1] + 0.5 * abs(dx))
+                    & (points[:, 1] >= y_values[0] - 0.5 * abs(dy))
+                    & (points[:, 1] <= y_values[-1] + 0.5 * abs(dy))
+                    & (points[:, 2] >= samples[0] - 0.5 * abs(dt))
+                    & (points[:, 2] <= samples[-1] + 0.5 * abs(dt))
+                )
+                if in_volume.any():
+                    unit_flat_indices.append(
+                        np.ravel_multi_index(
+                            (yy[in_volume], xx[in_volume], tt[in_volume]),
+                            dims=mask.shape,
+                        )
+                    )
+        if unit_flat_indices:
+            unique_flat = np.unique(np.concatenate(unit_flat_indices))
+            mask.reshape(-1)[unique_flat] = True
+            voxels = int(len(unique_flat))
         else:
-            yy_grid, xx_grid, tt_grid = np.meshgrid(yy, xx, tt, indexing="ij")
-            mask[yy_grid, xx_grid, tt_grid] = True
-            prior[yy_grid, xx_grid, tt_grid] = np.maximum(prior[yy_grid, xx_grid, tt_grid], 1.0)
-            voxels = int(yy_grid.size)
+            voxels = 0
         audit_rows.append(
             {
                 "fault_name": str(row["fault_name"]),
@@ -225,9 +331,21 @@ def rasterize_original_faults(
                 "cell_j": int(row["cell_j"]),
                 "area_3d": float(row["area_3d"]),
                 "dip_deg": float(row["dip_deg"]),
+                "source_triangle_count": int(triangle_count),
+                "sampled_surface_point_count": int(sampled_point_count),
                 "rasterized_voxel_count": voxels,
             }
         )
+    xy_radius_x = max(int(np.ceil(float(args.fault_xy_padding_m) / max(abs(dx), 1.0e-9))), 0)
+    xy_radius_y = max(int(np.ceil(float(args.fault_xy_padding_m) / max(abs(dy), 1.0e-9))), 0)
+    time_radius = max(int(np.ceil(float(args.fault_time_padding_ms) / max(abs(dt), 1.0e-9))), 0)
+    if mask.any() and (xy_radius_x > 0 or xy_radius_y > 0 or time_radius > 0):
+        structure = np.ones(
+            (2 * xy_radius_y + 1, 2 * xy_radius_x + 1, 2 * time_radius + 1),
+            dtype=bool,
+        )
+        mask = ndimage.binary_dilation(mask, structure=structure)
+    prior[mask] = 1.0
     return prior, mask, pd.DataFrame(audit_rows)
 
 
@@ -1235,8 +1353,20 @@ def main() -> int:
     horizon_surfaces = surface_grids_from_contract(mapping, horizon_contract)
 
     selected_faults = load_fault_overlap(args.input_qc_dir.resolve())
-    selected_faults = selected_faults[selected_faults["intersects_demo_xy_t"].astype(bool)].copy()
-    original_fault_grid, original_fault_mask, fault_audit = rasterize_original_faults(selected_faults, mapping, samples, args)
+    selected_faults = selected_faults[selected_faults["intersects_demo_xy"].astype(bool)].copy()
+    original_vtk_summary = merge_fault_vtps(
+        selected_faults,
+        args.fault_patch_root.resolve(),
+        output_dir / "original_fault_units_demo_raw_time.vtk",
+        output_dir / "original_fault_unit_manifest.csv",
+    )
+    original_fault_grid, original_fault_mask, fault_audit = rasterize_original_faults(
+        selected_faults,
+        args.fault_patch_root.resolve(),
+        mapping,
+        samples,
+        args,
+    )
     original_fault_flat = grid_to_flat(original_fault_grid.astype(np.float32), mapping)
     original_fault_mask_flat = grid_to_flat(original_fault_mask.astype(np.uint8), mapping).astype(bool)
     original_fault_horizon_qc = apply_window_inplace(
@@ -1247,11 +1377,6 @@ def main() -> int:
     original_fault_mask_grid, _, _ = flat_to_grid(original_fault_mask_flat.astype(np.float32), mapping)
     original_fault_mask = original_fault_mask_grid > 0.5
     fault_audit.to_csv(output_dir / "original_fault_rasterization_audit.csv", index=False, encoding="utf-8-sig")
-    original_vtk_summary = merge_fault_vtps(
-        selected_faults,
-        args.fault_patch_root.resolve(),
-        output_dir / "original_fault_panels_selected_raw_time.vtk",
-    )
 
     print("[step6c-large] loading seismic attributes", flush=True)
     coherence, _, coh_load = load_trace_matrix(volume_paths["Coherence"], source_trace_idx, samples, "Coherence")
@@ -1422,6 +1547,10 @@ def main() -> int:
         output_dir / "large_fault_prior_components.npz",
         large_prior=large_prior_flat.astype(np.float32),
         large_mask=large_mask_flat.astype(np.uint8),
+        original_fault_prior=grid_to_flat(original_fault_grid.astype(np.float32), mapping),
+        original_fault_mask=grid_to_flat(original_fault_mask.astype(np.float32), mapping).astype(np.uint8),
+        inferred_fault_prior=grid_to_flat((score_grid * inferred_mask.astype(np.float32)).astype(np.float32), mapping),
+        inferred_fault_mask=grid_to_flat(inferred_mask.astype(np.float32), mapping).astype(np.uint8),
         inferred_component_id=inferred_id_flat.astype(np.int32),
         inferred_candidate_branch_code=grid_to_flat(faultlike_branch_code_grid.astype(np.float32), mapping).astype(np.uint8),
         samples=samples.astype(np.float32),
@@ -1450,7 +1579,9 @@ def main() -> int:
         "output_contract": {
             "large_prior_sgy": str(output_dir / "large_fault_prior.sgy"),
             "component_npz": str(output_dir / "large_fault_prior_components.npz"),
-            "mask_storage": "large_mask inside component_npz",
+            "original_fault_surface_vtk": str(output_dir / "original_fault_units_demo_raw_time.vtk"),
+            "original_fault_manifest_csv": str(output_dir / "original_fault_unit_manifest.csv"),
+            "mask_storage": "original_fault_mask, inferred_fault_mask and combined large_mask inside component_npz",
         },
         "load": {
             "density": density_load,
@@ -1461,6 +1592,8 @@ def main() -> int:
         },
         "original_fault": {
             "selected_patch_count": int(len(selected_faults)),
+            "selection_contract": "demo_xy_intersection_only; source geometry is not time or horizon clipped",
+            "influence_contract": "triangle-rasterized derivative is clipped to per-trace T4-T7 before Step6D",
             "rasterized_voxel_count": int(original_fault_mask.sum()),
             "rasterized_voxel_fraction": float(original_fault_mask.mean()),
             "vtk": original_vtk_summary,

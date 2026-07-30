@@ -323,7 +323,9 @@ def fault_patch_summary_qc(
     t_min = float(samples[0])
     t_max = float(samples[-1])
     in_time = (summary["bbox_zmax"] >= t_min) & (summary["bbox_zmin"] <= t_max)
-    selected = summary.loc[in_margin & in_time].copy()
+    # Fault-unit ownership is an XY task-scope decision. Time-axis and horizon
+    # clipping belong only to downstream derivative influence volumes.
+    selected = summary.loc[in_margin].copy()
     selected["intersects_demo_xy"] = in_block.loc[selected.index].to_numpy(dtype=bool)
     selected["intersects_demo_xy_t"] = (in_block & in_time).loc[selected.index].to_numpy(dtype=bool)
     out = {
@@ -333,8 +335,11 @@ def fault_patch_summary_qc(
         "patches_intersect_demo_xy_and_t": int((in_block & in_time).sum()),
         "patches_intersect_margin_xy": int(in_margin.sum()),
         "patches_intersect_margin_xy_and_t": int((in_margin & in_time).sum()),
+        "fault_names_intersect_demo_xy": sorted(summary.loc[in_block, "fault_name"].astype(str).unique().tolist()),
         "fault_names_intersect_demo_xy_t": sorted(summary.loc[in_block & in_time, "fault_name"].astype(str).unique().tolist()),
+        "fault_names_intersect_margin_xy": sorted(summary.loc[in_margin, "fault_name"].astype(str).unique().tolist()),
         "fault_names_intersect_margin_xy_t": sorted(summary.loc[in_margin & in_time, "fault_name"].astype(str).unique().tolist()),
+        "selection_contract": "margin_xy_only; time overlap is diagnostic and must not delete source fault units",
         "selected_area_stats": finite_stats(selected["area_3d"]) if len(selected) else finite_stats([]),
         "selected_dip_stats": finite_stats(selected["dip_deg"]) if len(selected) else finite_stats([]),
         "selected_time_stats": finite_stats(selected["cz"]) if len(selected) else finite_stats([]),

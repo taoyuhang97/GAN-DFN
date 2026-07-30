@@ -148,12 +148,20 @@ def run_compact_context(
     medium_mask = step6b["medium_mask"].astype(bool)
     large_prior = step6c["large_prior"].astype(np.float32)
     large_mask = step6c["large_mask"].astype(bool)
+    original_fault_prior = step6c.get("original_fault_prior", np.zeros_like(large_prior)).astype(np.float32)
+    original_fault_mask = step6c.get("original_fault_mask", np.zeros_like(large_mask)).astype(bool)
+    inferred_fault_prior = step6c.get("inferred_fault_prior", np.zeros_like(large_prior)).astype(np.float32)
+    inferred_fault_mask = step6c.get("inferred_fault_mask", np.zeros_like(large_mask)).astype(bool)
     expected_shape = (len(mapping["x"]), len(medium_samples))
     for name, values in {
         "medium_prior": medium_prior,
         "medium_mask": medium_mask,
         "large_prior": large_prior,
         "large_mask": large_mask,
+        "original_fault_prior": original_fault_prior,
+        "original_fault_mask": original_fault_mask,
+        "inferred_fault_prior": inferred_fault_prior,
+        "inferred_fault_mask": inferred_fault_mask,
     }.items():
         if values.shape != expected_shape:
             raise ValueError(f"{name} shape {values.shape} != {expected_shape}")
@@ -162,6 +170,18 @@ def run_compact_context(
         "medium_mask": apply_window_inplace(medium_mask, horizon_contract, medium_samples, fill_value=False),
         "large_prior": apply_window_inplace(large_prior, horizon_contract, medium_samples, fill_value=0.0),
         "large_mask": apply_window_inplace(large_mask, horizon_contract, medium_samples, fill_value=False),
+        "original_fault_prior": apply_window_inplace(
+            original_fault_prior, horizon_contract, medium_samples, fill_value=0.0
+        ),
+        "original_fault_mask": apply_window_inplace(
+            original_fault_mask, horizon_contract, medium_samples, fill_value=False
+        ),
+        "inferred_fault_prior": apply_window_inplace(
+            inferred_fault_prior, horizon_contract, medium_samples, fill_value=0.0
+        ),
+        "inferred_fault_mask": apply_window_inplace(
+            inferred_fault_mask, horizon_contract, medium_samples, fill_value=False
+        ),
     }
 
     medium_damage, medium_damage_mask = build_damage_shell(
@@ -180,6 +200,22 @@ def run_compact_context(
         time_samples=int(args.large_damage_time_samples),
         outer_decay=float(args.large_damage_outer_decay),
     )
+    original_fault_damage, original_fault_damage_mask = build_damage_shell(
+        original_fault_prior,
+        original_fault_mask,
+        mapping,
+        xy_cells=int(args.large_damage_xy_cells),
+        time_samples=int(args.large_damage_time_samples),
+        outer_decay=float(args.large_damage_outer_decay),
+    )
+    inferred_fault_damage, inferred_fault_damage_mask = build_damage_shell(
+        inferred_fault_prior,
+        inferred_fault_mask,
+        mapping,
+        xy_cells=int(args.large_damage_xy_cells),
+        time_samples=int(args.large_damage_time_samples),
+        outer_decay=float(args.large_damage_outer_decay),
+    )
     damage_horizon_qc = {
         "medium_damage": apply_window_inplace(medium_damage, horizon_contract, medium_samples, fill_value=0.0),
         "medium_damage_mask": apply_window_inplace(
@@ -189,7 +225,23 @@ def run_compact_context(
         "large_damage_mask": apply_window_inplace(
             large_damage_mask, horizon_contract, medium_samples, fill_value=False
         ),
+        "original_fault_damage": apply_window_inplace(
+            original_fault_damage, horizon_contract, medium_samples, fill_value=0.0
+        ),
+        "original_fault_damage_mask": apply_window_inplace(
+            original_fault_damage_mask, horizon_contract, medium_samples, fill_value=False
+        ),
+        "inferred_fault_damage": apply_window_inplace(
+            inferred_fault_damage, horizon_contract, medium_samples, fill_value=0.0
+        ),
+        "inferred_fault_damage_mask": apply_window_inplace(
+            inferred_fault_damage_mask, horizon_contract, medium_samples, fill_value=False
+        ),
     }
+    large_damage_source_code = np.zeros_like(large_mask, dtype=np.uint8)
+    large_damage_source_code[original_fault_damage_mask] = 1
+    large_damage_source_code[inferred_fault_damage_mask] += 2
+    large_damage_boost = float(args.large_damage_boost)
     context_path = output_dir / "multiscale_damage_context_10ms.npz"
     np.savez_compressed(
         context_path,
@@ -197,9 +249,10 @@ def run_compact_context(
         medium_damage=(float(args.medium_damage_boost) * medium_damage).astype(np.float16),
         medium_damage_mask=medium_damage_mask.astype(np.uint8),
         medium_core_mask=medium_mask.astype(np.uint8),
-        large_damage=(float(args.large_damage_boost) * large_damage).astype(np.float16),
+        large_damage=(large_damage_boost * large_damage).astype(np.float16),
         large_damage_mask=large_damage_mask.astype(np.uint8),
         large_core_mask=large_mask.astype(np.uint8),
+        large_damage_source_code=large_damage_source_code.astype(np.uint8),
         source_trace_idx=horizon_contract.trace_idx.astype(np.int32),
         t4_time=horizon_contract.t4.astype(np.float32),
         t6_time=horizon_contract.t6.astype(np.float32),
@@ -230,6 +283,13 @@ def run_compact_context(
             "core_voxel_count": int(large_mask.sum()),
             "damage_voxel_count": int(large_damage_mask.sum()),
             "damage_stats": finite_stats(large_damage[large_damage_mask]),
+            "original_fault_core_voxel_count": int(original_fault_mask.sum()),
+            "original_fault_damage_voxel_count": int(original_fault_damage_mask.sum()),
+            "inferred_fault_core_voxel_count": int(inferred_fault_mask.sum()),
+            "inferred_fault_damage_voxel_count": int(inferred_fault_damage_mask.sum()),
+            "damage_source_code_counts": {
+                str(code): int((large_damage_source_code == code).sum()) for code in (1, 2, 3)
+            },
         },
         "fusion_parameters": {
             "medium_damage_xy_cells": int(args.medium_damage_xy_cells),
@@ -245,7 +305,7 @@ def run_compact_context(
             "background_floor": float(args.background_floor),
             "background_dynamic_weight": float(args.background_dynamic_weight),
         },
-        "reflection": "The compact bundle keeps medium/large damage context at 10 ms and does not expand it into duplicate 2 ms SGYs.",
+        "reflection": "The compact bundle keeps 10 ms damage context. Original and inferred fault influence are audited separately, merged for Step7A sampling, and clipped to per-trace T4-T7 after dilation.",
     }
     write_json(output_dir / "multiscale_bundle_summary.json", summary)
     print(json.dumps(summary, ensure_ascii=False, indent=2))

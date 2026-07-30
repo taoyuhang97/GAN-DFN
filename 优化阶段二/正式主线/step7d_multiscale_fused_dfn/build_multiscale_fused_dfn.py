@@ -241,6 +241,8 @@ def main() -> int:
             "small_dfn_csv": str(Path(config["small_dfn_csv"]).resolve()),
             "medium_dfn_csv": str(Path(config["medium_dfn_csv"]).resolve()),
             "large_dfn_csv": str(Path(config["large_dfn_csv"]).resolve()),
+            "original_fault_surface_vtk": str(Path(str(config["original_fault_surface_vtk"])).resolve()) if config.get("original_fault_surface_vtk") else "",
+            "original_fault_manifest_csv": str(Path(str(config["original_fault_manifest_csv"])).resolve()) if config.get("original_fault_manifest_csv") else "",
         },
         "outputs": {key: str(value) for key, value in paths.items()},
         "input_counts": {"small": int(len(small)), "medium": int(len(medium)), "large": int(len(large))},
@@ -261,6 +263,8 @@ def main() -> int:
             "csv_exists": paths["dfn_csv"].exists(),
             "raw_vtk_exists": bool(not write_vtk_enabled or paths["raw_vtk"].exists()),
             "audit_exists": paths["audit_csv"].exists(),
+            "original_fault_surface_passthrough_exists": bool(config.get("original_fault_surface_vtk") and Path(str(config["original_fault_surface_vtk"])).resolve().exists()),
+            "original_fault_manifest_passthrough_exists": bool(config.get("original_fault_manifest_csv") and Path(str(config["original_fault_manifest_csv"])).resolve().exists()),
         },
     }
     summary["status"] = "pass" if all(bool(v) for v in summary["checks"].values()) else "fail"

@@ -23,6 +23,7 @@ from build_cheye1_dfn_coherence_sections import (
     path_from_config,
     reset_output_images,
     scan_fault_surface_csv_intersections,
+    scan_original_fault_surface_intersections,
     scan_original_fault_stick_traces,
     scan_vtk_intersections,
     validate_inputs,
@@ -204,9 +205,17 @@ def build_overlay_contexts(
         "display_y_min": float(local.summary["display_y_min"]),
         "display_y_max": float(local.summary["display_y_max"]),
     }
+    fault_surface_vtk = path_from_config(config, "original_fault_surface_vtk") if config.get("original_fault_surface_vtk") else None
     fault_dat = path_from_config(config, "original_fault_stick_dat") if config.get("original_fault_stick_dat") else None
     fault_csv = path_from_config(config, "fault_surface_csv") if config.get("fault_surface_csv") else None
-    if fault_dat is not None:
+    if fault_surface_vtk is not None:
+        standard_faults, standard_fault_scan = scan_original_fault_surface_intersections(
+            fault_surface_vtk, overview.well_df, overview_display
+        )
+        local_faults, local_fault_scan = scan_original_fault_surface_intersections(
+            fault_surface_vtk, overview.well_df, local_display
+        )
+    elif fault_dat is not None:
         standard_faults, standard_fault_scan = scan_original_fault_stick_traces(
             fault_dat,
             dict(config.get("target_block") or {}),
@@ -409,6 +418,15 @@ def render_all(config_path: Path, config: dict[str, Any]) -> dict[str, Any]:
             "accounting_total": int(scan["patch_accounting_total"]),
             "accounting_closed": bool(scan["patch_accounting_closed"]),
         }
+    original_fault_surface_required = bool(config.get("original_fault_surface_vtk"))
+    original_fault_surface_loaded = all(
+        scan.get("fault_trace_source") == "step7c_original_fault_surface_triangles"
+        and int(scan.get("surface_triangle_count", 0)) > 0
+        for scan in (
+            overlay_summary["overview_fault_scan"],
+            overlay_summary["local_200m_fault_scan"],
+        )
+    )
     overlay_consistent = True
     for scope_name in scopes:
         for projection in ("XZ", "YZ"):
@@ -424,6 +442,9 @@ def render_all(config_path: Path, config: dict[str, Any]) -> dict[str, Any]:
         "all_planned_images_exist": all((output_dir / row["file"]).exists() for row in image_rows),
         "overlay_counts_consistent_across_backgrounds": bool(overlay_consistent),
         "step3_60_points_loaded": int(overlay_summary["step3_fracture_point_count"]) == 60,
+        "configured_original_fault_surface_loaded": bool(
+            not original_fault_surface_required or original_fault_surface_loaded
+        ),
         "overview_and_local_have_xz_yz_dfn": all(
             int(overlay_summary[key][f"selected_segment_count_{projection.lower()}"]) > 0
             for key in ("overview_scan", "local_200m_scan")

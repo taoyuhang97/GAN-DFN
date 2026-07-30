@@ -53,7 +53,8 @@ for name, path in summaries.items():
 required = [
     step6 / "step6c_large/large_fault_prior_components.npz",
     step6 / "step6c_large/large_fault_component_summary.csv",
-    step6 / "step6c_large/original_fault_panels_selected_raw_time.vtk",
+    step6 / "step6c_large/original_fault_units_demo_raw_time.vtk",
+    step6 / "step6c_large/original_fault_unit_manifest.csv",
     step7a / "small_dfn_patches.csv",
     step7b / "medium_dfn_patches.csv",
 ]
@@ -102,15 +103,15 @@ for path in summaries:
     rows.append({"path": str(path), "status": "pass"})
 step7c_dir = formal / f"step7c_large_fault_dfn/output/{version}"
 step7c_products = [
-    step7c_dir / "large_original_fault_merged_surface_raw_time.vtk",
-    step7c_dir / "large_fault_surface_raw_time.vtk",
-    step7c_dir / "large_fault_surface_patches.csv",
+    step7c_dir / "original_fault_units_demo_raw_time.vtk",
+    step7c_dir / "original_fault_units_demo_raw_time.vtp",
+    step7c_dir / "original_fault_unit_manifest.csv",
     step7c_dir / "large_inferred_fault_surfaces_raw_time.vtk",
+    step7c_dir / "large_inferred_fault_surfaces_raw_time.vtp",
     step7c_dir / "large_inferred_fault_surface_patches.csv",
-    step7c_dir / "large_fault_damage_zone_raw_time.vtk",
-    step7c_dir / "large_fault_damage_zone_patches.csv",
     step7c_dir / "large_fault_dfn_raw_time.vtk",
     step7c_dir / "large_fault_dfn_patches.csv",
+    step7c_dir / "large_fault_result_raw_time.vtm",
 ]
 missing_step7c = [str(path) for path in step7c_products if not path.exists() or path.stat().st_size <= 0]
 if missing_step7c:

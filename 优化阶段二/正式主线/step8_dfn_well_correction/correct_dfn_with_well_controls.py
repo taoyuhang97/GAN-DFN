@@ -1511,6 +1511,16 @@ def build_summary(
                     corrected_df.loc[layer_window_available, "TimeWindowMax"],
                 ).all()
             )
+    original_fault_surface = (
+        Path(str(config["original_fault_surface_vtk"])).resolve()
+        if config.get("original_fault_surface_vtk")
+        else None
+    )
+    original_fault_manifest = (
+        Path(str(config["original_fault_manifest_csv"])).resolve()
+        if config.get("original_fault_manifest_csv")
+        else None
+    )
     checks = {
         "has_well_controls_in_target_block": int(len(control_df)) > 0,
         "linked_patch_centers_no_farther_than_before_mean": bool(
@@ -1525,6 +1535,16 @@ def build_summary(
         "centers_within_layer_windows": centers_within_layer_windows,
         "orientation_fields_complete": bool(corrected_df[["AzimuthDeg", "DipDeg"]].notna().all().all()),
         "raw_vtk_output_exists": bool(paths["raw_vtk"].exists()),
+        "original_fault_surface_passthrough_exists": bool(
+            original_fault_surface is not None
+            and original_fault_surface.exists()
+            and original_fault_surface.stat().st_size > 0
+        ),
+        "original_fault_manifest_passthrough_exists": bool(
+            original_fault_manifest is not None
+            and original_fault_manifest.exists()
+            and original_fault_manifest.stat().st_size > 0
+        ),
     }
     return {
         "status": "pass" if all(checks.values()) else "fail",
@@ -1534,6 +1554,8 @@ def build_summary(
         "real_well_samples_root": str(Path(config["real_well_samples_root"]).resolve()),
         "corrected_dfn_csv": str(paths["corrected_csv"]),
         "corrected_dfn_raw_vtk": str(paths["raw_vtk"]),
+        "original_fault_surface_vtk": str(original_fault_surface) if original_fault_surface is not None else "",
+        "original_fault_manifest_csv": str(original_fault_manifest) if original_fault_manifest is not None else "",
         "well_control_correction_audit_csv": str(paths["audit_csv"]),
         "summary_json": str(paths["summary_json"]),
         "target_block": config["target_block"],
@@ -1542,6 +1564,7 @@ def build_summary(
             "adjust_existing_patch_when_local_candidate_available": True,
             "add_patch_when_no_local_candidate_available": True,
             "far_field_density_volume_patches_unchanged": True,
+            "original_fault_surface_passthrough_unchanged": True,
             "xy_search_radius_m": float(config.get("xy_search_radius_m", 80.0)),
             "time_search_radius_ms": float(config.get("time_search_radius_ms", 30.0)),
             "surface_dir": str(Path(config["surface_dir"]).resolve()) if config.get("surface_dir") else None,
