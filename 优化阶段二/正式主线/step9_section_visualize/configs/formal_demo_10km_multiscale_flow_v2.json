@@ -93,7 +93,9 @@
   "amplitude_clip_quantile": 0.99,
   "wiggle_max_trace_count": 0,
   "wiggle_lateral_scale_fraction": 0.42,
-  "original_fault_surface_vtk": "/home/tyh/projects/petroleum/code/GAN-DFN/优化阶段二/正式主线/step7c_large_fault_dfn/output/formal_demo_10km_multiscale_flow_v2/original_fault_units_demo_raw_time.vtk",
+  "formal_signed_attribute_display_style": "absolute_grayscale",
+  "signed_attribute_backup_display_style": "signed_red_white_blue",
+  "signed_attribute_backup_dir": "red_white_blue_backup",
   "horizon_contract_table": "/home/tyh/projects/petroleum/code/GAN-DFN/优化阶段二/正式主线/common/horizon_trace_table/output/formal_horizon_trace_table_v2/horizon_trace_table.npy",
   "horizon_window_contracts": {
     "2ms": "/home/tyh/projects/petroleum/code/GAN-DFN/优化阶段二/正式主线/common/horizon_trace_table/output/formal_horizon_trace_table_v2/horizon_windows_2ms.npz",

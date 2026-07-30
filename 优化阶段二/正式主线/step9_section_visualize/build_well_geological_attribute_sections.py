@@ -28,11 +28,25 @@ from well_curved_section_common import (
 )
 
 
+SIGNED_RWB_STYLE = "signed_red_white_blue"
+ABSOLUTE_GRAYSCALE_STYLE = "absolute_grayscale"
+
 ATTRIBUTE_SETTINGS = {
     "AntTrack": {"label": "蚂蚁体", "cmap": "gray_r"},
     "Coherence": {"label": "相干体", "cmap": "gray"},
     "CurvatureMax": {"label": "最大曲率体", "cmap": "seismic"},
 }
+
+
+def resolve_display_style(attribute: str, display_style: str) -> dict[str, object]:
+    """Return a shared rendering contract without changing sampled values."""
+    if attribute != "CurvatureMax":
+        return {"cmap": ATTRIBUTE_SETTINGS[attribute]["cmap"], "absolute": False, "style": "native"}
+    if display_style == SIGNED_RWB_STYLE:
+        return {"cmap": "seismic", "absolute": False, "style": SIGNED_RWB_STYLE}
+    if display_style == ABSOLUTE_GRAYSCALE_STYLE:
+        return {"cmap": "gray_r", "absolute": True, "style": ABSOLUTE_GRAYSCALE_STYLE}
+    raise ValueError(f"unsupported display style: {display_style}")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -41,7 +55,11 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def display_scale(attribute: str, values: list[np.ndarray]) -> tuple[float, float, object | None, dict[str, object]]:
+def display_scale(
+    attribute: str,
+    values: list[np.ndarray],
+    display_style: str = SIGNED_RWB_STYLE,
+) -> tuple[float, float, object | None, dict[str, object]]:
     finite = np.concatenate([arr[np.isfinite(arr)] for arr in values if np.isfinite(arr).any()])
     if attribute == "AntTrack":
         return -1.0, 1.0, None, {"rule": "fixed_-1_to_1_low_white_high_black"}
@@ -57,8 +75,23 @@ def display_scale(attribute: str, values: list[np.ndarray]) -> tuple[float, floa
     limit = float(np.quantile(np.abs(finite), 0.98)) if finite.size else 1.0
     if not np.isfinite(limit) or limit <= 0:
         limit = 1.0
+    style = resolve_display_style(attribute, display_style)
+    if bool(style["absolute"]):
+        return 0.0, limit, None, {
+            "rule": "absolute_zero_white_signed_extremes_black_abs_q98",
+            "limit": limit,
+            "display_style": display_style,
+            "value_transform": "absolute_value",
+            "colormap": style["cmap"],
+        }
     norm = TwoSlopeNorm(vmin=-limit, vcenter=0.0, vmax=limit)
-    return -limit, limit, norm, {"rule": "signed_zero_centered_symmetric_abs_q98", "limit": limit}
+    return -limit, limit, norm, {
+        "rule": "signed_zero_centered_symmetric_abs_q98",
+        "limit": limit,
+        "display_style": display_style,
+        "value_transform": "identity",
+        "colormap": style["cmap"],
+    }
 
 
 def plot_section(
@@ -69,20 +102,23 @@ def plot_section(
     vmax: float,
     norm,
     *,
+    display_style: str = SIGNED_RWB_STYLE,
     overlay_drawer: Callable[[Any, str], dict[str, int]] | None = None,
     scope_label: str | None = None,
     product_title: str | None = None,
 ) -> dict[str, int]:
     setting = ATTRIBUTE_SETTINGS[section.attribute]
+    style = resolve_display_style(section.attribute, display_style)
+    display_values = np.abs(section.values) if bool(style["absolute"]) else section.values
     overlay_enabled = overlay_drawer is not None
     figure_width = float(geometry.args.fig_width) + (4.0 if overlay_enabled else 0.0)
     fig, ax = plt.subplots(figsize=(figure_width, geometry.args.fig_height))
-    kwargs = {"shading": "auto", "cmap": setting["cmap"], "zorder": 1}
+    kwargs = {"shading": "auto", "cmap": style["cmap"], "zorder": 1}
     if norm is None:
         kwargs.update({"vmin": vmin, "vmax": vmax})
     else:
         kwargs["norm"] = norm
-    mesh = ax.pcolormesh(axis_edges(section.h), axis_edges(section.time), section.values, **kwargs)
+    mesh = ax.pcolormesh(axis_edges(section.h), axis_edges(section.time), display_values, **kwargs)
     draw_surface_curves(ax, geometry.surface_curves, section.projection)
     if section.projection == "XZ":
         draw_well_trajectory(ax, geometry.well_df["X"], geometry.well_df["TIME"], label=f"{geometry.well_name}井轨迹")
@@ -101,7 +137,8 @@ def plot_section(
         overlay_stats = overlay_drawer(ax, section.projection)
         fig.subplots_adjust(left=0.06, right=0.76, bottom=0.10, top=0.88)
         cax = fig.add_axes([0.78, 0.16, 0.014, 0.66])
-        fig.colorbar(mesh, cax=cax, label=setting["label"])
+        colorbar_label = f"{setting['label']}绝对值" if bool(style["absolute"]) else setting["label"]
+        fig.colorbar(mesh, cax=cax, label=colorbar_label)
         handles, labels = ax.get_legend_handles_labels()
         fig.legend(handles, labels, loc="upper left", bbox_to_anchor=(0.81, 0.88), fontsize=8.4, framealpha=0.92)
         title = product_title or "车页1导眼：DFN与成像测井裂缝对比剖面"
@@ -110,9 +147,11 @@ def plot_section(
         ax.set_title(f"{scope} | {setting['label']} | {section.projection} | T4-T7", fontsize=11, pad=8)
     else:
         ax.legend(loc="upper right")
-        fig.colorbar(mesh, ax=ax, pad=0.02, shrink=0.94, label=setting["label"])
+        colorbar_label = f"{setting['label']}绝对值" if bool(style["absolute"]) else setting["label"]
+        fig.colorbar(mesh, ax=ax, pad=0.02, shrink=0.94, label=colorbar_label)
         ax.set_title(f"{geometry.config['title_prefix']} | {setting['label']} | {section.projection} | T4-T7")
         fig.tight_layout()
+    output_path.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(output_path, dpi=geometry.args.dpi)
     plt.close(fig)
     return overlay_stats
@@ -124,6 +163,9 @@ def main() -> int:
     geometry = prepare_geometry(config)
     output_dir = Path(str(config["output_root"])).resolve() / "attribute_sections"
     output_dir.mkdir(parents=True, exist_ok=True)
+    primary_style = str(config.get("formal_signed_attribute_display_style", ABSOLUTE_GRAYSCALE_STYLE))
+    backup_style = str(config.get("signed_attribute_backup_display_style", SIGNED_RWB_STYLE))
+    backup_dir = output_dir / str(config.get("signed_attribute_backup_dir", "red_white_blue_backup"))
     paths = {name: Path(str(path)).resolve() for name, path in dict(config["volume_paths"]).items()}
     image_names = {
         ("AntTrack", "XZ"): "01_anttrack_section_xz_t4_t7.png",
@@ -141,11 +183,24 @@ def main() -> int:
     for attribute in attributes:
         print(f"[geological-attribute] sampling {attribute}", flush=True)
         xz, yz, stats = sample_volume_sections(geometry, attribute, paths[attribute])
-        vmin, vmax, norm, scale_info = display_scale(attribute, [xz.values, yz.values])
-        plot_section(xz, geometry, output_dir / image_names[(attribute, "XZ")], vmin, vmax, norm)
-        plot_section(yz, geometry, output_dir / image_names[(attribute, "YZ")], vmin, vmax, norm)
+        vmin, vmax, norm, scale_info = display_scale(attribute, [xz.values, yz.values], primary_style)
+        plot_section(xz, geometry, output_dir / image_names[(attribute, "XZ")], vmin, vmax, norm, display_style=primary_style)
+        plot_section(yz, geometry, output_dir / image_names[(attribute, "YZ")], vmin, vmax, norm, display_style=primary_style)
+        backup_images: list[str] = []
+        if attribute == "CurvatureMax":
+            backup_vmin, backup_vmax, backup_norm, backup_info = display_scale(attribute, [xz.values, yz.values], backup_style)
+            for section, projection in ((xz, "XZ"), (yz, "YZ")):
+                image_name = image_names[(attribute, projection)]
+                plot_section(section, geometry, backup_dir / image_name, backup_vmin, backup_vmax, backup_norm, display_style=backup_style)
+                backup_images.append(str(Path(backup_dir.name) / image_name))
+            scale_info["signed_rwb_backup"] = backup_info
         save_section_pair_npz(output_dir / f"{attribute.lower()}_section_samples.npz", xz, yz)
-        attribute_summary[attribute] = {**stats, "display": scale_info, "images": [image_names[(attribute, "XZ")], image_names[(attribute, "YZ")]]}
+        attribute_summary[attribute] = {
+            **stats,
+            "display": scale_info,
+            "images": [image_names[(attribute, "XZ")], image_names[(attribute, "YZ")]],
+            "signed_rwb_backup_images": backup_images,
+        }
     images = sorted(path.name for path in output_dir.glob("*.png"))
     expected_image_count = 2 * len(attributes)
     checks = {
@@ -153,6 +208,10 @@ def main() -> int:
         "no_curvature_pos_or_combined": not any("curvaturepos" in name.lower() or "combined" in name.lower() for name in images),
         "expected_png_count_generated": len(images) == expected_image_count,
         "all_sections_have_finite_values": all(float(item["finite_fraction"]) > 0 for item in attribute_summary.values()),
+        "curvature_signed_rwb_backup_complete": (
+            "CurvatureMax" not in attribute_summary
+            or len(attribute_summary["CurvatureMax"]["signed_rwb_backup_images"]) == 2
+        ),
     }
     summary = {
         "status": "pass" if all(checks.values()) else "fail",

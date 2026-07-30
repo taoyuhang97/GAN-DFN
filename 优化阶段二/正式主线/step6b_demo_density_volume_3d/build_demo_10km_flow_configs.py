@@ -105,14 +105,24 @@ def main() -> int:
             "trace_mapping_npz": mapping,
             "output_dir": str(FORMAL_ROOT / f"step7b_multiscale_initial_dfn/output/{version}"),
             "target_block": block,
+            "min_prior_score": 0.58,
             "min_component_voxels": 80,
             "component_voxels_per_patch": 140.0,
             "max_patches_per_component": 36,
             "orientation_window_time_samples": 4,
-            "component_selection_mode": "spatial_farthest",
-            "min_patch_center_separation_m": 25.0,
+            "component_selection_mode": "hybrid_anttrack_spatial",
+            "anttrack_primary_fraction": 0.60,
+            "spatial_candidate_multiplier": 4,
+            "anttrack_ridge_quantile": 0.72,
+            "anttrack_ridge_min_score": 0.45,
+            "anttrack_ridge_nms_radius_cells": 1,
+            "ridge_patch_spacing_m": 85.0,
+            "min_patch_center_separation_m": 40.0,
             "min_upstream_component_coverage_fraction": 0.65,
             "min_quadrants_covered": 3,
+            "spatial_coverage_tile_size_m": 250.0,
+            "spatial_coverage_min_candidate_voxels_per_tile": 20,
+            "min_spatial_tile_coverage_fraction": 0.60,
             "use_global_component_orientation_fallback": True,
             "local_pca_min_planarity": 0.03,
             "local_geometry_min_dip_deg": 30.0,
@@ -147,6 +157,12 @@ def main() -> int:
             "min_lowcoh_component_voxels": 900,
             "lowcoh_min_panel_voxels": 120,
             "inferred_geometry_mode": "step6c_surface_ransac_vertices",
+            "original_fault_compare_time_scale_m_per_ms": 2.0,
+            "original_fault_duplicate_center_distance_m": 60.0,
+            "original_fault_duplicate_vertex_distance_m": 100.0,
+            "original_fault_duplicate_min_vertex_fraction": 0.75,
+            "original_fault_duplicate_max_orientation_difference_deg": 25.0,
+            "original_fault_branch_context_distance_m": 120.0,
             "write_intermediate_vtk": False,
             **horizon_common,
         }
@@ -162,12 +178,13 @@ def main() -> int:
             "small_dfn_csv": str(FORMAL_ROOT / f"step7a_small_scale_dfn/output/{version}/small_dfn_patches.csv"),
             "medium_dfn_csv": str(FORMAL_ROOT / f"step7b_multiscale_initial_dfn/output/{version}/medium_dfn_patches.csv"),
             "large_dfn_csv": str(FORMAL_ROOT / f"step7c_large_fault_dfn/output/{version}/large_fault_dfn_patches.csv"),
-            "original_fault_surface_vtk": str(FORMAL_ROOT / f"step7c_large_fault_dfn/output/{version}/original_fault_units_demo_raw_time.vtk"),
+            "large_dfn_vtk": str(FORMAL_ROOT / f"step7c_large_fault_dfn/output/{version}/large_fault_dfn_raw_time.vtk"),
             "original_fault_manifest_csv": str(FORMAL_ROOT / f"step7c_large_fault_dfn/output/{version}/original_fault_unit_manifest.csv"),
             "output_dir": str(FORMAL_ROOT / f"step7d_multiscale_fused_dfn/output/{version}"),
-            "write_vtk": False,
+            "write_vtk": True,
         }
     )
+    step7d.pop("original_fault_surface_vtk", None)
     step7d_path = FORMAL_ROOT / f"step7d_multiscale_fused_dfn/configs/{version}.json"
     write_json(step7d_path, step7d)
     generated["step7d"] = str(step7d_path)
@@ -176,16 +193,22 @@ def main() -> int:
     step8.update(
         {
             "initial_dfn_csv": str(FORMAL_ROOT / f"step7d_multiscale_fused_dfn/output/{version}/fused_multiscale_dfn_patches.csv"),
+            "initial_dfn_vtk": str(FORMAL_ROOT / f"step7d_multiscale_fused_dfn/output/{version}/fused_multiscale_dfn_raw_time.vtk"),
             "initial_dfn_summary_json": str(FORMAL_ROOT / f"step7d_multiscale_fused_dfn/output/{version}/fused_multiscale_summary.json"),
             "fracture_points_csv": str(FORMAL_ROOT / "step4_expert_real_well_prediction/output/formal_six_expert_library_v3/predictions/all_wells_t4_t7_merged_fracture_points.csv"),
             "output_dir": str(FORMAL_ROOT / f"step8_dfn_well_correction/output/{version}"),
             "target_block": block,
             "export_debug_step_vtks": False,
-            "original_fault_surface_vtk": str(FORMAL_ROOT / f"step7c_large_fault_dfn/output/{version}/original_fault_units_demo_raw_time.vtk"),
             "original_fault_manifest_csv": str(FORMAL_ROOT / f"step7c_large_fault_dfn/output/{version}/original_fault_unit_manifest.csv"),
+            "enable_imaging_well_region_correction": True,
+            "imaging_well_region_xy_radius_m": 150.0,
+            "imaging_well_region_time_radius_ms": 40.0,
+            "imaging_well_region_density_blend": 0.65,
+            "imaging_well_region_min_influence": 0.05,
             **horizon_common,
         }
     )
+    step8.pop("original_fault_surface_vtk", None)
     step8_path = FORMAL_ROOT / f"step8_dfn_well_correction/configs/{version}.json"
     write_json(step8_path, step8)
     generated["step8"] = str(step8_path)
@@ -195,7 +218,6 @@ def main() -> int:
         {
             "input_vtk": str(FORMAL_ROOT / f"step8_dfn_well_correction/output/{version}/well_corrected_dfn_raw_time.vtk"),
             "dfn_patch_csv": str(FORMAL_ROOT / f"step8_dfn_well_correction/output/{version}/well_corrected_dfn_fracture_patches.csv"),
-            "original_fault_surface_vtk": str(FORMAL_ROOT / f"step7c_large_fault_dfn/output/{version}/original_fault_units_demo_raw_time.vtk"),
             "output_dir": str(FORMAL_ROOT / f"step9_section_visualize/output/{version}/cheye1_dfn_multibackground_sections"),
             "target_block": block,
             "overview_target_block": block,
@@ -206,11 +228,15 @@ def main() -> int:
             "product_title": "车页1导眼：10 km Demo多尺度DFN",
             "overview_product_title": "车页1导眼：10 km Demo整体DFN",
             "local_product_title": "车页1导眼：井周DFN与成像测井裂缝对比",
+            "formal_signed_attribute_display_style": "absolute_grayscale",
+            "signed_attribute_backup_display_style": "signed_red_white_blue",
+            "signed_attribute_backup_dir": "red_white_blue_backup",
             **horizon_common,
         }
     )
     step9.pop("original_fault_stick_dat", None)
     step9.pop("fault_surface_csv", None)
+    step9.pop("original_fault_surface_vtk", None)
     step9_path = FORMAL_ROOT / f"step9_section_visualize/configs/{version}.json"
     write_json(step9_path, step9)
     generated["step9"] = str(step9_path)

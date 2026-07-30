@@ -104,14 +104,13 @@ for path in summaries:
 step7c_dir = formal / f"step7c_large_fault_dfn/output/{version}"
 step7c_products = [
     step7c_dir / "original_fault_units_demo_raw_time.vtk",
-    step7c_dir / "original_fault_units_demo_raw_time.vtp",
     step7c_dir / "original_fault_unit_manifest.csv",
     step7c_dir / "large_inferred_fault_surfaces_raw_time.vtk",
-    step7c_dir / "large_inferred_fault_surfaces_raw_time.vtp",
     step7c_dir / "large_inferred_fault_surface_patches.csv",
+    step7c_dir / "large_inferred_known_fault_duplicates.csv",
+    step7c_dir / "large_inferred_known_fault_duplicates_raw_time.vtk",
     step7c_dir / "large_fault_dfn_raw_time.vtk",
     step7c_dir / "large_fault_dfn_patches.csv",
-    step7c_dir / "large_fault_result_raw_time.vtm",
 ]
 missing_step7c = [str(path) for path in step7c_products if not path.exists() or path.stat().st_size <= 0]
 if missing_step7c:

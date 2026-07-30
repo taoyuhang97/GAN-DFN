@@ -26,6 +26,13 @@ from common.horizon_trace_table.horizon_contract import (  # noqa: E402
     HorizonSpatialLookup,
     build_spatial_lookup,
 )
+from common.unified_dfn_vtk import (  # noqa: E402
+    ORIGINAL_FAULT_GEOMETRY_GROUP_CODE,
+    extract_geometry_group,
+    geometry_fingerprint,
+    unified_vtk_summary,
+    write_unified_dfn_vtk,
+)
 
 ALLOWED_LAYERS = ["沙三段", "沙四段"]
 LAYER_CODE = {"沙三段": 3, "沙四段": 4}
@@ -80,6 +87,7 @@ def output_paths(output_dir: Path) -> dict[str, Path]:
         "raw_vtk": output_dir / "well_corrected_dfn_raw_time.vtk",
         "summary_json": output_dir / "well_corrected_dfn_summary.json",
         "audit_csv": output_dir / "well_control_correction_audit.csv",
+        "region_audit_csv": output_dir / "imaging_well_region_correction_audit.csv",
     }
 
 
@@ -656,7 +664,121 @@ def correction_columns() -> list[str]:
         "ControlInsidePatchEnvelope",
         "WellControlCenterOffsetM",
         "WellControlCenterOffsetTimeMs",
+        "ImagingWellRegionCorrected",
+        "ImagingWellRegionInfluence",
+        "ImagingWellRegionControlID",
+        "ImagingWellRegionOriginalDensity",
+        "ImagingWellRegionCorrectedDensity",
     ]
+
+
+def apply_imaging_well_region_correction(
+    patch_df: pd.DataFrame,
+    control_df: pd.DataFrame,
+    config: dict[str, Any],
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Enhance nearby small predictions from positive Step3 imaging controls only."""
+    out = patch_df.copy()
+    audit_columns = [
+        "PatchID", "WellName", "LayerGroup", "NearestImagingControlID",
+        "XYDistanceM", "TimeDistanceMs", "Influence",
+        "OriginalSourceDensity", "CorrectedSourceDensity",
+    ]
+    numeric_defaults = {
+        "ImagingWellRegionCorrected": 0,
+        "ImagingWellRegionInfluence": 0.0,
+        "ImagingWellRegionOriginalDensity": np.nan,
+        "ImagingWellRegionCorrectedDensity": np.nan,
+    }
+    for column, default in numeric_defaults.items():
+        if column not in out.columns:
+            out[column] = default
+    # This provenance field may already exist as an all-NaN float column in a
+    # historical input.  Always coerce it before assigning string control IDs.
+    if "ImagingWellRegionControlID" not in out.columns:
+        out["ImagingWellRegionControlID"] = pd.Series("", index=out.index, dtype="object")
+    else:
+        out["ImagingWellRegionControlID"] = out["ImagingWellRegionControlID"].astype("object")
+    if not bool(config.get("enable_imaging_well_region_correction", False)):
+        return out, pd.DataFrame(columns=audit_columns)
+
+    is_imaging = safe_numeric(
+        control_df.get("IsImagingGroundTruth", pd.Series(0, index=control_df.index))
+    ).fillna(0).astype(int).eq(1)
+    controls = control_df.loc[is_imaging].copy()
+    if controls.empty:
+        return out, pd.DataFrame(columns=audit_columns)
+    xy_radius = float(config.get("imaging_well_region_xy_radius_m", 150.0))
+    time_radius = float(config.get("imaging_well_region_time_radius_ms", 40.0))
+    blend = float(np.clip(config.get("imaging_well_region_density_blend", 0.65), 0.0, 1.0))
+    min_influence = float(np.clip(config.get("imaging_well_region_min_influence", 0.05), 0.0, 1.0))
+    if xy_radius <= 0.0 or time_radius <= 0.0 or blend <= 0.0:
+        return out, pd.DataFrame(columns=audit_columns)
+
+    candidate_mask = (
+        out.get("FractureScale", pd.Series("", index=out.index)).astype(str).str.lower().eq("small")
+        & safe_numeric(out.get("IsWellControlPatch", pd.Series(0, index=out.index))).fillna(0).astype(int).eq(0)
+    )
+    rows: list[dict[str, Any]] = []
+    for (well_name, layer), group in controls.groupby(["WellName", "LayerGroup"], dropna=False):
+        candidates = out[candidate_mask & out["LayerGroup"].astype(str).eq(str(layer))].copy()
+        if candidates.empty:
+            continue
+        control_coords = np.column_stack(
+            [
+                group["X"].to_numpy(dtype=float) / xy_radius,
+                group["Y"].to_numpy(dtype=float) / xy_radius,
+                group["TIME"].to_numpy(dtype=float) / time_radius,
+            ]
+        )
+        tree = cKDTree(control_coords)
+        candidate_coords = np.column_stack(
+            [
+                candidates["CenterX"].to_numpy(dtype=float) / xy_radius,
+                candidates["CenterY"].to_numpy(dtype=float) / xy_radius,
+                candidates["CenterTime"].to_numpy(dtype=float) / time_radius,
+            ]
+        )
+        scaled_distance, positions = tree.query(candidate_coords, k=1)
+        for patch_idx, distance, control_position in zip(candidates.index, scaled_distance, positions):
+            if not np.isfinite(distance) or float(distance) > 1.0:
+                continue
+            influence = float(np.exp(-0.5 * float(distance) ** 2))
+            if influence < min_influence:
+                continue
+            control = group.iloc[int(control_position)]
+            original_density = float(
+                safe_numeric(pd.Series([out.at[patch_idx, "SourceDensity"]])).fillna(0.0).iloc[0]
+            )
+            control_density = float(
+                safe_numeric(pd.Series([control.get("Density", np.nan)])).fillna(original_density).iloc[0]
+            )
+            corrected_density = max(
+                original_density,
+                original_density + blend * influence * max(control_density - original_density, 0.0),
+            )
+            out.at[patch_idx, "SourceDensity"] = corrected_density
+            if "SourceDensityRender" in out.columns:
+                out.at[patch_idx, "SourceDensityRender"] = corrected_density
+            out.at[patch_idx, "ImagingWellRegionCorrected"] = 1
+            out.at[patch_idx, "ImagingWellRegionInfluence"] = influence
+            out.at[patch_idx, "ImagingWellRegionControlID"] = str(control["WellControlSampleID"])
+            out.at[patch_idx, "ImagingWellRegionOriginalDensity"] = original_density
+            out.at[patch_idx, "ImagingWellRegionCorrectedDensity"] = corrected_density
+            rows.append(
+                {
+                    "PatchID": str(out.at[patch_idx, "PatchID"]),
+                    "WellName": str(well_name),
+                    "LayerGroup": str(layer),
+                    "NearestImagingControlID": str(control["WellControlSampleID"]),
+                    "XYDistanceM": float(np.hypot(float(out.at[patch_idx, "CenterX"]) - float(control["X"]), float(out.at[patch_idx, "CenterY"]) - float(control["Y"]))),
+                    "TimeDistanceMs": abs(float(out.at[patch_idx, "CenterTime"]) - float(control["TIME"])),
+                    "Influence": influence,
+                    "OriginalSourceDensity": original_density,
+                    "CorrectedSourceDensity": corrected_density,
+                }
+            )
+    return out, pd.DataFrame(rows, columns=audit_columns)
 
 
 def stable_unit_value(key: str) -> float:
@@ -1390,7 +1512,7 @@ def export_debug_step_vtks(
             "04 contains only existing patches adjusted to well controls.",
             "05 contains only newly added well-control patches.",
             "06 is the final corrected DFN with hard fault surfaces removed for display comparison.",
-            "07 is the full final corrected DFN, equivalent in content to well_corrected_dfn_raw_time.vtk.",
+            "07 contains corrected predicted patches only; the formal well_corrected_dfn_raw_time.vtk also carries unchanged original-fault triangles.",
         ],
         "exported_vtks": exported,
         "counts": {
@@ -1511,9 +1633,9 @@ def build_summary(
                     corrected_df.loc[layer_window_available, "TimeWindowMax"],
                 ).all()
             )
-    original_fault_surface = (
-        Path(str(config["original_fault_surface_vtk"])).resolve()
-        if config.get("original_fault_surface_vtk")
+    initial_dfn_vtk = (
+        Path(str(config["initial_dfn_vtk"])).resolve()
+        if config.get("initial_dfn_vtk")
         else None
     )
     original_fault_manifest = (
@@ -1535,15 +1657,32 @@ def build_summary(
         "centers_within_layer_windows": centers_within_layer_windows,
         "orientation_fields_complete": bool(corrected_df[["AzimuthDeg", "DipDeg"]].notna().all().all()),
         "raw_vtk_output_exists": bool(paths["raw_vtk"].exists()),
-        "original_fault_surface_passthrough_exists": bool(
-            original_fault_surface is not None
-            and original_fault_surface.exists()
-            and original_fault_surface.stat().st_size > 0
+        "initial_unified_dfn_vtk_exists": bool(
+            initial_dfn_vtk is not None
+            and initial_dfn_vtk.exists()
+            and initial_dfn_vtk.stat().st_size > 0
         ),
         "original_fault_manifest_passthrough_exists": bool(
             original_fault_manifest is not None
             and original_fault_manifest.exists()
             and original_fault_manifest.stat().st_size > 0
+        ),
+        "unified_vtk_has_predicted_and_original_groups": bool(
+            int(config.get("_unified_vtk_summary", {}).get("predicted_cell_count", -1)) == len(corrected_df)
+            and int(config.get("_unified_vtk_summary", {}).get("original_fault_cell_count", 0)) > 0
+        ),
+        "original_fault_geometry_preserved": bool(
+            config.get("_unified_vtk_summary", {}).get("original_fault_geometry_fingerprint")
+            == config.get("_input_original_fault_fingerprint")
+        ),
+        "original_fault_render_area_uses_predicted_median": bool(
+            config.get("_unified_vtk_write", {}).get("original_fault_render_area_policy")
+            == "predicted_patch_area_median_not_physical_triangle_area"
+        ),
+        "imaging_well_region_audit_exists": bool(paths["region_audit_csv"].exists()),
+        "imaging_well_region_correction_applied": bool(
+            not config.get("enable_imaging_well_region_correction", False)
+            or int(config.get("_imaging_well_region_summary", {}).get("corrected_patch_count", 0)) > 0
         ),
     }
     return {
@@ -1554,9 +1693,10 @@ def build_summary(
         "real_well_samples_root": str(Path(config["real_well_samples_root"]).resolve()),
         "corrected_dfn_csv": str(paths["corrected_csv"]),
         "corrected_dfn_raw_vtk": str(paths["raw_vtk"]),
-        "original_fault_surface_vtk": str(original_fault_surface) if original_fault_surface is not None else "",
+        "initial_dfn_vtk": str(initial_dfn_vtk) if initial_dfn_vtk is not None else "",
         "original_fault_manifest_csv": str(original_fault_manifest) if original_fault_manifest is not None else "",
         "well_control_correction_audit_csv": str(paths["audit_csv"]),
+        "imaging_well_region_correction_audit_csv": str(paths["region_audit_csv"]),
         "summary_json": str(paths["summary_json"]),
         "target_block": config["target_block"],
         "correction_logic": {
@@ -1564,7 +1704,7 @@ def build_summary(
             "adjust_existing_patch_when_local_candidate_available": True,
             "add_patch_when_no_local_candidate_available": True,
             "far_field_density_volume_patches_unchanged": True,
-            "original_fault_surface_passthrough_unchanged": True,
+            "original_fault_triangles_carried_unchanged_from_step7d_unified_vtk": True,
             "xy_search_radius_m": float(config.get("xy_search_radius_m", 80.0)),
             "time_search_radius_ms": float(config.get("time_search_radius_ms", 30.0)),
             "surface_dir": str(Path(config["surface_dir"]).resolve()) if config.get("surface_dir") else None,
@@ -1580,6 +1720,7 @@ def build_summary(
             "force_well_control_small_scale": bool(config.get("force_well_control_small_scale", False)),
             "well_control_match_scales": list(config.get("well_control_match_scales", [])),
             "well_control_template_scales": list(config.get("well_control_template_scales", [])),
+            "imaging_well_region_correction": dict(config.get("_imaging_well_region_summary", {})),
             "step4_small_orientation_policy": dict(config.get("step4_small_orientation_policy", {})),
             "step4_event_aggregation": {
                 "enabled": bool(config.get("enable_step4_event_aggregation", False)),
@@ -1631,6 +1772,10 @@ def build_summary(
             "center_y_stats": finite_stats(corrected_df["CenterY"]),
             "center_time_stats": finite_stats(corrected_df["CenterTime"]),
         },
+        "unified_vtk": {
+            **dict(config.get("_unified_vtk_write", {})),
+            **dict(config.get("_unified_vtk_summary", {})),
+        },
         "match_quality": {
             "before_distance_stats": finite_stats(before_dist),
             "after_distance_stats": finite_stats(after_dist),
@@ -1659,15 +1804,23 @@ def main() -> int:
     ensure_dir(output_dir)
 
     initial_csv = Path(config["initial_dfn_csv"]).resolve()
+    initial_vtk = Path(config["initial_dfn_vtk"]).resolve()
     fracture_csv = Path(config["fracture_points_csv"]).resolve()
     samples_root = Path(config["real_well_samples_root"]).resolve()
     initial_summary_json = Path(config.get("initial_dfn_summary_json", "")).resolve()
     surface_dir = Path(config["surface_dir"]).resolve() if config.get("surface_dir") else None
-    for label, path in [("initial_dfn_csv", initial_csv), ("fracture_points_csv", fracture_csv), ("real_well_samples_root", samples_root)]:
+    for label, path in [("initial_dfn_csv", initial_csv), ("initial_dfn_vtk", initial_vtk), ("fracture_points_csv", fracture_csv), ("real_well_samples_root", samples_root)]:
         if not path.exists():
             raise FileNotFoundError(f"{label} does not exist: {path}")
     if surface_dir is not None and not surface_dir.exists():
         raise FileNotFoundError(f"surface_dir does not exist: {surface_dir}")
+    input_original_fault_mesh = extract_geometry_group(
+        initial_vtk,
+        ORIGINAL_FAULT_GEOMETRY_GROUP_CODE,
+    ).triangulate()
+    if input_original_fault_mesh.n_cells <= 0:
+        raise RuntimeError("Step7D unified VTK contains no original-fault triangles")
+    config["_input_original_fault_fingerprint"] = geometry_fingerprint(input_original_fault_mesh)
 
     initial_df = load_initial_dfn(initial_csv)
     step4_control_df = load_control_points(fracture_csv, dict(config["target_block"]))
@@ -1711,6 +1864,23 @@ def main() -> int:
         config=config,
         surface_lookup=surface_lookup,
     )
+    corrected_df, region_audit_df = apply_imaging_well_region_correction(
+        patch_df=corrected_df,
+        control_df=control_df,
+        config=config,
+    )
+    config["_imaging_well_region_summary"] = {
+        "enabled": bool(config.get("enable_imaging_well_region_correction", False)),
+        "positive_evidence_only": True,
+        "xy_radius_m": float(config.get("imaging_well_region_xy_radius_m", 150.0)),
+        "time_radius_ms": float(config.get("imaging_well_region_time_radius_ms", 40.0)),
+        "density_blend": float(config.get("imaging_well_region_density_blend", 0.65)),
+        "corrected_patch_count": int(len(region_audit_df)),
+        "mean_influence": float(region_audit_df["Influence"].mean()) if not region_audit_df.empty else 0.0,
+        "mean_density_increase": float(
+            (region_audit_df["CorrectedSourceDensity"] - region_audit_df["OriginalSourceDensity"]).mean()
+        ) if not region_audit_df.empty else 0.0,
+    }
     corrected_df, final_horizon_qc = enforce_final_center_horizon_contract(corrected_df, surface_lookup)
     after_dist = nearest_patch_distances(corrected_df, control_df, time_scale=time_scale)
 
@@ -1731,15 +1901,24 @@ def main() -> int:
     final_horizon_qc["vertex_geometry"] = vertex_horizon_qc
     corrected_df.to_csv(paths["corrected_csv"], index=False, encoding="utf-8-sig")
     audit_df.to_csv(paths["audit_csv"], index=False, encoding="utf-8-sig")
+    region_audit_df.to_csv(paths["region_audit_csv"], index=False, encoding="utf-8-sig")
+    predicted_vtk = output_dir / ".well_corrected_predicted_only_raw_time.vtk"
     write_legacy_vtk(
-        paths["raw_vtk"],
+        predicted_vtk,
         corrected_df,
-        "well_corrected_dfn_raw_time",
+        "well_corrected_predicted_only_raw_time",
         display=False,
         display_z_scale=display_z_scale,
         use_dip_geometry=use_dip_geometry,
         geometry_time_scale_m_per_ms=geometry_time_scale,
     )
+    config["_unified_vtk_write"] = write_unified_dfn_vtk(
+        paths["raw_vtk"],
+        predicted_vtk,
+        initial_vtk,
+    )
+    predicted_vtk.unlink(missing_ok=True)
+    config["_unified_vtk_summary"] = unified_vtk_summary(paths["raw_vtk"])
     debug_vtks: dict[str, str] = {}
     if bool(config.get("export_debug_step_vtks", False)):
         debug_vtks = export_debug_step_vtks(

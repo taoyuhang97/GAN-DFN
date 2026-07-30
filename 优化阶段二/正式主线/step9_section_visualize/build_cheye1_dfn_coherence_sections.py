@@ -52,6 +52,11 @@ from common.horizon_trace_table.horizon_contract import (  # noqa: E402
     HorizonSpatialLookup,
     build_spatial_lookup,
 )
+from common.unified_dfn_vtk import (  # noqa: E402
+    ORIGINAL_FAULT_GEOMETRY_GROUP_CODE,
+    extract_geometry_group,
+    geometry_group_counts,
+)
 
 
 WELL_NAME = "车页1导眼"
@@ -114,8 +119,13 @@ def path_from_config(config: dict[str, Any], key: str) -> Path:
 
 
 def build_namespace(config: dict[str, Any], half_width: float) -> SimpleNamespace:
+    input_vtk = path_from_config(config, "input_vtk")
+    group_counts = geometry_group_counts(input_vtk)
     return SimpleNamespace(
-        input_vtk=path_from_config(config, "input_vtk"),
+        input_vtk=input_vtk,
+        predicted_cell_count=int(group_counts["predicted_cell_count"]),
+        original_fault_cell_count=int(group_counts["original_fault_cell_count"]),
+        combined_cell_count=int(group_counts["combined_cell_count"]),
         well_trajectory_csv=None,
         surface_dir=path_from_config(config, "surface_dir"),
         output_dir=path_from_config(config, "output_dir"),
@@ -202,14 +212,6 @@ def validate_inputs(config: dict[str, Any]) -> None:
         path = path_from_config(config, "dfn_patch_csv")
         if not path.exists():
             raise FileNotFoundError(f"dfn_patch_csv not found: {path}")
-    if config.get("original_fault_stick_dat"):
-        path = path_from_config(config, "original_fault_stick_dat")
-        if not path.exists():
-            raise FileNotFoundError(f"original_fault_stick_dat not found: {path}")
-    if config.get("original_fault_surface_vtk"):
-        path = path_from_config(config, "original_fault_surface_vtk")
-        if not path.exists():
-            raise FileNotFoundError(f"original_fault_surface_vtk not found: {path}")
 
 
 def reset_output_images(output_dir: Path) -> None:
@@ -449,9 +451,20 @@ def scan_vtk_intersections(args: SimpleNamespace, surfaces: dict[str, Any], well
         polygon_header = next_nonempty(handle).split()
         if len(polygon_header) < 3 or polygon_header[0] != "POLYGONS":
             raise ValueError(f"POLYGONS block missing: {args.input_vtk}")
-        polygon_count = int(polygon_header[1])
-        total_to_scan = min(polygon_count, int(args.max_polygons)) if int(args.max_polygons) > 0 else polygon_count
-        print(f"[cheye1-section] intersection scanning polygons: {total_to_scan}/{polygon_count}", flush=True)
+        combined_polygon_count = int(polygon_header[1])
+        predicted_polygon_count = int(getattr(args, "predicted_cell_count", combined_polygon_count))
+        if predicted_polygon_count > combined_polygon_count:
+            raise ValueError(f"predicted cell count exceeds VTK polygon count: {args.input_vtk}")
+        total_to_scan = (
+            min(predicted_polygon_count, int(args.max_polygons))
+            if int(args.max_polygons) > 0
+            else predicted_polygon_count
+        )
+        print(
+            f"[cheye1-section] intersection scanning predicted polygons: "
+            f"{total_to_scan}/{predicted_polygon_count}; combined={combined_polygon_count}",
+            flush=True,
+        )
 
         for polygon_index in range(total_to_scan):
             processed_polygon_count += 1
@@ -627,7 +640,9 @@ def scan_vtk_intersections(args: SimpleNamespace, surfaces: dict[str, Any], well
         "small_projection_half_width_m": float(getattr(args, "small_projection_half_width", args.half_width)),
         "small_projection_include_well_control": bool(getattr(args, "small_projection_include_well_control", True)),
         "point_count": int(point_count),
-        "polygon_count": int(polygon_count),
+        "polygon_count": int(predicted_polygon_count),
+        "combined_polygon_count": int(combined_polygon_count),
+        "original_fault_polygon_count": int(getattr(args, "original_fault_cell_count", 0)),
         "scanned_polygon_count": int(total_to_scan),
         "processed_polygon_count": int(processed_polygon_count),
         "selected_patch_count": int(selected_patch_count),
@@ -832,13 +847,13 @@ def curved_section_triangle_line(
 
 
 def scan_original_fault_surface_intersections(
-    fault_vtk: Path | None,
+    fault_vtk: Path | pv.PolyData | None,
     well_df: pd.DataFrame,
     display: dict[str, float],
 ) -> tuple[list[ProjectionSegment], dict[str, Any]]:
     if fault_vtk is None:
         return [], {"enabled": False, "segment_count": 0}
-    loaded = pv.read(fault_vtk)
+    loaded = pv.read(fault_vtk) if isinstance(fault_vtk, Path) else fault_vtk
     mesh = loaded if isinstance(loaded, pv.PolyData) else loaded.extract_surface(algorithm="dataset_surface")
     mesh = mesh.triangulate()
     faces = np.asarray(mesh.faces, dtype=np.int64).reshape(-1, 4)
@@ -880,8 +895,8 @@ def scan_original_fault_surface_intersections(
             counts[projection] += 1
     return segments, {
         "enabled": True,
-        "fault_trace_source": "step7c_original_fault_surface_triangles",
-        "original_fault_surface_vtk": str(fault_vtk),
+        "fault_trace_source": "step8_unified_dfn_original_fault_triangles",
+        "original_fault_surface_vtk": str(fault_vtk) if isinstance(fault_vtk, Path) else "embedded_in_step8_unified_vtk",
         "surface_point_count": int(mesh.n_points),
         "surface_triangle_count": int(mesh.n_cells),
         "segment_count": int(len(segments)),
@@ -890,6 +905,20 @@ def scan_original_fault_surface_intersections(
         "horizon_filter_applied": False,
         "intersection_mode": "triangle_vs_well_curved_section",
     }
+
+
+def scan_unified_original_fault_intersections(
+    unified_vtk: Path,
+    well_df: pd.DataFrame,
+    display: dict[str, float],
+) -> tuple[list[ProjectionSegment], dict[str, Any]]:
+    original_mesh = extract_geometry_group(
+        unified_vtk,
+        ORIGINAL_FAULT_GEOMETRY_GROUP_CODE,
+    ).triangulate()
+    segments, summary = scan_original_fault_surface_intersections(original_mesh, well_df, display)
+    summary["unified_dfn_vtk"] = str(unified_vtk)
+    return segments, summary
 
 
 def load_original_fault_sticks(path: Path, target_block: dict[str, Any], context_padding_m: float = 10000.0) -> pd.DataFrame:
@@ -1093,15 +1122,15 @@ def add_dfn_segments(ax, segments: list[ProjectionSegment], projection: str, *, 
         projected_widths = [max(0.35, width * 0.62) for width in projected_widths]
         if overlay:
             halo_widths = [width + 0.55 for width in projected_widths]
-            ax.add_collection(LineCollection(projected_lines, colors=DFN_HALO_COLOR, linewidths=halo_widths, alpha=0.22, zorder=4.6))
-        ax.add_collection(LineCollection(projected_lines, colors=projected_colors, linewidths=projected_widths, alpha=0.48, zorder=4.8 if overlay else 1.8))
+            ax.add_collection(LineCollection(projected_lines, colors=DFN_HALO_COLOR, linewidths=halo_widths, alpha=0.22, zorder=12.6))
+        ax.add_collection(LineCollection(projected_lines, colors=projected_colors, linewidths=projected_widths, alpha=0.48, zorder=12.8 if overlay else 1.8))
         ax.plot([], [], color="#6b7280", linewidth=1.4, alpha=0.58, label="小尺度裂缝投影")
     if not intersection_lines:
         return len(projected_lines)
     if overlay:
         halo_widths = [width + 1.35 for width in intersection_widths]
-        ax.add_collection(LineCollection(intersection_lines, colors=DFN_HALO_COLOR, linewidths=halo_widths, alpha=0.72, zorder=5))
-    ax.add_collection(LineCollection(intersection_lines, colors=intersection_colors, linewidths=intersection_widths, alpha=0.92, zorder=6 if overlay else 2))
+        ax.add_collection(LineCollection(intersection_lines, colors=DFN_HALO_COLOR, linewidths=halo_widths, alpha=0.72, zorder=13.0))
+    ax.add_collection(LineCollection(intersection_lines, colors=intersection_colors, linewidths=intersection_widths, alpha=0.92, zorder=13.2 if overlay else 2))
     return len(intersection_lines) + len(projected_lines)
 
 
@@ -1508,50 +1537,12 @@ def main() -> None:
     print("[cheye1-section] scanning DFN local 200m band as section intersections + small-scale band projection", flush=True)
     local_segments, local_scan = scan_vtk_intersections(local_args, surfaces, well_df)
     print("[cheye1-section] scanning fault surface traces", flush=True)
-    fault_surface_vtk = path_from_config(config, "original_fault_surface_vtk") if config.get("original_fault_surface_vtk") else None
-    fault_dat = path_from_config(config, "original_fault_stick_dat") if config.get("original_fault_stick_dat") else None
-    fault_csv = path_from_config(config, "fault_surface_csv") if config.get("fault_surface_csv") else None
-    if fault_surface_vtk is not None:
-        standard_fault_segments, standard_fault_scan = scan_original_fault_surface_intersections(
-            fault_surface_vtk, well_df, full_display
-        )
-        local_fault_segments, local_fault_scan = scan_original_fault_surface_intersections(
-            fault_surface_vtk, well_df, local_display
-        )
-    elif fault_dat is not None:
-        standard_fault_segments, standard_fault_scan = scan_original_fault_stick_traces(
-            fault_dat,
-            dict(config.get("target_block") or {}),
-            well_df,
-            float(config.get("fault_trace_half_width_m", config.get("dfn_half_width_m", 50.0))),
-            full_display,
-            surfaces,
-            context_padding_m=float(config.get("original_fault_context_padding_m", 10000.0)),
-        )
-        local_fault_segments, local_fault_scan = scan_original_fault_stick_traces(
-            fault_dat,
-            dict(config.get("target_block") or {}),
-            well_df,
-            float(config.get("local_fault_trace_half_width_m", config.get("local_dfn_half_width_m", 200.0))),
-            local_display,
-            surfaces,
-            context_padding_m=float(config.get("original_fault_context_padding_m", 10000.0)),
-        )
-    else:
-        standard_fault_segments, standard_fault_scan = scan_fault_surface_csv_intersections(
-            fault_csv,
-            surfaces,
-            well_df,
-            float(config.get("fault_trace_half_width_m", config.get("dfn_half_width_m", 50.0))),
-            max_polygons=int(config.get("fault_trace_max_polygons", 0)),
-        )
-        local_fault_segments, local_fault_scan = scan_fault_surface_csv_intersections(
-            fault_csv,
-            surfaces,
-            well_df,
-            float(config.get("local_fault_trace_half_width_m", config.get("local_dfn_half_width_m", 200.0))),
-            max_polygons=int(config.get("fault_trace_max_polygons", 0)),
-        )
+    standard_fault_segments, standard_fault_scan = scan_unified_original_fault_intersections(
+        standard_args.input_vtk, well_df, full_display
+    )
+    local_fault_segments, local_fault_scan = scan_unified_original_fault_intersections(
+        standard_args.input_vtk, well_df, local_display
+    )
 
     coherence_path = path_from_config(config, "coherence_volume_path")
     handle, samples, trace_at = open_volume_context(coherence_path)

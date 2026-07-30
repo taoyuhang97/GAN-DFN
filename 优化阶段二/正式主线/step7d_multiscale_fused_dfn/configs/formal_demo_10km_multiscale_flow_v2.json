@@ -5,7 +5,7 @@
   "output_dir": "/home/tyh/projects/petroleum/code/GAN-DFN/优化阶段二/正式主线/step7d_multiscale_fused_dfn/output/formal_demo_10km_multiscale_flow_v2",
   "random_seed": 20260717,
   "small_downsample_near_major_radius_m": 70.0,
-  "original_fault_surface_vtk": "/home/tyh/projects/petroleum/code/GAN-DFN/优化阶段二/正式主线/step7c_large_fault_dfn/output/formal_demo_10km_multiscale_flow_v2/original_fault_units_demo_raw_time.vtk",
+  "large_dfn_vtk": "/home/tyh/projects/petroleum/code/GAN-DFN/优化阶段二/正式主线/step7c_large_fault_dfn/output/formal_demo_10km_multiscale_flow_v2/large_fault_dfn_raw_time.vtk",
   "original_fault_manifest_csv": "/home/tyh/projects/petroleum/code/GAN-DFN/优化阶段二/正式主线/step7c_large_fault_dfn/output/formal_demo_10km_multiscale_flow_v2/original_fault_unit_manifest.csv",
-  "write_vtk": false
+  "write_vtk": true
 }

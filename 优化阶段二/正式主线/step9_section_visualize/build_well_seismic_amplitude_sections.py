@@ -13,7 +13,7 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
-from matplotlib.colors import TwoSlopeNorm
+from matplotlib.colors import Normalize, TwoSlopeNorm
 
 from build_well_attribute_section_visualization import axis_edges
 from well_curved_section_common import (
@@ -26,6 +26,18 @@ from well_curved_section_common import (
     save_section_pair_npz,
     write_json,
 )
+
+
+SIGNED_RWB_STYLE = "signed_red_white_blue"
+ABSOLUTE_GRAYSCALE_STYLE = "absolute_grayscale"
+
+
+def resolve_amplitude_display_style(display_style: str) -> dict[str, object]:
+    if display_style == SIGNED_RWB_STYLE:
+        return {"cmap": "seismic", "absolute": False, "style": SIGNED_RWB_STYLE}
+    if display_style == ABSOLUTE_GRAYSCALE_STYLE:
+        return {"cmap": "gray_r", "absolute": True, "style": ABSOLUTE_GRAYSCALE_STYLE}
+    raise ValueError(f"unsupported display style: {display_style}")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -84,6 +96,7 @@ def plot_variable_density(
     title_suffix: str = "",
     panel: bool = False,
     *,
+    display_style: str = SIGNED_RWB_STYLE,
     overlay_drawer: Callable[[Any, str], dict[str, int]] | None = None,
     scope_label: str | None = None,
     product_title: str | None = None,
@@ -92,13 +105,15 @@ def plot_variable_density(
     if overlay_drawer is not None:
         width += 4.0
     fig, ax = plt.subplots(figsize=(width, height))
-    norm = TwoSlopeNorm(vmin=-limit, vcenter=0.0, vmax=limit)
+    style = resolve_amplitude_display_style(display_style)
+    norm = Normalize(vmin=0.0, vmax=limit) if bool(style["absolute"]) else TwoSlopeNorm(vmin=-limit, vcenter=0.0, vmax=limit)
+    display_values = np.abs(section.values) if bool(style["absolute"]) else section.values
     mesh = ax.pcolormesh(
         axis_edges(section.h),
         axis_edges(section.time),
-        section.values,
+        display_values,
         shading="auto",
-        cmap="seismic",
+        cmap=style["cmap"],
         norm=norm,
         rasterized=True,
         zorder=1,
@@ -109,13 +124,13 @@ def plot_variable_density(
         overlay_stats = overlay_drawer(ax, section.projection)
         fig.subplots_adjust(left=0.06, right=0.76, bottom=0.10, top=0.88)
         cax = fig.add_axes([0.78, 0.16, 0.014, 0.66])
-        fig.colorbar(mesh, cax=cax, label="地震振幅")
+        fig.colorbar(mesh, cax=cax, label="地震振幅绝对值" if bool(style["absolute"]) else "地震振幅")
         handles, labels = ax.get_legend_handles_labels()
         fig.legend(handles, labels, loc="upper left", bbox_to_anchor=(0.81, 0.88), fontsize=8.4, framealpha=0.92)
         fig.suptitle(product_title or "车页1导眼：DFN与成像测井裂缝对比剖面", y=0.975, fontsize=13)
         ax.set_title(f"{scope_label or '剖面'} | 地震振幅变密度 | {section.projection} | T4-T7{title_suffix}", fontsize=11, pad=8)
     else:
-        fig.colorbar(mesh, ax=ax, pad=0.02, shrink=0.94, label="地震振幅")
+        fig.colorbar(mesh, ax=ax, pad=0.02, shrink=0.94, label="地震振幅绝对值" if bool(style["absolute"]) else "地震振幅")
         ax.set_title(f"{geometry.config['title_prefix']} | 地震振幅变密度 | {section.projection} | T4-T7{title_suffix}")
         fig.tight_layout()
     save_figure(fig, output_path, dpi, bool(geometry.config.get("write_svg", False)))
@@ -206,7 +221,13 @@ def split_section(section: AttributeSection, panel_count: int) -> list[Attribute
     ]
 
 
-def plot_section_panels(section: AttributeSection, geometry, output_dir: Path, limit: float) -> dict[str, object]:
+def plot_section_panels(
+    section: AttributeSection,
+    geometry,
+    output_dir: Path,
+    limit: float,
+    display_style: str = SIGNED_RWB_STYLE,
+) -> dict[str, object]:
     panel_count = int(
         geometry.config.get("xz_panel_count" if section.projection == "XZ" else "yz_panel_count", 0)
     )
@@ -222,7 +243,7 @@ def plot_section_panels(section: AttributeSection, geometry, output_dir: Path, l
         suffix = f" | 分段{panel_index}/{len(panels)}"
         density_name = f"seisamp_variable_density_{section.projection.lower()}_panel_{panel_index:02d}_t4_t7.png"
         wiggle_name = f"seisamp_wiggle_variable_area_{section.projection.lower()}_panel_{panel_index:02d}_t4_t7.png"
-        plot_variable_density(panel_section, geometry, density_dir / density_name, limit, suffix, panel=True)
+        plot_variable_density(panel_section, geometry, density_dir / density_name, limit, suffix, panel=True, display_style=display_style)
         count = plot_wiggle_variable_area(panel_section, geometry, wiggle_dir / wiggle_name, limit, suffix, panel=True)
         density_pngs.append(str(Path("variable_density_panels") / density_name))
         wiggle_pngs.append(str(Path("wiggle_variable_area_panels") / wiggle_name))
@@ -241,6 +262,9 @@ def main() -> int:
     geometry = prepare_geometry(config)
     output_dir = Path(str(config["output_root"])).resolve() / "seismic_amplitude_sections"
     output_dir.mkdir(parents=True, exist_ok=True)
+    primary_style = str(config.get("formal_signed_attribute_display_style", ABSOLUTE_GRAYSCALE_STYLE))
+    backup_style = str(config.get("signed_attribute_backup_display_style", SIGNED_RWB_STYLE))
+    backup_dir = output_dir / str(config.get("signed_attribute_backup_dir", "red_white_blue_backup"))
     seis_path = Path(str(config["volume_paths"]["SeisAmp"])).resolve()
     print("[seismic-section] sampling SeisAmp", flush=True)
     xz, yz, stats = sample_volume_sections(geometry, "SeisAmp", seis_path)
@@ -253,12 +277,14 @@ def main() -> int:
         ("wiggle", "XZ"): "07_seisamp_wiggle_variable_area_xz_t4_t7.png",
         ("wiggle", "YZ"): "08_seisamp_wiggle_variable_area_yz_t4_t7.png",
     }
-    plot_variable_density(xz, geometry, output_dir / image_names[("density", "XZ")], limit)
-    plot_variable_density(yz, geometry, output_dir / image_names[("density", "YZ")], limit)
+    plot_variable_density(xz, geometry, output_dir / image_names[("density", "XZ")], limit, display_style=primary_style)
+    plot_variable_density(yz, geometry, output_dir / image_names[("density", "YZ")], limit, display_style=primary_style)
+    plot_variable_density(xz, geometry, backup_dir / image_names[("density", "XZ")], limit, display_style=backup_style)
+    plot_variable_density(yz, geometry, backup_dir / image_names[("density", "YZ")], limit, display_style=backup_style)
     wiggle_xz = plot_wiggle_variable_area(xz, geometry, output_dir / image_names[("wiggle", "XZ")], limit)
     wiggle_yz = plot_wiggle_variable_area(yz, geometry, output_dir / image_names[("wiggle", "YZ")], limit)
-    xz_panels = plot_section_panels(xz, geometry, output_dir, limit)
-    yz_panels = plot_section_panels(yz, geometry, output_dir, limit)
+    xz_panels = plot_section_panels(xz, geometry, output_dir, limit, primary_style)
+    yz_panels = plot_section_panels(yz, geometry, output_dir, limit, primary_style)
     save_section_pair_npz(output_dir / "seisamp_section_samples.npz", xz, yz)
     images = sorted(path.name for path in output_dir.glob("*.png"))
     checks = {
@@ -266,6 +292,10 @@ def main() -> int:
         "finite_section_values": float(stats["finite_fraction"]) > 0,
         "symmetric_nonzero_display_limit": limit > 0,
         "wiggle_traces_drawn": wiggle_xz > 0 and wiggle_yz > 0,
+        "signed_rwb_variable_density_backup_complete": all(
+            (backup_dir / image_names[("density", projection)]).exists()
+            for projection in ("XZ", "YZ")
+        ),
     }
     summary = {
         "status": "pass" if all(checks.values()) else "fail",
@@ -276,7 +306,10 @@ def main() -> int:
         "display": {
             "clip_quantile": quantile,
             "symmetric_limit": limit,
-            "variable_density_colormap": "seismic_zero_centered",
+            "formal_variable_density_style": primary_style,
+            "signed_rwb_backup_style": backup_style,
+            "signed_rwb_backup_dir": str(backup_dir),
+            "absolute_grayscale_rule": "zero_white_positive_and_negative_extremes_black_abs_q99",
             "wiggle_normalization": "global_section_limit_no_per_trace_normalization",
             "wiggle_trace_selection": "all_section_trace_coordinates_when_configured_max_count_is_zero",
             "wiggle_positive_fill": "black",

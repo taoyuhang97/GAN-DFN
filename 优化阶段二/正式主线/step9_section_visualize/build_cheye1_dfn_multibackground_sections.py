@@ -22,9 +22,7 @@ from build_cheye1_dfn_coherence_sections import (
     load_step3_imaging_segment_track,
     path_from_config,
     reset_output_images,
-    scan_fault_surface_csv_intersections,
-    scan_original_fault_surface_intersections,
-    scan_original_fault_stick_traces,
+    scan_unified_original_fault_intersections,
     scan_vtk_intersections,
     validate_inputs,
 )
@@ -50,6 +48,8 @@ from common.horizon_trace_table.horizon_contract import build_spatial_lookup  # 
 
 ATTRIBUTE_ORDER = ["AntTrack", "Coherence", "CurvatureMax"]
 PRODUCT_TITLE = "车页1导眼：DFN与成像测井裂缝对比剖面"
+FORMAL_DISPLAY_STYLE = "absolute_grayscale"
+BACKUP_DISPLAY_STYLE = "signed_red_white_blue"
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -205,42 +205,16 @@ def build_overlay_contexts(
         "display_y_min": float(local.summary["display_y_min"]),
         "display_y_max": float(local.summary["display_y_max"]),
     }
-    fault_surface_vtk = path_from_config(config, "original_fault_surface_vtk") if config.get("original_fault_surface_vtk") else None
-    fault_dat = path_from_config(config, "original_fault_stick_dat") if config.get("original_fault_stick_dat") else None
-    fault_csv = path_from_config(config, "fault_surface_csv") if config.get("fault_surface_csv") else None
-    if fault_surface_vtk is not None:
-        standard_faults, standard_fault_scan = scan_original_fault_surface_intersections(
-            fault_surface_vtk, overview.well_df, overview_display
-        )
-        local_faults, local_fault_scan = scan_original_fault_surface_intersections(
-            fault_surface_vtk, overview.well_df, local_display
-        )
-    elif fault_dat is not None:
-        standard_faults, standard_fault_scan = scan_original_fault_stick_traces(
-            fault_dat,
-            dict(config.get("target_block") or {}),
-            overview.well_df,
-            float(config.get("fault_trace_half_width_m", standard_args.half_width)),
-            overview_display,
-            surfaces,
-            context_padding_m=float(config.get("original_fault_context_padding_m", 10000.0)),
-        )
-        local_faults, local_fault_scan = scan_original_fault_stick_traces(
-            fault_dat,
-            dict(config.get("target_block") or {}),
-            overview.well_df,
-            float(config.get("local_fault_trace_half_width_m", local_args.half_width)),
-            local_display,
-            surfaces,
-            context_padding_m=float(config.get("original_fault_context_padding_m", 10000.0)),
-        )
-    else:
-        standard_faults, standard_fault_scan = scan_fault_surface_csv_intersections(
-            fault_csv, surfaces, overview.well_df, float(config.get("fault_trace_half_width_m", standard_args.half_width))
-        )
-        local_faults, local_fault_scan = scan_fault_surface_csv_intersections(
-            fault_csv, surfaces, overview.well_df, float(config.get("local_fault_trace_half_width_m", local_args.half_width))
-        )
+    standard_faults, standard_fault_scan = scan_unified_original_fault_intersections(
+        standard_args.input_vtk,
+        overview.well_df,
+        overview_display,
+    )
+    local_faults, local_fault_scan = scan_unified_original_fault_intersections(
+        standard_args.input_vtk,
+        overview.well_df,
+        local_display,
+    )
 
     contexts = {
         "overview": SectionOverlayContext(
@@ -297,6 +271,9 @@ def render_all(config_path: Path, config: dict[str, Any]) -> dict[str, Any]:
             cache_dir = output_dir / "section_samples" / scope_name
             save_section_pair_npz(cache_dir / f"{attribute.lower()}_section_samples.npz", xz, yz)
 
+    formal_display_style = str(config.get("formal_signed_attribute_display_style", FORMAL_DISPLAY_STYLE))
+    backup_display_style = str(config.get("signed_attribute_backup_display_style", BACKUP_DISPLAY_STYLE))
+    backup_dir = output_dir / str(config.get("signed_attribute_backup_dir", "red_white_blue_backup"))
     attribute_scales: dict[str, tuple[float, float, Any, dict[str, Any]]] = {}
     for attribute in ATTRIBUTE_ORDER:
         arrays = [
@@ -304,7 +281,13 @@ def render_all(config_path: Path, config: dict[str, Any]) -> dict[str, Any]:
             for scope in scopes
             for projection in (0, 1)
         ]
-        attribute_scales[attribute] = display_scale(attribute, arrays)
+        attribute_scales[attribute] = display_scale(attribute, arrays, formal_display_style)
+    curvature_arrays = [
+        sampled[scope]["CurvatureMax"][projection].values
+        for scope in scopes
+        for projection in (0, 1)
+    ]
+    backup_curvature_scale = display_scale("CurvatureMax", curvature_arrays, backup_display_style)
     seis_sections = [
         sampled[scope]["SeisAmp"][projection]
         for scope in scopes
@@ -361,6 +344,7 @@ def render_all(config_path: Path, config: dict[str, Any]) -> dict[str, Any]:
                 vmin,
                 vmax,
                 norm,
+                display_style=formal_display_style,
                 overlay_drawer=drawer,
                 scope_label=scope_labels[scope_name],
                 product_title=product_title,
@@ -371,6 +355,7 @@ def render_all(config_path: Path, config: dict[str, Any]) -> dict[str, Any]:
                 geometry,
                 output_path,
                 seis_limit,
+                display_style=formal_display_style,
                 overlay_drawer=drawer,
                 scope_label=scope_labels[scope_name],
                 product_title=product_title,
@@ -387,6 +372,36 @@ def render_all(config_path: Path, config: dict[str, Any]) -> dict[str, Any]:
             )
             stats = dict(captured)
             stats["wiggle_trace_count"] = int(trace_count)
+        backup_file: Path | None = None
+        if attribute == "CurvatureMax" and renderer == "attribute":
+            vmin, vmax, norm, _ = backup_curvature_scale
+            backup_file = backup_dir / filename
+            backup_drawer, _ = make_overlay_drawer(overlay_contexts[scope_name])
+            plot_section(
+                section,
+                geometry,
+                backup_file,
+                vmin,
+                vmax,
+                norm,
+                display_style=backup_display_style,
+                overlay_drawer=backup_drawer,
+                scope_label=scope_labels[scope_name],
+                product_title=product_title,
+            )
+        elif attribute == "SeisAmp" and renderer == "density":
+            backup_file = backup_dir / filename
+            backup_drawer, _ = make_overlay_drawer(overlay_contexts[scope_name])
+            plot_variable_density(
+                section,
+                geometry,
+                backup_file,
+                seis_limit,
+                display_style=backup_display_style,
+                overlay_drawer=backup_drawer,
+                scope_label=scope_labels[scope_name],
+                product_title=product_title,
+            )
         image_rows.append(
             {
                 "number": number,
@@ -397,11 +412,14 @@ def render_all(config_path: Path, config: dict[str, Any]) -> dict[str, Any]:
                 "projection": projection,
                 "section_shape": [int(value) for value in section.values.shape],
                 "overlay": stats,
+                "formal_display_style": formal_display_style if renderer in ("attribute", "density") else "wiggle_black",
+                "signed_rwb_backup_file": str(backup_file.relative_to(output_dir)) if backup_file else None,
             }
         )
         print(f"[multi-background] rendered {filename}", flush=True)
 
     png_files = sorted(path.name for path in output_dir.glob("*.png"))
+    backup_png_files = sorted(path.name for path in backup_dir.glob("*.png")) if backup_dir.exists() else []
     scan_accounting: dict[str, dict[str, Any]] = {}
     for scan_name in ("overview_scan", "local_200m_scan"):
         scan = dict(overlay_summary[scan_name])
@@ -418,9 +436,8 @@ def render_all(config_path: Path, config: dict[str, Any]) -> dict[str, Any]:
             "accounting_total": int(scan["patch_accounting_total"]),
             "accounting_closed": bool(scan["patch_accounting_closed"]),
         }
-    original_fault_surface_required = bool(config.get("original_fault_surface_vtk"))
     original_fault_surface_loaded = all(
-        scan.get("fault_trace_source") == "step7c_original_fault_surface_triangles"
+        scan.get("fault_trace_source") == "step8_unified_dfn_original_fault_triangles"
         and int(scan.get("surface_triangle_count", 0)) > 0
         for scan in (
             overlay_summary["overview_fault_scan"],
@@ -440,10 +457,14 @@ def render_all(config_path: Path, config: dict[str, Any]) -> dict[str, Any]:
     checks = {
         "expected_image_count": len(png_files) == (len(requested_numbers) if requested_numbers else 20),
         "all_planned_images_exist": all((output_dir / row["file"]).exists() for row in image_rows),
+        "signed_rwb_backup_complete": all(
+            row["signed_rwb_backup_file"] is None or (output_dir / row["signed_rwb_backup_file"]).exists()
+            for row in image_rows
+        ) and len(backup_png_files) == sum(row["signed_rwb_backup_file"] is not None for row in image_rows),
         "overlay_counts_consistent_across_backgrounds": bool(overlay_consistent),
         "step3_60_points_loaded": int(overlay_summary["step3_fracture_point_count"]) == 60,
         "configured_original_fault_surface_loaded": bool(
-            not original_fault_surface_required or original_fault_surface_loaded
+            original_fault_surface_loaded
         ),
         "overview_and_local_have_xz_yz_dfn": all(
             int(overlay_summary[key][f"selected_segment_count_{projection.lower()}"]) > 0
@@ -474,6 +495,11 @@ def render_all(config_path: Path, config: dict[str, Any]) -> dict[str, Any]:
         "display": {
             "attributes": {name: info for name, (*_, info) in attribute_scales.items()},
             "seismic_symmetric_limit": float(seis_limit),
+            "formal_20_image_style": formal_display_style,
+            "signed_rwb_backup_style": backup_display_style,
+            "signed_rwb_backup_dir": str(backup_dir),
+            "signed_rwb_backup_pngs": backup_png_files,
+            "absolute_grayscale_rule": "zero_white_positive_and_negative_extremes_black_abs_q98",
         },
         "images": image_rows,
         "png_files": png_files,

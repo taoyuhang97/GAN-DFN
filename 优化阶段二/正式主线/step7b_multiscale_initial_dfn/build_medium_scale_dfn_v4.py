@@ -464,6 +464,69 @@ def anttrack_ridge_order(group: pd.DataFrame, config: dict[str, Any]) -> tuple[n
     }
 
 
+def medium_selection_order(
+    group: pd.DataFrame,
+    config: dict[str, Any],
+    target: int,
+    time_scale: float,
+) -> tuple[np.ndarray, dict[str, Any], dict[int, str]]:
+    mode = str(config.get("component_selection_mode", "hybrid_anttrack_spatial")).strip().lower()
+    ridge_order, ridge_summary = anttrack_ridge_order(group, config)
+    spatial_limit = min(
+        len(group),
+        max(int(target) * int(config.get("spatial_candidate_multiplier", 4)), int(target) + 32),
+    )
+    spatial_order = spatially_distributed_order(group, time_scale, spatial_limit)
+    source_by_index: dict[int, str] = {}
+
+    def unique_concat(parts: list[tuple[str, np.ndarray]]) -> np.ndarray:
+        ordered: list[int] = []
+        seen: set[int] = set()
+        for source, values in parts:
+            for value in values:
+                idx = int(value)
+                if idx in seen:
+                    continue
+                seen.add(idx)
+                ordered.append(idx)
+                source_by_index[idx] = source
+        return np.asarray(ordered, dtype=np.int64)
+
+    if mode == "anttrack_ridge_nms":
+        order = unique_concat([("anttrack_ridge", ridge_order)])
+        ridge_quota = int(target)
+    elif mode == "spatial_farthest":
+        order = unique_concat(
+            [
+                ("spatial_coverage", spatial_order),
+                ("anttrack_ridge_fallback", ridge_order),
+            ]
+        )
+        ridge_quota = 0
+    elif mode == "hybrid_anttrack_spatial":
+        ridge_fraction = float(np.clip(config.get("anttrack_primary_fraction", 0.60), 0.0, 1.0))
+        requested_ridge_quota = max(int(np.floor(int(target) * ridge_fraction + 0.5)), 1)
+        if int(target) > 1:
+            requested_ridge_quota = min(requested_ridge_quota, int(target) - 1)
+        ridge_quota = min(len(ridge_order), requested_ridge_quota)
+        order = unique_concat(
+            [
+                ("anttrack_ridge_primary", ridge_order[:ridge_quota]),
+                ("spatial_coverage", spatial_order),
+                ("anttrack_ridge_fallback", ridge_order[ridge_quota:]),
+            ]
+        )
+    else:
+        raise ValueError(f"unsupported component_selection_mode: {mode}")
+    return order, {
+        **ridge_summary,
+        "selection_mode": mode,
+        "anttrack_primary_quota": int(ridge_quota),
+        "spatial_candidate_count": int(len(spatial_order)),
+        "ordered_candidate_count": int(len(order)),
+    }, source_by_index
+
+
 def ridge_extent_m(group: pd.DataFrame, order: np.ndarray, grid: dict[str, Any], time_scale: float) -> float:
     if not len(order):
         return 0.0
@@ -594,9 +657,13 @@ def select_medium_patches(candidates: pd.DataFrame, grid: dict[str, Any], config
         target = min(target, len(group))
         if target <= 0:
             continue
-        order = ridge_order
+        order, selection_summary, selection_source = medium_selection_order(
+            group,
+            config,
+            target,
+            time_scale,
+        )
         selected_rows = []
-        selected_local_indices: list[int] = []
         selected_coords: list[np.ndarray] = []
         used_cells: set[tuple[int, int, int]] = set()
         for local_idx in order:
@@ -666,8 +733,8 @@ def select_medium_patches(candidates: pd.DataFrame, grid: dict[str, Any], config
             row["LocalBandPcaLinearity"] = float(geom["linearity"])
             row["PatchShapeMode"] = "rectangular_local_medium_band_pca_v4"
             row["OrientationSourceOverride"] = str(geom["reason"])
+            row["SelectionSource"] = str(selection_source.get(int(local_idx), "unknown"))
             selected_rows.append(row)
-            selected_local_indices.append(int(local_idx))
             selected_coords.append(center_coord)
         for ordinal, row in enumerate(selected_rows, start=1):
             row["BandPatchOrdinal"] = ordinal
@@ -689,8 +756,16 @@ def select_medium_patches(candidates: pd.DataFrame, grid: dict[str, Any], config
                     "LengthMedianM": float(selected["OverrideLengthM"].median()),
                     "HeightMedianMs": float(selected["OverrideHeightTimeMs"].median()),
                     "CandidateBranch": str(group["CandidateBranch"].iloc[0]) if "CandidateBranch" in group.columns else "unknown",
+                    "SelectionMode": str(selection_summary["selection_mode"]),
+                    "AntTrackPrimaryQuota": int(selection_summary["anttrack_primary_quota"]),
+                    "SpatialCandidateCount": int(selection_summary["spatial_candidate_count"]),
                     "AntTrackRidgeCandidateCount": int(ridge_summary["ridge_candidate_count"]),
-                    "AntTrackRidgeSelectedCount": int(len(selected_local_indices)),
+                    "AntTrackRidgeSelectedCount": int(
+                        selected["SelectionSource"].astype(str).str.startswith("anttrack_ridge").sum()
+                    ),
+                    "SpatialCoverageSelectedCount": int(
+                        selected["SelectionSource"].astype(str).eq("spatial_coverage").sum()
+                    ),
                     "AntTrackRidgeThreshold": float(ridge_summary["ridge_anttrack_threshold"]),
                     "AntTrackRidgeLengthM": float(ridge_length),
                     "LocalBandWidthMedianM": float(selected["LocalBandWidthM"].median()),
@@ -752,7 +827,16 @@ def write_candidate_components_vtk(path: Path, summaries: list[dict[str, Any]], 
     path.write_text("\n".join(out) + "\n", encoding="utf-8")
 
 
-def build_summary(config_path: Path, config: dict[str, Any], paths: dict[str, Path], candidates: pd.DataFrame, selected: pd.DataFrame, patch_df: pd.DataFrame, bands: list[dict[str, Any]]) -> dict[str, Any]:
+def build_summary(
+    config_path: Path,
+    config: dict[str, Any],
+    paths: dict[str, Path],
+    candidates: pd.DataFrame,
+    selected: pd.DataFrame,
+    patch_df: pd.DataFrame,
+    bands: list[dict[str, Any]],
+    grid: dict[str, Any],
+) -> dict[str, Any]:
     candidate_components = candidates[["LayerGroup", "ComponentID"]].drop_duplicates()
     selected_components = selected[["LayerGroup", "ComponentID"]].drop_duplicates() if len(selected) else pd.DataFrame()
     candidate_component_count = int(len(candidate_components))
@@ -789,6 +873,28 @@ def build_summary(config_path: Path, config: dict[str, Any], paths: dict[str, Pa
         nearest = cKDTree(coords).query(coords, k=2)[0][:, 1]
     else:
         nearest = np.asarray([], dtype=float)
+    tile_size_m = max(float(config.get("spatial_coverage_tile_size_m", 250.0)), 1.0)
+    min_candidate_voxels_per_tile = max(int(config.get("spatial_coverage_min_candidate_voxels_per_tile", 20)), 1)
+    candidate_tiles = pd.DataFrame(
+        {
+            "LayerGroup": candidates["LayerGroup"].astype(str).to_numpy(),
+            "TileX": np.floor(grid["x_values"][candidates["IX"].to_numpy(dtype=int)] / tile_size_m).astype(np.int64),
+            "TileY": np.floor(grid["y_values"][candidates["IY"].to_numpy(dtype=int)] / tile_size_m).astype(np.int64),
+        }
+    )
+    candidate_tile_counts = candidate_tiles.groupby(["LayerGroup", "TileX", "TileY"]).size()
+    active_candidate_tiles = set(candidate_tile_counts[candidate_tile_counts >= min_candidate_voxels_per_tile].index.tolist())
+    selected_tiles = set(
+        zip(
+            selected["LayerGroup"].astype(str),
+            np.floor(grid["x_values"][selected["IX"].to_numpy(dtype=int)] / tile_size_m).astype(np.int64),
+            np.floor(grid["y_values"][selected["IY"].to_numpy(dtype=int)] / tile_size_m).astype(np.int64),
+        )
+    )
+    covered_candidate_tiles = active_candidate_tiles & selected_tiles
+    spatial_tile_coverage_fraction = float(len(covered_candidate_tiles) / max(len(active_candidate_tiles), 1))
+    requested_selection_mode = str(config.get("component_selection_mode", "hybrid_anttrack_spatial")).strip().lower()
+    recorded_selection_modes = sorted({str(item.get("SelectionMode", "")) for item in bands})
     checks = {
         "has_patches": len(patch_df) > 0,
         "all_medium_scale": bool(patch_df["FractureScale"].astype(str).eq("medium").all()),
@@ -801,11 +907,22 @@ def build_summary(config_path: Path, config: dict[str, Any], paths: dict[str, Pa
         "covers_upstream_components": bool(upstream_component_count == 0 or upstream_component_coverage >= float(config.get("min_upstream_component_coverage_fraction", 0.65))),
         "covers_spatial_quadrants": bool(len(quadrant_counts) >= int(config.get("min_quadrants_covered", 3))),
         "centers_respect_minimum_spacing": bool(nearest.size == 0 or float(np.quantile(nearest, 0.05)) >= 0.5 * float(config.get("min_patch_center_separation_m", 25.0))),
+        "component_selection_mode_applied": recorded_selection_modes == [requested_selection_mode],
+        "covers_candidate_spatial_tiles": bool(
+            not active_candidate_tiles
+            or spatial_tile_coverage_fraction >= float(config.get("min_spatial_tile_coverage_fraction", 0.60))
+        ),
     }
     return {
         "status": "pass" if all(checks.values()) else "fail",
         "config_path": str(config_path),
-        "generation_logic": "step7b_anttrack_ridge_nms_with_local_geometry_pca_v5",
+        "generation_logic": "step7b_hybrid_anttrack_ridge_and_spatial_coverage_with_local_geometry_pca_v6",
+        "component_selection": {
+            "requested_mode": requested_selection_mode,
+            "recorded_modes": recorded_selection_modes,
+            "anttrack_primary_fraction": float(config.get("anttrack_primary_fraction", 0.60)),
+            "spatial_candidate_multiplier": int(config.get("spatial_candidate_multiplier", 4)),
+        },
         "inputs": {
             "medium_prior_sgy": str(Path(config["medium_prior_sgy"]).resolve()),
             "medium_mask_sgy": str(Path(config["medium_mask_sgy"]).resolve()) if config.get("medium_mask_sgy") else "",
@@ -825,6 +942,14 @@ def build_summary(config_path: Path, config: dict[str, Any], paths: dict[str, Pa
         "upstream_selected_component_count": int(len(upstream_component_ids & selected_component_ids)),
         "upstream_component_coverage_fraction": upstream_component_coverage,
         "quadrant_counts": quadrant_counts,
+        "spatial_tile_coverage": {
+            "tile_size_m": tile_size_m,
+            "min_candidate_voxels_per_tile": min_candidate_voxels_per_tile,
+            "active_candidate_tile_count": int(len(active_candidate_tiles)),
+            "selected_tile_count": int(len(selected_tiles)),
+            "covered_candidate_tile_count": int(len(covered_candidate_tiles)),
+            "coverage_fraction": spatial_tile_coverage_fraction,
+        },
         "layer_counts": layer_counts,
         "candidate_branch_counts": branch_counts,
         "nearest_center_distance": legacy.finite_stats(nearest),
@@ -895,6 +1020,7 @@ def main() -> int:
         "LowDipRejected",
         "LowDipPolicy",
         "CandidateBranch",
+        "SelectionSource",
         "AntTrackScore",
         "MediumScore",
         "AntTrackSeedFraction",
@@ -902,7 +1028,7 @@ def main() -> int:
     ]:
         if column in selected.columns:
             patch_df[column] = selected[column].to_numpy()
-    patch_df["GenerationStage"] = "step7b_medium_anttrack_ridge_local_pca_v5"
+    patch_df["GenerationStage"] = "step7b_medium_hybrid_anttrack_spatial_local_pca_v6"
     patch_df["FractureScale"] = "medium"
     patch_df["FractureScaleCode"] = 2
     patch_df["SourceType"] = "medium_anttrack_fracture_corridor"
@@ -910,7 +1036,7 @@ def main() -> int:
     patch_df.loc[:, "OrientationSource"] = "local_anttrack_ridge_geometry_pca"
     patch_df["Confidence"] = np.clip(pd.to_numeric(patch_df["SamplingWeight"], errors="coerce").fillna(0.0), 0.0, 1.0)
     audit_df = legacy.build_audit(patch_df)
-    audit_df["ActionReason"] = "medium_scale_patch_centered_on_step6b_anttrack_ridge"
+    audit_df["ActionReason"] = "medium_scale_patch_centered_on_step6b_anttrack_ridge_or_spatial_coverage"
 
     patch_df.to_csv(paths["dfn_csv"], index=False, encoding="utf-8-sig")
     audit_df.to_csv(paths["audit_csv"], index=False, encoding="utf-8-sig")
@@ -920,7 +1046,7 @@ def main() -> int:
     if bool(config.get("write_intermediate_vtk", False)):
         legacy.write_legacy_vtk(paths["raw_vtk"], patch_df, "step7b_medium_dfn_raw_time", display=False, display_z_scale=float(config.get("display_z_scale", 5.0)), geometry_time_scale_m_per_ms=geometry_time_scale)
         write_candidate_components_vtk(paths["candidate_components_vtk"], bands, candidates, grid, "medium_candidate_components_raw_time")
-    summary = build_summary(config_path, config, paths, candidates, selected, patch_df, bands)
+    summary = build_summary(config_path, config, paths, candidates, selected, patch_df, bands, grid)
     paths["summary_json"].write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
     print(f"[step7b-medium-v4] CSV: {paths['dfn_csv']}", flush=True)
     print(f"[step7b-medium-v4] VTK: {paths['raw_vtk']}", flush=True)

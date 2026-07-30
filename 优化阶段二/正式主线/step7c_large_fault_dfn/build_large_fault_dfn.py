@@ -12,30 +12,30 @@ import numpy as np
 import pandas as pd
 import pyvista as pv
 from scipy import ndimage
+from scipy.spatial import cKDTree
 
 
 CURRENT_DIR = Path(__file__).resolve().parent
 FORMAL_ROOT = CURRENT_DIR.parent
 REPO_ROOT = CURRENT_DIR.parents[2]
 LEGACY_STEP7B_DIR = CURRENT_DIR.parent / "step7b_initial_dfn_3d"
-OLD_FAULT_POSTFUSION_DIR = REPO_ROOT / "研究内容三/优化阶段一/单元DFN融合/区域断层后融合"
 DEFAULT_CONFIG = CURRENT_DIR / "configs/formal_candidate_cheye1_step7c_large_v1.json"
 if str(FORMAL_ROOT) not in sys.path:
     sys.path.insert(0, str(FORMAL_ROOT))
 if str(LEGACY_STEP7B_DIR) not in sys.path:
     sys.path.insert(0, str(LEGACY_STEP7B_DIR))
-if str(OLD_FAULT_POSTFUSION_DIR) not in sys.path:
-    sys.path.insert(0, str(OLD_FAULT_POSTFUSION_DIR))
-
 import build_initial_dfn_from_3d_density_sgy as legacy  # noqa: E402
-from build_fault_surface_fragments_from_raw_patches import run_build_fault_surface_fragments  # noqa: E402
-from build_regional_fault_panels import run_build_regional_fault_panels  # noqa: E402
 from common.horizon_trace_table.horizon_contract import (  # noqa: E402
     HorizonSpatialLookup,
     build_spatial_lookup,
     load_contract_for_mapping,
     surface_grids_from_contract,
     validate_window_contract,
+)
+from common.unified_dfn_vtk import (  # noqa: E402
+    geometry_fingerprint,
+    unified_vtk_summary,
+    write_unified_dfn_vtk,
 )
 
 
@@ -110,14 +110,13 @@ def read_csv_flexible(path: Path) -> pd.DataFrame:
 def output_paths(output_dir: Path) -> dict[str, Path]:
     return {
         "original_surface_vtk": output_dir / "original_fault_units_demo_raw_time.vtk",
-        "original_surface_vtp": output_dir / "original_fault_units_demo_raw_time.vtp",
         "original_manifest_csv": output_dir / "original_fault_unit_manifest.csv",
         "lowcoh_csv": output_dir / "large_inferred_fault_surface_patches.csv",
         "lowcoh_vtk": output_dir / "large_inferred_fault_surfaces_raw_time.vtk",
-        "lowcoh_vtp": output_dir / "large_inferred_fault_surfaces_raw_time.vtp",
+        "duplicate_csv": output_dir / "large_inferred_known_fault_duplicates.csv",
+        "duplicate_vtk": output_dir / "large_inferred_known_fault_duplicates_raw_time.vtk",
         "dfn_csv": output_dir / "large_fault_dfn_patches.csv",
         "raw_vtk": output_dir / "large_fault_dfn_raw_time.vtk",
-        "combined_vtm": output_dir / "large_fault_result_raw_time.vtm",
         "audit_csv": output_dir / "large_generation_audit.csv",
         "summary_json": output_dir / "large_fault_dfn_summary.json",
     }
@@ -129,18 +128,6 @@ def file_sha256(path: Path) -> str:
         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
-
-
-def write_multiblock_vtm(path: Path, original_surface: Path, inferred_surface: Path) -> None:
-    content = f'''<?xml version="1.0"?>
-<VTKFile type="vtkMultiBlockDataSet" version="1.0" byte_order="LittleEndian">
-  <vtkMultiBlockDataSet>
-    <DataSet index="0" name="original_fault_surfaces_complete_demo" file="{original_surface.name}"/>
-    <DataSet index="1" name="seismic_inferred_local_fault_panels" file="{inferred_surface.name}"/>
-  </vtkMultiBlockDataSet>
-</VTKFile>
-'''
-    path.write_text(content, encoding="utf-8")
 
 
 def vertex_columns() -> list[str]:
@@ -165,6 +152,136 @@ def add_vertex_columns(row: dict[str, Any], vertices: np.ndarray) -> dict[str, A
         row[f"V{idx}Y"] = float(verts[idx - 1, 1])
         row[f"V{idx}Z"] = float(verts[idx - 1, 2])
     return row
+
+
+def normalized_panel_normal(vertices: np.ndarray, time_scale_m_per_ms: float) -> np.ndarray | None:
+    scaled = np.asarray(vertices, dtype=float).copy()
+    scaled[:, 2] *= float(time_scale_m_per_ms)
+    normal = np.cross(scaled[1] - scaled[0], scaled[3] - scaled[0])
+    norm = float(np.linalg.norm(normal))
+    if norm <= 1.0e-9:
+        return None
+    return normal / norm
+
+
+def classify_inferred_panels_against_original(
+    frame: pd.DataFrame,
+    original_surface: Path,
+    component_npz: Path,
+    config: dict[str, Any],
+) -> tuple[pd.DataFrame, dict[str, Any]]:
+    if frame.empty:
+        return frame.copy(), {"input_count": 0, "formal_count": 0, "duplicate_count": 0}
+    time_scale = float(config.get("original_fault_compare_time_scale_m_per_ms", 2.0))
+    center_limit = float(config.get("original_fault_duplicate_center_distance_m", 60.0))
+    vertex_limit = float(config.get("original_fault_duplicate_vertex_distance_m", 100.0))
+    min_vertex_fraction = float(config.get("original_fault_duplicate_min_vertex_fraction", 0.75))
+    max_orientation_difference = float(config.get("original_fault_duplicate_max_orientation_difference_deg", 25.0))
+    branch_context_distance = float(config.get("original_fault_branch_context_distance_m", 120.0))
+
+    npz = np.load(component_npz)
+    required = {"original_fault_mask", "x", "y", "samples"}
+    missing = sorted(required.difference(npz.files))
+    if missing:
+        raise ValueError(f"{component_npz} missing original-fault comparison arrays: {missing}")
+    original_mask = npz["original_fault_mask"].astype(bool)
+    trace_idx, time_idx = np.where(original_mask)
+    if not len(trace_idx):
+        raise RuntimeError("original fault mask is empty; cannot classify inferred fault panels")
+    original_voxel_points = np.column_stack(
+        [
+            npz["x"][trace_idx].astype(float),
+            npz["y"][trace_idx].astype(float),
+            npz["samples"][time_idx].astype(float) * time_scale,
+        ]
+    )
+    voxel_tree = cKDTree(original_voxel_points)
+
+    original_mesh = pv.read(original_surface)
+    if not isinstance(original_mesh, pv.PolyData):
+        original_mesh = original_mesh.extract_surface(algorithm="dataset_surface")
+    original_mesh = original_mesh.triangulate()
+    faces = np.asarray(original_mesh.faces, dtype=np.int64).reshape(-1, 4)[:, 1:4]
+    mesh_points = np.asarray(original_mesh.points, dtype=float).copy()
+    mesh_points[:, 2] *= time_scale
+    triangles = mesh_points[faces]
+    triangle_centers = triangles.mean(axis=1)
+    triangle_normals = np.cross(triangles[:, 1] - triangles[:, 0], triangles[:, 2] - triangles[:, 0])
+    triangle_norms = np.linalg.norm(triangle_normals, axis=1)
+    valid_triangles = triangle_norms > 1.0e-9
+    triangle_normals[valid_triangles] /= triangle_norms[valid_triangles, None]
+    triangle_tree = cKDTree(triangle_centers)
+
+    output = frame.copy().reset_index(drop=True)
+    vertices_per_panel = [vertices_from_row(row) for _, row in output.iterrows()]
+    centers = output[["CenterX", "CenterY", "CenterTime"]].to_numpy(dtype=float)
+    centers_scaled = centers.copy()
+    centers_scaled[:, 2] *= time_scale
+    center_distances = voxel_tree.query(centers_scaled, k=1, workers=-1)[0]
+    nearest_triangles = triangle_tree.query(centers_scaled, k=1, workers=-1)[1].astype(np.int64)
+
+    relations: list[str] = []
+    orientation_differences: list[float] = []
+    vertex_near_fractions: list[float] = []
+    vertex_min_distances: list[float] = []
+    for row_idx, vertices in enumerate(vertices_per_panel):
+        scaled_vertices = np.asarray(vertices, dtype=float).copy()
+        scaled_vertices[:, 2] *= time_scale
+        vertex_distances = voxel_tree.query(scaled_vertices, k=1, workers=-1)[0]
+        vertex_fraction = float(np.mean(vertex_distances <= vertex_limit))
+        vertex_min_distance = float(np.min(vertex_distances))
+        panel_normal = normalized_panel_normal(vertices, time_scale)
+        triangle_idx = int(nearest_triangles[row_idx])
+        if panel_normal is None or not valid_triangles[triangle_idx]:
+            orientation_difference = float("nan")
+        else:
+            cosine = float(np.clip(abs(np.dot(panel_normal, triangle_normals[triangle_idx])), 0.0, 1.0))
+            orientation_difference = float(np.degrees(np.arccos(cosine)))
+        duplicate = bool(
+            float(center_distances[row_idx]) <= center_limit
+            and np.isfinite(orientation_difference)
+            and orientation_difference <= max_orientation_difference
+            and vertex_fraction >= min_vertex_fraction
+        )
+        near_original = bool(
+            float(center_distances[row_idx]) <= branch_context_distance
+            or vertex_min_distance <= branch_context_distance
+        )
+        relations.append(
+            "known_fault_duplicate"
+            if duplicate
+            else "known_fault_branch_or_splay"
+            if near_original
+            else "independent_inferred_fault"
+        )
+        orientation_differences.append(orientation_difference)
+        vertex_near_fractions.append(vertex_fraction)
+        vertex_min_distances.append(vertex_min_distance)
+
+    output["OriginalFaultRelation"] = relations
+    output["OriginalFaultCenterDistanceM"] = center_distances.astype(float)
+    output["OriginalFaultVertexMinDistanceM"] = vertex_min_distances
+    output["OriginalFaultVertexNearFraction"] = vertex_near_fractions
+    output["OriginalFaultOrientationDifferenceDeg"] = orientation_differences
+    output["OriginalFaultNearestTriangleID"] = nearest_triangles.astype(int)
+    output["KeepInFormalDFN"] = output["OriginalFaultRelation"].ne("known_fault_duplicate").astype(int)
+    counts = output["OriginalFaultRelation"].value_counts(dropna=False)
+    return output, {
+        "input_count": int(len(output)),
+        "formal_count": int(output["KeepInFormalDFN"].sum()),
+        "duplicate_count": int(output["OriginalFaultRelation"].eq("known_fault_duplicate").sum()),
+        "relation_counts": {str(key): int(value) for key, value in counts.items()},
+        "parameters": {
+            "time_scale_m_per_ms": time_scale,
+            "duplicate_center_distance_m": center_limit,
+            "duplicate_vertex_distance_m": vertex_limit,
+            "duplicate_min_vertex_fraction": min_vertex_fraction,
+            "duplicate_max_orientation_difference_deg": max_orientation_difference,
+            "branch_context_distance_m": branch_context_distance,
+        },
+        "center_distance_m": finite_stats(output["OriginalFaultCenterDistanceM"]),
+        "orientation_difference_deg": finite_stats(output["OriginalFaultOrientationDifferenceDeg"]),
+    }
 
 
 def filter_target_block_centers(frame: pd.DataFrame, config: dict[str, Any]) -> tuple[pd.DataFrame, dict[str, int]]:
@@ -1293,8 +1410,13 @@ def main() -> int:
         output_dir / "large_original_fault_panel_patches.csv",
         output_dir / "large_fault_damage_zone_patches.csv",
         output_dir / "large_fault_damage_zone_raw_time.vtk",
+        output_dir / "large_original_fault_merged_surface_raw_time.vtk",
+        output_dir / "original_fault_units_demo_raw_time.vtp",
+        output_dir / "large_inferred_fault_surfaces_raw_time.vtp",
+        output_dir / "large_fault_result_raw_time.vtm",
     ]:
         legacy_path.unlink(missing_ok=True)
+    shutil.rmtree(output_dir / "surface_panel_workspace", ignore_errors=True)
 
     source_surface_value = config.get("original_fault_surface_vtk", config.get("original_fault_merged_surface_vtk"))
     if not source_surface_value:
@@ -1315,7 +1437,8 @@ def main() -> int:
     original_mesh = pv.read(paths["original_surface_vtk"])
     if not isinstance(original_mesh, pv.PolyData):
         original_mesh = original_mesh.extract_surface(algorithm="dataset_surface")
-    original_mesh.triangulate().save(paths["original_surface_vtp"])
+    original_mesh = original_mesh.triangulate()
+    original_geometry_fingerprint = geometry_fingerprint(original_mesh)
     manifest_df = read_csv_flexible(paths["original_manifest_csv"])
 
     lowcoh_patches = build_inferred_surface_panels(config)
@@ -1329,18 +1452,38 @@ def main() -> int:
         ).dropna().astype(int)
     )
     lowcoh_patches, lowcoh_horizon_qc = enforce_center_horizon_contract(lowcoh_patches, horizon_lookup)
+    classified_patches, inferred_classification = classify_inferred_panels_against_original(
+        lowcoh_patches,
+        paths["original_surface_vtk"],
+        Path(config["large_prior_components_npz"]).resolve(),
+        config,
+    )
+    duplicate_patches = classified_patches[
+        classified_patches["OriginalFaultRelation"].eq("known_fault_duplicate")
+    ].copy().reset_index(drop=True)
+    lowcoh_patches = classified_patches[
+        classified_patches["KeepInFormalDFN"].eq(1)
+    ].copy().reset_index(drop=True)
+    duplicate_patches.to_csv(paths["duplicate_csv"], index=False, encoding="utf-8-sig")
+    write_patch_vtk(
+        paths["duplicate_vtk"],
+        duplicate_patches,
+        "step7c_known_original_fault_duplicate_panels_raw_time",
+    )
+    classified_inferred_ids = set(
+        pd.to_numeric(classified_patches.get("ComponentID", pd.Series(dtype=float)), errors="coerce").dropna().astype(int)
+    )
     step7c_inferred_ids = set(
         pd.to_numeric(lowcoh_patches.get("ComponentID", pd.Series(dtype=float)), errors="coerce").dropna().astype(int)
     )
-    inferred_component_coverage_fraction = float(
+    classified_component_coverage_fraction = float(
+        len(upstream_inferred_ids & classified_inferred_ids) / max(len(upstream_inferred_ids), 1)
+    )
+    formal_component_retention_fraction = float(
         len(upstream_inferred_ids & step7c_inferred_ids) / max(len(upstream_inferred_ids), 1)
     )
     lowcoh_patches.to_csv(paths["lowcoh_csv"], index=False, encoding="utf-8-sig")
     write_patch_vtk(paths["lowcoh_vtk"], lowcoh_patches, "step7c_large_inferred_fault_surfaces_raw_time")
-    inferred_mesh = pv.read(paths["lowcoh_vtk"])
-    if not isinstance(inferred_mesh, pv.PolyData):
-        inferred_mesh = inferred_mesh.extract_surface(algorithm="dataset_surface")
-    inferred_mesh.triangulate().save(paths["lowcoh_vtp"])
     patch_df = lowcoh_patches.copy()
     patch_df.to_csv(paths["dfn_csv"], index=False, encoding="utf-8-sig")
     audit_cols = [
@@ -1362,10 +1505,19 @@ def main() -> int:
         "BandContinuityMode",
         "ComponentID",
         "ComponentPanelCount",
+        "OriginalFaultRelation",
+        "OriginalFaultCenterDistanceM",
+        "OriginalFaultVertexMinDistanceM",
+        "OriginalFaultVertexNearFraction",
+        "OriginalFaultOrientationDifferenceDeg",
     ]
     patch_df[[col for col in audit_cols if col in patch_df.columns]].to_csv(paths["audit_csv"], index=False, encoding="utf-8-sig")
-    write_patch_vtk(paths["raw_vtk"], patch_df, "step7c_large_fault_dfn_raw_time")
-    write_multiblock_vtm(paths["combined_vtm"], paths["original_surface_vtp"], paths["lowcoh_vtp"])
+    unified_write = write_unified_dfn_vtk(
+        paths["raw_vtk"],
+        paths["lowcoh_vtk"],
+        paths["original_surface_vtk"],
+    )
+    unified_summary = unified_vtk_summary(paths["raw_vtk"])
     summary = {
         "status": "pass",
         "config_path": str(config_path),
@@ -1386,8 +1538,12 @@ def main() -> int:
         "original_fault_source_sha256": source_surface_hash,
         "original_fault_copied_sha256": copied_surface_hash,
         "formal_original_fault_patch_count": 0,
+        "formal_original_fault_triangle_count": int(unified_summary["original_fault_cell_count"]),
         "inferred_fault_surface_patch_count": int(len(lowcoh_patches)),
+        "inferred_known_fault_duplicate_patch_count": int(len(duplicate_patches)),
+        "inferred_original_fault_classification": inferred_classification,
         "patch_count": int(len(patch_df)),
+        "unified_vtk": {**unified_write, **unified_summary},
         "damage_zone_included_in_formal_dfn": False,
         "horizon_contract_qc": {
             "original_fault_surface": "not_applied_by_contract",
@@ -1405,8 +1561,10 @@ def main() -> int:
             "component_count": int(lowcoh_patches["ComponentID"].nunique()) if "ComponentID" in lowcoh_patches.columns and len(lowcoh_patches) else 0,
             "panel_count": int(len(lowcoh_patches)),
             "upstream_component_count": int(len(upstream_inferred_ids)),
-            "covered_upstream_component_count": int(len(upstream_inferred_ids & step7c_inferred_ids)),
-            "upstream_component_coverage_fraction": inferred_component_coverage_fraction,
+            "classified_upstream_component_count": int(len(upstream_inferred_ids & classified_inferred_ids)),
+            "classified_upstream_component_coverage_fraction": classified_component_coverage_fraction,
+            "formal_retained_upstream_component_count": int(len(upstream_inferred_ids & step7c_inferred_ids)),
+            "formal_component_retention_fraction": formal_component_retention_fraction,
             "candidate_branch_counts": (
                 {str(k): int(v) for k, v in lowcoh_patches["CandidateBranch"].value_counts(dropna=False).items()}
                 if "CandidateBranch" in lowcoh_patches.columns
@@ -1422,18 +1580,33 @@ def main() -> int:
         "checks": {
             "has_large_patches": len(patch_df) > 0,
             "original_surface_vtk_exists": paths["original_surface_vtk"].exists(),
-            "original_surface_vtp_exists": paths["original_surface_vtp"].exists(),
             "original_manifest_csv_exists": paths["original_manifest_csv"].exists(),
             "original_surface_transport_hash_preserved": source_surface_hash == copied_surface_hash,
             "original_faults_excluded_from_patch_csv": not patch_df["SourceType"].astype(str).str.contains("original_fault").any(),
             "lowcoh_vtk_exists": paths["lowcoh_vtk"].exists(),
-            "lowcoh_vtp_exists": paths["lowcoh_vtp"].exists(),
+            "duplicate_classification_accounting_closed": bool(
+                int(inferred_classification["input_count"])
+                == int(inferred_classification["formal_count"]) + int(inferred_classification["duplicate_count"])
+            ),
+            "known_fault_duplicates_excluded_from_formal_csv": bool(
+                not patch_df.get("OriginalFaultRelation", pd.Series(dtype=str)).eq("known_fault_duplicate").any()
+            ),
             "raw_vtk_exists": paths["raw_vtk"].exists(),
             "csv_exists": paths["dfn_csv"].exists(),
-            "combined_vtm_exists": paths["combined_vtm"].exists(),
+            "unified_vtk_has_predicted_and_original_groups": bool(
+                int(unified_summary["predicted_cell_count"]) == len(patch_df)
+                and int(unified_summary["original_fault_cell_count"]) > 0
+            ),
+            "unified_vtk_preserves_original_fault_geometry": bool(
+                unified_summary["original_fault_geometry_fingerprint"] == original_geometry_fingerprint
+            ),
+            "original_fault_render_area_uses_predicted_median": bool(
+                unified_write["original_fault_render_area_policy"]
+                == "predicted_patch_area_median_not_physical_triangle_area"
+            ),
             "formal_dfn_excludes_damage_zone": True,
             "covers_all_step6c_inferred_components": bool(
-                not upstream_inferred_ids or inferred_component_coverage_fraction >= 1.0
+                not upstream_inferred_ids or classified_component_coverage_fraction >= 1.0
             ),
         },
     }
@@ -1441,7 +1614,7 @@ def main() -> int:
     paths["summary_json"].write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
     print(f"[step7c-large] CSV: {paths['dfn_csv']}", flush=True)
     print(f"[step7c-large] original surface: {paths['original_surface_vtk']}", flush=True)
-    print(f"[step7c-large] inferred VTK: {paths['raw_vtk']}", flush=True)
+    print(f"[step7c-large] unified VTK: {paths['raw_vtk']}", flush=True)
     print(f"[step7c-large] status={summary['status']} patch_count={len(patch_df)}", flush=True)
     return 0 if summary["status"] == "pass" else 1
 

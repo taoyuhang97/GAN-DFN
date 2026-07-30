@@ -2,17 +2,29 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 import pandas as pd
+import pyvista as pv
 from scipy.spatial import cKDTree
 
 
 CURRENT_DIR = Path(__file__).resolve().parent
+FORMAL_ROOT = CURRENT_DIR.parent
 DEFAULT_CONFIG = CURRENT_DIR / "configs/formal_candidate_cheye1_step7d_fused_v1.json"
 CSV_ENCODINGS = ("utf-8-sig", "utf-8", "gb18030", "gbk")
+if str(FORMAL_ROOT) not in sys.path:
+    sys.path.insert(0, str(FORMAL_ROOT))
+from common.unified_dfn_vtk import (  # noqa: E402
+    ORIGINAL_FAULT_GEOMETRY_GROUP_CODE,
+    extract_geometry_group,
+    geometry_fingerprint,
+    unified_vtk_summary,
+    write_unified_dfn_vtk,
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -97,6 +109,7 @@ def annotate_small_near_major(
     small: pd.DataFrame,
     major: pd.DataFrame,
     config: dict[str, Any],
+    original_fault_centers: np.ndarray | None = None,
 ) -> tuple[pd.DataFrame, dict[str, Any]]:
     out = small.copy()
     out["NearestMajorPatchID"] = ""
@@ -104,7 +117,12 @@ def annotate_small_near_major(
     out["NearestMajorDistanceM"] = np.nan
     out["StructuralRelation"] = "small_background"
     out["MajorInfluenceRadiusM"] = float(config.get("small_downsample_near_major_radius_m", 80.0))
-    if small.empty or major.empty:
+    original_xy = (
+        np.asarray(original_fault_centers, dtype=float)[:, :2]
+        if original_fault_centers is not None and len(original_fault_centers)
+        else np.empty((0, 2), dtype=float)
+    )
+    if small.empty or (major.empty and not len(original_xy)):
         return out.reset_index(drop=True), {
             "reason": "empty_small_or_major",
             "input_small_count": int(len(small)),
@@ -116,12 +134,22 @@ def annotate_small_near_major(
 
     radius = float(config.get("small_downsample_near_major_radius_m", 80.0))
     major_xy = major[["CenterX", "CenterY"]].to_numpy(dtype=float)
-    tree = cKDTree(major_xy)
+    reference_xy = np.vstack([major_xy, original_xy])
+    tree = cKDTree(reference_xy)
     small_xy = small[["CenterX", "CenterY"]].to_numpy(dtype=float)
     dist, idx = tree.query(small_xy, k=1)
-    nearest = major.iloc[idx].reset_index(drop=True)
-    out["NearestMajorPatchID"] = nearest["PatchID"].astype(str).to_numpy()
-    out["NearestMajorScale"] = nearest["FractureScale"].astype(str).to_numpy()
+    nearest_ids: list[str] = []
+    nearest_scales: list[str] = []
+    for reference_index in idx.astype(int):
+        if reference_index < len(major):
+            nearest_row = major.iloc[reference_index]
+            nearest_ids.append(str(nearest_row["PatchID"]))
+            nearest_scales.append(str(nearest_row["FractureScale"]))
+        else:
+            nearest_ids.append(f"original_fault_triangle_{reference_index - len(major) + 1:06d}")
+            nearest_scales.append("original_fault")
+    out["NearestMajorPatchID"] = nearest_ids
+    out["NearestMajorScale"] = nearest_scales
     out["NearestMajorDistanceM"] = dist.astype(float)
     near = dist <= radius
     out.loc[near, "StructuralRelation"] = "small_derivative_near_major"
@@ -133,6 +161,11 @@ def annotate_small_near_major(
         "input_small_count": int(len(small)),
         "output_small_count": int(len(out)),
         "major_scale_counts": {str(k): int(v) for k, v in major["FractureScale"].value_counts(dropna=False).items()},
+        "original_fault_reference_triangle_count": int(len(original_xy)),
+        "nearest_original_fault_count": int(np.sum(np.asarray(nearest_scales, dtype=object) == "original_fault")),
+        "near_original_fault_count": int(
+            np.sum(near & (np.asarray(nearest_scales, dtype=object) == "original_fault"))
+        ),
     }
 
 
@@ -213,13 +246,27 @@ def main() -> int:
     output_dir = Path(config["output_dir"]).resolve()
     ensure_dir(output_dir)
     paths = output_paths(output_dir)
-    rng = np.random.default_rng(int(config.get("random_seed", 20260715)))
-
     small = normalize_input(read_csv_flexible(Path(config["small_dfn_csv"]).resolve()), "small", Path(config["small_dfn_csv"]).resolve())
     medium = normalize_input(read_csv_flexible(Path(config["medium_dfn_csv"]).resolve()), "medium", Path(config["medium_dfn_csv"]).resolve())
     large = normalize_input(read_csv_flexible(Path(config["large_dfn_csv"]).resolve()), "large", Path(config["large_dfn_csv"]).resolve())
+    large_dfn_vtk = Path(str(config["large_dfn_vtk"])).resolve()
+    if not large_dfn_vtk.exists():
+        raise FileNotFoundError(f"Step7C unified VTK not found: {large_dfn_vtk}")
+    original_fault_mesh = extract_geometry_group(
+        large_dfn_vtk,
+        ORIGINAL_FAULT_GEOMETRY_GROUP_CODE,
+    ).triangulate()
+    if original_fault_mesh.n_cells <= 0:
+        raise RuntimeError("Step7C unified VTK contains no original-fault triangles")
+    original_fault_centers = np.asarray(original_fault_mesh.cell_centers().points, dtype=float)
+    original_fault_fingerprint = geometry_fingerprint(original_fault_mesh)
     major = pd.concat([medium, large], ignore_index=True)
-    small_annotated, small_relation_summary = annotate_small_near_major(small, major, config)
+    small_annotated, small_relation_summary = annotate_small_near_major(
+        small,
+        major,
+        config,
+        original_fault_centers=original_fault_centers,
+    )
     fused = pd.concat([large, medium, small_annotated], ignore_index=True)
     fused["PatchID"] = [f"fused_multiscale_{idx + 1:06d}" for idx in range(len(fused))]
     fused = add_render_columns(fused)
@@ -232,7 +279,14 @@ def main() -> int:
     audit.to_csv(paths["audit_csv"], index=False, encoding="utf-8-sig")
     write_vtk_enabled = bool(config.get("write_vtk", True))
     if write_vtk_enabled:
-        write_vtk(paths["raw_vtk"], fused, "step7d_fused_multiscale_dfn_raw_time")
+        predicted_vtk = output_dir / ".fused_multiscale_predicted_only_raw_time.vtk"
+        write_vtk(predicted_vtk, fused, "step7d_fused_multiscale_predicted_only_raw_time")
+        unified_write = write_unified_dfn_vtk(paths["raw_vtk"], predicted_vtk, large_dfn_vtk)
+        predicted_vtk.unlink(missing_ok=True)
+        unified_summary = unified_vtk_summary(paths["raw_vtk"])
+    else:
+        unified_write = {}
+        unified_summary = {}
     summary = {
         "status": "pass",
         "config_path": str(config_path),
@@ -241,13 +295,14 @@ def main() -> int:
             "small_dfn_csv": str(Path(config["small_dfn_csv"]).resolve()),
             "medium_dfn_csv": str(Path(config["medium_dfn_csv"]).resolve()),
             "large_dfn_csv": str(Path(config["large_dfn_csv"]).resolve()),
-            "original_fault_surface_vtk": str(Path(str(config["original_fault_surface_vtk"])).resolve()) if config.get("original_fault_surface_vtk") else "",
+            "large_dfn_vtk": str(large_dfn_vtk),
             "original_fault_manifest_csv": str(Path(str(config["original_fault_manifest_csv"])).resolve()) if config.get("original_fault_manifest_csv") else "",
         },
         "outputs": {key: str(value) for key, value in paths.items()},
         "input_counts": {"small": int(len(small)), "medium": int(len(medium)), "large": int(len(large))},
         "small_relation_summary": small_relation_summary,
         "patch_count": int(len(fused)),
+        "unified_vtk": {**unified_write, **unified_summary},
         "scale_counts": {str(k): int(v) for k, v in fused["FractureScale"].value_counts(dropna=False).items()},
         "source_type_counts": {str(k): int(v) for k, v in fused["SourceType"].value_counts(dropna=False).items()},
         "structural_relation_counts": {str(k): int(v) for k, v in fused["StructuralRelation"].value_counts(dropna=False).items()} if "StructuralRelation" in fused.columns else {},
@@ -263,7 +318,22 @@ def main() -> int:
             "csv_exists": paths["dfn_csv"].exists(),
             "raw_vtk_exists": bool(not write_vtk_enabled or paths["raw_vtk"].exists()),
             "audit_exists": paths["audit_csv"].exists(),
-            "original_fault_surface_passthrough_exists": bool(config.get("original_fault_surface_vtk") and Path(str(config["original_fault_surface_vtk"])).resolve().exists()),
+            "unified_vtk_has_predicted_and_original_groups": bool(
+                not write_vtk_enabled
+                or (
+                    int(unified_summary.get("predicted_cell_count", -1)) == len(fused)
+                    and int(unified_summary.get("original_fault_cell_count", 0)) > 0
+                )
+            ),
+            "original_fault_geometry_preserved": bool(
+                not write_vtk_enabled
+                or unified_summary.get("original_fault_geometry_fingerprint") == original_fault_fingerprint
+            ),
+            "original_fault_render_area_uses_predicted_median": bool(
+                not write_vtk_enabled
+                or unified_write.get("original_fault_render_area_policy")
+                == "predicted_patch_area_median_not_physical_triangle_area"
+            ),
             "original_fault_manifest_passthrough_exists": bool(config.get("original_fault_manifest_csv") and Path(str(config["original_fault_manifest_csv"])).resolve().exists()),
         },
     }

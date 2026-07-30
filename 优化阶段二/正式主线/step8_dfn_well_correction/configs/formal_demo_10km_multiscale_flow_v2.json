@@ -65,8 +65,13 @@
     "azimuth_jitter_deg": 10.0,
     "dip_jitter_deg": 6.0
   },
-  "original_fault_surface_vtk": "/home/tyh/projects/petroleum/code/GAN-DFN/优化阶段二/正式主线/step7c_large_fault_dfn/output/formal_demo_10km_multiscale_flow_v2/original_fault_units_demo_raw_time.vtk",
+  "initial_dfn_vtk": "/home/tyh/projects/petroleum/code/GAN-DFN/优化阶段二/正式主线/step7d_multiscale_fused_dfn/output/formal_demo_10km_multiscale_flow_v2/fused_multiscale_dfn_raw_time.vtk",
   "original_fault_manifest_csv": "/home/tyh/projects/petroleum/code/GAN-DFN/优化阶段二/正式主线/step7c_large_fault_dfn/output/formal_demo_10km_multiscale_flow_v2/original_fault_unit_manifest.csv",
+  "enable_imaging_well_region_correction": true,
+  "imaging_well_region_xy_radius_m": 150.0,
+  "imaging_well_region_time_radius_ms": 40.0,
+  "imaging_well_region_density_blend": 0.65,
+  "imaging_well_region_min_influence": 0.05,
   "horizon_contract_table": "/home/tyh/projects/petroleum/code/GAN-DFN/优化阶段二/正式主线/common/horizon_trace_table/output/formal_horizon_trace_table_v2/horizon_trace_table.npy",
   "horizon_trace_table_path": "/home/tyh/projects/petroleum/code/GAN-DFN/优化阶段二/正式主线/common/horizon_trace_table/output/formal_horizon_trace_table_v2/horizon_trace_table.npy",
   "horizon_window_contracts": {

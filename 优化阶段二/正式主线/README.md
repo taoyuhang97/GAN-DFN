@@ -140,11 +140,11 @@ step7a_small_scale_dfn/output/candidate_cheye1_final_lowcoh_vertical_v1/
 
 当前口径：
 
-- `large_original_fault_merged_surface_raw_time.vtk` 保存 Step6C 选中单元断层直接拼接后的曲面，仅用于原始地质解释对比。
-- `large_fault_surface_raw_time.vtk` 与 `large_fault_surface_patches.csv` 保存逐道 T4-T7 内的原始断层 surface fragments，作为最终 DFN 中的原始断层硬约束。
-- `large_inferred_fault_surfaces_raw_time.vtk` 保存 Step6C 相干体主导、自主识别的补充小断层，不替代原始断层解释。
-- `large_fault_damage_zone_raw_time.vtk` 仅为损伤带诊断结果，不进入 Step7D；损伤带衍生小裂缝由 Step6D/Step7A 表达。
-- Step7D 正式读取 `large_fault_dfn_patches.csv`，其中只包含原始断层 fragments 和自主识别断层。
+- `original_fault_units_demo_raw_time.vtk` 保存demo XY范围内原始断层单元的完整拼接三角面，是最终DFN正式组成部分，不是对比附件。
+- 原始断层不进入patch CSV，不按T4-T7裁切，也不转换为矩形panel；Step7C、Step7D和Step8均在统一正式VTK中携带该几何。
+- `large_inferred_fault_surfaces_raw_time.vtk` 保存Step6C相干体主导的自主识别断层；与已知断层重合的重复识别必须排除，分支断层和独立新增断层保留。
+- `large_fault_dfn_raw_time.vtk` 是Step7C正式大尺度DFN，通过单元标记包含原始断层和去重后的自主识别断层；原始断层`PatchAreaM2`使用预测面片面积中位数作为渲染兼容值。
+- Step7D读取去重后的`large_fault_dfn_patches.csv`参与patch融合，并从Step7C统一VTK读取原始断层三角面参与结构邻近关系，输出完整多尺度统一VTK。
 
 ### Step7D 大中小尺度融合
 
@@ -164,6 +164,8 @@ step7a_small_scale_dfn/output/candidate_cheye1_final_lowcoh_vertical_v1/
 - Step7B：`candidate_cheye1_step7b_medium_lowcoh_vertical_v1`
 - Step7C：`candidate_cheye1_step7c_large_faultlike_surface_v1`
 
+正式输出必须在一个VTK中包含原始断层和融合预测裂缝片两个单元组；原始断层几何与Step7C保持一致。
+
 ## Step7B 初始三维工具说明
 
 目录：`step7b_initial_dfn_3d`
@@ -181,7 +183,8 @@ step7a_small_scale_dfn/output/candidate_cheye1_final_lowcoh_vertical_v1/
 - Step3 成像测井真值保留真实方向。
 - Step4 常规测井密集点按 `gap=6 ms`、`max_span=18 ms` 聚合为事件。
 - 所有井控裂缝限制为 small，不改变中大尺度构造主体。
-- 当前输出 8,537 个裂缝片，其中 159 个井控片全部为 small；相对 Step7D 的 changed/added 比例约 1.89%。
+- 原始断层不参与井点移动或层位裁切，但作为最终DFN正式单元组写入Step8统一VTK。
+- 当前10 km正式输出为52,274个预测裂缝片，其中262个井控片全部为small；相对Step7D的新增或调整比例约0.50%。同一最终VTK另含13,314个原始断层三角形。
 
 ## Step9 当前检查点
 
@@ -193,7 +196,7 @@ DFN/相干体 8 图配置：
 
 - 中、大尺度裂缝只显示真实曲剖面交线。
 - small 裂缝允许限定半宽投影；井控 small 裂缝默认不参与该投影。
-- 原始断层解释已载入，但当前车页1导眼 XZ/YZ 曲剖面与原始断层没有足够交点，因此可见原始断层段数为 0；这不表示断层输入缺失。
+- Step9从Step8最终统一VTK读取井控矫正裂缝片和原始断层，不再直接回读Step7C旁路文件。
 - 地质属性、地震振幅和逐道 T4-T7 层位工具已纳入代码。逐道层位目前只完成全矿区振幅预览，其他正式图件仍需在下一阶段重跑验收。
 
 Step9 仍保留通用矿区/井剖面属性体绘图配置，用于后续生成其它剖面图。
