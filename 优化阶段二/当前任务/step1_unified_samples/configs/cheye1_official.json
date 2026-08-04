@@ -1,0 +1,12 @@
+{
+  "well_name": "车页1导眼",
+  "inputs": {
+    "around_data_csv": "/data/shared/project-oil/wx数据/砂砾岩/优化阶段一/研究内容一/井斜/测井-地震时窗_uniform_0p2ms/车页1导眼_around_data.csv",
+    "fractures_csv": "/data/shared/project-oil/wx数据/砂砾岩/优化阶段一/研究内容一/成像测井/裂缝提取/车页1导眼_fractures.csv",
+    "final_log_with_fractures_csv": "/data/shared/project-oil/wx数据/砂砾岩/优化阶段一/研究内容一/两阶段裂缝预测流程结果/现有常规测井裂缝预测/车页1导眼/final_log_with_fractures.csv",
+    "final_fracture_points_csv": "/data/shared/project-oil/wx数据/砂砾岩/优化阶段一/研究内容一/两阶段裂缝预测流程结果/现有常规测井裂缝预测/车页1导眼/final_fracture_points.csv",
+    "final_fracture_segments_csv": "/data/shared/project-oil/wx数据/砂砾岩/优化阶段一/研究内容一/两阶段裂缝预测流程结果/现有常规测井裂缝预测/车页1导眼/final_fracture_segments.csv",
+    "final_strata_segmentation_csv": "/data/shared/project-oil/wx数据/砂砾岩/优化阶段一/研究内容一/两阶段裂缝预测流程结果/现有常规测井裂缝预测/车页1导眼/final_strata_segmentation.csv"
+  },
+  "output_csv": "/home/tyh/projects/petroleum/code/GAN-DFN/优化阶段二/当前任务/step1_unified_samples/output/车页1导眼_unified_point_table.csv"
+}

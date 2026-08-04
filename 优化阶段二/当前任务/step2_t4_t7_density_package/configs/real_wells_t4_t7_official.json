@@ -1,0 +1,8 @@
+{
+  "input_dir": "/data/shared/project-oil/wx数据/砂砾岩/优化阶段二/交付物_三样结果/01_整合后的真实测井连续裂缝密度曲线和实际裂缝点位/分井连续裂缝密度曲线",
+  "layer_dir": "/data/shared/project-oil/wx数据/砂砾岩/层位",
+  "file_glob": "*.csv",
+  "min_thickness": 1.0,
+  "output_csv": "/home/tyh/projects/petroleum/code/GAN-DFN/优化阶段二/当前任务/step2_t4_t7_density_package/output/real_wells_t4_t7_density_samples.csv",
+  "summary_json": "/home/tyh/projects/petroleum/code/GAN-DFN/优化阶段二/当前任务/step2_t4_t7_density_package/output/real_wells_t4_t7_density_samples_summary.json"
+}

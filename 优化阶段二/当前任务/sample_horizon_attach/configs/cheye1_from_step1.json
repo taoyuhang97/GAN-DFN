@@ -1,0 +1,7 @@
+{
+  "input_csv": "/home/tyh/projects/petroleum/code/GAN-DFN/优化阶段二/当前任务/step1_unified_samples/output/车页1导眼_unified_point_table.csv",
+  "layer_dir": "/data/shared/project-oil/wx数据/砂砾岩/层位",
+  "output_csv": "/home/tyh/projects/petroleum/code/GAN-DFN/优化阶段二/当前任务/sample_horizon_attach/output/车页1导眼_horizon_attached.csv",
+  "summary_json": "/home/tyh/projects/petroleum/code/GAN-DFN/优化阶段二/当前任务/sample_horizon_attach/output/车页1导眼_horizon_attached_summary.json",
+  "min_thickness": 1.0
+}

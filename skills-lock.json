@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "skills": {
+    "cast-subagents": {
+      "source": "917Dhj/cast-subagents",
+      "sourceType": "github",
+      "skillPath": "SKILL.md",
+      "computedHash": "6b6da75e47a0731ac2efcb5b96b30e0d8effa4fd402008d24b246d455e2f2d78"
+    }
+  }
+}

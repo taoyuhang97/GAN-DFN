@@ -1,0 +1,18 @@
+{
+  "sample_csv": "/home/tyh/projects/petroleum/code/GAN-DFN/优化阶段二/当前任务/step2_target_block_and_density_samples/output/candidate_a_t4_t7_density_training_samples.csv",
+  "trace_xy_csv": "/home/tyh/projects/petroleum/code/GAN-DFN/数据精简/trace_header_xy.csv",
+  "output_csv": "/home/tyh/projects/petroleum/code/GAN-DFN/优化阶段二/当前任务/step3_candidate_a_density_volume/output/candidate_a_t4_t7_density_volume.csv",
+  "summary_json": "/home/tyh/projects/petroleum/code/GAN-DFN/优化阶段二/当前任务/step3_candidate_a_density_volume/output/candidate_a_t4_t7_density_volume_summary.json",
+  "target_block": {
+    "name": "candidate_a",
+    "x_min": 568567.32,
+    "x_max": 571567.32,
+    "y_min": 4199778.5,
+    "y_max": 4202778.5
+  },
+  "layer_groups": [
+    "沙三段",
+    "沙四段"
+  ],
+  "k_neighbors": 8
+}

@@ -1,0 +1,37 @@
+{
+  "records_csv": "优化阶段二/当前任务/step0_t4_t7_surface_tools/demo_data/demo_records.csv",
+  "records_encoding": "utf-8-sig",
+  "layer_dir": "优化阶段二/当前任务/step0_t4_t7_surface_tools/demo_data",
+  "selected_surface_files": {
+    "T4": {
+      "surface_name": "T4_old",
+      "surface_file": "优化阶段二/当前任务/step0_t4_t7_surface_tools/demo_data/T4_old.dat",
+      "selection_reason": "prefer_old_t4"
+    },
+    "T5": {
+      "surface_name": "T5_20240715_DM_Sm",
+      "surface_file": "优化阶段二/当前任务/step0_t4_t7_surface_tools/demo_data/T5_20240715_DM_Sm.dat",
+      "selection_reason": "prefer_updated_t5_t7"
+    },
+    "T6": {
+      "surface_name": "T6_20240715_DM_Sm",
+      "surface_file": "优化阶段二/当前任务/step0_t4_t7_surface_tools/demo_data/T6_20240715_DM_Sm.dat",
+      "selection_reason": "prefer_updated_t5_t7"
+    },
+    "T7": {
+      "surface_name": "T7_20240715_DM_Sm",
+      "surface_file": "优化阶段二/当前任务/step0_t4_t7_surface_tools/demo_data/T7_20240715_DM_Sm.dat",
+      "selection_reason": "prefer_updated_t5_t7"
+    }
+  },
+  "num_records": 3,
+  "num_valid_xy_records": 3,
+  "num_all_checks_passed": 3,
+  "num_any_check_failed": 0,
+  "min_thickness": 20.0,
+  "time_domain_counts": {
+    "out_of_target": 1,
+    "sha3_t4_t6": 1,
+    "sha4_t6_t7": 1
+  }
+}

@@ -1,0 +1,14 @@
+{
+  "sample_csv": "/home/tyh/projects/petroleum/code/GAN-DFN/优化阶段二/当前任务/step2_target_block_and_density_samples/output/candidate_a_t4_t7_density_training_samples.csv",
+  "trace_grid_csv": "/home/tyh/projects/petroleum/code/GAN-DFN/优化阶段二/当前任务/step3_candidate_a_density_volume/output/candidate_a_trace_grid_xy.csv",
+  "reference_volume_csv": "/home/tyh/projects/petroleum/code/GAN-DFN/优化阶段二/当前任务/step3_candidate_a_density_volume/output/candidate_a_t4_t7_density_volume.csv",
+  "target_attribute_csv": "/home/tyh/projects/petroleum/code/GAN-DFN/优化阶段二/当前任务/step3_candidate_a_density_volume/output/candidate_a_target_trace_attributes.csv",
+  "output_volume_csv": "/home/tyh/projects/petroleum/code/GAN-DFN/优化阶段二/当前任务/step3_candidate_a_density_volume/output/candidate_a_t4_t7_predicted_density_volume.csv",
+  "summary_json": "/home/tyh/projects/petroleum/code/GAN-DFN/优化阶段二/当前任务/step3_candidate_a_density_volume/output/candidate_a_t4_t7_predicted_density_volume_summary.json",
+  "sgy_paths": {
+    "SEIS_TRUE": "/data/shared/project-oil/wx数据/砂砾岩/psdm_final_time.sgy",
+    "COHERENCE": "/data/shared/project-oil/wx数据/砂砾岩/补充材料-20260623/车西_T4-T7/车西-相干体T4-T7.sgy",
+    "ANT_TRACK": "/data/shared/project-oil/wx数据/砂砾岩/补充材料-20260623/车西_T4-T7/车西-蚂蚁体T4-T7.sgy",
+    "FRACTURE_INV": "/data/shared/project-oil/wx数据/砂砾岩/补充材料-20260623/车西_T4-T7/裂缝反演数据T5-T7.sgy"
+  }
+}

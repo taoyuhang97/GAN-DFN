@@ -1,0 +1,63 @@
+{
+  "input_dir": "/data/shared/project-oil/wx数据/砂砾岩/优化阶段二/交付物_三样结果/01_整合后的真实测井连续裂缝密度曲线和实际裂缝点位/分井连续裂缝密度曲线",
+  "virtual_input_dir": "/data/shared/project-oil/wx数据/砂砾岩/优化阶段二/交付物_三样结果/02_整合后的虚拟测井连续裂缝密度曲线和实际裂缝点位/分源井井周外推裂缝密度体",
+  "layer_dir": "/data/shared/project-oil/wx数据/砂砾岩/层位",
+  "output_csv": "/home/tyh/projects/petroleum/code/GAN-DFN/优化阶段二/当前任务/step2_target_block_and_density_samples/output/candidate_a_t4_t7_density_training_samples.csv",
+  "summary_json": "/home/tyh/projects/petroleum/code/GAN-DFN/优化阶段二/当前任务/step2_target_block_and_density_samples/output/candidate_a_t4_t7_density_training_samples_summary.json",
+  "min_thickness": 1.0,
+  "target_block": {
+    "name": "candidate_a",
+    "x_min": 568567.32,
+    "x_max": 571567.32,
+    "y_min": 4199778.5,
+    "y_max": 4202778.5
+  },
+  "selected_wells": [
+    "车49",
+    "车57",
+    "车58",
+    "车71",
+    "车571",
+    "车571-3",
+    "车575",
+    "车斜576",
+    "车斜577"
+  ],
+  "model_input_fields": [
+    "X",
+    "Y",
+    "TIME",
+    "LayerGroup",
+    "SEIS_TRUE",
+    "COHERENCE",
+    "ANT_TRACK",
+    "CURVATURE_MAX",
+    "CURVATURE_POS"
+  ],
+  "auxiliary_fields": [
+    "SourceKind",
+    "SourceWellName",
+    "TrackWellName",
+    "WellName",
+    "TVD",
+    "DEPT",
+    "HasFracture",
+    "PredAzimuth",
+    "PredDip",
+    "PredStrataName",
+    "PredSegmentID",
+    "SEIS_SOURCE_ROLE",
+    "TIME_OFFSET_FROM_START",
+    "T4Time",
+    "T5Time",
+    "T6Time",
+    "T7Time",
+    "InTargetT4T7",
+    "SurfaceOrderValid",
+    "InputRowValid",
+    "T4_MANHATTAN_DISTANCE",
+    "T5_MANHATTAN_DISTANCE",
+    "T6_MANHATTAN_DISTANCE",
+    "T7_MANHATTAN_DISTANCE"
+  ]
+}
