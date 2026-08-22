@@ -1,0 +1,58 @@
+{
+  "step2_output_dir": "太古界/step2_well_log_segments/output/taigu_step2_regular_v3",
+  "output_dir": "output/taigu_step3_imaging_v3",
+  "wells": [
+    {
+      "well_name": "埕北310", "density_kind": "VDC01", "fracture_scope": "统计范围待核验", "supervision_status": "candidate_scope_pending", "max_density_interpolation_gap_m": 0.5,
+      "density_sources": [{"path": "/data/shared/project-oil/wx数据/埕岛太古界/埕岛-桩海地区成像测井/埕北310井xrmi成果归档/cb310-xrmi-facture.TXT", "format": "whitespace", "depth_index": 0, "value_index": 1}],
+      "point_sources": [{"path": "/data/shared/project-oil/wx数据/埕岛太古界/埕岛-桩海地区成像测井/埕北310井xrmi成果归档/cb310-conductivefrac.asc", "format": "whitespace", "depth_index": 0, "azimuth_index": 1, "dip_index": 2}]
+    },
+    {
+      "well_name": "埕北313", "density_kind": "P10_SUM_C", "fracture_scope": "ECF + CCF + DCF + Fault", "supervision_status": "supervision_ready", "max_density_interpolation_gap_m": 0.5,
+      "density_sources": [
+        {"path": "/data/shared/project-oil/wx数据/埕岛太古界/埕岛-桩海地区成像测井/埕北313井FMI_ELAN解释成果数据/FMI/CSV/埕北313井_FractureLogs裂缝参数_4174-4627m.csv", "format": "csv", "depth_column": "TDEP", "value_column": "P10_SUM_C"},
+        {"path": "/data/shared/project-oil/wx数据/埕岛太古界/埕岛-桩海地区成像测井/埕北313井FMI_ELAN解释成果数据/FMI/CSV/埕北313井_FractureLogs裂缝参数_4751-4884m.csv", "format": "csv", "depth_column": "TDEP", "value_column": "P10_SUM_C"}
+      ],
+      "point_sources": [
+        {"path": "/data/shared/project-oil/wx数据/埕岛太古界/埕岛-桩海地区成像测井/埕北313井FMI_ELAN解释成果数据/FMI/CSV/Dips蝌蚪/埕北313井_CCF连续高导缝.csv", "format": "csv", "depth_column": "TDEP", "azimuth_column": "Azimuth", "dip_column": "Dip_TRU"},
+        {"path": "/data/shared/project-oil/wx数据/埕岛太古界/埕岛-桩海地区成像测井/埕北313井FMI_ELAN解释成果数据/FMI/CSV/Dips蝌蚪/埕北313井_DCF不连续高导缝.csv", "format": "csv", "depth_column": "TDEP", "azimuth_column": "Azimuth", "dip_column": "Dip_TRU"},
+        {"path": "/data/shared/project-oil/wx数据/埕岛太古界/埕岛-桩海地区成像测井/埕北313井FMI_ELAN解释成果数据/FMI/CSV/Dips蝌蚪/埕北313井_ECF溶蚀加强缝.csv", "format": "csv", "depth_column": "TDEP", "azimuth_column": "Azimuth", "dip_column": "Dip_TRU"},
+        {"path": "/data/shared/project-oil/wx数据/埕岛太古界/埕岛-桩海地区成像测井/埕北313井FMI_ELAN解释成果数据/FMI/CSV/Dips蝌蚪/埕北313井_Fault断层.csv", "format": "csv", "depth_column": "TDEP", "azimuth_column": "Azimuth", "dip_column": "Dip_TRU"}
+      ]
+    },
+    {
+      "well_name": "埕北816", "density_kind": "FVDC", "fracture_scope": "统计范围待核验", "supervision_status": "candidate_scope_pending", "max_density_interpolation_gap_m": 0.5,
+      "density_sources": [{"path": "/data/shared/project-oil/wx数据/埕岛太古界/埕岛-桩海地区成像测井/中石化_胜利油田_埕北816井/FMI_delivery/TXT/埕北816井连续型高导缝计算结果.txt", "format": "whitespace", "depth_index": 0, "value_index": 1}],
+      "point_sources": [{"path": "/data/shared/project-oil/wx数据/埕岛太古界/埕岛-桩海地区成像测井/中石化_胜利油田_埕北816井/FMI_delivery/TXT/埕北816井连续型高导缝产状.TXT", "format": "whitespace", "depth_index": 0, "azimuth_index": 2, "dip_index": 1}]
+    },
+    {
+      "well_name": "埕北古7", "density_kind": "FVDC", "fracture_scope": "仅构造裂缝", "supervision_status": "supervision_ready", "max_density_interpolation_gap_m": 0.5,
+      "density_sources": [{"path": "/data/shared/project-oil/wx数据/埕岛太古界/埕岛-桩海地区成像测井/胜利_埕北古7井FMI_Petrophysics_递交资料/FMI测井部分/TXT/Chengbeigu7_fracture_par.txt", "format": "whitespace", "depth_index": 0, "value_index": 1}],
+      "point_sources": [{"path": "/data/shared/project-oil/wx数据/埕岛太古界/埕岛-桩海地区成像测井/胜利_埕北古7井FMI_Petrophysics_递交资料/FMI测井部分/TXT/Chengbeigu7_Conductive.txt", "format": "whitespace", "depth_index": 0, "azimuth_index": 2, "dip_index": 1}]
+    },
+    {
+      "well_name": "埕北古斜405", "density_kind": "P10_SUM_裂缝密度", "fracture_scope": "ECF + CCF + DCF", "supervision_status": "supervision_ready", "max_density_interpolation_gap_m": 1.0,
+      "density_sources": [{"path": "/data/shared/project-oil/wx数据/埕岛太古界/埕岛-桩海地区成像测井/中国石化胜利油田埕北古斜405井FMI成像测井解释成果/埕北古斜405井FMI成像解释成果数据文件/CSV/埕北古斜405井_Fracture parameter_Final_裂缝参数.csv", "format": "csv", "depth_column": "MD", "value_column": "P10_SUM_裂缝密度"}],
+      "point_sources": [
+        {"path": "/data/shared/project-oil/wx数据/埕岛太古界/埕岛-桩海地区成像测井/中国石化胜利油田埕北古斜405井FMI成像测井解释成果/埕北古斜405井FMI成像解释成果数据文件/CSV/埕北古斜405井_CCF__Final_连续高导缝.csv", "format": "csv", "depth_column": "TDEP", "azimuth_column": "Azimuth", "dip_column": "Dip_TRU"},
+        {"path": "/data/shared/project-oil/wx数据/埕岛太古界/埕岛-桩海地区成像测井/中国石化胜利油田埕北古斜405井FMI成像测井解释成果/埕北古斜405井FMI成像解释成果数据文件/CSV/埕北古斜405井_DCF__Final-不连续高导缝.csv", "format": "csv", "depth_column": "TDEP", "azimuth_column": "Azimuth", "dip_column": "Dip_TRU"},
+        {"path": "/data/shared/project-oil/wx数据/埕岛太古界/埕岛-桩海地区成像测井/中国石化胜利油田埕北古斜405井FMI成像测井解释成果/埕北古斜405井FMI成像解释成果数据文件/CSV/埕北古斜405井_ECF__Final_溶蚀加强缝.csv", "format": "csv", "depth_column": "TDEP", "azimuth_column": "Azimuth", "dip_column": "Dip_TRU"}
+      ]
+    },
+    {
+      "well_name": "桩海102", "density_kind": "FVDC", "fracture_scope": "统计范围待核验", "supervision_status": "density_only_scope_pending", "max_density_interpolation_gap_m": 0.5,
+      "density_sources": [{"path": "/data/shared/project-oil/wx数据/埕岛太古界/埕岛-桩海地区成像测井/桩海102/ascii/fracture_data.dat", "format": "whitespace", "depth_index": 0, "value_index": 1}],
+      "point_sources": []
+    },
+    {
+      "well_name": "桩斜169", "density_kind": "FVDC(P10)", "fracture_scope": "ECF + CCF + DCF + Low_angle_CF", "supervision_status": "supervision_ready", "max_density_interpolation_gap_m": 1.5,
+      "density_sources": [{"path": "/data/shared/project-oil/wx数据/埕岛太古界/埕岛-桩海地区成像测井/中国石化胜利油田桩斜169井测井解释成果/桩斜169井FMI成像解释数据文件/FMI/ASCII/桩斜169井裂缝参数.csv", "format": "csv", "depth_column": "TDEP", "value_column": "FVDC(P10)"}],
+      "point_sources": [
+        {"path": "/data/shared/project-oil/wx数据/埕岛太古界/埕岛-桩海地区成像测井/中国石化胜利油田桩斜169井测井解释成果/桩斜169井FMI成像解释数据文件/FMI/ASCII/桩斜169井CCF_连续高导缝.csv", "format": "csv", "depth_column": "TDEP", "azimuth_column": "Azimuth", "dip_column": "Dip_TRU"},
+        {"path": "/data/shared/project-oil/wx数据/埕岛太古界/埕岛-桩海地区成像测井/中国石化胜利油田桩斜169井测井解释成果/桩斜169井FMI成像解释数据文件/FMI/ASCII/桩斜169井DCF_不连续高导缝.csv", "format": "csv", "depth_column": "TDEP", "azimuth_column": "Azimuth", "dip_column": "Dip_TRU"},
+        {"path": "/data/shared/project-oil/wx数据/埕岛太古界/埕岛-桩海地区成像测井/中国石化胜利油田桩斜169井测井解释成果/桩斜169井FMI成像解释数据文件/FMI/ASCII/桩斜169井ECF_溶蚀增强缝.csv", "format": "csv", "depth_column": "TDEP", "azimuth_column": "Azimuth", "dip_column": "Dip_TRU"},
+        {"path": "/data/shared/project-oil/wx数据/埕岛太古界/埕岛-桩海地区成像测井/中国石化胜利油田桩斜169井测井解释成果/桩斜169井FMI成像解释数据文件/FMI/ASCII/桩斜169井Low angle_CF_低角度高导缝.csv", "format": "csv", "depth_column": "TDEP", "azimuth_column": "Azimuth", "dip_column": "Dip_TRU"}
+      ]
+    }
+  ]
+}

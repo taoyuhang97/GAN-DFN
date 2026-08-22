@@ -185,6 +185,18 @@ def patch_is_well_control_for_index(metadata: pd.DataFrame | None, polygon_index
     return bool(pd.notna(value) and int(value) == 1)
 
 
+def patch_window_mode_for_index(metadata: pd.DataFrame | None, polygon_index: int) -> str:
+    if metadata is None or polygon_index < 0 or polygon_index >= len(metadata):
+        return ""
+    return str(metadata.iloc[int(polygon_index)].get("WindowValidationMode", "")).strip().lower()
+
+
+def patch_layer_for_index(metadata: pd.DataFrame | None, polygon_index: int) -> str:
+    if metadata is None or polygon_index < 0 or polygon_index >= len(metadata):
+        return ""
+    return str(metadata.iloc[int(polygon_index)].get("LayerGroup", "")).strip()
+
+
 def validate_inputs(config: dict[str, Any]) -> None:
     required_paths = [
         "input_vtk",
@@ -419,8 +431,10 @@ def scan_vtk_intersections(args: SimpleNamespace, surfaces: dict[str, Any], well
     segments: list[ProjectionSegment] = []
     skipped_by_curve_time = 0
     skipped_by_interval = 0
+    voxel_coverage_interval_exemptions = 0
     skipped_by_area = 0
     skipped_by_geometry = 0
+    skipped_by_scale = 0
     skipped_by_surface_distance = 0
     skipped_by_surface_distance_xz = 0
     skipped_by_surface_distance_yz = 0
@@ -435,6 +449,8 @@ def scan_vtk_intersections(args: SimpleNamespace, surfaces: dict[str, Any], well
     skipped_small_projection_well_control_xz = 0
     skipped_small_projection_well_control_yz = 0
     scanned_scale_counts: dict[str, int] = {}
+    allowed_scales = getattr(args, "allowed_scales", None)
+    allowed_scale_set = {str(value).strip().lower() for value in allowed_scales} if allowed_scales else None
 
     with args.input_vtk.open("r", encoding="utf-8", errors="ignore") as handle:
         header = [next_nonempty(handle) for _ in range(4)]
@@ -486,11 +502,20 @@ def scan_vtk_intersections(args: SimpleNamespace, surfaces: dict[str, Any], well
                 continue
             interval = interval_for_center(center, surfaces)
             if interval is None:
-                skipped_by_interval += 1
-                continue
+                window_mode = patch_window_mode_for_index(getattr(args, "dfn_patch_metadata", None), polygon_index)
+                layer = patch_layer_for_index(getattr(args, "dfn_patch_metadata", None), polygon_index)
+                if window_mode == "voxel_coverage" and layer in ("沙三段", "沙四段"):
+                    interval = "T4->T6" if layer == "沙三段" else "T6->T7"
+                    voxel_coverage_interval_exemptions += 1
+                else:
+                    skipped_by_interval += 1
+                    continue
             patch_scale = patch_scale_for_index(getattr(args, "dfn_patch_metadata", None), polygon_index)
             patch_is_well_control = patch_is_well_control_for_index(getattr(args, "dfn_patch_metadata", None), polygon_index)
             scanned_scale_counts[patch_scale or "unknown"] = int(scanned_scale_counts.get(patch_scale or "unknown", 0)) + 1
+            if allowed_scale_set is not None and (patch_scale or "unknown") not in allowed_scale_set:
+                skipped_by_scale += 1
+                continue
 
             y_on_well_curve = float(np.interp(center_time, well_time, well_y))
             x_on_well_curve = float(np.interp(center_time, well_time, well_x))
@@ -666,14 +691,16 @@ def scan_vtk_intersections(args: SimpleNamespace, surfaces: dict[str, Any], well
         "skipped_by_no_intersection_yz": int(skipped_by_no_intersection_yz),
         "skipped_by_curve_time": int(skipped_by_curve_time),
         "skipped_by_interval": int(skipped_by_interval),
+        "voxel_coverage_interval_exemption_count": int(voxel_coverage_interval_exemptions),
         "skipped_by_area": int(skipped_by_area),
         "skipped_by_geometry": int(skipped_by_geometry),
+        "skipped_by_scale": int(skipped_by_scale),
         "patch_accounting_total": int(
-            selected_patch_count + skipped_by_surface_distance + skipped_by_interval + skipped_by_area + skipped_by_geometry
+            selected_patch_count + skipped_by_surface_distance + skipped_by_interval + skipped_by_area + skipped_by_geometry + skipped_by_scale
         ),
         "patch_accounting_closed": bool(
             processed_polygon_count
-            == selected_patch_count + skipped_by_surface_distance + skipped_by_interval + skipped_by_area + skipped_by_geometry
+            == selected_patch_count + skipped_by_surface_distance + skipped_by_interval + skipped_by_area + skipped_by_geometry + skipped_by_scale
         ),
         "bounds_x_min": float(bounds_min[0]),
         "bounds_x_max": float(bounds_max[0]),

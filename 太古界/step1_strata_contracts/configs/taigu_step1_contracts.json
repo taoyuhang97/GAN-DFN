@@ -1,0 +1,76 @@
+{
+  "wellhead_path": "/data/shared/project-oil/wx数据/埕岛太古界/参与井井头信息.dat",
+  "time_depth_dir": "/data/shared/project-oil/wx数据/埕岛太古界/时深",
+  "surface_paths": {
+    "top": "/data/shared/project-oil/wx数据/埕岛太古界/层位/Grid_上部复合层T-a-1.dat",
+    "middle": "/data/shared/project-oil/wx数据/埕岛太古界/层位/Grid_太古界顶Art_1.dat",
+    "bottom": "/data/shared/project-oil/wx数据/埕岛太古界/层位/Grid_风化壳底Art_d1-1.dat"
+  },
+  "regular_las_roots": [
+    "/data/shared/project-oil/wx数据/埕岛太古界/侧向电阻率曲线/常规测井/RD"
+  ],
+  "max_surface_match_distance_m": 100.0,
+  "output_dir": "太古界/step1_strata_contracts/output/taigu_step1_contracts_v1",
+  "imaging_tvd_contracts": [
+    {
+      "well_name": "埕北305",
+      "interpreted_tvd_intervals": [[3782.11, 4325.57]],
+      "boundary_tvd": 4221.0,
+      "upper_strata": "上部复合层",
+      "lower_strata": "太古界风化壳",
+      "status": "prediction_only",
+      "source_kind": "imaging_interpretation_manual"
+    },
+    {
+      "well_name": "埕北310",
+      "interpreted_tvd_intervals": [[3408.16, 4052.53]],
+      "single_strata": "上部复合层",
+      "status": "candidate_supervision",
+      "source_kind": "imaging_interpretation_manual"
+    },
+    {
+      "well_name": "埕北313",
+      "interpreted_tvd_intervals": [[4174.10, 4627.00], [4751.00, 4884.00]],
+      "boundary_tvd": 4783.0,
+      "upper_strata": "上部复合层",
+      "lower_strata": "太古界风化壳",
+      "status": "candidate_supervision",
+      "source_kind": "imaging_interpretation_manual"
+    },
+    {
+      "well_name": "埕北816",
+      "interpreted_tvd_intervals": [[3537.85, 3612.48]],
+      "single_strata": "太古界风化壳",
+      "status": "candidate_supervision",
+      "source_kind": "imaging_interpretation_manual"
+    },
+    {
+      "well_name": "埕北古7",
+      "interpreted_tvd_intervals": [[3146.06, 3340.21]],
+      "single_strata": "太古界风化壳",
+      "status": "candidate_supervision",
+      "source_kind": "imaging_interpretation_manual"
+    },
+    {
+      "well_name": "埕北古斜405",
+      "interpreted_tvd_intervals": [[3676.50, 3998.10]],
+      "single_strata": "上部复合层",
+      "status": "candidate_supervision",
+      "source_kind": "imaging_interpretation_manual"
+    },
+    {
+      "well_name": "桩海102",
+      "interpreted_tvd_intervals": [[4316.56, 4697.06]],
+      "single_strata": "上部复合层",
+      "status": "candidate_density_only",
+      "source_kind": "imaging_interpretation_manual"
+    },
+    {
+      "well_name": "桩斜169",
+      "interpreted_tvd_intervals": [[4264.60, 4925.48]],
+      "single_strata": "上部复合层",
+      "status": "candidate_supervision",
+      "source_kind": "imaging_interpretation_manual"
+    }
+  ]
+}

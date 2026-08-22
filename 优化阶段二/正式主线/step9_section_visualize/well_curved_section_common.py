@@ -29,6 +29,51 @@ from build_well_attribute_section_visualization import (
 from trace_horizon_section import build_trace_horizon_section_curves, resolve_horizon_trace_table
 
 
+def apply_display_t7_curve(
+    config: dict[str, Any],
+    well_df: pd.DataFrame,
+    trace_tree,
+    trace_ids: np.ndarray,
+    x_values: np.ndarray,
+    y_values: np.ndarray,
+    surface_curves,
+    iteration_count: int = 12,
+):
+    """Override the drawn T7 horizon curve with the ORIGINAL T7 depth.
+
+    The section surface/time range is still built from the extended contract
+    (so the below-original-T7 extension region is included and its patches are
+    visible), but the T7 line on the figure is re-calibrated to the original
+    T7 interpretation from ``step9_display_horizon_table`` when configured.
+    """
+    display_table = config.get("step9_display_horizon_table")
+    if not display_table:
+        return surface_curves
+    display_path = Path(str(display_table)).resolve()
+    if not display_path.exists():
+        raise FileNotFoundError(f"step9_display_horizon_table not found: {display_path}")
+    display_curves, _ = build_trace_horizon_section_curves(
+        display_path,
+        well_df,
+        trace_tree,
+        trace_ids,
+        x_values,
+        y_values,
+        iteration_count=iteration_count,
+    )
+    display_lookup = {
+        (curve.projection, curve.surface): curve for curve in display_curves if curve.surface == "T7"
+    }
+    output = []
+    for curve in surface_curves:
+        if curve.surface == "T7":
+            replacement = display_lookup.get((curve.projection, "T7"))
+            if replacement is not None:
+                curve = replacement
+        output.append(curve)
+    return output
+
+
 @dataclass
 class CurvedSectionGeometry:
     config: dict[str, Any]
@@ -133,6 +178,16 @@ def prepare_geometry(config: dict[str, Any]) -> CurvedSectionGeometry:
         trace_ids,
         x_values,
         y_values,
+        iteration_count=int(config.get("horizon_curve_iteration_count", 12)),
+    )
+    surface_curves = apply_display_t7_curve(
+        config,
+        well_df,
+        trace_tree,
+        trace_ids,
+        x_values,
+        y_values,
+        surface_curves,
         iteration_count=int(config.get("horizon_curve_iteration_count", 12)),
     )
     summary["horizon_display"] = horizon_summary

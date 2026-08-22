@@ -64,15 +64,27 @@ def enforce_center_horizon_contract(
         return frame.copy(), {"input_count": 0, "kept_count": 0, "rejected_count": 0}
     rows: list[pd.Series] = []
     rejected = 0
+    kept_center_outside_voxel_coverage = 0
     for _, source_row in frame.iterrows():
         row = source_row.copy()
         local = lookup.query(float(row["CenterX"]), float(row["CenterY"]))
         interval = lookup.interval(float(row["CenterX"]), float(row["CenterY"]), float(row["CenterTime"]))
         if interval is None:
-            rejected += 1
-            continue
-        row["LayerGroup"] = "沙三段" if interval == "T4->T6" else "沙四段"
-        row["LayerCode"] = 1 if interval == "T4->T6" else 2
+            # Voxel-coverage validated panels: the panel body (>=90% of its
+            # evidence voxels) lies inside per-trace T4-T7 windows even though
+            # the panel centroid projects outside the window of its own trace.
+            # Keep them so mine-scale display does not lose valid inferred
+            # fault surfaces. LayerGroup was assigned from the dominant layer.
+            if str(row.get("WindowValidationMode", "")).strip() == "voxel_coverage":
+                row["CenterInWindow"] = 0
+                kept_center_outside_voxel_coverage += 1
+            else:
+                rejected += 1
+                continue
+        else:
+            row["CenterInWindow"] = 1
+            row["LayerGroup"] = "沙三段" if interval == "T4->T6" else "沙四段"
+            row["LayerCode"] = 1 if interval == "T4->T6" else 2
         row["SourceTraceIdx"] = int(local["TraceIdx"])
         row["LocalT4Time"] = float(local["T4"])
         row["LocalT6Time"] = float(local["T6"])
@@ -82,7 +94,7 @@ def enforce_center_horizon_contract(
         rows.append(row)
     output = pd.DataFrame(rows, columns=list(frame.columns) + [
         name for name in [
-            "SourceTraceIdx", "LocalT4Time", "LocalT6Time", "LocalT7Time",
+            "SourceTraceIdx", "LocalT4Time", "LocalT6Time", "LocalT7Time", "CenterInWindow",
             "LocalShasanPresent", "LocalShasiPresent",
         ] if name not in frame.columns
     ])
@@ -90,6 +102,7 @@ def enforce_center_horizon_contract(
         "input_count": int(len(frame)),
         "kept_count": int(len(output)),
         "rejected_count": int(rejected),
+        "kept_center_outside_voxel_coverage_count": int(kept_center_outside_voxel_coverage),
     }
 
 
@@ -1250,9 +1263,17 @@ def build_inferred_surface_panels(config: dict[str, Any]) -> pd.DataFrame:
     for ordinal, surface_row in surface_df.iterrows():
         vertices = vertices_from_row(surface_row)
         center, vertex_length, vertex_height, vertex_azimuth, vertex_dip = row_geometry_from_vertices(vertices)
-        layer = contract_layer_for_center(config, center)
-        if layer is None:
-            continue
+        dominant_layer = str(surface_row.get("dominant_layer", "")).strip()
+        dominant_fraction = float(surface_row.get("dominant_layer_fraction", np.nan))
+        min_window_fraction = float(config.get("inferred_surface_min_window_voxel_fraction", 0.90))
+        window_validation_mode = "center_fallback"
+        if dominant_layer in ("沙三段", "沙四段") and np.isfinite(dominant_fraction) and dominant_fraction >= min_window_fraction:
+            layer = dominant_layer
+            window_validation_mode = "voxel_coverage"
+        else:
+            layer = contract_layer_for_center(config, center)
+            if layer is None:
+                continue
         surface_id = int(surface_row.get("surface_id", surface_row.get("component_id", ordinal + 1)))
         raw_component_id = int(surface_row.get("raw_component_id", surface_id))
         panel_chain_id = str(surface_row.get("panel_chain_id", f"raw_{raw_component_id:05d}"))
@@ -1308,6 +1329,8 @@ def build_inferred_surface_panels(config: dict[str, Any]) -> pd.DataFrame:
                 "RelativePositionStd": float(surface_row.get("relative_position_std", np.nan)),
                 "RelativePositionSpan": float(surface_row.get("relative_position_span", np.nan)),
                 "CandidateBranch": str(surface_row.get("candidate_branch", "lowcoherence_weighted_local_sheet")),
+                "WindowValidationMode": window_validation_mode,
+                "WindowVoxelFraction": float(dominant_fraction) if np.isfinite(dominant_fraction) else np.nan,
                 "OrientationSource": "step6c_local_supported_sheet_panel_vertices",
                 "SizeRule": "step6c_local_evidence_extent_150_to_500m",
                 "BandID": panel_chain_id,
@@ -1505,6 +1528,9 @@ def main() -> int:
         "BandContinuityMode",
         "ComponentID",
         "ComponentPanelCount",
+        "WindowValidationMode",
+        "WindowVoxelFraction",
+        "CenterInWindow",
         "OriginalFaultRelation",
         "OriginalFaultCenterDistanceM",
         "OriginalFaultVertexMinDistanceM",
@@ -1512,6 +1538,25 @@ def main() -> int:
         "OriginalFaultOrientationDifferenceDeg",
     ]
     patch_df[[col for col in audit_cols if col in patch_df.columns]].to_csv(paths["audit_csv"], index=False, encoding="utf-8-sig")
+    window_validation_retained = (
+        lowcoh_patches[lowcoh_patches["CenterInWindow"].fillna(0).eq(0)].copy()
+        if "CenterInWindow" in lowcoh_patches.columns
+        else pd.DataFrame()
+    )
+    window_validation = {
+        "min_window_voxel_fraction": float(config.get("inferred_surface_min_window_voxel_fraction", 0.90)),
+        "mode_counts": {
+            str(key): int(value)
+            for key, value in lowcoh_patches.get("WindowValidationMode", pd.Series(dtype=str)).value_counts(dropna=False).items()
+        },
+        "center_outside_window_retained_count": int(len(window_validation_retained)),
+        "center_outside_window_retained_surface_ids": sorted(
+            pd.to_numeric(window_validation_retained.get("ComponentID", pd.Series(dtype=float)), errors="coerce")
+            .dropna()
+            .astype(int)
+            .tolist()
+        ),
+    }
     unified_write = write_unified_dfn_vtk(
         paths["raw_vtk"],
         paths["lowcoh_vtk"],
@@ -1540,6 +1585,7 @@ def main() -> int:
         "formal_original_fault_patch_count": 0,
         "formal_original_fault_triangle_count": int(unified_summary["original_fault_cell_count"]),
         "inferred_fault_surface_patch_count": int(len(lowcoh_patches)),
+        "window_validation": window_validation,
         "inferred_known_fault_duplicate_patch_count": int(len(duplicate_patches)),
         "inferred_original_fault_classification": inferred_classification,
         "patch_count": int(len(patch_df)),

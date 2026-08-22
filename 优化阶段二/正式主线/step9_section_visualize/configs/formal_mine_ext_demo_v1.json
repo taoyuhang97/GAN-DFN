@@ -1,0 +1,133 @@
+{
+  "input_vtk": "/home/tyh/projects/petroleum/code/GAN-DFN/优化阶段二/正式主线/output/formal_mine_ext_demo_v1/step8_well_correction/well_corrected_dfn_raw_time.vtk",
+  "dfn_patch_csv": "/home/tyh/projects/petroleum/code/GAN-DFN/优化阶段二/正式主线/output/formal_mine_ext_demo_v1/step8_well_correction/well_corrected_dfn_fracture_patches.csv",
+  "trace_header_csv": "/home/tyh/projects/petroleum/code/GAN-DFN/数据精简/trace_header_xy.csv",
+  "real_well_samples_root": "/home/tyh/projects/petroleum/code/GAN-DFN/优化阶段二/正式主线/step2_real_well_t4_t7_samples/output/formal_all_wells",
+  "surface_dir": "/data/shared/project-oil/wx数据/砂砾岩/层位",
+  "horizon_trace_table_path": "/home/tyh/projects/petroleum/code/GAN-DFN/优化阶段二/正式主线/output/formal_mine_ext_demo_v1/horizon_contract_ext/horizon_trace_table_ext.npy",
+  "coherence_volume_path": "/data/shared/project-oil/wx数据/砂砾岩/补充材料-20260623/车西_T4-T7/车西-相干体T4-T7.sgy",
+  "step3_imaging_group_csvs": [
+    "/home/tyh/projects/petroleum/code/GAN-DFN/优化阶段二/正式主线/step3_imaging_supervision_samples/output/formal_rebuild/groups/车页1导眼_沙三段.csv",
+    "/home/tyh/projects/petroleum/code/GAN-DFN/优化阶段二/正式主线/step3_imaging_supervision_samples/output/formal_rebuild/groups/车页1导眼_沙四段.csv"
+  ],
+  "volume_paths": {
+    "AntTrack": "/data/shared/project-oil/wx数据/砂砾岩/补充材料-20260623/车西_T4-T7/车西-蚂蚁体T4-T7.sgy",
+    "Coherence": "/data/shared/project-oil/wx数据/砂砾岩/补充材料-20260623/车西_T4-T7/车西-相干体T4-T7.sgy",
+    "CurvatureMax": "/data/shared/project-oil/wx数据/砂砾岩/补充材料-20260623/车西-最大曲率T4-T7.sgy",
+    "SeisAmp": "/data/shared/project-oil/wx数据/砂砾岩/psdm_final_time.sgy"
+  },
+  "overview_section_sample_paths": {},
+  "output_dir": "/home/tyh/projects/petroleum/code/GAN-DFN/优化阶段二/正式主线/output/formal_mine_ext_demo_v1/step9_sections/cheye1_dfn_multibackground_sections",
+  "well_name": "车页1导眼",
+  "exclude_wells": [],
+  "target_block": {
+    "name": "ext_demo_5km_cheye1",
+    "x_min": 576300.0,
+    "x_max": 581300.0,
+    "y_min": 4197732.0,
+    "y_max": 4202732.0
+  },
+  "overview_target_block": {
+    "name": "ext_demo_5km_cheye1",
+    "x_min": 576300.0,
+    "x_max": 581300.0,
+    "y_min": 4197732.0,
+    "y_max": 4202732.0
+  },
+  "dfn_half_width_m": 50.0,
+  "fault_trace_half_width_m": 50.0,
+  "local_axis_radius_m": 500.0,
+  "local_dfn_half_width_m": 200.0,
+  "local_fault_trace_half_width_m": 200.0,
+  "small_projection_enabled": true,
+  "small_projection_half_width_m": 150.0,
+  "small_projection_include_well_control": false,
+  "local_small_projection_half_width_m": 200.0,
+  "original_fault_context_padding_m": 10000.0,
+  "time_padding_ms": 20.0,
+  "axis_sample_count": 0,
+  "horizon_curve_iteration_count": 12,
+  "max_polygons": 0,
+  "max_selected": 0,
+  "min_patch_area": 0.0,
+  "max_patch_area": 0.0,
+  "progress_interval": 100,
+  "title_prefix": "车页1导眼 5km T7延伸验证剖面",
+  "product_title": "车页1导眼：5km 扩展沙四段DFN",
+  "overview_product_title": "车页1导眼：5km 扩展沙四段整体DFN",
+  "local_product_title": "车页1导眼：井周DFN与成像测井裂缝对比",
+  "image_numbers": [
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    9,
+    10,
+    11,
+    12,
+    13,
+    14,
+    15,
+    16,
+    17,
+    18,
+    19,
+    20
+  ],
+  "z_label": "TWT / ms",
+  "fig_width": 18.0,
+  "fig_height": 8.2,
+  "local_fig_width": 15.5,
+  "local_fig_height": 7.8,
+  "dpi": 240,
+  "render_dpi": 200,
+  "figure_height_px": 2400,
+  "xz_total_width_px": 12000,
+  "yz_total_width_px": 9000,
+  "local_render_dpi": 240,
+  "write_svg": false,
+  "amplitude_clip_quantile": 0.99,
+  "wiggle_max_trace_count": 0,
+  "wiggle_lateral_scale_fraction": 0.42,
+  "formal_signed_attribute_display_style": "absolute_grayscale",
+  "signed_attribute_backup_display_style": "signed_red_white_blue",
+  "signed_attribute_backup_dir": "red_white_blue_backup",
+  "horizon_contract_table": "/home/tyh/projects/petroleum/code/GAN-DFN/优化阶段二/正式主线/output/formal_mine_ext_demo_v1/horizon_contract_ext/horizon_trace_table_ext.npy",
+  "horizon_window_contracts": {
+    "2ms": "/home/tyh/projects/petroleum/code/GAN-DFN/优化阶段二/正式主线/output/formal_mine_ext_demo_v1/horizon_contract_ext/horizon_windows_2ms_ext.npz",
+    "10ms": "/home/tyh/projects/petroleum/code/GAN-DFN/优化阶段二/正式主线/output/formal_mine_ext_demo_v1/horizon_contract_ext/horizon_windows_10ms_ext.npz"
+  },
+  "step9_diagnostic_sections": {
+    "enabled": true,
+    "scopes": [
+      "overview",
+      "local_200m"
+    ],
+    "scales": {
+      "small": {
+        "attribute": "CurvatureMax",
+        "label": "小尺度裂缝×曲率体"
+      },
+      "medium": {
+        "attribute": "AntTrack",
+        "label": "中尺度裂缝×蚂蚁体"
+      },
+      "large": {
+        "attribute": "Coherence",
+        "label": "大尺度裂缝×相干体"
+      }
+    },
+    "image_number_start_overview": 101,
+    "image_number_start_local": 111
+  },
+  "single_scale_dfn_export": {
+    "enabled": true,
+    "output_dir": "/home/tyh/projects/petroleum/code/GAN-DFN/优化阶段二/正式主线/output/formal_mine_ext_demo_v1/step8_well_correction/single_scale_dfn"
+  },
+  "single_scale_diag_output_dir": "/home/tyh/projects/petroleum/code/GAN-DFN/优化阶段二/正式主线/output/formal_mine_ext_demo_v1/step9_sections/single_scale_diagnostic_sections",
+  "step9_display_horizon_table": "/home/tyh/projects/petroleum/code/GAN-DFN/优化阶段二/正式主线/common/horizon_trace_table/output/formal_horizon_trace_table_v2_mine/horizon_trace_table.npy"
+}

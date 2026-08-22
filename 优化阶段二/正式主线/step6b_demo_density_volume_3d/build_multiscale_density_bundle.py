@@ -145,11 +145,54 @@ def regular_sample_axis(source_samples: np.ndarray, interval_ms: float) -> np.nd
     return (start + np.arange(count, dtype=np.float64) * interval).astype(np.float64)
 
 
+def _read_trace_runs(handle, indices: np.ndarray) -> np.ndarray:
+    """Read the given trace indices as a matrix, using contiguous raw reads.
+
+    ``indices`` must be sorted ascending. Contiguous runs are read in bulk with
+    ``handle.trace.raw[start:stop]`` instead of one segyio call per trace, which
+    is the dominant cost when loading mine-scale volumes.
+    """
+    values = np.asarray(indices, dtype=np.int64)
+    if values.size == 0:
+        return np.empty((0, len(handle.samples)), dtype=np.float32)
+    boundaries = np.where(np.diff(values) != 1)[0] + 1
+    chunks = np.split(values, boundaries)
+    parts: list[np.ndarray] = []
+    for chunk in chunks:
+        start = int(chunk[0])
+        stop = int(chunk[-1]) + 1
+        parts.append(np.asarray(handle.trace.raw[start:stop], dtype=np.float32))
+    return np.concatenate(parts, axis=0)
+
+
+def _resample_matrix(matrix: np.ndarray, source_samples: np.ndarray, target_samples: np.ndarray) -> np.ndarray:
+    """Vectorized linear resampling along the sample axis with NaN outside range."""
+    source = np.asarray(source_samples, dtype=np.float64)
+    if source.size < 2:
+        raise ValueError("source sample axis must contain at least two values")
+    dt = float(np.median(np.diff(source)))
+    if dt <= 0 or not np.allclose(np.diff(source), dt, atol=1.0e-6, rtol=0.0):
+        raise ValueError("source sample axis is not regular")
+    positions = (np.asarray(target_samples, dtype=np.float64) - float(source[0])) / dt
+    left = np.floor(positions).astype(np.int64)
+    alpha = (positions - left).astype(np.float32)
+    valid = (left >= 0) & (left < len(source) - 1)
+    output = np.full((matrix.shape[0], len(target_samples)), np.nan, dtype=np.float32)
+    if valid.any():
+        left_valid = left[valid]
+        a = alpha[valid][None, :]
+        v0 = matrix[:, left_valid]
+        v1 = matrix[:, left_valid + 1]
+        output[:, valid] = v0 * (1.0 - a) + v1 * a
+    return output
+
+
 def load_trace_matrix(path: Path, source_trace_idx: np.ndarray | None, target_samples: np.ndarray | None, label: str) -> tuple[np.ndarray, np.ndarray, dict[str, Any]]:
     with segyio.open(str(path), "r", ignore_geometry=True) as handle:
         samples = np.asarray(handle.samples, dtype=np.float64)
         if source_trace_idx is None:
-            matrix = np.stack([handle.trace[idx] for idx in range(handle.tracecount)]).astype(np.float32)
+            indices = np.arange(handle.tracecount, dtype=np.int64)
+            matrix = _read_trace_runs(handle, indices)
             return matrix, samples, {"path": str(path), "trace_count": int(handle.tracecount), "sample_count": int(len(samples))}
 
         if target_samples is None:
@@ -158,16 +201,17 @@ def load_trace_matrix(path: Path, source_trace_idx: np.ndarray | None, target_sa
         max_trace = int(np.max(source_trace_idx)) if len(source_trace_idx) else -1
         if max_trace >= int(handle.tracecount):
             raise ValueError(f"{label} tracecount {handle.tracecount} is smaller than mapping max source trace {max_trace}")
-        matrix = np.empty((len(source_trace_idx), len(target_samples)), dtype=np.float32)
-        for out_idx, src_idx in enumerate(source_trace_idx):
-            trace = np.asarray(handle.trace[int(src_idx)], dtype=np.float32)
-            if same_samples:
-                matrix[out_idx, :] = trace
-            else:
-                matrix[out_idx, :] = np.interp(target_samples, samples, trace, left=np.nan, right=np.nan).astype(np.float32)
-            if (out_idx + 1) % 10000 == 0:
-                print(f"[step6-multiscale] loaded {label} traces={out_idx + 1}/{len(source_trace_idx)}", flush=True)
-        return matrix, target_samples, {
+        order = np.argsort(source_trace_idx, kind="stable")
+        sorted_indices = np.asarray(source_trace_idx, dtype=np.int64)[order]
+        matrix = _read_trace_runs(handle, sorted_indices)
+        if not np.array_equal(sorted_indices, np.asarray(source_trace_idx, dtype=np.int64)):
+            inverse = np.empty_like(order)
+            inverse[order] = np.arange(len(order), dtype=np.int64)
+            matrix = matrix[inverse]
+        if not same_samples:
+            matrix = _resample_matrix(matrix, samples, np.asarray(target_samples, dtype=np.float64))
+            print(f"[step6-multiscale] resampled {label} traces={matrix.shape[0]} samples={len(target_samples)}", flush=True)
+        return matrix, np.asarray(target_samples, dtype=np.float64), {
             "path": str(path),
             "source_trace_count": int(handle.tracecount),
             "loaded_trace_count": int(len(source_trace_idx)),

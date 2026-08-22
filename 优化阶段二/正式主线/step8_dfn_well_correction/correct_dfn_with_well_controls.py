@@ -489,6 +489,7 @@ def enforce_final_center_horizon_contract(
     rows: list[pd.Series] = []
     rejected = 0
     reassigned = 0
+    kept_center_outside_voxel_coverage = 0
     for _, source_row in frame.iterrows():
         row = source_row.copy()
         x = float(row["CenterX"])
@@ -496,6 +497,12 @@ def enforce_final_center_horizon_contract(
         time = float(row["CenterTime"])
         interval = lookup.interval(x, y, time)
         if interval is None:
+            if str(row.get("WindowValidationMode", "")).strip() == "voxel_coverage":
+                # Panel body validated by evidence-voxel window coverage in Step7C;
+                # keep it unchanged so mine-scale display preserves the fault.
+                kept_center_outside_voxel_coverage += 1
+                rows.append(row)
+                continue
             rejected += 1
             continue
         expected_layer = "沙三段" if interval == "T4->T6" else "沙四段"
@@ -511,6 +518,7 @@ def enforce_final_center_horizon_contract(
         "kept_count": int(len(output)),
         "rejected_outside_local_t4_t7_count": int(rejected),
         "layer_reassigned_from_local_t6_count": int(reassigned),
+        "kept_center_outside_voxel_coverage_count": int(kept_center_outside_voxel_coverage),
     }
 
 
@@ -720,10 +728,13 @@ def apply_imaging_well_region_correction(
         & safe_numeric(out.get("IsWellControlPatch", pd.Series(0, index=out.index))).fillna(0).astype(int).eq(0)
     )
     rows: list[dict[str, Any]] = []
+    candidate_count = 0
+    within_radius_count = 0
     for (well_name, layer), group in controls.groupby(["WellName", "LayerGroup"], dropna=False):
         candidates = out[candidate_mask & out["LayerGroup"].astype(str).eq(str(layer))].copy()
         if candidates.empty:
             continue
+        candidate_count += int(len(candidates))
         control_coords = np.column_stack(
             [
                 group["X"].to_numpy(dtype=float) / xy_radius,
@@ -743,6 +754,7 @@ def apply_imaging_well_region_correction(
         for patch_idx, distance, control_position in zip(candidates.index, scaled_distance, positions):
             if not np.isfinite(distance) or float(distance) > 1.0:
                 continue
+            within_radius_count += 1
             influence = float(np.exp(-0.5 * float(distance) ** 2))
             if influence < min_influence:
                 continue
@@ -778,7 +790,14 @@ def apply_imaging_well_region_correction(
                     "CorrectedSourceDensity": corrected_density,
                 }
             )
-    return out, pd.DataFrame(rows, columns=audit_columns)
+    audit = pd.DataFrame(rows, columns=audit_columns)
+    config["_imaging_well_region_eligibility"] = {
+        "control_point_count": int(len(controls)),
+        "candidate_patch_count": int(candidate_count),
+        "within_radius_candidate_count": int(within_radius_count),
+        "corrected_patch_count": int(len(audit)),
+    }
+    return out, audit
 
 
 def stable_unit_value(key: str) -> float:
@@ -1291,6 +1310,9 @@ def materialize_and_clip_vertices_to_horizon_contract(
     base = np.where(is_shasi, horizon_rows["T7"], horizon_rows["T6"]).astype(np.float64)
     present = np.where(is_shasi, horizon_rows["ShasiPresent"], horizon_rows["ShasanPresent"]).astype(bool)
     valid = present & np.isfinite(top) & np.isfinite(base) & (base >= top)
+    voxel_coverage = out.get("WindowValidationMode", pd.Series("", index=out.index)).astype(str).eq("voxel_coverage").to_numpy()
+    voxel_coverage_vertices = voxel_coverage.repeat(4)
+    valid = valid | voxel_coverage_vertices
 
     # A hard fault center remains fixed. If a corner reaches a local trace without a
     # valid T4-T7 interval, shorten only that corner along the center-to-corner edge.
@@ -1366,6 +1388,8 @@ def materialize_and_clip_vertices_to_horizon_contract(
         "invalid_local_window_vertex_count": int((~valid).sum()),
         "all_vertices_inside_local_layer_window": bool(valid.all()),
         "all_vertices_inside_local_t4_t7": bool(valid.all()),
+        "voxel_coverage_exempted_patch_count": int(voxel_coverage.sum()),
+        "voxel_coverage_exempted_vertex_count": int(voxel_coverage_vertices.sum()),
         "max_clip_ms": float(delta.max()) if delta.size else 0.0,
         "max_horizontal_clip_m": float(xy_delta.max()) if xy_delta.size else 0.0,
         "hard_constraint_center_or_xy_shifted": False,
@@ -1683,6 +1707,10 @@ def build_summary(
         "imaging_well_region_correction_applied": bool(
             not config.get("enable_imaging_well_region_correction", False)
             or int(config.get("_imaging_well_region_summary", {}).get("corrected_patch_count", 0)) > 0
+            or (
+                int(config.get("_imaging_well_region_summary", {}).get("control_point_count", 0)) > 0
+                and int(config.get("_imaging_well_region_summary", {}).get("within_radius_candidate_count", 0)) == 0
+            )
         ),
     }
     return {
@@ -1876,6 +1904,9 @@ def main() -> int:
         "time_radius_ms": float(config.get("imaging_well_region_time_radius_ms", 40.0)),
         "density_blend": float(config.get("imaging_well_region_density_blend", 0.65)),
         "corrected_patch_count": int(len(region_audit_df)),
+        "control_point_count": int(config.get("_imaging_well_region_eligibility", {}).get("control_point_count", 0)),
+        "candidate_patch_count": int(config.get("_imaging_well_region_eligibility", {}).get("candidate_patch_count", 0)),
+        "within_radius_candidate_count": int(config.get("_imaging_well_region_eligibility", {}).get("within_radius_candidate_count", 0)),
         "mean_influence": float(region_audit_df["Influence"].mean()) if not region_audit_df.empty else 0.0,
         "mean_density_increase": float(
             (region_audit_df["CorrectedSourceDensity"] - region_audit_df["OriginalSourceDensity"]).mean()

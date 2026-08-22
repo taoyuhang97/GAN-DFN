@@ -1,0 +1,43 @@
+{
+  "step2_output_dir": "太古界/step2_well_log_segments/output/taigu_step2_regular_v3",
+  "step3_output_dir": "太古界/step3_imaging_groups/output/taigu_step3_imaging_v3",
+  "strata": ["上部复合层", "太古界风化壳"],
+  "point_wells": ["埕北313", "桩斜169", "埕北古斜405", "埕北310", "埕北816"],
+  "density_only_wells": ["桩海102"],
+  "max_support_gap_m": 0.5,
+  "merge": {
+    "tolerance_m": 0.25,
+    "weight_scheme": "equal",
+    "gap_break_m": 0.5
+  },
+  "label": {
+    "clear_positive_density_quantile": 0.5,
+    "clear_positive_point_radius_m": 0.5,
+    "clear_background_density_max": 0.0,
+    "clear_background_point_exclusion_m": 0.75
+  },
+  "threshold_strategy": "match_oof_prevalence",
+  "random_state": 42,
+  "xgb_n_jobs": 2,
+  "stage1_params": {
+    "n_estimators": 300,
+    "max_depth": 3,
+    "learning_rate": 0.05,
+    "min_child_weight": 8,
+    "subsample": 0.85,
+    "colsample_bytree": 0.85,
+    "reg_alpha": 0.2,
+    "reg_lambda": 2.0
+  },
+  "stage2_params": {
+    "n_estimators": 300,
+    "max_depth": 3,
+    "learning_rate": 0.05,
+    "min_child_weight": 6,
+    "subsample": 0.85,
+    "colsample_bytree": 0.85,
+    "reg_alpha": 0.1,
+    "reg_lambda": 2.0
+  },
+  "output_dir": "太古界/step4_fracture_prediction/output/taigu_step4_gr_rd_rs_v1"
+}

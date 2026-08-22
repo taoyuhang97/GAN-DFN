@@ -35,6 +35,15 @@ def main() -> int:
     block = dict(master["target_block"])
     step6_root = Path(master["output_dir"]).resolve()
     mapping = str(Path(master["trace_mapping_npz"]).resolve())
+    output_root = str(master.get("output_root") or "").strip()
+
+    def step_output_dir(legacy_dir: str, sub_dir: str) -> str:
+        """Centralized version-root outputs when master defines output_root;
+        otherwise keep the legacy per-step `output/<version>` layout."""
+        if output_root:
+            return f"{output_root.rstrip('/')}/{sub_dir}"
+        return str(FORMAL_ROOT / f"{legacy_dir}/output/{version}")
+
     horizon_common = {
         "horizon_contract_table": str(Path(master["horizon_contract_table"]).resolve()),
         "horizon_trace_table_path": str(Path(master["horizon_contract_table"]).resolve()),
@@ -56,7 +65,7 @@ def main() -> int:
     step7a_template.update(
         {
             "trace_mapping_npz": mapping,
-            "output_dir": str(FORMAL_ROOT / f"step7a_small_scale_dfn/output/{version}"),
+            "output_dir": step_output_dir("step7a_small_scale_dfn", "step7a_small_scale"),
             "target_block": block,
             "density_sgy": str(step6_root / "step6a_small/small_background_score.sgy"),
             "small_score_sgy": str(step6_root / "step6a_small/small_background_score.sgy"),
@@ -103,7 +112,7 @@ def main() -> int:
             "medium_components_npz": str(step6_root / "step6b_medium/medium_corridor_components.npz"),
             "medium_component_summary_csv": str(step6_root / "step6b_medium/medium_corridor_component_summary.csv"),
             "trace_mapping_npz": mapping,
-            "output_dir": str(FORMAL_ROOT / f"step7b_multiscale_initial_dfn/output/{version}"),
+            "output_dir": step_output_dir("step7b_multiscale_initial_dfn", "step7b_medium_scale"),
             "target_block": block,
             "min_prior_score": 0.58,
             "min_component_voxels": 80,
@@ -150,10 +159,10 @@ def main() -> int:
             "large_prior_components_npz": str(step6_root / "step6c_large/large_fault_prior_components.npz"),
             "large_component_summary_csv": str(step6_root / "step6c_large/large_fault_component_summary.csv"),
             "trace_mapping_npz": mapping,
-            "output_dir": str(FORMAL_ROOT / f"step7c_large_fault_dfn/output/{version}"),
+            "output_dir": step_output_dir("step7c_large_fault_dfn", "step7c_large_fault"),
             "target_block": block,
-            "time_min_ms": 1990.0,
-            "time_max_ms": 3626.0,
+            "time_min_ms": float(master.get("step7c_time_min_ms", 1990.0)),
+            "time_max_ms": float(master.get("step7c_time_max_ms", 3626.0)),
             "min_lowcoh_component_voxels": 900,
             "lowcoh_min_panel_voxels": 120,
             "inferred_geometry_mode": "step6c_surface_ransac_vertices",
@@ -178,28 +187,33 @@ def main() -> int:
             "small_dfn_csv": str(FORMAL_ROOT / f"step7a_small_scale_dfn/output/{version}/small_dfn_patches.csv"),
             "medium_dfn_csv": str(FORMAL_ROOT / f"step7b_multiscale_initial_dfn/output/{version}/medium_dfn_patches.csv"),
             "large_dfn_csv": str(FORMAL_ROOT / f"step7c_large_fault_dfn/output/{version}/large_fault_dfn_patches.csv"),
-            "large_dfn_vtk": str(FORMAL_ROOT / f"step7c_large_fault_dfn/output/{version}/large_fault_dfn_raw_time.vtk"),
-            "original_fault_manifest_csv": str(FORMAL_ROOT / f"step7c_large_fault_dfn/output/{version}/original_fault_unit_manifest.csv"),
-            "output_dir": str(FORMAL_ROOT / f"step7d_multiscale_fused_dfn/output/{version}"),
+            "large_dfn_vtk": str(Path(step_output_dir("step7c_large_fault_dfn", "step7c_large_fault")) / "large_fault_dfn_raw_time.vtk"),
+            "original_fault_manifest_csv": str(Path(step_output_dir("step7c_large_fault_dfn", "step7c_large_fault")) / "original_fault_unit_manifest.csv"),
+            "output_dir": step_output_dir("step7d_multiscale_fused_dfn", "step7d_fused"),
             "write_vtk": True,
         }
     )
     step7d.pop("original_fault_surface_vtk", None)
+    if output_root:
+        step7d["small_dfn_csv"] = str(Path(step_output_dir("step7a_small_scale_dfn", "step7a_small_scale")) / "small_dfn_patches.csv")
+        step7d["medium_dfn_csv"] = str(Path(step_output_dir("step7b_multiscale_initial_dfn", "step7b_medium_scale")) / "medium_dfn_patches.csv")
+        step7d["large_dfn_csv"] = str(Path(step_output_dir("step7c_large_fault_dfn", "step7c_large_fault")) / "large_fault_dfn_patches.csv")
     step7d_path = FORMAL_ROOT / f"step7d_multiscale_fused_dfn/configs/{version}.json"
     write_json(step7d_path, step7d)
     generated["step7d"] = str(step7d_path)
 
     step8 = read_json(FORMAL_ROOT / "step8_dfn_well_correction/configs/formal_well_control_correction_candidate_cheye1_final_lowcoh_vertical_v1_smallwell_event_v1.json")
+    step7d_dir = step_output_dir("step7d_multiscale_fused_dfn", "step7d_fused")
     step8.update(
         {
-            "initial_dfn_csv": str(FORMAL_ROOT / f"step7d_multiscale_fused_dfn/output/{version}/fused_multiscale_dfn_patches.csv"),
-            "initial_dfn_vtk": str(FORMAL_ROOT / f"step7d_multiscale_fused_dfn/output/{version}/fused_multiscale_dfn_raw_time.vtk"),
-            "initial_dfn_summary_json": str(FORMAL_ROOT / f"step7d_multiscale_fused_dfn/output/{version}/fused_multiscale_summary.json"),
+            "initial_dfn_csv": str(Path(step7d_dir) / "fused_multiscale_dfn_patches.csv"),
+            "initial_dfn_vtk": str(Path(step7d_dir) / "fused_multiscale_dfn_raw_time.vtk"),
+            "initial_dfn_summary_json": str(Path(step7d_dir) / "fused_multiscale_summary.json"),
             "fracture_points_csv": str(FORMAL_ROOT / "step4_expert_real_well_prediction/output/formal_six_expert_library_v3/predictions/all_wells_t4_t7_merged_fracture_points.csv"),
-            "output_dir": str(FORMAL_ROOT / f"step8_dfn_well_correction/output/{version}"),
+            "output_dir": step_output_dir("step8_dfn_well_correction", "step8_well_correction"),
             "target_block": block,
             "export_debug_step_vtks": False,
-            "original_fault_manifest_csv": str(FORMAL_ROOT / f"step7c_large_fault_dfn/output/{version}/original_fault_unit_manifest.csv"),
+            "original_fault_manifest_csv": str(Path(step_output_dir("step7c_large_fault_dfn", "step7c_large_fault")) / "original_fault_unit_manifest.csv"),
             "enable_imaging_well_region_correction": True,
             "imaging_well_region_xy_radius_m": 150.0,
             "imaging_well_region_time_radius_ms": 40.0,
@@ -209,6 +223,8 @@ def main() -> int:
         }
     )
     step8.pop("original_fault_surface_vtk", None)
+    if "single_scale_dfn_export" in master:
+        step8["single_scale_dfn_export"] = dict(master["single_scale_dfn_export"])
     step8_path = FORMAL_ROOT / f"step8_dfn_well_correction/configs/{version}.json"
     write_json(step8_path, step8)
     generated["step8"] = str(step8_path)
@@ -216,24 +232,32 @@ def main() -> int:
     step9 = read_json(FORMAL_ROOT / "step9_section_visualize/configs/formal_candidate_cheye1_final_lowcoh_vertical_v1_smallwell_event_v1_multibackground_sections.json")
     step9.update(
         {
-            "input_vtk": str(FORMAL_ROOT / f"step8_dfn_well_correction/output/{version}/well_corrected_dfn_raw_time.vtk"),
-            "dfn_patch_csv": str(FORMAL_ROOT / f"step8_dfn_well_correction/output/{version}/well_corrected_dfn_fracture_patches.csv"),
-            "output_dir": str(FORMAL_ROOT / f"step9_section_visualize/output/{version}/cheye1_dfn_multibackground_sections"),
+            "input_vtk": str(Path(step_output_dir("step8_dfn_well_correction", "step8_well_correction")) / "well_corrected_dfn_raw_time.vtk"),
+            "dfn_patch_csv": str(Path(step_output_dir("step8_dfn_well_correction", "step8_well_correction")) / "well_corrected_dfn_fracture_patches.csv"),
+            "output_dir": step_output_dir("step9_section_visualize", "step9_sections/cheye1_dfn_multibackground_sections"),
             "target_block": block,
             "overview_target_block": block,
             "overview_section_sample_paths": {},
             "local_axis_radius_m": float(master.get("step9_local_axis_radius_m", 500.0)),
             "image_numbers": list(range(1, 21)),
-            "title_prefix": "车页1导眼10 km Demo剖面",
-            "product_title": "车页1导眼：10 km Demo多尺度DFN",
-            "overview_product_title": "车页1导眼：10 km Demo整体DFN",
-            "local_product_title": "车页1导眼：井周DFN与成像测井裂缝对比",
+            "title_prefix": str(master.get("step9_title_prefix", "车页1导眼10 km Demo剖面")),
+            "product_title": str(master.get("step9_product_title", "车页1导眼：10 km Demo多尺度DFN")),
+            "overview_product_title": str(master.get("step9_overview_product_title", "车页1导眼：10 km Demo整体DFN")),
+            "local_product_title": str(master.get("step9_local_product_title", "车页1导眼：井周DFN与成像测井裂缝对比")),
             "formal_signed_attribute_display_style": "absolute_grayscale",
             "signed_attribute_backup_display_style": "signed_red_white_blue",
             "signed_attribute_backup_dir": "red_white_blue_backup",
             **horizon_common,
         }
     )
+    if "step9_diagnostic_sections" in master:
+        step9["step9_diagnostic_sections"] = dict(master["step9_diagnostic_sections"])
+    if "single_scale_dfn_export" in master:
+        step9["single_scale_dfn_export"] = dict(master["single_scale_dfn_export"])
+    if master.get("single_scale_diag_output_dir"):
+        step9["single_scale_diag_output_dir"] = str(master["single_scale_diag_output_dir"])
+    if master.get("step9_display_horizon_table"):
+        step9["step9_display_horizon_table"] = str(master["step9_display_horizon_table"])
     step9.pop("original_fault_stick_dat", None)
     step9.pop("fault_surface_csv", None)
     step9.pop("original_fault_surface_vtk", None)

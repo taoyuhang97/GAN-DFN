@@ -1,0 +1,40 @@
+{
+  "step1_output_dir": "太古界/step1_strata_contracts/output/taigu_step1_contracts_v1",
+  "regular_las_roots": [
+    "/data/shared/project-oil/wx数据/埕岛太古界/侧向电阻率曲线/常规测井/RD"
+  ],
+  "imaging_las_roots": [
+    "/data/shared/project-oil/wx数据/埕岛太古界/侧向电阻率曲线/成像测井/RD"
+  ],
+  "deviation_dir": "/data/shared/project-oil/wx数据/埕岛太古界/井斜",
+  "surface_paths": {
+    "top": "/data/shared/project-oil/wx数据/埕岛太古界/层位/Grid_上部复合层T-a-1.dat",
+    "middle": "/data/shared/project-oil/wx数据/埕岛太古界/层位/Grid_太古界顶Art_1.dat",
+    "bottom": "/data/shared/project-oil/wx数据/埕岛太古界/层位/Grid_风化壳底Art_d1-1.dat"
+  },
+  "imaging_well_coords": {
+    "埕北305": [668400.00, 4227800.00],
+    "埕北310": [668575.00, 4226975.00],
+    "埕北313": [669950.00, 4229500.00],
+    "埕北古7": [664650.00, 4230100.00],
+    "埕北古斜405": [665423.85, 4242610.18],
+    "桩斜169": [669008.65, 4221446.19],
+    "埕北816": [665507.14, 4231506.80],
+    "桩海102": [670700.00, 4222600.00]
+  },
+  "imaging_time_depth_borrow": {
+    "埕北305": "CB39",
+    "埕北310": "CB39",
+    "埕北313": "CBGX19",
+    "埕北古7": "CB303",
+    "埕北古斜405": "CBGX22",
+    "桩斜169": "CBGX19",
+    "埕北816": "CB303",
+    "桩海102": "CB39"
+  },
+  "well_tvd_windows": {
+    "埕北313": [[4174.0, 4627.0], [4751.0, 4884.0]]
+  },
+  "source_internal_gap_factor": 3.0,
+  "output_dir": "太古界/step2_well_log_segments/output/taigu_step2_regular_v3"
+}

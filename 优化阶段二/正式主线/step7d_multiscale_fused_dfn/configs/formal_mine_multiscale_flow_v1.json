@@ -1,0 +1,11 @@
+{
+  "small_dfn_csv": "/home/tyh/projects/petroleum/code/GAN-DFN/优化阶段二/正式主线/output/formal_mine_multiscale_flow_v1/step7a_small_scale/small_dfn_patches.csv",
+  "medium_dfn_csv": "/home/tyh/projects/petroleum/code/GAN-DFN/优化阶段二/正式主线/output/formal_mine_multiscale_flow_v1/step7b_medium_scale/medium_dfn_patches.csv",
+  "large_dfn_csv": "/home/tyh/projects/petroleum/code/GAN-DFN/优化阶段二/正式主线/output/formal_mine_multiscale_flow_v1/step7c_large_fault/large_fault_dfn_patches.csv",
+  "output_dir": "/home/tyh/projects/petroleum/code/GAN-DFN/优化阶段二/正式主线/output/formal_mine_multiscale_flow_v1/step7d_fused",
+  "random_seed": 20260717,
+  "small_downsample_near_major_radius_m": 70.0,
+  "large_dfn_vtk": "/home/tyh/projects/petroleum/code/GAN-DFN/优化阶段二/正式主线/output/formal_mine_multiscale_flow_v1/step7c_large_fault/large_fault_dfn_raw_time.vtk",
+  "original_fault_manifest_csv": "/home/tyh/projects/petroleum/code/GAN-DFN/优化阶段二/正式主线/output/formal_mine_multiscale_flow_v1/step7c_large_fault/original_fault_unit_manifest.csv",
+  "write_vtk": true
+}

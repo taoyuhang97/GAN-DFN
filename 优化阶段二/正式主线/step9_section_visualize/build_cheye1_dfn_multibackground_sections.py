@@ -33,6 +33,7 @@ from trace_horizon_section import build_trace_horizon_section_curves, resolve_ho
 from well_curved_section_common import (
     AttributeSection,
     CurvedSectionGeometry,
+    apply_display_t7_curve,
     prepare_geometry,
     read_json,
     sample_volume_sections,
@@ -79,6 +80,16 @@ def local_geometry(base: CurvedSectionGeometry, config: dict[str, Any]) -> Curve
         base.trace_ids,
         x_values,
         y_values,
+        iteration_count=int(config.get("horizon_curve_iteration_count", 12)),
+    )
+    curves = apply_display_t7_curve(
+        config,
+        base.well_df,
+        base.trace_tree,
+        base.trace_ids,
+        x_values,
+        y_values,
+        curves,
         iteration_count=int(config.get("horizon_curve_iteration_count", 12)),
     )
     time_min, time_max = finite_bounds_from_curves(curves, float(config.get("time_padding_ms", 20.0)))

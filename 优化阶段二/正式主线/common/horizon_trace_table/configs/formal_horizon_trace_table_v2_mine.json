@@ -1,0 +1,21 @@
+{
+  "version": "formal_horizon_trace_table_v2_mine",
+  "source_horizon_table": "/home/tyh/projects/petroleum/code/GAN-DFN/优化阶段二/正式主线/common/horizon_trace_table/output/formal_horizon_trace_table_v1/horizon_trace_table.npy",
+  "trace_header_csv": "/home/tyh/projects/petroleum/code/GAN-DFN/数据精简/trace_header_xy.csv",
+  "output_dir": "/home/tyh/projects/petroleum/code/GAN-DFN/优化阶段二/正式主线/common/horizon_trace_table/output/formal_horizon_trace_table_v2_mine",
+  "output_filename": "horizon_trace_table.npy",
+  "target_block": {
+    "x_min": 556150,
+    "x_max": 581650,
+    "y_min": 4193975,
+    "y_max": 4212275
+  },
+  "sample_axes": [
+    {"name": "2ms", "start_ms": 1082.0, "stop_ms": 3626.0, "interval_ms": 2.0},
+    {"name": "10ms", "start_ms": 1082.0, "stop_ms": 3622.0, "interval_ms": 10.0}
+  ],
+  "qc_wells": [
+    {"name": "车571", "x": 571252.0, "y": 4202608.0, "radius_m": 100.0},
+    {"name": "车572", "x": 571812.0, "y": 4203818.0, "radius_m": 100.0}
+  ]
+}

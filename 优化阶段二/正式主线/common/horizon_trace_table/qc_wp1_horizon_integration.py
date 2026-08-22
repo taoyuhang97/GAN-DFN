@@ -70,13 +70,14 @@ def main() -> int:
     expected = trace_window_mask(subset, samples_2ms, 0, subset_count)
     synthetic_mask_pass = bool(np.array_equal(synthetic.astype(bool), expected))
 
+    version = str(master.get("version", "formal_demo_10km_multiscale_flow_v2"))
     generated_configs = {
-        "step6": FORMAL_ROOT / "step6b_demo_density_volume_3d/configs/formal_demo_10km_multiscale_flow_v2_expanded.json",
-        "step7a": FORMAL_ROOT / "step7a_small_scale_dfn/configs/formal_demo_10km_multiscale_flow_v2.json",
-        "step7b": FORMAL_ROOT / "step7b_multiscale_initial_dfn/configs/formal_demo_10km_multiscale_flow_v2.json",
-        "step7c": FORMAL_ROOT / "step7c_large_fault_dfn/configs/formal_demo_10km_multiscale_flow_v2.json",
-        "step8": FORMAL_ROOT / "step8_dfn_well_correction/configs/formal_demo_10km_multiscale_flow_v2.json",
-        "step9": FORMAL_ROOT / "step9_section_visualize/configs/formal_demo_10km_multiscale_flow_v2.json",
+        "step6": FORMAL_ROOT / f"step6b_demo_density_volume_3d/configs/{version}_expanded.json",
+        "step7a": FORMAL_ROOT / f"step7a_small_scale_dfn/configs/{version}.json",
+        "step7b": FORMAL_ROOT / f"step7b_multiscale_initial_dfn/configs/{version}.json",
+        "step7c": FORMAL_ROOT / f"step7c_large_fault_dfn/configs/{version}.json",
+        "step8": FORMAL_ROOT / f"step8_dfn_well_correction/configs/{version}.json",
+        "step9": FORMAL_ROOT / f"step9_section_visualize/configs/{version}.json",
     }
     expected_table = str(Path(master["horizon_contract_table"]).resolve())
     config_rows: dict[str, Any] = {}

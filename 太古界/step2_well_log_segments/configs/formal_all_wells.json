@@ -1,0 +1,17 @@
+{
+  "log_dir": "/data/shared/project-oil/wx数据/砂砾岩/测井",
+  "track_dir": "/data/shared/project-oil/wx数据/砂砾岩/井斜",
+  "time_dir": "/data/shared/project-oil/wx数据/砂砾岩/时深",
+  "layer_dir": "/data/shared/project-oil/wx数据/砂砾岩/层位",
+  "trace_header_csv": "/home/tyh/projects/petroleum/code/GAN-DFN/数据精简/trace_header_xy.csv",
+  "output_root": "/home/tyh/projects/petroleum/code/GAN-DFN/优化阶段二/正式主线/step2_real_well_t4_t7_samples/output/formal_all_wells",
+  "summary_csv": "/home/tyh/projects/petroleum/code/GAN-DFN/优化阶段二/正式主线/step2_real_well_t4_t7_samples/output/formal_all_wells/real_well_t4_t7_summary.csv",
+  "discover_wells_from_log_dir": true,
+  "volume_paths": {
+    "SeisAmp": "/data/shared/project-oil/wx数据/砂砾岩/psdm_final_time.sgy",
+    "Coherence": "/data/shared/project-oil/wx数据/砂砾岩/补充材料-20260623/车西_T4-T7/车西-相干体T4-T7.sgy",
+    "AntTrack": "/data/shared/project-oil/wx数据/砂砾岩/补充材料-20260623/车西_T4-T7/车西-蚂蚁体T4-T7.sgy",
+    "CurvatureMax": "/data/shared/project-oil/wx数据/砂砾岩/补充材料-20260623/车西-最大曲率T4-T7.sgy",
+    "CurvaturePos": "/data/shared/project-oil/wx数据/砂砾岩/补充材料-20260623/车西_T4-T7/车西-最大正曲率T4-T7.sgy"
+  }
+}
