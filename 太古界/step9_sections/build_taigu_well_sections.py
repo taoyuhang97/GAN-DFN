@@ -160,9 +160,9 @@ def main() -> int:
     track_x = track["X"].to_numpy(dtype=np.float64)
     track_y = track["Y"].to_numpy(dtype=np.float64)
     half_width = float(config["projection_half_width_m"])
-    time_pad = 20.0
-    t_min = float(np.floor((track_t.min() - time_pad) / 2.0) * 2.0)
-    t_max = float(np.ceil((track_t.max() + time_pad) / 2.0) * 2.0)
+    valid_h = horizon.dropna(subset=["TopTimeMs", "MidTimeMs", "BaseTimeMs"])
+    t_min = float(np.floor(valid_h["TopTimeMs"].min() / 2.0) * 2.0)
+    t_max = float(np.ceil((valid_h["BaseTimeMs"].max() + 50.0) / 2.0) * 2.0)
     section_times = np.arange(t_min, t_max + 1.0e-6, 2.0)
 
     with ObnAmplitudeSampler(Path(config["obn_segy"]), Path(config["trace_header_csv"])) as sampler:
@@ -196,13 +196,9 @@ def main() -> int:
                 dens_rows = [trace_to_row[int(t)] for t in unique_traces]
                 dens_matrix = np.stack([np.asarray(handle.trace[int(r)], dtype=np.float32) for r in dens_rows])
                 dens_axis = np.asarray(handle.samples, dtype=np.float64)
-                dens_flat = np.array(
-                    [
-                        float(np.interp(query_times[i], dens_axis, dens_matrix[inverse[i]]))
-                        for i in range(len(query_times))
-                    ],
-                    dtype=np.float32,
-                )
+                dens_time_idx = np.searchsorted(dens_axis, query_times)
+                dens_time_idx = np.clip(dens_time_idx, 0, len(dens_axis) - 1)
+                dens_flat = dens_matrix[inverse, dens_time_idx]
                 dens_image = dens_flat.reshape(n_time, n_coord)
 
                 fig, ax = plt.subplots(figsize=(14, 7))
@@ -227,27 +223,23 @@ def main() -> int:
                     alpha=0.55,
                     interpolation="nearest",
                 )
-                # well path curve and horizons along the well path
+                # horizon surfaces intersected with the curved section plane
+                horizon_map = horizon.set_index("TraceIdx")
+                for name, color, label in (
+                    ("TopTimeMs", "cyan", "Top horizon"),
+                    ("MidTimeMs", "lime", "Mid horizon"),
+                    ("BaseTimeMs", "orange", "Base horizon"),
+                ):
+                    values = horizon_map.loc[trace_idx, name].to_numpy(dtype=np.float64).reshape(n_time, n_coord)
+                    diff = np.abs(values - section_times[:, None])
+                    diff = np.where(np.isfinite(diff), diff, np.inf)
+                    t_curve = np.full(n_coord, np.nan, dtype=np.float64)
+                    finite_cols = np.isfinite(values).any(axis=0)
+                    if finite_cols.any():
+                        t_curve[finite_cols] = section_times[np.argmin(diff[:, finite_cols], axis=0)]
+                    ax.plot(coords, t_curve, color=color, lw=1.2, label=label)
+                # well path curve
                 ax.plot(well_coord, section_times, color="black", lw=2.0, label=f"{config['profile_well']} track")
-                well_rows = track[(track["TIME"] >= t_min) & (track["TIME"] <= t_max)]
-                if len(well_rows):
-                    well_trace, _ = sampler.nearest_trace(
-                        well_rows["X"].to_numpy(dtype=np.float64), well_rows["Y"].to_numpy(dtype=np.float64)
-                    )
-                    horizon_map = horizon.set_index("TraceIdx")
-                    for name, color, label in (
-                        ("TopTimeMs", "cyan", "Top horizon"),
-                        ("MidTimeMs", "lime", "Mid horizon"),
-                        ("BaseTimeMs", "orange", "Base horizon"),
-                    ):
-                        values = horizon_map.loc[well_trace, name].to_numpy(dtype=np.float64)
-                        ax.plot(
-                            well_rows["X"].to_numpy() if axis == "X" else well_rows["Y"].to_numpy(),
-                            values,
-                            color=color,
-                            lw=0.8,
-                            label=label,
-                        )
                 # patches & labels projected with half width
                 if axis == "X":
                     patch_proj = patches[(patches["Y"] - interp_well(patches["TIME"].to_numpy(), track_t, track_y)).abs() <= half_width]
