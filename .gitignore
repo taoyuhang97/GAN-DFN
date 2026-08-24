@@ -17,6 +17,9 @@ reference/
 **/output/
 **/outputs/
 
+# 太古界全链运行日志。
+太古界/output_v2_logs/
+
 # 运行日志与工具内部目录。
 优化阶段二/正式主线/logs/
 .agents/

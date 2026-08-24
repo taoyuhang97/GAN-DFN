@@ -1,0 +1,46 @@
+{
+  "version": "taigu_step5_v1",
+  "output_dir": "/home/tyh/projects/petroleum/code/GAN-DFN/太古界/step5_virtual_wells/output/taigu_step5_v1",
+  "step4_merged_predictions_csv": "/home/tyh/projects/petroleum/code/GAN-DFN/太古界/step4_fracture_prediction/output/taigu_step4_gr_rd_rs_v1/predictions/all_wells_merged_density_prediction.csv",
+  "step2_well_metadata_csv": "/home/tyh/projects/petroleum/code/GAN-DFN/太古界/step2_well_log_segments/output/taigu_step2_regular_v3/taigu_step2_well_metadata.csv",
+  "step3_groups_root": "/home/tyh/projects/petroleum/code/GAN-DFN/太古界/step3_imaging_groups/output/taigu_step3_imaging_v3/groups",
+  "trace_header_csv": "/home/tyh/projects/petroleum/code/GAN-DFN/太古界/common/trace_contract/output/obn_trace_header_v1/obn_trace_header_xy.csv",
+  "surface_lookup_cache_npz": "/home/tyh/projects/petroleum/code/GAN-DFN/太古界/common/horizon_contract/output/horizon_contract_v1/surface_lookup_cache.npz",
+  "obn_segy": "/data/shared/project-oil/wx数据/埕岛太古界/cd2023_obn_pstm_cub_all_grid125_1206_haorui.segy",
+  "neighborhood_radius": 2,
+  "max_time_shift_ms": 60.0,
+  "max_virtual_neighbor_distance_m": 40.0,
+  "max_sample_distance_m": 30.0,
+  "max_horizon_match_distance_m": 10.0,
+  "confidence": {
+    "regular": 1.0,
+    "imaging_borrow_distance_scale_m": 10000.0,
+    "min_confidence": 0.2
+  },
+  "max_virtual_weight_fraction": 5.0,
+  "strong_supervision_wells": [
+    "埕北310",
+    "埕北313",
+    "埕北816",
+    "埕北古斜405",
+    "桩斜169",
+    "桩海102"
+  ],
+  "continuity": {
+    "enabled": true,
+    "scale_multiplier": 1.0,
+    "scale_floor": 1.0e-6,
+    "min_continuity": 0.3,
+    "distance_scale_m": 500.0,
+    "weight_divisor": 25.0
+  },
+  "context_time_offsets_ms": [
+    -4.0,
+    -2.0,
+    0.0,
+    2.0,
+    4.0
+  ],
+  "md_merge_tolerance": 0.011,
+  "write_audit_detail": true
+}

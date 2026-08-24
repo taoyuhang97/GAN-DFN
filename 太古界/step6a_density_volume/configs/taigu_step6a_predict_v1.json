@@ -1,0 +1,13 @@
+{
+  "version": "taigu_step6a_predict_v1",
+  "output_dir": "/home/tyh/projects/petroleum/code/GAN-DFN/太古界/step6a_density_volume/output/taigu_step6a_v1/volume",
+  "model_joblib": "/home/tyh/projects/petroleum/code/GAN-DFN/太古界/step6a_density_volume/output/taigu_step6a_v1/models/step6_two_stage_density_models.joblib",
+  "demo_grid_csv": "/home/tyh/projects/petroleum/code/GAN-DFN/太古界/common/trace_contract/output/taigu_demo_grid_v1/demo_grid.csv",
+  "horizon_contract_csv": "/home/tyh/projects/petroleum/code/GAN-DFN/太古界/common/horizon_contract/output/horizon_contract_v1/demo_horizon_contract.csv",
+  "horizon_windows_npz": "/home/tyh/projects/petroleum/code/GAN-DFN/太古界/common/horizon_contract/output/horizon_contract_v1/horizon_windows_2ms.npz",
+  "trace_header_csv": "/home/tyh/projects/petroleum/code/GAN-DFN/太古界/common/trace_contract/output/obn_trace_header_v1/obn_trace_header_xy.csv",
+  "obn_segy": "/data/shared/project-oil/wx数据/埕岛太古界/cd2023_obn_pstm_cub_all_grid125_1206_haorui.segy",
+  "block_x_line_count": 20,
+  "sample_interval_ms": 2.0,
+  "ext_window_ms": 50.0
+}
