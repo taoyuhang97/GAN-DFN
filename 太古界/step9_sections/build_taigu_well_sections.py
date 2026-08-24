@@ -32,6 +32,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import segyio
+from matplotlib.collections import LineCollection
 
 
 CURRENT_DIR = Path(__file__).resolve().parent
@@ -248,15 +249,43 @@ def main() -> int:
                     patch_proj = patches[(patches["X"] - interp_well(patches["TIME"].to_numpy(), track_t, track_x)).abs() <= half_width]
                     label_proj = labels[(labels["X"] - interp_well(labels["TIME"].to_numpy(), track_t, track_x)).abs() <= half_width]
                 if len(patch_proj):
-                    ax.scatter(
-                        patch_proj[coord_label.split(" ")[0]],
-                        patch_proj["TIME"],
-                        c=patch_proj["Density"],
-                        cmap="hot_r",
-                        s=8,
-                        alpha=0.8,
-                        label="small patches",
-                    )
+                    z_scale = float(config["display_z_scale_m_per_ms"])
+                    segments = []
+                    densities = []
+                    for _, pk in patch_proj.iterrows():
+                        az = np.radians(float(pk["AzimuthDeg"]))
+                        dip = np.radians(float(pk["DipDeg"]))
+                        strike = np.array([np.cos(az), np.sin(az), 0.0])
+                        dipdir = np.array([-np.sin(az), np.cos(az), 0.0])
+                        dipvec = np.array([np.sin(dip) * dipdir[0], np.sin(dip) * dipdir[1], np.cos(dip)])
+                        normal = np.cross(strike, dipvec)
+                        norm = np.linalg.norm(normal)
+                        if norm < 1.0e-12:
+                            continue
+                        normal = normal / norm
+                        sec_normal = np.array([0.0, 1.0, 0.0]) if axis == "X" else np.array([1.0, 0.0, 0.0])
+                        trace_dir = np.cross(normal, sec_normal)
+                        if axis == "X":
+                            d2 = np.array([trace_dir[0], trace_dir[2]])
+                            cx = float(pk["X"])
+                        else:
+                            d2 = np.array([trace_dir[1], trace_dir[2]])
+                            cx = float(pk["Y"])
+                        length = np.linalg.norm(d2)
+                        if length < 1.0e-6:
+                            continue
+                        d2 = d2 / length
+                        half = float(pk["PatchLengthM"]) / 2.0
+                        z_center = float(pk["TIME"]) * z_scale
+                        p0 = [cx - half * d2[0], (z_center - half * d2[1]) / z_scale]
+                        p1 = [cx + half * d2[0], (z_center + half * d2[1]) / z_scale]
+                        segments.append([p0, p1])
+                        densities.append(float(pk["Density"]))
+                    if segments:
+                        collection = LineCollection(segments, cmap="hot_r", linewidths=1.1, alpha=0.9)
+                        collection.set_array(np.asarray(densities, dtype=np.float64))
+                        ax.add_collection(collection)
+                        ax.plot([], [], color="red", lw=1.1, label="small fracture traces")
                 if len(label_proj):
                     ax.scatter(
                         label_proj[coord_label.split(" ")[0]],
