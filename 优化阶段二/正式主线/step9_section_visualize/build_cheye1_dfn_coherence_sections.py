@@ -76,10 +76,26 @@ IMAGING_SEGMENT_COLOR = "#00f5ff"
 IMAGING_SEGMENT_GLOW = "#083344"
 FAULT_TRACE_COLOR = "#ffe600"
 FAULT_TRACE_HALO = "#111827"
-FAULT_TRACE_WIDTH = 2.8
+FAULT_TRACE_WIDTH = 2.5
 FAULT_TRACE_HALO_WIDTH = 5.2
-FAULT_TRACE_OVERVIEW_WIDTH = 1.25
+FAULT_TRACE_OVERVIEW_WIDTH = 2.5
 FAULT_TRACE_OVERVIEW_HALO_WIDTH = 2.4
+# 方案B：尺度 -> (线宽, 线型)。颜色按层段（沙三橙/沙四蓝），
+# 中小尺度用粗细区分；大尺度用描边或虚实线由预览确认。
+SCALE_LINE_STYLES = {
+    "small": (1.5, "-"),
+    "medium": (2.5, "-"),
+    "large": (2.5, "-"),   # 大/中同宽，大尺度靠黑色描边区分
+    "": (1.4, "-"),
+}
+# 大尺度是否加深色描边（轮廓）；预览脚本可切换对比"虚实线 vs 描边"
+SCALE_LARGE_HALO = True
+# 方案B：图例样本样式，尺度 -> (颜色, 线型, 线宽, 标签)
+SCALE_LEGEND_STYLES = {
+    "small": ("#9ca3af", "-", 2.0, "小尺度裂缝"),
+    "medium": ("#6b7280", "-", 2.6, "中尺度裂缝"),
+    "large": ("#374151", "-", 2.6, "大尺度裂缝"),
+}
 DFN_WIDTH_MIN = 0.45
 DFN_WIDTH_MAX = 3.0
 DFN_WIDTH_POWER = 0.80
@@ -330,10 +346,12 @@ def make_summary(display: dict[str, float], time_min: float, time_max: float) ->
 
 def segment_lines(
     segments: list[ProjectionSegment], projection: str
-) -> tuple[list[tuple[tuple[float, float], tuple[float, float]]], list[str], list[float]]:
+) -> tuple[list[tuple[tuple[float, float], tuple[float, float]]], list[str], list[float], list[str]]:
+    """返回 (线段, 颜色, 线宽, 线型)；线宽/线型按尺度区分（方案B），颜色保留层段色。"""
     lines: list[tuple[tuple[float, float], tuple[float, float]]] = []
     colors: list[str] = []
     widths: list[float] = []
+    linestyles: list[str] = []
     selected = [segment for segment in segments if segment.projection == projection]
     areas = np.asarray([max(float(segment.patch_area), 1.0) for segment in selected], dtype=float)
     if areas.size > 1 and np.isfinite(areas).all() and float(np.nanmax(areas)) > float(np.nanmin(areas)):
@@ -348,12 +366,12 @@ def segment_lines(
         if segment.projection != projection:
             continue
         colors.append(DFN_INTERVAL_COLORS.get(segment.interval, "#ef4444"))
+        patch_scale = str(getattr(segment, "scale", "")).strip().lower()
+        width, linestyle = SCALE_LINE_STYLES.get(patch_scale, SCALE_LINE_STYLES[""])
         if hi > lo:
             area_norm = float(np.clip((max(float(segment.patch_area), 1.0) - lo) / (hi - lo), 0.0, 1.0))
-            width = DFN_WIDTH_MIN + (DFN_WIDTH_MAX - DFN_WIDTH_MIN) * (area_norm ** DFN_WIDTH_POWER)
             scale = DFN_SEGMENT_SCALE_MIN + (DFN_SEGMENT_SCALE_MAX - DFN_SEGMENT_SCALE_MIN) * (area_norm ** DFN_SEGMENT_SCALE_POWER)
         else:
-            width = 0.5 * (DFN_WIDTH_MIN + DFN_WIDTH_MAX)
             scale = 1.0
         h_mid = 0.5 * (float(segment.h1) + float(segment.h2))
         z_mid = 0.5 * (float(segment.z1) + float(segment.z2))
@@ -361,7 +379,8 @@ def segment_lines(
         z_half = 0.5 * (float(segment.z2) - float(segment.z1)) * scale
         lines.append(((h_mid - h_half, z_mid - z_half), (h_mid + h_half, z_mid + z_half)))
         widths.append(float(width))
-    return lines, colors, widths
+        linestyles.append(linestyle)
+    return lines, colors, widths, linestyles
 
 
 def append_segment_with_mode(segments: list[ProjectionSegment], segment: ProjectionSegment, mode: str) -> None:
@@ -548,6 +567,7 @@ def scan_vtk_intersections(args: SimpleNamespace, surfaces: dict[str, Any], well
                             z1=float(line[0][1]),
                             h2=float(line[1][0]),
                             z2=float(line[1][1]),
+                            scale=patch_scale,
                         ),
                         "intersection",
                     )
@@ -581,6 +601,7 @@ def scan_vtk_intersections(args: SimpleNamespace, surfaces: dict[str, Any], well
                                 z1=float(line[0][1]),
                                 h2=float(line[1][0]),
                                 z2=float(line[1][1]),
+                                scale=patch_scale,
                             ),
                             "small_projection",
                         )
@@ -608,6 +629,7 @@ def scan_vtk_intersections(args: SimpleNamespace, surfaces: dict[str, Any], well
                             z1=float(line[0][1]),
                             h2=float(line[1][0]),
                             z2=float(line[1][1]),
+                            scale=patch_scale,
                         ),
                         "intersection",
                     )
@@ -641,6 +663,7 @@ def scan_vtk_intersections(args: SimpleNamespace, surfaces: dict[str, Any], well
                                 z1=float(line[0][1]),
                                 h2=float(line[1][0]),
                                 z2=float(line[1][1]),
+                                scale=patch_scale,
                             ),
                             "small_projection",
                         )
@@ -1125,7 +1148,7 @@ def add_fault_trace_segments(
     line_style = (0, (5, 3)) if overview else "-"
     ax.add_collection(LineCollection(lines, colors=FAULT_TRACE_HALO, linewidths=halo_width, alpha=0.70 if overview else 0.86, zorder=9, linestyles=line_style))
     ax.add_collection(LineCollection(lines, colors=FAULT_TRACE_COLOR, linewidths=line_width, alpha=0.78 if overview else 0.96, zorder=10, linestyles=line_style))
-    ax.plot([], [], color=FAULT_TRACE_COLOR, linewidth=line_width, linestyle=line_style, label="断层轨迹")
+    ax.plot([], [], color=FAULT_TRACE_COLOR, linewidth=line_width, linestyle=line_style, label="原始断层")
     return len(lines)
 
 
@@ -1140,24 +1163,37 @@ def add_dfn_segments(ax, segments: list[ProjectionSegment], projection: str, *, 
         for segment in segments
         if segment.projection == projection and getattr(segment, "display_mode", "intersection") == "small_projection"
     ]
-    intersection_lines, intersection_colors, intersection_widths = segment_lines(intersection_segments, projection)
-    projected_lines, projected_colors, projected_widths = segment_lines(projected_segments, projection)
+    intersection_lines, intersection_colors, intersection_widths, intersection_styles = segment_lines(intersection_segments, projection)
+    projected_lines, projected_colors, projected_widths, projected_styles = segment_lines(projected_segments, projection)
     if not intersection_lines and not projected_lines:
         ax.text(0.5, 0.5, "无T4-T7裂缝片段", transform=ax.transAxes, ha="center", va="center")
         return 0
     if projected_lines:
-        projected_widths = [max(0.35, width * 0.62) for width in projected_widths]
-        if overlay:
-            halo_widths = [width + 0.55 for width in projected_widths]
-            ax.add_collection(LineCollection(projected_lines, colors=DFN_HALO_COLOR, linewidths=halo_widths, alpha=0.22, zorder=12.6))
-        ax.add_collection(LineCollection(projected_lines, colors=projected_colors, linewidths=projected_widths, alpha=0.48, zorder=12.8 if overlay else 1.8))
-        ax.plot([], [], color="#6b7280", linewidth=1.4, alpha=0.58, label="小尺度裂缝投影")
+        # 投影小尺度与正常小尺度统一显示：层段色、按尺度线宽、正常透明度，不再单独图例
+        ax.add_collection(LineCollection(projected_lines, colors=projected_colors, linewidths=projected_widths, alpha=0.92, zorder=12.8 if overlay else 1.8, linestyles=projected_styles))
     if not intersection_lines:
         return len(projected_lines)
-    if overlay:
-        halo_widths = [width + 1.35 for width in intersection_widths]
-        ax.add_collection(LineCollection(intersection_lines, colors=DFN_HALO_COLOR, linewidths=halo_widths, alpha=0.72, zorder=13.0))
-    ax.add_collection(LineCollection(intersection_lines, colors=intersection_colors, linewidths=intersection_widths, alpha=0.92, zorder=13.2 if overlay else 2))
+    if overlay and SCALE_LARGE_HALO:
+        # 描边（轮廓）只用于大尺度，突出主断裂；中/小尺度无描边
+        large_flags = [
+            str(getattr(segment, "scale", "")).strip().lower() == "large"
+            for segment in intersection_segments
+        ]
+        halo_lines = [line for line, flag in zip(intersection_lines, large_flags) if flag]
+        halo_widths = [width + 1.8 for width, flag in zip(intersection_widths, large_flags) if flag]
+        halo_styles = [style for style, flag in zip(intersection_styles, large_flags) if flag]
+        if halo_lines:
+            ax.add_collection(LineCollection(halo_lines, colors=DFN_HALO_COLOR, linewidths=halo_widths, alpha=0.78, zorder=13.0, linestyles=halo_styles))
+    ax.add_collection(LineCollection(intersection_lines, colors=intersection_colors, linewidths=intersection_widths, alpha=0.92, zorder=13.2 if overlay else 2, linestyles=intersection_styles))
+    # 方案B：按实际出现的尺度添加图例项（颜色用中性灰，避免与层段色混淆）
+    present_scales = {
+        str(getattr(segment, "scale", "")).strip().lower()
+        for segment in [*intersection_segments, *projected_segments]
+    }
+    for scale_key in ("small", "medium", "large"):
+        if scale_key in present_scales:
+            color, style, width, label = SCALE_LEGEND_STYLES[scale_key]
+            ax.plot([], [], color=color, linestyle=style, linewidth=width, label=label)
     return len(intersection_lines) + len(projected_lines)
 
 

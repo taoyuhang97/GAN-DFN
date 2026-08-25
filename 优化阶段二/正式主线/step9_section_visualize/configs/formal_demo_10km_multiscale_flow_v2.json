@@ -17,6 +17,33 @@
     "SeisAmp": "/data/shared/project-oil/wx数据/砂砾岩/psdm_final_time.sgy"
   },
   "overview_section_sample_paths": {},
+  "section_time_max_override_ms": 3620.0,
+  "presentation_output_root": "/home/tyh/projects/petroleum/code/GAN-DFN/优化阶段二/正式主线/output/step9_section_presentation",
+  "presentation_scale_name": "10km_v2",
+  "presentation_targets": {
+    "overview": {
+      "width_cm": 30.0,
+      "height_cm": 20.0,
+      "dpi": 300,
+      "max_traces": 200,
+      "time_decim": 2,
+      "legend_width_in": 2.2,
+      "legend_fontsize": 9.0,
+      "wiggle_linewidth": 0.7,
+      "wiggle_lateral_scale_fraction": 0.58
+    },
+    "local_200m": {
+      "width_cm": 30.0,
+      "height_cm": 20.0,
+      "dpi": 300,
+      "max_traces": 0,
+      "time_decim": 2,
+      "legend_width_in": 2.2,
+      "legend_fontsize": 9.0,
+      "wiggle_linewidth": 0.7,
+      "wiggle_lateral_scale_fraction": 0.58
+    }
+  },
   "output_dir": "/home/tyh/projects/petroleum/code/GAN-DFN/优化阶段二/正式主线/step9_section_visualize/output/formal_demo_10km_multiscale_flow_v2/cheye1_dfn_multibackground_sections",
   "well_name": "车页1导眼",
   "exclude_wells": [],

@@ -252,14 +252,46 @@ def build_overlay_contexts(
 
 def render_all(config_path: Path, config: dict[str, Any]) -> dict[str, Any]:
     validate_inputs(config)
+    presentation_root = config.get("presentation_output_root")
+    scale_name = str(config.get("presentation_scale_name", ""))
+    presentation_enabled = bool(presentation_root and scale_name)
     output_dir = path_from_config(config, "output_dir")
-    reset_output_images(output_dir)
+    if not presentation_enabled:
+        reset_output_images(output_dir)
     overview_config = dict(config)
     overview_config["target_block"] = dict(config.get("overview_target_block") or {})
     overview = prepare_geometry(overview_config)
     overview.summary["scope_name"] = "overview"
     local = local_geometry(overview, config)
     scopes = {"overview": overview, "local_200m": local}
+    # 显示下界覆盖：T7 以下延伸区（DFN 最深约 3618 ms）默认被 T7+padding 截断，
+    # 用 section_time_max_override_ms 把剖面纵向范围扩到该深度，T7 层位线仍按原始位置。
+    time_max_override = config.get("section_time_max_override_ms")
+    if time_max_override:
+        override_value = float(time_max_override)
+        for geometry in scopes.values():
+            geometry.time_max = max(float(geometry.time_max), override_value)
+            geometry.summary["display_time_max"] = max(
+                float(geometry.summary.get("display_time_max", 0.0)), override_value
+            )
+            geometry.summary["section_time_max_override_ms"] = override_value
+    for geometry in scopes.values():
+        curve_extents: dict[str, tuple[float | None, float | None]] = {}
+        for projection in ("XZ", "YZ"):
+            tmin: list[float] = []
+            tmax: list[float] = []
+            for curve in geometry.surface_curves:
+                if curve.projection != projection:
+                    continue
+                z = np.asarray(curve.z)
+                finite = np.isfinite(z)
+                if finite.any():
+                    tmin.append(float(z[finite].min()))
+                    tmax.append(float(z[finite].max()))
+            curve_extents[projection] = (
+                (min(tmin), max(tmax)) if tmin else (None, None)
+            )
+        geometry.summary["_curve_extents"] = curve_extents
     scope_labels = {"overview": "矿区尺度 | 当前候选区DFN", "local_200m": "井周200 m"}
     overlay_contexts, overlay_summary = build_overlay_contexts(config, overview, local)
 
@@ -281,6 +313,39 @@ def render_all(config_path: Path, config: dict[str, Any]) -> dict[str, Any]:
             xz, yz, _ = sampled[scope_name][attribute]
             cache_dir = output_dir / "section_samples" / scope_name
             save_section_pair_npz(cache_dir / f"{attribute.lower()}_section_samples.npz", xz, yz)
+
+    # 属性剖面（蚂蚁/相干/曲率）的深度范围，供振幅/波形剖面套用，保证整组剖面深度一致
+    depth_pad = 10.0
+    for scope_name, geometry in scopes.items():
+        attribute_bounds: dict[str, tuple[float, float]] = {}
+        for projection in ("XZ", "YZ"):
+            proj_index = 0 if projection == "XZ" else 1
+            tmin: list[float] = []
+            tmax: list[float] = []
+            for attribute in ATTRIBUTE_ORDER:
+                section = sampled[scope_name][attribute][proj_index]
+                vals = np.asarray(section.values)
+                time = np.asarray(section.time)
+                finite_rows = np.isfinite(vals).any(axis=1)
+                if finite_rows.any():
+                    tmin.append(float(time[finite_rows].min()))
+                    tmax.append(float(time[finite_rows].max()))
+            curve_ext = geometry.summary.get("_curve_extents", {}).get(projection)
+            candidates_min = [
+                value for value in (*tmin, curve_ext[0] if curve_ext else None)
+                if value is not None
+            ]
+            candidates_max = [
+                value for value in (*tmax, curve_ext[1] if curve_ext else None)
+                if value is not None
+            ]
+            top = min(candidates_min) if candidates_min else float(geometry.time_min)
+            bottom = max(candidates_max) if candidates_max else float(geometry.time_max)
+            attribute_bounds[projection] = (
+                max(float(geometry.time_min), top - depth_pad),
+                min(float(geometry.time_max), bottom + depth_pad),
+            )
+        geometry.summary["_attribute_depth_bounds"] = attribute_bounds
 
     formal_display_style = str(config.get("formal_signed_attribute_display_style", FORMAL_DISPLAY_STYLE))
     backup_display_style = str(config.get("signed_attribute_backup_display_style", BACKUP_DISPLAY_STYLE))
@@ -331,12 +396,177 @@ def render_all(config_path: Path, config: dict[str, Any]) -> dict[str, Any]:
     requested_numbers = {int(value) for value in config.get("image_numbers", [])}
     if requested_numbers:
         image_plan = [row for row in image_plan if row[0] in requested_numbers]
+
+    if presentation_enabled:
+        root = Path(str(presentation_root)).resolve() / scale_name
+        root.mkdir(parents=True, exist_ok=True)
+        targets = dict(config.get("presentation_targets") or {})
+        full_dir = root / "full_resolution"
+        full_summary = render_pass(
+            "full_resolution", full_dir, config_path, config, image_plan,
+            scopes, sampled, overlay_contexts, overlay_summary,
+            attribute_scales, backup_curvature_scale, seis_limit,
+            scope_labels, formal_display_style, backup_display_style, requested_numbers,
+        )
+        ppt_sampled = build_ppt_sampled(sampled, targets)
+        ppt_scopes = {
+            name: make_ppt_geometry(geometry, targets.get(name, {}))
+            for name, geometry in scopes.items()
+        }
+        ppt_dir = root / "ppt_decimated"
+        ppt_summary = render_pass(
+            "ppt_decimated", ppt_dir, config_path, config, image_plan,
+            ppt_scopes, ppt_sampled, overlay_contexts, overlay_summary,
+            attribute_scales, backup_curvature_scale, seis_limit,
+            scope_labels, formal_display_style, backup_display_style, requested_numbers,
+        )
+        root_summary = {
+            "status": "pass"
+            if full_summary["status"] == "pass" and ppt_summary["status"] == "pass"
+            else "fail",
+            "config_path": str(config_path.resolve()),
+            "scale_name": scale_name,
+            "presentation_targets": targets,
+            "full_resolution": {
+                "dir": str(full_dir),
+                "image_count": int(len(full_summary["images"])),
+                "summary_json": str(full_dir / "section_summary.json"),
+            },
+            "ppt_decimated": {
+                "dir": str(ppt_dir),
+                "image_count": int(len(ppt_summary["images"])),
+                "summary_json": str(ppt_dir / "section_summary.json"),
+            },
+            "ppt_wiggle_trace_counts": {
+                f"{row['number']:02d}_{row['scope']}_{row['projection']}": int(row["overlay"].get("wiggle_trace_count", -1))
+                for row in ppt_summary["images"]
+                if row["renderer"] == "wiggle"
+            },
+        }
+        write_json(root / "section_presentation_summary.json", root_summary)
+        print(f"[multi-background] presentation root={root}", flush=True)
+        print(f"[multi-background] status={root_summary['status']}", flush=True)
+        return root_summary
+
+    summary = render_pass(
+        "default", output_dir, config_path, config, image_plan,
+        scopes, sampled, overlay_contexts, overlay_summary,
+        attribute_scales, backup_curvature_scale, seis_limit,
+        scope_labels, formal_display_style, backup_display_style, requested_numbers,
+    )
+    return summary
+def decimate_section(section: AttributeSection, max_traces: int, time_decim: int) -> AttributeSection:
+    """按目标道数与时间采样倍数抽稀一个剖面切片。"""
+    n_traces = len(section.h)
+    if max_traces and max_traces > 0 and max_traces < n_traces:
+        selected = np.unique(np.linspace(0, n_traces - 1, int(max_traces), dtype=int))
+    else:
+        selected = np.arange(n_traces, dtype=int)
+    tstep = max(1, int(time_decim or 1))
+    values = np.asarray(section.values)
+    decimated = AttributeSection(
+        section.attribute,
+        section.projection,
+        np.asarray(section.h)[selected],
+        np.asarray(section.time)[::tstep],
+        values[::tstep][:, selected],
+    )
+    for attr_name in ("display_time_min", "display_time_max"):
+        if hasattr(section, attr_name):
+            setattr(decimated, attr_name, getattr(section, attr_name))
+    return decimated
+
+
+def apply_section_display_bounds(section: AttributeSection, geometry: CurvedSectionGeometry) -> None:
+    """按剖面自身数据范围 + 该投影层位曲线范围自适应纵轴（断层深度不参与）。"""
+    vals = np.asarray(section.values)
+    finite_rows = np.isfinite(vals).any(axis=1)
+    time = np.asarray(section.time)
+    pad = 10.0
+    if finite_rows.any():
+        top = float(time[finite_rows].min())
+        bottom = float(time[finite_rows].max())
+    else:
+        top, bottom = float(geometry.time_min), float(geometry.time_max)
+    curve_ext = geometry.summary.get("_curve_extents", {}).get(section.projection)
+    if curve_ext and curve_ext[0] is not None:
+        top = min(top, float(curve_ext[0]))
+        bottom = max(bottom, float(curve_ext[1]))
+    section.display_time_min = max(float(geometry.time_min), top - pad)
+    section.display_time_max = min(float(geometry.time_max), bottom + pad)
+
+
+def make_ppt_geometry(geometry: CurvedSectionGeometry, target: dict[str, Any]) -> CurvedSectionGeometry:
+    """按 PPT 目标尺寸生成几何：dpi、画布像素、图例列宽、线宽等。"""
+    dpi = int(target.get("dpi", 300))
+    width_cm = float(target["width_cm"])
+    height_cm = float(target["height_cm"])
+    width_px = int(round(width_cm / 2.54 * dpi))
+    height_px = int(round(height_cm / 2.54 * dpi))
+    legend_width_in = float(target.get("legend_width_in", min(4.0, width_cm / 2.54 * 0.28)))
+    args = SimpleNamespace(**vars(geometry.args))
+    args.fig_width = max(1.0, width_px / dpi - legend_width_in)
+    args.fig_height = height_px / dpi
+    args.dpi = dpi
+    config = dict(geometry.config)
+    config["render_dpi"] = dpi
+    config["xz_total_width_px"] = max(200, int(round(width_px - legend_width_in * dpi)))
+    config["yz_total_width_px"] = max(200, int(round(width_px - legend_width_in * dpi)))
+    config["figure_height_px"] = height_px
+    config["overlay_legend_width_in"] = legend_width_in
+    config["overlay_legend_fontsize"] = float(target.get("legend_fontsize", 8.0))
+    config["wiggle_linewidth"] = float(target.get("wiggle_linewidth", 0.7))
+    if target.get("wiggle_lateral_scale_fraction") is not None:
+        config["wiggle_lateral_scale_fraction"] = float(target["wiggle_lateral_scale_fraction"])
+    return replace(geometry, args=args, config=config)
+
+
+def build_ppt_sampled(sampled: dict[str, Any], targets: dict[str, dict[str, Any]]) -> dict[str, Any]:
+    ppt_sampled: dict[str, Any] = {}
+    for scope_name, scope_samples in sampled.items():
+        target = targets.get(scope_name, {})
+        max_traces = int(target.get("max_traces", 0))
+        time_decim = int(target.get("time_decim", 1))
+        ppt_sampled[scope_name] = {}
+        for attribute, pair in scope_samples.items():
+            xz, yz, info = pair
+            ppt_sampled[scope_name][attribute] = (
+                decimate_section(xz, max_traces, time_decim),
+                decimate_section(yz, max_traces, time_decim),
+                info,
+            )
+    return ppt_sampled
+
+
+def render_image_plan(
+    image_plan: list[tuple[int, str, str, str, str]],
+    output_dir: Path,
+    scopes: dict[str, CurvedSectionGeometry],
+    sampled: dict[str, Any],
+    overlay_contexts: dict[str, SectionOverlayContext],
+    attribute_scales: dict[str, Any],
+    backup_curvature_scale: Any,
+    seis_limit: float,
+    scope_labels: dict[str, str],
+    config: dict[str, Any],
+    formal_display_style: str,
+    backup_display_style: str,
+) -> tuple[list[dict[str, Any]], list[str], list[str]]:
+    backup_dir = output_dir / "red_white_blue_backup"
+    backup_dir.mkdir(parents=True, exist_ok=True)
     image_rows: list[dict[str, Any]] = []
     mode_names = {"attribute": "dfn", "density": "density_dfn", "wiggle": "wiggle_dfn"}
     for number, scope_name, attribute, projection, renderer in image_plan:
         section_index = 0 if projection == "XZ" else 1
         section = sampled[scope_name][attribute][section_index]
         geometry = scopes[scope_name]
+        apply_section_display_bounds(section, geometry)
+        if attribute == "SeisAmp":
+            # 振幅/波形剖面与同 scope 同投影的属性剖面共用深度范围，避免纵向不一致
+            attr_bounds = geometry.summary.get("_attribute_depth_bounds", {}).get(projection)
+            if attr_bounds is not None:
+                section.display_time_min = float(attr_bounds[0])
+                section.display_time_max = float(attr_bounds[1])
         product_title = str(
             config.get("overview_product_title", config.get("product_title", PRODUCT_TITLE))
             if scope_name == "overview"
@@ -431,6 +661,50 @@ def render_all(config_path: Path, config: dict[str, Any]) -> dict[str, Any]:
 
     png_files = sorted(path.name for path in output_dir.glob("*.png"))
     backup_png_files = sorted(path.name for path in backup_dir.glob("*.png")) if backup_dir.exists() else []
+    return image_rows, png_files, backup_png_files
+
+
+def render_pass(
+    pass_name: str,
+    pass_dir: Path,
+    config_path: Path,
+    config: dict[str, Any],
+    image_plan: list[tuple[int, str, str, str, str]],
+    scopes: dict[str, CurvedSectionGeometry],
+    sampled: dict[str, Any],
+    overlay_contexts: dict[str, SectionOverlayContext],
+    overlay_summary: dict[str, Any],
+    attribute_scales: dict[str, Any],
+    backup_curvature_scale: Any,
+    seis_limit: float,
+    scope_labels: dict[str, str],
+    formal_display_style: str,
+    backup_display_style: str,
+    requested_numbers: set[int],
+) -> dict[str, Any]:
+    pass_dir.mkdir(parents=True, exist_ok=True)
+    for path in pass_dir.glob("*.png"):
+        path.unlink()
+    backup_dir = pass_dir / "red_white_blue_backup"
+    backup_dir.mkdir(parents=True, exist_ok=True)
+    for path in backup_dir.glob("*.png"):
+        path.unlink()
+
+    image_rows, png_files, backup_png_files = render_image_plan(
+        image_plan,
+        pass_dir,
+        scopes,
+        sampled,
+        overlay_contexts,
+        attribute_scales,
+        backup_curvature_scale,
+        seis_limit,
+        scope_labels,
+        config,
+        formal_display_style,
+        backup_display_style,
+    )
+
     scan_accounting: dict[str, dict[str, Any]] = {}
     for scan_name in ("overview_scan", "local_200m_scan"):
         scan = dict(overlay_summary[scan_name])
@@ -467,16 +741,14 @@ def render_all(config_path: Path, config: dict[str, Any]) -> dict[str, Any]:
                 overlay_consistent = overlay_consistent and len(counts) == 1 and next(iter(counts), 0) > 0
     checks = {
         "expected_image_count": len(png_files) == (len(requested_numbers) if requested_numbers else 20),
-        "all_planned_images_exist": all((output_dir / row["file"]).exists() for row in image_rows),
+        "all_planned_images_exist": all((pass_dir / row["file"]).exists() for row in image_rows),
         "signed_rwb_backup_complete": all(
-            row["signed_rwb_backup_file"] is None or (output_dir / row["signed_rwb_backup_file"]).exists()
+            row["signed_rwb_backup_file"] is None or (pass_dir / row["signed_rwb_backup_file"]).exists()
             for row in image_rows
         ) and len(backup_png_files) == sum(row["signed_rwb_backup_file"] is not None for row in image_rows),
         "overlay_counts_consistent_across_backgrounds": bool(overlay_consistent),
         "step3_60_points_loaded": int(overlay_summary["step3_fracture_point_count"]) == 60,
-        "configured_original_fault_surface_loaded": bool(
-            original_fault_surface_loaded
-        ),
+        "configured_original_fault_surface_loaded": bool(original_fault_surface_loaded),
         "overview_and_local_have_xz_yz_dfn": all(
             int(overlay_summary[key][f"selected_segment_count_{projection.lower()}"]) > 0
             for key in ("overview_scan", "local_200m_scan")
@@ -492,14 +764,15 @@ def render_all(config_path: Path, config: dict[str, Any]) -> dict[str, Any]:
     }
     summary = {
         "status": "pass" if all(checks.values()) else "fail",
+        "pass_name": pass_name,
         "config_path": str(config_path.resolve()),
-        "output_dir": str(output_dir),
+        "output_dir": str(pass_dir),
         "product_title": str(config.get("product_title", PRODUCT_TITLE)),
         "scope_product_titles": {
             "overview": str(config.get("overview_product_title", config.get("product_title", PRODUCT_TITLE))),
             "local_200m": str(config.get("local_product_title", PRODUCT_TITLE)),
         },
-        "well_name": overview.well_name,
+        "well_name": next(iter(scopes.values())).well_name,
         "scope_geometry": {name: geometry.summary for name, geometry in scopes.items()},
         "overlay_source": overlay_summary,
         "projection_accounting": scan_accounting,
@@ -516,9 +789,9 @@ def render_all(config_path: Path, config: dict[str, Any]) -> dict[str, Any]:
         "png_files": png_files,
         "checks": checks,
     }
-    write_json(output_dir / "section_summary.json", summary)
-    print(f"[multi-background] output={output_dir}", flush=True)
-    print(f"[multi-background] status={summary['status']}", flush=True)
+    write_json(pass_dir / "section_summary.json", summary)
+    print(f"[multi-background] pass={pass_name} output={pass_dir}", flush=True)
+    print(f"[multi-background] pass_status={summary['status']}", flush=True)
     return summary
 
 

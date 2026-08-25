@@ -80,7 +80,9 @@ def apply_axes(ax, section: AttributeSection, geometry, *, show_legend: bool = T
         draw_well_trajectory(ax, geometry.well_df["Y"], geometry.well_df["TIME"], label=f"{geometry.well_name}井轨迹")
         ax.set_xlabel("Y / m")
     ax.set_xlim(float(section.h[0]), float(section.h[-1]))
-    ax.set_ylim(float(geometry.summary["display_time_min"]), float(geometry.summary["display_time_max"]))
+    tmin = float(getattr(section, "display_time_min", geometry.summary["display_time_min"]))
+    tmax = float(getattr(section, "display_time_max", geometry.summary["display_time_max"]))
+    ax.set_ylim(tmin, tmax)
     ax.invert_yaxis()
     ax.set_ylabel(geometry.args.z_label)
     ax.grid(True, linewidth=0.25, alpha=0.22)
@@ -103,7 +105,10 @@ def plot_variable_density(
 ) -> dict[str, int]:
     width, height, dpi = figure_size_inches(section, geometry, panel=panel)
     if overlay_drawer is not None:
-        width += 4.0
+        legend_width_in = float(geometry.config.get("overlay_legend_width_in", 4.0))
+        width += legend_width_in
+    else:
+        legend_width_in = 0.0
     fig, ax = plt.subplots(figsize=(width, height))
     style = resolve_amplitude_display_style(display_style)
     norm = Normalize(vmin=0.0, vmax=limit) if bool(style["absolute"]) else TwoSlopeNorm(vmin=-limit, vcenter=0.0, vmax=limit)
@@ -122,11 +127,13 @@ def plot_variable_density(
     overlay_stats: dict[str, int] = {}
     if overlay_drawer is not None:
         overlay_stats = overlay_drawer(ax, section.projection)
-        fig.subplots_adjust(left=0.06, right=0.76, bottom=0.10, top=0.88)
-        cax = fig.add_axes([0.78, 0.16, 0.014, 0.66])
+        right = max(0.55, 1.0 - legend_width_in / width)
+        fig.subplots_adjust(left=0.06, right=right, bottom=0.10, top=0.88)
+        cax = fig.add_axes([right + 0.012, 0.16, 0.014, 0.66])
         fig.colorbar(mesh, cax=cax, label="地震振幅绝对值" if bool(style["absolute"]) else "地震振幅")
         handles, labels = ax.get_legend_handles_labels()
-        fig.legend(handles, labels, loc="upper left", bbox_to_anchor=(0.81, 0.88), fontsize=8.4, framealpha=0.92)
+        legend_fontsize = float(geometry.config.get("overlay_legend_fontsize", 8.4))
+        fig.legend(handles, labels, loc="upper left", bbox_to_anchor=(right + 0.035, 0.88), fontsize=legend_fontsize, framealpha=0.92)
         fig.suptitle(product_title or "车页1导眼：DFN与成像测井裂缝对比剖面", y=0.975, fontsize=13)
         ax.set_title(f"{scope_label or '剖面'} | 地震振幅变密度 | {section.projection} | T4-T7{title_suffix}", fontsize=11, pad=8)
     else:
@@ -152,7 +159,10 @@ def plot_wiggle_variable_area(
 ) -> int:
     width, height, dpi = figure_size_inches(section, geometry, panel=panel)
     if overlay_drawer is not None:
-        width += 3.6
+        legend_width_in = float(geometry.config.get("overlay_legend_width_in", 3.6))
+        width += legend_width_in
+    else:
+        legend_width_in = 0.0
     fig, ax = plt.subplots(figsize=(width, height))
     max_traces = int(geometry.config.get("wiggle_max_trace_count", 0))
     if max_traces <= 0 or max_traces >= len(section.h):
@@ -169,7 +179,8 @@ def plot_wiggle_variable_area(
         trace = np.clip(trace, -limit, limit)
         baseline = float(section.h[idx])
         displaced = baseline + trace * lateral_scale
-        ax.plot(displaced, section.time, color="#111827", linewidth=0.42, alpha=0.88, zorder=1)
+        wiggle_linewidth = float(geometry.config.get("wiggle_linewidth", 0.42))
+        ax.plot(displaced, section.time, color="#111827", linewidth=wiggle_linewidth, alpha=0.88, zorder=1)
         ax.fill_betweenx(
             section.time,
             baseline,
@@ -184,9 +195,11 @@ def plot_wiggle_variable_area(
     ax.set_facecolor("white")
     if overlay_drawer is not None:
         overlay_drawer(ax, section.projection)
-        fig.subplots_adjust(left=0.06, right=0.79, bottom=0.10, top=0.88)
+        right = max(0.55, 1.0 - legend_width_in / width)
+        fig.subplots_adjust(left=0.06, right=right, bottom=0.10, top=0.88)
         handles, labels = ax.get_legend_handles_labels()
-        fig.legend(handles, labels, loc="upper left", bbox_to_anchor=(0.81, 0.88), fontsize=8.4, framealpha=0.92)
+        legend_fontsize = float(geometry.config.get("overlay_legend_fontsize", 8.4))
+        fig.legend(handles, labels, loc="upper left", bbox_to_anchor=(right + 0.035, 0.88), fontsize=legend_fontsize, framealpha=0.92)
         fig.suptitle(product_title or "车页1导眼：DFN与成像测井裂缝对比剖面", y=0.975, fontsize=13)
         ax.set_title(
             f"{scope_label or '剖面'} | 地震波形+变面积 | {section.projection} | "

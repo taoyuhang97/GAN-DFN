@@ -49,7 +49,7 @@ def draw_section_overlays(ax: Any, context: SectionOverlayContext, projection: s
     patch_count = add_imaging_fracture_patch_segments(ax, context.imaging_patch_segments, projection)
     point_count = draw_fracture_labels(ax, context.fracture_df, projection, context.display_summary)
     for interval, color in DFN_INTERVAL_COLORS.items():
-        ax.plot([], [], color=color, linewidth=2.4, label=INTERVAL_LABELS.get(interval, interval))
+        ax.plot([], [], color=color, linewidth=2.0, label=INTERVAL_LABELS.get(interval, interval))
     return {
         "dfn_segment_count": int(dfn_count),
         "fault_segment_count": int(fault_count),

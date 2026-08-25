@@ -196,6 +196,11 @@ stage_step7d() {
 
 stage_step8() {
   "${PYTHON_BIN}" "${FORMAL_ROOT}/step8_dfn_well_correction/correct_dfn_with_well_controls.py" --config "${STEP8_CONFIG}"
+  read XMIN XMAX YMIN YMAX <<<"$(python3 -c "import json; b=json.load(open('${MASTER_CONFIG}'))['target_block']; print(f'{b[\"x_min\"]} {b[\"x_max\"]} {b[\"y_min\"]} {b[\"y_max\"]}')")"
+  "${PYTHON_BIN}" "${FORMAL_ROOT}/step8_dfn_well_correction/export_well_trajectories_vtk.py" \
+    --wells-root "${FORMAL_ROOT}/step2_real_well_t4_t7_samples/output/formal_all_wells" \
+    --output-dir "${STEP6_ROOT}/step8_well_correction" \
+    --x-min "${XMIN}" --x-max "${XMAX}" --y-min "${YMIN}" --y-max "${YMAX}"
 }
 
 stage_single_scale_export() {

@@ -111,7 +111,8 @@ def plot_section(
     style = resolve_display_style(section.attribute, display_style)
     display_values = np.abs(section.values) if bool(style["absolute"]) else section.values
     overlay_enabled = overlay_drawer is not None
-    figure_width = float(geometry.args.fig_width) + (4.0 if overlay_enabled else 0.0)
+    legend_width_in = float(geometry.config.get("overlay_legend_width_in", 4.0)) if overlay_enabled else 0.0
+    figure_width = float(geometry.args.fig_width) + legend_width_in
     fig, ax = plt.subplots(figsize=(figure_width, geometry.args.fig_height))
     kwargs = {"shading": "auto", "cmap": style["cmap"], "zorder": 1}
     if norm is None:
@@ -128,19 +129,23 @@ def plot_section(
         draw_well_trajectory(ax, geometry.well_df["Y"], geometry.well_df["TIME"], label=f"{geometry.well_name}井轨迹")
         ax.set_xlim(float(geometry.summary["display_y_min"]), float(geometry.summary["display_y_max"]))
         ax.set_xlabel("Y / m")
-    ax.set_ylim(float(geometry.summary["display_time_min"]), float(geometry.summary["display_time_max"]))
+    tmin = float(getattr(section, "display_time_min", geometry.summary["display_time_min"]))
+    tmax = float(getattr(section, "display_time_max", geometry.summary["display_time_max"]))
+    ax.set_ylim(tmin, tmax)
     ax.invert_yaxis()
     ax.set_ylabel(geometry.args.z_label)
     ax.grid(True, linewidth=0.3, alpha=0.25)
     overlay_stats: dict[str, int] = {}
     if overlay_drawer is not None:
         overlay_stats = overlay_drawer(ax, section.projection)
-        fig.subplots_adjust(left=0.06, right=0.76, bottom=0.10, top=0.88)
-        cax = fig.add_axes([0.78, 0.16, 0.014, 0.66])
+        right = max(0.55, 1.0 - legend_width_in / figure_width)
+        fig.subplots_adjust(left=0.06, right=right, bottom=0.10, top=0.88)
+        cax = fig.add_axes([right + 0.012, 0.16, 0.014, 0.66])
         colorbar_label = f"{setting['label']}绝对值" if bool(style["absolute"]) else setting["label"]
         fig.colorbar(mesh, cax=cax, label=colorbar_label)
         handles, labels = ax.get_legend_handles_labels()
-        fig.legend(handles, labels, loc="upper left", bbox_to_anchor=(0.81, 0.88), fontsize=8.4, framealpha=0.92)
+        legend_fontsize = float(geometry.config.get("overlay_legend_fontsize", 8.4))
+        fig.legend(handles, labels, loc="upper left", bbox_to_anchor=(right + 0.035, 0.88), fontsize=legend_fontsize, framealpha=0.92)
         title = product_title or "车页1导眼：DFN与成像测井裂缝对比剖面"
         scope = scope_label or "剖面"
         fig.suptitle(title, y=0.975, fontsize=13)

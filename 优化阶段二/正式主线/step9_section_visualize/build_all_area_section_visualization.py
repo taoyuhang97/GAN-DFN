@@ -57,10 +57,10 @@ INTERVAL_LABELS = {
 }
 
 SURFACE_LINE_STYLES = {
-    "T4": ("#111827", "-"),
-    "T5": ("#64748b", ":"),
-    "T6": ("#059669", "--"),
-    "T7": ("#7c3aed", "-.") ,
+    "T4": ("#f97316", "-"),            # 橙
+    "T5": ("#06b6d4", (0, (4, 2))),    # 青（长虚线）
+    "T6": ("#a855f7", "-"),            # 紫
+    "T7": ("#ec4899", "-."),           # 粉（点划线）
 }
 
 
@@ -150,6 +150,7 @@ class ProjectionSegment:
     z1: float
     h2: float
     z2: float
+    scale: str = ""
 
 
 @dataclass
@@ -724,8 +725,8 @@ def draw_surface_curves(ax, curves: list[SurfaceSectionCurve], projection: str, 
             curve.z[finite],
             color=color,
             linestyle=linestyle,
-            linewidth=1.65,
-            alpha=0.9,
+            linewidth=2.4,
+            alpha=0.96,
             label=f"{curve.surface}层位界面" if add_labels else None,
             zorder=3,
         )
