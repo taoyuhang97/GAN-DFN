@@ -525,14 +525,15 @@ def build_ppt_sampled(sampled: dict[str, Any], targets: dict[str, dict[str, Any]
     ppt_sampled: dict[str, Any] = {}
     for scope_name, scope_samples in sampled.items():
         target = targets.get(scope_name, {})
-        max_traces = int(target.get("max_traces", 0))
+        max_traces_xz = int(target.get("max_traces_xz", target.get("max_traces", 0)))
+        max_traces_yz = int(target.get("max_traces_yz", target.get("max_traces", 0)))
         time_decim = int(target.get("time_decim", 1))
         ppt_sampled[scope_name] = {}
         for attribute, pair in scope_samples.items():
             xz, yz, info = pair
             ppt_sampled[scope_name][attribute] = (
-                decimate_section(xz, max_traces, time_decim),
-                decimate_section(yz, max_traces, time_decim),
+                decimate_section(xz, max_traces_xz, time_decim),
+                decimate_section(yz, max_traces_yz, time_decim),
                 info,
             )
     return ppt_sampled

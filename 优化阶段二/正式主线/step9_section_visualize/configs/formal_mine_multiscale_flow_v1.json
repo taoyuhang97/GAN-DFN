@@ -22,10 +22,11 @@
   "presentation_scale_name": "mine_v1",
   "presentation_targets": {
     "overview": {
-      "width_cm": 25.0,
-      "height_cm": 5.5,
+      "width_cm": 75.0,
+      "height_cm": 16.5,
       "dpi": 300,
-      "max_traces": 200,
+      "max_traces_xz": 510,
+      "max_traces_yz": 366,
       "time_decim": 4,
       "legend_width_in": 1.8,
       "legend_fontsize": 7.5,
@@ -33,8 +34,8 @@
       "wiggle_lateral_scale_fraction": 0.58
     },
     "local_200m": {
-      "width_cm": 15.0,
-      "height_cm": 10.0,
+      "width_cm": 45.0,
+      "height_cm": 30.0,
       "dpi": 300,
       "max_traces": 0,
       "time_decim": 2,
