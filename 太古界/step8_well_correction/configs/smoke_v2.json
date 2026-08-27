@@ -1,0 +1,48 @@
+{
+  "version": "taigu_step8_v1",
+  "output_dir": "/home/tyh/projects/petroleum/code/GAN-DFN/太古界/step8_well_correction/output/smoke_v2",
+  "step7a_patches_csv": "/home/tyh/projects/petroleum/code/GAN-DFN/太古界/step7a_small_scale_dfn/output/taigu_step7a_v1/fracture_patches.csv",
+  "step3_groups_root": "/home/tyh/projects/petroleum/code/GAN-DFN/太古界/step3_imaging_groups/output/taigu_step3_imaging_v3/groups",
+  "step4_fracture_points_csv": "/home/tyh/projects/petroleum/code/GAN-DFN/太古界/step4_fracture_prediction/output/taigu_step4_gr_rd_rs_v1/predictions/all_wells_merged_fracture_points.csv",
+  "step2_segments_root": "/home/tyh/projects/petroleum/code/GAN-DFN/太古界/step2_well_log_segments/output/taigu_step2_regular_v3",
+  "demo_grid_csv": "/home/tyh/projects/petroleum/code/GAN-DFN/太古界/common/trace_contract/output/taigu_demo_grid_v1/demo_grid.csv",
+  "horizon_contract_csv": "/home/tyh/projects/petroleum/code/GAN-DFN/太古界/common/horizon_contract/output/horizon_contract_v1/demo_horizon_contract.csv",
+  "strong_control_wells": [
+    "埕北古斜405"
+  ],
+  "weak_control_well": "埕北古406",
+  "xy_search_radius_m": 80.0,
+  "time_search_radius_ms": 30.0,
+  "time_scale_m_per_ms": 2.0,
+  "strong_negative_removal_xy_m": 30.0,
+  "strong_negative_removal_time_ms": 6.0,
+  "added_patch_length_m": [
+    50.0,
+    120.0
+  ],
+  "added_patch_height_ms": [
+    8.0,
+    28.0
+  ],
+  "step4_event_gap_ms": 6.0,
+  "step4_event_max_span_ms": 18.0,
+  "adjusted_patch_length_m": [
+    35.0,
+    120.0
+  ],
+  "adjusted_patch_height_ms": [
+    8.0,
+    28.0
+  ],
+  "force_well_control_small_scale": true,
+  "enable_imaging_well_region_correction": true,
+  "imaging_well_region_xy_radius_m": 150.0,
+  "imaging_well_region_time_radius_ms": 40.0,
+  "imaging_well_region_density_blend": 0.65,
+  "imaging_well_region_min_influence": 0.05,
+  "max_query_candidates": 30,
+  "well_control_center_offset_min_m": 20.0,
+  "well_control_center_offset_max_m": 70.0,
+  "display_z_scale_m_per_ms": 2.0,
+  "md_merge_tolerance": 0.011
+}

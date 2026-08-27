@@ -1,0 +1,18 @@
+{
+  "version": "taigu_step9_v1",
+  "output_dir": "/home/tyh/projects/petroleum/code/GAN-DFN/太古界/step9_sections/output/smoke_v2",
+  "profile_well": "埕北古斜405",
+  "obn_segy": "/data/shared/project-oil/wx数据/埕岛太古界/cd2023_obn_pstm_cub_all_grid125_1206_haorui.segy",
+  "trace_header_csv": "/home/tyh/projects/petroleum/code/GAN-DFN/太古界/common/trace_contract/output/obn_trace_header_v1/obn_trace_header_xy.csv",
+  "demo_grid_csv": "/home/tyh/projects/petroleum/code/GAN-DFN/太古界/common/trace_contract/output/taigu_demo_grid_v1/demo_grid.csv",
+  "horizon_contract_csv": "/home/tyh/projects/petroleum/code/GAN-DFN/太古界/common/horizon_contract/output/horizon_contract_v1/demo_horizon_contract.csv",
+  "density_sgy": "/home/tyh/projects/petroleum/code/GAN-DFN/太古界/step6a_density_volume/output/taigu_step6a_v1/volume/predicted_fracture_density.sgy",
+  "window_code_npz": "/home/tyh/projects/petroleum/code/GAN-DFN/太古界/step6a_density_volume/output/taigu_step6a_v1/volume/window_code.npz",
+  "corrected_patches_csv": "/home/tyh/projects/petroleum/code/GAN-DFN/太古界/step8_well_correction/output/taigu_step8_v1/well_corrected_fracture_patches.csv",
+  "step3_groups_root": "/home/tyh/projects/petroleum/code/GAN-DFN/太古界/step3_imaging_groups/output/taigu_step3_imaging_v3/groups",
+  "step2_segments_root": "/home/tyh/projects/petroleum/code/GAN-DFN/太古界/step2_well_log_segments/output/taigu_step2_regular_v3",
+  "projection_half_width_m": 40.0,
+  "well_local_half_width_m": 1000.0,
+  "display_z_scale_m_per_ms": 2.0,
+  "md_merge_tolerance": 0.011
+}
