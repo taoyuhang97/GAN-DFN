@@ -28,6 +28,7 @@ import joblib
 import numpy as np
 import pandas as pd
 import segyio
+from scipy.spatial import cKDTree
 
 
 CURRENT_DIR = Path(__file__).resolve().parent
@@ -37,16 +38,24 @@ if str(COMMON_DIR) not in sys.path:
 if str(COMMON_DIR / "seismic_sampling") not in sys.path:
     sys.path.insert(0, str(COMMON_DIR / "seismic_sampling"))
 
-from amplitude_sampling import ObnAmplitudeSampler  # noqa: E402
+if str(COMMON_DIR / "attribute_sampling") not in sys.path:
+    sys.path.insert(0, str(COMMON_DIR / "attribute_sampling"))
+from attribute_sampling import MultiAttributeSampler  # noqa: E402
+
+
+class _NoAmplitudeSampler:
+    def __enter__(self): return self
+    def __exit__(self, *args): return False
+    @property
+    def handle(self): return None
+    def read_2ms_block(self, trace_indices, sample_axis):
+        return np.zeros((len(np.asarray(trace_indices)), len(sample_axis)), dtype=np.float32)
 
 
 FEATURE_COLUMNS = [
-    "SeisAmp",
-    "SeisAmpM4",
-    "SeisAmpM2",
-    "SeisAmpP2",
-    "SeisAmpP4",
-    "AmpMad5",
+    "Coherence",
+    "AntTrack",
+    "CurvatureMax",
     "LayerCode",
     "RelativeTimeInLayer",
     "TimeSinceTop",
@@ -107,7 +116,7 @@ class RunningStats:
 
 
 def build_layer_features(
-    amplitude: np.ndarray,
+    attributes: dict[str, np.ndarray],
     samples: np.ndarray,
     top: np.ndarray,
     base: np.ndarray,
@@ -115,7 +124,7 @@ def build_layer_features(
     layer_code: float,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     times = samples[None, :]
-    mask = valid[:, None] & (times >= top[:, None]) & (times <= base[:, None]) & np.isfinite(amplitude)
+    mask = valid[:, None] & (times >= top[:, None]) & (times <= base[:, None]) & np.isfinite(attributes["CurvatureMax"])
     row_idx, time_idx = np.where(mask)
     if row_idx.size == 0:
         return np.empty((0, len(FEATURE_COLUMNS)), dtype=np.float32), row_idx, time_idx
@@ -125,27 +134,11 @@ def build_layer_features(
     thickness = local_base - local_top
     since_top = local_time - local_top
     to_base = local_base - local_time
-    center_amp = amplitude[row_idx, time_idx]
-    amp_m4 = np.full(len(row_idx), np.nan, dtype=np.float32)
-    amp_m2 = np.full(len(row_idx), np.nan, dtype=np.float32)
-    amp_p2 = np.full(len(row_idx), np.nan, dtype=np.float32)
-    amp_p4 = np.full(len(row_idx), np.nan, dtype=np.float32)
-    valid_t = time_idx >= 2
-    amp_m4[valid_t] = amplitude[row_idx[valid_t], time_idx[valid_t] - 2]
-    amp_m2[valid_t] = amplitude[row_idx[valid_t], time_idx[valid_t] - 1]
-    valid_p = time_idx < len(samples) - 2
-    amp_p2[valid_p] = amplitude[row_idx[valid_p], time_idx[valid_p] + 1]
-    amp_p4[valid_p] = amplitude[row_idx[valid_p], time_idx[valid_p] + 2]
-    context = np.column_stack([amp_m4, amp_m2, center_amp, amp_p2, amp_p4])
-    amp_mad5 = np.nanmedian(np.abs(context - center_amp[:, None]), axis=1).astype(np.float32)
     features = np.column_stack(
         [
-            center_amp,
-            amp_m4,
-            amp_m2,
-            amp_p2,
-            amp_p4,
-            amp_mad5,
+            attributes["Coherence"][row_idx, time_idx],
+            attributes["AntTrack"][row_idx, time_idx],
+            attributes["CurvatureMax"][row_idx, time_idx],
             np.full(row_idx.size, layer_code, dtype=np.float32),
             since_top / thickness,
             since_top,
@@ -155,6 +148,48 @@ def build_layer_features(
         ]
     ).astype(np.float32)
     return features, row_idx, time_idx
+
+
+def fill_missing_horizons_nearest(
+    grid: pd.DataFrame, max_distance_m: float, min_thickness_ms: float
+) -> pd.DataFrame:
+    """Fill only nearby invalid traces from one complete valid source trace.
+
+    Original picks are retained; filled picks are provenance-tagged for QC.
+    """
+    out = grid.copy()
+    out["OriginalSurfaceValid"] = out["SurfaceValid"].fillna(0).astype(bool)
+    for c in ("TopTimeMs", "MidTimeMs", "BaseTimeMs"):
+        out[f"Original{c}"] = out[c]
+    out["HorizonFillUsed"] = False
+    out["HorizonFillValid"] = False
+    out["HorizonFillSourceTraceIdx"] = np.nan
+    out["HorizonFillDistanceM"] = np.nan
+    out["FilledSurfaceValid"] = out["OriginalSurfaceValid"]
+    valid = out["OriginalSurfaceValid"].to_numpy()
+    valid_quality = valid & out[["TopTimeMs", "MidTimeMs", "BaseTimeMs"]].notna().all(axis=1).to_numpy()
+    valid_quality &= (out["MidTimeMs"] - out["TopTimeMs"] >= min_thickness_ms).to_numpy()
+    valid_quality &= (out["BaseTimeMs"] - out["MidTimeMs"] >= min_thickness_ms).to_numpy()
+    bad = np.flatnonzero(~valid)
+    src_idx = np.flatnonzero(valid_quality)
+    if bad.size and src_idx.size:
+        tree = cKDTree(out.loc[src_idx, ["X", "Y"]].to_numpy(float))
+        distances, nearest = tree.query(out.loc[bad, ["X", "Y"]].to_numpy(float), k=1)
+        for dest, dist, near in zip(bad, distances, nearest):
+            if not np.isfinite(dist) or dist > max_distance_m:
+                continue
+            src = int(src_idx[int(near)])
+            vals = out.loc[src, ["TopTimeMs", "MidTimeMs", "BaseTimeMs"]]
+            top, mid, base = (float(vals["TopTimeMs"]), float(vals["MidTimeMs"]), float(vals["BaseTimeMs"]))
+            if not (top < mid < base and mid - top >= min_thickness_ms and base - mid >= min_thickness_ms):
+                continue
+            out.loc[dest, ["TopTimeMs", "MidTimeMs", "BaseTimeMs"]] = [top, mid, base]
+            out.loc[dest, "HorizonFillUsed"] = True
+            out.loc[dest, "HorizonFillValid"] = True
+            out.loc[dest, "FilledSurfaceValid"] = True
+            out.loc[dest, "HorizonFillSourceTraceIdx"] = int(out.iloc[src]["TraceIdx"])
+            out.loc[dest, "HorizonFillDistanceM"] = float(dist)
+    return out
 
 
 def main() -> int:
@@ -167,7 +202,8 @@ def main() -> int:
     window_npz = output_dir / "window_code.npz"
     block_qc_path = output_dir / "prediction_block_qc.csv"
     summary_path = output_dir / "prediction_summary.json"
-    for path in (output_sgy, partial_sgy, window_npz, block_qc_path, summary_path):
+    horizon_qc_path = output_dir / "horizon_fill_qc.csv"
+    for path in (output_sgy, partial_sgy, window_npz, block_qc_path, summary_path, horizon_qc_path):
         if path.exists() and not args.replace_output:
             raise FileExistsError(f"refusing to overwrite existing prediction output: {path}")
 
@@ -193,18 +229,35 @@ def main() -> int:
     if len(grid) != int(grid["TraceIdx"].nunique()):
         raise RuntimeError("demo grid has duplicate TraceIdx")
 
-    valid_mask = grid["SurfaceValid"].fillna(0).astype(bool).to_numpy()
+    max_fill_distance = float(config.get("max_horizon_fill_distance_m", 25.0))
+    min_thickness = float(config.get("min_horizon_thickness_ms", 1.0))
+    fill_enabled = bool(config.get("horizon_fill_enabled", True))
+    if fill_enabled:
+        grid = fill_missing_horizons_nearest(grid, max_fill_distance, min_thickness)
+    else:
+        grid["OriginalSurfaceValid"] = grid["SurfaceValid"].fillna(0).astype(bool)
+        grid["HorizonFillUsed"] = False; grid["HorizonFillValid"] = False
+        grid["HorizonFillSourceTraceIdx"] = np.nan; grid["HorizonFillDistanceM"] = np.nan
+        grid["FilledSurfaceValid"] = grid["OriginalSurfaceValid"]
+    grid["SurfaceValid"] = grid["FilledSurfaceValid"]
+    top = grid["TopTimeMs"].to_numpy(dtype=np.float64)
+    mid = grid["MidTimeMs"].to_numpy(dtype=np.float64)
+    base = grid["BaseTimeMs"].to_numpy(dtype=np.float64)
+    horizon_order_valid = (np.isfinite(top) & np.isfinite(mid) & np.isfinite(base) & (top < mid) & (mid < base) & ((mid - top) >= min_thickness) & ((base - mid) >= min_thickness))
+    # Defensive QC: any failed post-fill geometry remains invalid for prediction.
+    grid.loc[~horizon_order_valid, "FilledSurfaceValid"] = False
+    grid.loc[~horizon_order_valid, "SurfaceValid"] = False
+    valid_mask = grid["FilledSurfaceValid"].to_numpy()
+    if not valid_mask.any():
+        raise RuntimeError("horizon contract contains no valid surfaces")
     valid_top = grid.loc[valid_mask, "TopTimeMs"].to_numpy()
     valid_base = grid.loc[valid_mask, "BaseTimeMs"].to_numpy()
     axis_start = float(np.floor(valid_top.min() / interval_ms) * interval_ms)
     axis_stop = float(np.ceil((valid_base + ext_window_ms).max() / interval_ms) * interval_ms)
     sample_axis = np.arange(axis_start, axis_stop + interval_ms * 0.5, interval_ms, dtype=np.float64)
-
-    top = grid["TopTimeMs"].to_numpy(dtype=np.float64)
-    mid = grid["MidTimeMs"].to_numpy(dtype=np.float64)
-    base = grid["BaseTimeMs"].to_numpy(dtype=np.float64)
     x_line_count = int(grid["IX"].max()) + 1
     block_x_lines = max(int(config.get("block_x_line_count", 20)), 1)
+    total_blocks = (x_line_count + block_x_lines - 1) // block_x_lines
     model_upper = artifact["models"]["上部复合层"]
     model_crust = artifact["models"]["太古界风化壳"]
     cap = min(float(density_cap), float(model_upper["density_cap"]), float(model_crust["density_cap"]))
@@ -216,7 +269,18 @@ def main() -> int:
     layer_total = {"上部复合层": 0, "太古界风化壳": 0}
     started = time.time()
 
-    with ObnAmplitudeSampler(Path(config["obn_segy"]), Path(config["trace_header_csv"])) as sampler:
+    attr_sampler = MultiAttributeSampler(
+        config["attribute_volume_paths"],
+        config.get("attribute_invalid_rules", {}),
+        config.get("attribute_time_origins_ms", {}),
+    )
+    with _NoAmplitudeSampler() as sampler, attr_sampler:
+        run_started = time.time()
+        print(
+            f"[step6a-predict] start traces={len(grid)} x_lines={x_line_count} "
+            f"blocks={total_blocks} samples={len(sample_axis)} interval_ms={interval_ms}",
+            flush=True,
+        )
         spec = segyio.spec()
         spec.sorting = segyio.TraceSortingFormat.UNKNOWN_SORTING
         spec.format = 5
@@ -224,10 +288,7 @@ def main() -> int:
         spec.tracecount = int(len(grid))
         delay_ms = int(round(float(sample_axis[0])))
         interval_us = int(round(interval_ms * 1000.0))
-        source_handle = sampler.handle
         with segyio.create(str(partial_sgy), spec) as output_handle:
-            output_handle.text[0] = source_handle.text[0]
-            output_handle.bin.update(source_handle.bin)
             output_handle.bin[segyio.BinField.Interval] = interval_us
             output_handle.bin[segyio.BinField.Samples] = int(len(sample_axis))
             output_handle.bin[segyio.BinField.Format] = 5
@@ -237,13 +298,19 @@ def main() -> int:
                 ix_stop = min(ix_start + block_x_lines, x_line_count)
                 block = grid[grid["IX"].between(ix_start, ix_stop - 1)].sort_values("TraceIdx").copy()
                 source_indices = block["TraceIdx"].to_numpy(dtype=np.int64)
-                amplitude = sampler.read_2ms_block(source_indices, sample_axis)
+                bx = block["X"].to_numpy(dtype=float); by = block["Y"].to_numpy(dtype=float)
+                attrs = attr_sampler.sample_at_xy(
+                    np.repeat(bx, len(sample_axis)),
+                    np.repeat(by, len(sample_axis)),
+                    np.tile(sample_axis, len(block)),
+                )
+                attr_arrays = {name: attrs[name].reshape(len(block), len(sample_axis)) for name in ("Coherence", "AntTrack", "CurvatureMax")}
                 predicted = np.full((len(block), len(sample_axis)), np.nan, dtype=np.float32)
                 codes = np.zeros((len(block), len(sample_axis)), dtype=np.uint8)
-                block_valid = block["SurfaceValid"].fillna(0).astype(bool).to_numpy()
+                block_valid = block["FilledSurfaceValid"].fillna(0).astype(bool).to_numpy()
 
                 features, row_idx, time_idx = build_layer_features(
-                    amplitude, sample_axis, block["TopTimeMs"].to_numpy(), block["MidTimeMs"].to_numpy(), block_valid, 1.0
+                    attr_arrays, sample_axis, block["TopTimeMs"].to_numpy(), block["MidTimeMs"].to_numpy(), block_valid, 1.0
                 )
                 if len(row_idx):
                     prob = model_upper["classifier"].predict_proba(features)[:, 1]
@@ -253,7 +320,7 @@ def main() -> int:
                     layer_total["上部复合层"] += int(len(row_idx))
 
                 features, row_idx, time_idx = build_layer_features(
-                    amplitude, sample_axis, block["MidTimeMs"].to_numpy(), block["BaseTimeMs"].to_numpy(), block_valid, 2.0
+                    attr_arrays, sample_axis, block["MidTimeMs"].to_numpy(), block["BaseTimeMs"].to_numpy(), block_valid, 2.0
                 )
                 if len(row_idx):
                     prob = model_crust["classifier"].predict_proba(features)[:, 1]
@@ -263,7 +330,7 @@ def main() -> int:
                     layer_total["太古界风化壳"] += int(len(row_idx))
 
                 features, row_idx, time_idx = build_layer_features(
-                    amplitude,
+                    attr_arrays,
                     sample_axis,
                     block["BaseTimeMs"].to_numpy(),
                     block["BaseTimeMs"].to_numpy() + ext_window_ms,
@@ -281,7 +348,12 @@ def main() -> int:
                 stats_ext.update(np.where(codes == 2, predicted, np.nan))
                 for local_index, (_, row) in enumerate(block.iterrows()):
                     source_index = int(row["TraceIdx"])
-                    header = dict(source_handle.header[source_index])
+                    header = {
+                        segyio.TraceField.TRACE_SEQUENCE_FILE: output_cursor + 1,
+                        segyio.TraceField.TRACE_SEQUENCE_LINE: output_cursor + 1,
+                        segyio.TraceField.INLINE_3D: int(row.get("Inline3D", 0)),
+                        segyio.TraceField.CROSSLINE_3D: int(row.get("Crossline3D", 0)),
+                    }
                     header[segyio.TraceField.TRACE_SEQUENCE_FILE] = output_cursor + 1
                     header[segyio.TraceField.TRACE_SEQUENCE_LINE] = output_cursor + 1
                     header[segyio.TraceField.TRACE_SAMPLE_COUNT] = int(len(sample_axis))
@@ -300,19 +372,33 @@ def main() -> int:
                         "IXStart": ix_start,
                         "IXStopExclusive": ix_stop,
                         "TraceCount": int(len(block)),
-                        "SurfaceValidTraceCount": int(block_valid.sum()),
+                        "OriginalSurfaceValidTraceCount": int(block["OriginalSurfaceValid"].sum()),
+                        "HorizonFilledTraceCount": int(block["HorizonFillValid"].sum()),
+                        "FilledSurfaceValidTraceCount": int(block_valid.sum()),
+                        "HorizonFillRejectedTraceCount": int((~block["OriginalSurfaceValid"] & ~block["HorizonFillValid"]).sum()),
+                        "HorizonFillDistanceMeanM": float(block.loc[block["HorizonFillValid"], "HorizonFillDistanceM"].mean()) if block["HorizonFillValid"].any() else np.nan,
+                        "HorizonFillDistanceMaxM": float(block.loc[block["HorizonFillValid"], "HorizonFillDistanceM"].max()) if block["HorizonFillValid"].any() else np.nan,
                         "FinitePredictionCount": finite_count,
                         "NaNCount": int(predicted.size - finite_count),
                         "UpperPredictionCount": int(layer_total["上部复合层"]),
                         "CrustPredictionCount": int(layer_total["太古界风化壳"]),
                         "Ext50PredictionCount": int((codes == 2).sum()),
                         "PredictionMean": float(np.nanmean(predicted)) if finite_count else np.nan,
-                        "ElapsedSeconds": 0.0,
+                        "ElapsedSeconds": float(time.time() - run_started),
                     }
                 )
+                elapsed = time.time() - run_started
+                completed_fraction = block_index / max(total_blocks, 1)
+                eta = elapsed * (1.0 - completed_fraction) / completed_fraction if completed_fraction > 0 else np.nan
+                try:
+                    partial_mb = partial_sgy.stat().st_size / (1024.0 * 1024.0)
+                except OSError:
+                    partial_mb = np.nan
                 print(
                     f"[step6a-predict] block={block_index} ix={ix_start}:{ix_stop} "
-                    f"traces={output_cursor}/{len(grid)} finite={finite_count}",
+                    f"progress={block_index}/{total_blocks} ({completed_fraction:.1%}) "
+                    f"traces={output_cursor}/{len(grid)} finite={finite_count} "
+                    f"elapsed={elapsed/60.0:.1f}min eta={eta/60.0:.1f}min partial={partial_mb:.1f}MB",
                     flush=True,
                 )
                 if args.max_x_lines > 0 and ix_stop >= args.max_x_lines:
@@ -321,6 +407,10 @@ def main() -> int:
                     break
         partial_sgy.replace(output_sgy)
         np.savez_compressed(window_npz, window_code=window_codes, sample_axis=sample_axis.astype(np.float32))
+        print(
+            f"[step6a-predict] volume_written sgy={output_sgy} elapsed={(time.time()-run_started)/60.0:.1f}min",
+            flush=True,
+        )
 
     with segyio.open(str(output_sgy), "r", ignore_geometry=True) as handle:
         samples = np.asarray(handle.samples, dtype=np.float64)
@@ -350,13 +440,26 @@ def main() -> int:
             "window_code_npz": str(window_npz),
             "prediction_block_qc_csv": str(block_qc_path),
             "prediction_summary_json": str(summary_path),
+            "horizon_fill_qc_csv": str(horizon_qc_path),
         },
         "grid": {
             "trace_count": int(len(grid)),
             "x_line_count": int(grid["IX"].max()) + 1,
             "y_line_count": int(grid["IY"].max()) + 1,
-            "surface_valid_trace_count": int(valid_mask.sum()),
+            "surface_valid_trace_count": int(grid["FilledSurfaceValid"].fillna(0).astype(bool).sum()),
             "surface_valid_fraction": float(valid_mask.mean()),
+            "surface_valid_original_trace_count": int(grid["OriginalSurfaceValid"].sum()),
+            "horizon_filled_trace_count": int(grid["HorizonFillValid"].sum()),
+            "horizon_fill_rejected_trace_count": int((~grid["OriginalSurfaceValid"] & ~grid["HorizonFillValid"]).sum()),
+            "horizon_order_valid_trace_count": int(horizon_order_valid.sum()),
+            "horizon_fill_enabled": fill_enabled,
+            "max_horizon_fill_distance_m": max_fill_distance,
+            "horizon_fill_distance_m": {
+                "max": float(grid.loc[grid["HorizonFillValid"], "HorizonFillDistanceM"].max())
+                if grid["HorizonFillValid"].any() else 0.0,
+                "mean": float(grid.loc[grid["HorizonFillValid"], "HorizonFillDistanceM"].mean())
+                if grid["HorizonFillValid"].any() else 0.0,
+            },
         },
         "sample_axis": {
             "time_min_ms": float(sample_axis[0]),
@@ -376,6 +479,8 @@ def main() -> int:
         "elapsed_seconds": float(time.time() - started),
     }
     pd.DataFrame(block_rows).to_csv(block_qc_path, index=False, encoding="utf-8-sig")
+    qc_columns = ["TraceIdx", "IX", "IY", "X", "Y", "OriginalSurfaceValid", "HorizonFillValid", "HorizonFillSourceTraceIdx", "HorizonFillDistanceM", "FilledSurfaceValid", "TopTimeMs", "MidTimeMs", "BaseTimeMs"]
+    grid[qc_columns].to_csv(horizon_qc_path, index=False, encoding="utf-8-sig")
     write_json(summary_path, summary)
     print(json.dumps(summary, ensure_ascii=False, indent=2))
     return 0 if status == "pass" else 1

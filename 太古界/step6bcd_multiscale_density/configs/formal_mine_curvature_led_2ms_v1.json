@@ -1,0 +1,29 @@
+{
+  "unified_samples_csv": "/home/tyh/projects/petroleum/code/GAN-DFN/优化阶段二/正式主线/step5b_unified_samples_t4_t7/output/formal_curvature_led_v2/unified_t4_t7_density_samples.csv",
+  "layer_dir": "/data/shared/project-oil/wx数据/砂砾岩/层位",
+  "output_dir": "/home/tyh/projects/petroleum/code/GAN-DFN/优化阶段二/正式主线/step6b_demo_density_volume_3d/output/formal_mine_curvature_led_2ms_v1/models",
+  "prediction_sample_interval_ms": 2.0,
+  "training_chunksize": 250000,
+  "validation_group_folds": 3,
+  "density_cap": 10.0,
+  "random_state": 20260728,
+  "classifier": {
+    "learning_rate": 0.05,
+    "max_depth": 5,
+    "max_iter": 180,
+    "min_samples_leaf": 80,
+    "l2_regularization": 0.1,
+    "early_stopping": false,
+    "verbose": 1
+  },
+  "conditional_density_regressor": {
+    "learning_rate": 0.05,
+    "max_depth": 5,
+    "max_iter": 220,
+    "min_samples_leaf": 40,
+    "l2_regularization": 0.1,
+    "loss": "squared_error",
+    "early_stopping": false,
+    "verbose": 1
+  }
+}

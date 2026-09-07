@@ -1,0 +1,21 @@
+{
+  "medium_prior_sgy": "/home/tyh/projects/petroleum/code/GAN-DFN/太古界/step6b_medium_corridor/output/taigu_medium_v1/medium_corridor_prior.sgy",
+  "medium_components_npz": "/home/tyh/projects/petroleum/code/GAN-DFN/太古界/step6b_medium_corridor/output/taigu_medium_v1/medium_corridor_components.npz",
+  "medium_component_summary_csv": "/home/tyh/projects/petroleum/code/GAN-DFN/太古界/step6b_medium_corridor/output/taigu_medium_v1/medium_corridor_component_summary.csv",
+  "trace_mapping_npz": "/home/tyh/projects/petroleum/code/GAN-DFN/太古界/common/trace_contract/output/taigu_demo_grid_v1/trace_mapping.npz",
+  "horizon_contract_table": "/home/tyh/projects/petroleum/code/GAN-DFN/太古界/common/horizon_contract/output/taigu_attribute_full_horizon_contract_v1/demo_horizon_contract.npy",
+  "output_dir": "/home/tyh/projects/petroleum/code/GAN-DFN/太古界/step7b_multiscale_initial_dfn/output/taigu_medium_v1",
+  "min_prior_score": 0.45,
+  "min_component_voxels": 35,
+  "max_component_count": 0,
+  "target_patch_count": 0,
+  "min_patches_per_component": 2,
+  "max_patches_per_component": 36,
+  "orientation_time_scale_m_per_ms": 2.0,
+  "geometry_time_scale_m_per_ms": 2.0,
+  "min_dip_deg": 25.0,
+  "max_dip_deg": 89.0,
+  "reject_low_dip_patches": false,
+  "base_length_m": {"上部复合层": 24.0, "太古界风化壳": 26.0},
+  "base_height_time_ms": {"上部复合层": 8.0, "太古界风化壳": 8.0}
+}

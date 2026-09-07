@@ -1,0 +1,84 @@
+{
+  "input_density_sgy": "/home/tyh/projects/petroleum/code/GAN-DFN/太古界/step6a_density_volume/output/taigu_step6a_attribute_v3_full/volume/predicted_fracture_density.sgy",
+  "trace_mapping_npz": "/home/tyh/projects/petroleum/code/GAN-DFN/太古界/common/trace_contract/output/taigu_demo_grid_v1/trace_mapping.npz",
+  "horizon_contract_table": "/home/tyh/projects/petroleum/code/GAN-DFN/太古界/common/horizon_contract/output/taigu_attribute_full_horizon_contract_v1/demo_horizon_contract.npy",
+  "volume_paths": {
+    "Coherence": "/data/shared/project-oil/wx数据/埕岛太古界/体数据/Chengdao-Taigujie-Eigenstructure Coherence.sgy",
+    "AntTrack": "/data/shared/project-oil/wx数据/埕岛太古界/体数据/Chengdao-Taigujie-AntTracking.sgy",
+    "CurvatureMax": "/data/shared/project-oil/wx数据/埕岛太古界/体数据/Chengdao-Taigujie-Most Positive Curvature.sgy"
+  },
+  "output_dir": "/home/tyh/projects/petroleum/code/GAN-DFN/太古界/step6b_medium_corridor/output/taigu_medium_v1",
+  "medium_evidence": {"sample_interval_ms": 10.0},
+  "small_density_sgy_name": "candidate_cheye1_small_density.sgy",
+  "small_prior_sgy_name": "candidate_cheye1_small_prior.sgy",
+  "medium_prior_sgy_name": "candidate_cheye1_medium_prior.sgy",
+  "medium_mask_sgy_name": "candidate_cheye1_medium_candidate_mask.sgy",
+  "large_prior_sgy_name": "candidate_cheye1_large_prior.sgy",
+  "large_mask_sgy_name": "candidate_cheye1_large_candidate_mask.sgy",
+  "integrated_density_sgy_name": "candidate_cheye1_integrated_density.sgy",
+  "output_trace_mapping_name": "candidate_cheye1_3d_trace_mapping.npz",
+  "bundle_npz_name": "candidate_cheye1_multiscale_prior_bundle.npz",
+  "summary_name": "candidate_cheye1_multiscale_density_bundle_summary.json",
+  "score_config": {
+    "anttrack_score": {
+      "valid_min": -0.99,
+      "low_quantile": 0.20,
+      "high_quantile": 0.96,
+      "power": 1.0
+    },
+    "coherence_score": {
+      "valid_min": 0.0,
+      "low_quantile": 0.05,
+      "high_quantile": 0.95,
+      "power": 1.25
+    },
+    "curvaturemax_score": {
+      "low_quantile": 0.50,
+      "high_quantile": 0.98,
+      "power": 1.0
+    },
+    "curvaturepos_score": {
+      "low_quantile": 0.50,
+      "high_quantile": 0.98,
+      "power": 1.0
+    }
+  },
+  "small_prior": {
+    "density_quantile_scale": 0.95,
+    "large_medium_suppression": 0.55,
+    "large_medium_density_attenuation": 0.35
+  },
+  "medium_prior": {
+    "score_threshold": 0.52,
+    "min_ant_score": 0.58,
+    "min_component_voxels": 35,
+    "use_26_connectivity": true,
+    "ant_weight_base": 0.65,
+    "lowcoh_support_weight": 0.20,
+    "curvature_support_weight": 0.15,
+    "outside_mask_attenuation": 0.12,
+    "summary_component_limit": 30
+  },
+  "large_prior": {
+    "score_threshold": 0.68,
+    "min_component_voxels": 120,
+    "use_26_connectivity": true,
+    "orientation_time_scale_m_per_ms": 1.0,
+    "min_time_extent_ms": 35.0,
+    "strong_time_extent_ms": 120.0,
+    "horizontal_max_time_extent_ms": 12.0,
+    "horizontal_min_extent_m": 700.0,
+    "min_pca_dip_deg": 45.0,
+    "kept_component_floor": 0.35,
+    "mask_score_floor_multiplier": 0.65,
+    "summary_component_limit": 30
+  },
+  "integration": {
+    "small_weight": 1.0,
+    "medium_additive_density": 4.0,
+    "medium_power": 1.2,
+    "large_additive_density": 5.5,
+    "large_power": 1.15,
+    "density_cap": 10.0
+  }
+}

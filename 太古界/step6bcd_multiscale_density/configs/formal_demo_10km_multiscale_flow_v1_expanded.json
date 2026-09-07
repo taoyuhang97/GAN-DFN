@@ -1,0 +1,62 @@
+{
+  "version": "formal_demo_10km_multiscale_flow_v1",
+  "input_density_sgy": "/home/tyh/projects/petroleum/code/GAN-DFN/优化阶段二/正式主线/step6b_demo_density_volume_3d/output/formal_demo_10km_curvature_led_2ms_v1/base_density/predicted_fracture_density.sgy",
+  "trace_mapping_npz": "/home/tyh/projects/petroleum/code/GAN-DFN/优化阶段二/正式主线/step6b_demo_density_volume_3d/output/formal_demo_10km_curvature_led_2ms_v1/base_density/trace_mapping.npz",
+  "output_dir": "/home/tyh/projects/petroleum/code/GAN-DFN/优化阶段二/正式主线/step6b_demo_density_volume_3d/output/formal_demo_10km_multiscale_flow_v1",
+  "target_block": {
+    "name": "formal_demo_10km_multiscale_flow_v1",
+    "x_min": 571250,
+    "x_max": 581250,
+    "y_min": 4196500,
+    "y_max": 4206500
+  },
+  "volume_paths": {
+    "SeisAmp": "/data/shared/project-oil/wx数据/砂砾岩/psdm_final_time.sgy",
+    "Coherence": "/data/shared/project-oil/wx数据/砂砾岩/补充材料-20260623/车西_T4-T7/车西-相干体T4-T7.sgy",
+    "AntTrack": "/data/shared/project-oil/wx数据/砂砾岩/补充材料-20260623/车西_T4-T7/车西-蚂蚁体T4-T7.sgy",
+    "CurvatureMax": "/data/shared/project-oil/wx数据/砂砾岩/补充材料-20260623/车西-最大曲率T4-T7.sgy"
+  },
+  "small_evidence": {
+    "sample_interval_ms": 2.0,
+    "density_weight": 0.5,
+    "curvature_weight": 0.5,
+    "curvature_transform": "absolute",
+    "curvature_clip_low_q": 0.5,
+    "curvature_clip_high_q": 0.995,
+    "candidate_quantile": 0.88,
+    "core_quantile": 0.95
+  },
+  "medium_evidence": {
+    "sample_interval_ms": 10.0
+  },
+  "large_evidence": {
+    "sample_interval_ms": 10.0
+  },
+  "compact_multiscale_flow": true,
+  "compact_step7_sampling": true,
+  "write_intermediate_vtk": false,
+  "score_config": {
+    "anttrack_score": {
+      "low_quantile": 0.2,
+      "high_quantile": 0.96,
+      "power": 1.0
+    },
+    "coherence_score": {
+      "valid_min": 0.0,
+      "low_quantile": 0.05,
+      "high_quantile": 0.95,
+      "power": 1.25
+    },
+    "curvaturemax_score": {
+      "low_quantile": 0.5,
+      "high_quantile": 0.98,
+      "power": 1.0
+    }
+  },
+  "step7a_probability_scale_multiplier": 0.09,
+  "step7a_fail_fast_patch_count_limit": 120000,
+  "step7a_compact_sampling_chunk_samples": 20,
+  "step7a_orientation_cache_xy_cells": 3,
+  "step7a_orientation_cache_time_samples": 5,
+  "step9_local_axis_radius_m": 500.0
+}

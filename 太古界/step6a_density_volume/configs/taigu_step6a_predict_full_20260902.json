@@ -1,0 +1,22 @@
+{
+  "version": "taigu_step6a_predict_full_20260902",
+  "output_dir": "/home/tyh/projects/petroleum/code/GAN-DFN/太古界/step6a_density_volume/output/taigu_step6a_attribute_v3_full/volume",
+  "model_joblib": "/home/tyh/projects/petroleum/code/GAN-DFN/太古界/step6a_density_volume/output/taigu_step6a_attribute_v3_full/models/step6_two_stage_density_models.joblib",
+  "demo_grid_csv": "/home/tyh/projects/petroleum/code/GAN-DFN/太古界/common/trace_contract/output/taigu_demo_grid_v1/demo_grid.csv",
+  "horizon_contract_csv": "/home/tyh/projects/petroleum/code/GAN-DFN/太古界/common/horizon_contract/output/taigu_attribute_full_horizon_contract_v1/demo_horizon_contract.csv",
+  "horizon_windows_npz": "/home/tyh/projects/petroleum/code/GAN-DFN/太古界/common/horizon_contract/output/taigu_attribute_full_horizon_contract_v1/horizon_windows_2ms.npz",
+  "trace_header_csv": "/home/tyh/projects/petroleum/code/GAN-DFN/太古界/common/attribute_trace_contract/output/taigu_attribute_trace_header_v1/attribute_trace_header.csv",
+  "attribute_volume_paths": {
+    "Coherence": "/data/shared/project-oil/wx数据/埕岛太古界/体数据/Chengdao-Taigujie-Eigenstructure Coherence.sgy",
+    "AntTrack": "/data/shared/project-oil/wx数据/埕岛太古界/体数据/Chengdao-Taigujie-AntTracking.sgy",
+    "CurvatureMax": "/data/shared/project-oil/wx数据/埕岛太古界/体数据/Chengdao-Taigujie-Most Positive Curvature.sgy"
+  },
+  "attribute_invalid_rules": {"AntTrack": {"invalid_le": -0.99}},
+  "attribute_time_origins_ms": {"Coherence": 1800.0, "AntTrack": 1800.0, "CurvatureMax": 1800.0},
+  "block_x_line_count": 20,
+  "sample_interval_ms": 2.0,
+  "ext_window_ms": 50.0,
+  "horizon_fill_enabled": true,
+  "max_horizon_fill_distance_m": 25.0,
+  "min_horizon_thickness_ms": 1.0
+}

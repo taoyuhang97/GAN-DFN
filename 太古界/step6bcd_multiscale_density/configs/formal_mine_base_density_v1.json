@@ -1,0 +1,31 @@
+{
+  "model_joblib": "/home/tyh/projects/petroleum/code/GAN-DFN/优化阶段二/正式主线/step6b_demo_density_volume_3d/output/formal_mine_curvature_led_2ms_v1/models/step6_two_stage_density_models.joblib",
+  "trace_header_csv": "/home/tyh/projects/petroleum/code/GAN-DFN/数据精简/trace_header_xy.csv",
+  "layer_dir": "/data/shared/project-oil/wx数据/砂砾岩/层位",
+  "source_sgy_for_headers": "/data/shared/project-oil/wx数据/砂砾岩/psdm_final_time.sgy",
+  "output_dir": "/home/tyh/projects/petroleum/code/GAN-DFN/优化阶段二/正式主线/output/formal_mine_multiscale_flow_v1/step6_base_density",
+  "target_block": {
+    "name": "formal_mine_base_density_v1",
+    "x_min": 556150,
+    "x_max": 581650,
+    "y_min": 4193975,
+    "y_max": 4212275
+  },
+  "volume_paths": {
+    "SeisAmp": "/data/shared/project-oil/wx数据/砂砾岩/psdm_final_time.sgy",
+    "Coherence": "/data/shared/project-oil/wx数据/砂砾岩/补充材料-20260623/车西_T4-T7/车西-相干体T4-T7.sgy",
+    "AntTrack": "/data/shared/project-oil/wx数据/砂砾岩/补充材料-20260623/车西_T4-T7/车西-蚂蚁体T4-T7.sgy",
+    "CurvatureMax": "/data/shared/project-oil/wx数据/砂砾岩/补充材料-20260623/车西-最大曲率T4-T7.sgy"
+  },
+  "sample_interval_ms": 2.0,
+  "block_x_line_count": 4,
+  "density_cap": 10.0,
+  "diagnostics": {
+    "well_name": "车页1导眼",
+    "well_main_csv": "/home/tyh/projects/petroleum/code/GAN-DFN/优化阶段二/正式主线/step2_real_well_t4_t7_samples/output/formal_all_wells/车页1导眼/车页1导眼_t4_t7_real_well_main.csv",
+    "step3_group_csvs": [
+      "/home/tyh/projects/petroleum/code/GAN-DFN/优化阶段二/正式主线/step3_imaging_supervision_samples/output/formal_rebuild/groups/车页1导眼_沙三段.csv",
+      "/home/tyh/projects/petroleum/code/GAN-DFN/优化阶段二/正式主线/step3_imaging_supervision_samples/output/formal_rebuild/groups/车页1导眼_沙四段.csv"
+    ]
+  }
+}

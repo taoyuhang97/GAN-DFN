@@ -1,23 +1,3 @@
-#!/usr/bin/env python3
-"""Step6A (太古界): train two-stage (presence + conditional density) models.
-
-Model logic (per layer 上部复合层 / 太古界风化壳):
-  Stage1  HistGradientBoostingClassifier  on PresenceLabel (weighted)
-  Stage2  HistGradientBoostingRegressor   on DensityLabel for positive rows only
-  Final density = P(presence) * clip(E[density|presence], 0, density_cap)
-
-Validation: GroupKFold on SourceWellName (real + virtual + strong rows of a
-well always stay in the same fold). 上部复合层: 11 source wells / 5 folds;
-太古界风化壳: 3 source wells (301/303/321) / 3-fold leave-one-well-out.
-Metrics are reported per layer, per fold and pooled (OOF).
-
-Outputs (config.output_dir):
-  step6_two_stage_density_models.joblib
-  step6_two_stage_training_summary.json
-  step6_two_stage_grouped_validation.csv
-  step6_acceptance_summary.json   status=pass
-"""
-
 from __future__ import annotations
 
 import argparse
@@ -44,12 +24,34 @@ from sklearn.metrics import (
 from sklearn.model_selection import GroupKFold
 
 
+CURRENT_DIR = Path(__file__).resolve().parent
+SURFACE_TOOL_DIR = CURRENT_DIR.parent / "step1_surface_framework"
+if str(SURFACE_TOOL_DIR) not in sys.path:
+    sys.path.insert(0, str(SURFACE_TOOL_DIR))
+
+from surface_tools import load_surface_tables, validate_surface_order  # noqa: E402
+
+
+ALLOWED_LAYERS = ("沙三段", "沙四段")
+LAYER_CODE = {"沙三段": 3.0, "沙四段": 4.0}
+ATTRIBUTE_COLUMNS = ("SeisAmp", "Coherence", "AntTrack", "CurvatureMax")
+FEATURE_COLUMNS = (
+    *ATTRIBUTE_COLUMNS,
+    "LayerCode",
+    "RelativeTimeInLayer",
+    "TimeSinceTop",
+    "TimeToBase",
+    "LayerThickness",
+    "TimeMs",
+)
+NULL_THRESHOLD = -1.0e6
+
+
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Train Step6A two-stage density models (太古界).")
+    parser = argparse.ArgumentParser(description="Train Step6 two-stage fracture-density models without volume prediction.")
     parser.add_argument("--config", type=Path, required=True)
-    parser.add_argument("--output-dir", type=Path, default=None)
-    parser.add_argument("--max-rows", type=int, default=0, help="Smoke-test cap.")
-    parser.add_argument("--replace-output", action="store_true")
+    parser.add_argument("--max-chunks", type=int, default=0, help="Smoke-test chunk cap; 0 reads the full Step5B table.")
+    parser.add_argument("--output-dir", type=Path, default=None, help="Optional isolated output override.")
     return parser.parse_args()
 
 
@@ -57,22 +59,9 @@ def read_json(path: Path) -> dict[str, Any]:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
-def write_json(path: Path, payload: dict[str, Any]) -> None:
-    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-
-
-def json_ready(value: Any) -> Any:
-    if isinstance(value, dict):
-        return {str(key): json_ready(item) for key, item in value.items()}
-    if isinstance(value, (list, tuple)):
-        return [json_ready(item) for item in value]
-    if isinstance(value, np.ndarray):
-        return value.tolist()
-    if isinstance(value, (np.integer, np.floating)):
-        return value.item()
-    if isinstance(value, np.bool_):
-        return bool(value)
-    return value
+def clean_numeric(series: pd.Series) -> pd.Series:
+    values = pd.to_numeric(series, errors="coerce").replace([np.inf, -np.inf], np.nan)
+    return values.mask(values <= NULL_THRESHOLD, np.nan)
 
 
 def finite_stats(values: np.ndarray) -> dict[str, float | int | None]:
@@ -90,72 +79,70 @@ def finite_stats(values: np.ndarray) -> dict[str, float | int | None]:
     }
 
 
-def imaging_density_reference(groups_root: Path, strong_wells: list[str]) -> dict[str, Any]:
-    """Per-well, per-strata imaging density quantiles (reference only, no mixing)."""
-    out: dict[str, Any] = {}
-    for well in strong_wells:
-        group_files = sorted(groups_root.glob(f"{well}_*.csv"))
-        parts = []
-        for group_file in group_files:
-            frame = pd.read_csv(group_file, encoding="utf-8-sig")
-            for column in ("Density", "HasFractureDensity"):
-                if column in frame.columns:
-                    frame[column] = pd.to_numeric(frame[column], errors="coerce")
-            parts.append(frame[["StrataName", "Density", "HasFractureDensity"]])
-        if not parts:
-            continue
-        frame = pd.concat(parts, ignore_index=True)
-        well_rows: dict[str, Any] = {"rows": int(len(frame))}
-        for strata, sub in frame.groupby("StrataName"):
-            dens = sub["Density"].dropna()
-            well_rows[str(strata)] = {
-                "rows": int(len(dens)),
-                "positive_rows": int((sub["HasFractureDensity"].fillna(0).astype(int) == 1).sum()),
-                "quantiles": {
-                    str(q): float(dens.quantile(q)) if len(dens) else None
-                    for q in (0.1, 0.25, 0.5, 0.75, 0.9, 0.95)
-                },
-            }
-        out[str(well)] = well_rows
-    return out
+def json_ready(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {str(key): json_ready(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [json_ready(item) for item in value]
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    if isinstance(value, (np.integer, np.floating)):
+        return value.item()
+    if isinstance(value, np.bool_):
+        return bool(value)
+    return value
 
 
-def attach_layer_features(df: pd.DataFrame, lookups: dict[str, cKDTree], payload: Any, max_distance: float) -> pd.DataFrame:
+def load_surface_lookups(layer_dir: Path) -> dict[str, tuple[cKDTree, np.ndarray]]:
+    surfaces = load_surface_tables(layer_dir)
+    lookups: dict[str, tuple[cKDTree, np.ndarray]] = {}
+    for code, payload in surfaces.items():
+        table = payload["table"]
+        xy = table[["X", "Y"]].to_numpy(dtype=np.float64)
+        lookups[code] = (cKDTree(xy), table["Z"].to_numpy(dtype=np.float64))
+    return lookups
+
+
+def attach_layer_time_features(df: pd.DataFrame, lookups: dict[str, tuple[cKDTree, np.ndarray]]) -> pd.DataFrame:
     work = df.copy()
+    for column in ("X", "Y", "TIME"):
+        work[column] = clean_numeric(work[column])
+    work = work.dropna(subset=["X", "Y", "TIME"]).copy()
+    if work.empty:
+        return work
     xy = work[["X", "Y"]].to_numpy(dtype=np.float64)
-    for code in ("top", "mid", "base"):
-        distance, index = lookups[code].query(xy, k=1, p=1)
-        distance = np.asarray(distance, dtype=np.float64)
-        times = payload[f"{code}_t"][np.asarray(index, dtype=np.int64)]
-        work[f"{code}_TIME"] = np.where(distance <= max_distance, times, np.nan)
+    for code, (tree, surface_time) in lookups.items():
+        _, indices = tree.query(xy, k=1, p=1)
+        work[f"{code}_TIME"] = surface_time[np.asarray(indices, dtype=np.int64)]
+    work = validate_surface_order(work, min_thickness=1.0)
+    work = work[work["Check_All"].fillna(False)].copy()
+    if work.empty:
+        return work
     layer = work["LayerGroup"].astype(str)
-    is_upper = layer.eq("上部复合层")
-    is_crust = layer.eq("太古界风化壳")
-    work["LayerTopTime"] = np.where(is_upper, work["top_TIME"], np.where(is_crust, work["mid_TIME"], np.nan))
-    work["LayerBaseTime"] = np.where(is_upper, work["mid_TIME"], np.where(is_crust, work["base_TIME"], np.nan))
-    work["LayerCode"] = np.where(is_upper, 1.0, np.where(is_crust, 2.0, np.nan))
+    is_sha3 = layer.eq("沙三段")
+    is_sha4 = layer.eq("沙四段")
+    work["LayerTopTime"] = np.where(is_sha3, work["T4_TIME"], np.where(is_sha4, work["T6_TIME"], np.nan))
+    work["LayerBaseTime"] = np.where(is_sha3, work["T6_TIME"], np.where(is_sha4, work["T7_TIME"], np.nan))
     work["LayerThickness"] = work["LayerBaseTime"] - work["LayerTopTime"]
     work["TimeSinceTop"] = work["TIME"] - work["LayerTopTime"]
     work["TimeToBase"] = work["LayerBaseTime"] - work["TIME"]
     work = work[
         work["LayerThickness"].gt(0)
-        & work["TimeSinceTop"].ge(-0.5)
-        & work["TimeToBase"].ge(-0.5)
+        & work["TimeSinceTop"].ge(0)
+        & work["TimeToBase"].ge(0)
     ].copy()
     work["RelativeTimeInLayer"] = work["TimeSinceTop"] / work["LayerThickness"]
+    work["LayerCode"] = layer.loc[work.index].map(LAYER_CODE)
     work["TimeMs"] = work["TIME"]
     return work
 
 
 def collect_training_data(
     input_csv: Path,
-    lookups: dict[str, cKDTree],
-    payload: Any,
-    feature_columns: list[str],
-    max_distance: float,
+    lookups: dict[str, tuple[cKDTree, np.ndarray]],
     chunksize: int,
-    max_rows: int,
-) -> dict[str, dict[str, np.ndarray]]:
+    max_chunks: int,
+) -> tuple[dict[str, dict[str, np.ndarray]], dict[str, Any]]:
     usecols = [
         "SourceKind",
         "SourceWellName",
@@ -167,62 +154,80 @@ def collect_training_data(
         "PresenceLabel",
         "DensityLabel",
         "SampleWeight",
-        "Coherence",
-        "AntTrack",
-        "CurvatureMax",
+        *ATTRIBUTE_COLUMNS,
     ]
-    frame = pd.read_csv(input_csv, encoding="utf-8-sig", usecols=usecols, low_memory=False)
-    if max_rows > 0:
-        frame = frame.head(int(max_rows)).copy()
-    for column in (
-        "X",
-        "Y",
-        "TIME",
-        "PresenceLabel",
-        "DensityLabel",
-        "SampleWeight",
-        "Coherence",
-        "AntTrack",
-        "CurvatureMax",
-    ):
-        frame[column] = pd.to_numeric(frame[column], errors="coerce")
-    work = frame[frame["LayerGroup"].astype(str).isin(["上部复合层", "太古界风化壳"])].copy()
-    work = attach_layer_features(work, lookups, payload, max_distance)
-    if work.empty:
-        return {}, {}
-    for column in feature_columns:
-        work[column] = pd.to_numeric(work[column], errors="coerce")
-    valid = work[feature_columns].notna().all(axis=1)
-    valid &= work["PresenceLabel"].isin([0.0, 1.0]) & work["SampleWeight"].gt(0) & work["SourceWellName"].notna()
-    positive = work["PresenceLabel"].eq(1.0)
-    valid &= (~positive) | (work["DensityLabel"].notna() & work["DensityLabel"].ge(0))
-    work = work.loc[valid].copy()
+    parts: dict[str, dict[str, list[np.ndarray]]] = {
+        layer: {"x": [], "presence": [], "density": [], "weight": [], "group": []} for layer in ALLOWED_LAYERS
+    }
     group_codes: dict[str, int] = {}
-    for well in work["SourceWellName"].astype(str).unique():
-        if well not in group_codes:
-            group_codes[well] = len(group_codes)
-    work["_GroupCode"] = work["SourceWellName"].astype(str).map(group_codes).astype(np.int16)
-    parts: dict[str, dict[str, list[np.ndarray]]] = {}
-    for layer in ("上部复合层", "太古界风化壳"):
-        layer_work = work[work["LayerGroup"].astype(str).eq(layer)]
-        if layer_work.empty:
+    scan = {
+        "input_rows_seen": 0,
+        "rows_after_surface_and_feature_filter": 0,
+        "dropped_missing_required_feature": 0,
+        "dropped_invalid_label_or_weight": 0,
+        "chunks_read": 0,
+        "source_kind_counts": {},
+    }
+    reader = pd.read_csv(input_csv, encoding="utf-8-sig", usecols=usecols, chunksize=chunksize, low_memory=False)
+    for chunk_index, chunk in enumerate(reader, start=1):
+        scan["chunks_read"] = chunk_index
+        scan["input_rows_seen"] += int(len(chunk))
+        for key, count in chunk["SourceKind"].astype(str).value_counts(dropna=False).items():
+            scan["source_kind_counts"][str(key)] = scan["source_kind_counts"].get(str(key), 0) + int(count)
+        work = chunk[chunk["LayerGroup"].astype(str).isin(ALLOWED_LAYERS)].copy()
+        work = attach_layer_time_features(work, lookups)
+        if work.empty:
             continue
-        parts[layer] = {
-            "x": [layer_work[feature_columns].to_numpy(dtype=np.float32)],
-            "presence": [layer_work["PresenceLabel"].to_numpy(dtype=np.int8)],
-            "density": [layer_work["DensityLabel"].to_numpy(dtype=np.float32)],
-            "weight": [layer_work["SampleWeight"].to_numpy(dtype=np.float32)],
-            "group": [layer_work["_GroupCode"].to_numpy(dtype=np.int16)],
-        }
-        print(f"[step6a-train] layer={layer} rows={len(layer_work)} wells={layer_work['SourceWellName'].nunique()}", flush=True)
+        for column in (*ATTRIBUTE_COLUMNS, *FEATURE_COLUMNS[4:]):
+            work[column] = clean_numeric(work[column])
+        required_feature_mask = work[list(FEATURE_COLUMNS)].notna().all(axis=1)
+        scan["dropped_missing_required_feature"] += int((~required_feature_mask).sum())
+        work = work.loc[required_feature_mask].copy()
+        work["PresenceLabel"] = clean_numeric(work["PresenceLabel"])
+        work["DensityLabel"] = clean_numeric(work["DensityLabel"])
+        work["SampleWeight"] = clean_numeric(work["SampleWeight"])
+        valid_label = work["PresenceLabel"].isin([0.0, 1.0]) & work["SampleWeight"].gt(0)
+        valid_label &= work["SourceWellName"].notna()
+        positive = work["PresenceLabel"].eq(1.0)
+        valid_label &= (~positive) | (work["DensityLabel"].notna() & work["DensityLabel"].ge(0))
+        scan["dropped_invalid_label_or_weight"] += int((~valid_label).sum())
+        work = work.loc[valid_label].copy()
+        if work.empty:
+            continue
+        scan["rows_after_surface_and_feature_filter"] += int(len(work))
+        for well in work["SourceWellName"].astype(str).unique():
+            if well not in group_codes:
+                group_codes[well] = len(group_codes)
+        work["_GroupCode"] = work["SourceWellName"].astype(str).map(group_codes).astype(np.int16)
+        for layer in ALLOWED_LAYERS:
+            layer_work = work[work["LayerGroup"].astype(str).eq(layer)]
+            if layer_work.empty:
+                continue
+            parts[layer]["x"].append(layer_work[list(FEATURE_COLUMNS)].to_numpy(dtype=np.float32))
+            parts[layer]["presence"].append(layer_work["PresenceLabel"].to_numpy(dtype=np.int8))
+            parts[layer]["density"].append(layer_work["DensityLabel"].to_numpy(dtype=np.float32))
+            parts[layer]["weight"].append(layer_work["SampleWeight"].to_numpy(dtype=np.float32))
+            parts[layer]["group"].append(layer_work["_GroupCode"].to_numpy(dtype=np.int16))
+        print(
+            f"[step6-train] chunk={chunk_index} input_rows={scan['input_rows_seen']} "
+            f"kept_rows={scan['rows_after_surface_and_feature_filter']}",
+            flush=True,
+        )
+        if max_chunks > 0 and chunk_index >= max_chunks:
+            break
+
     data: dict[str, dict[str, np.ndarray]] = {}
-    for layer, part in parts.items():
-        data[layer] = {key: np.concatenate(value, axis=0) for key, value in part.items()}
-    return data, group_codes
+    for layer in ALLOWED_LAYERS:
+        if not parts[layer]["x"]:
+            raise RuntimeError(f"no valid training rows for {layer}")
+        data[layer] = {key: np.concatenate(value, axis=0) for key, value in parts[layer].items()}
+    scan["source_well_count"] = int(len(group_codes))
+    scan["source_well_group_codes"] = {well: int(code) for well, code in sorted(group_codes.items(), key=lambda item: item[1])}
+    return data, scan
 
 
 def classifier_metrics(y_true: np.ndarray, probability: np.ndarray, weight: np.ndarray) -> dict[str, Any]:
-    out = {
+    out: dict[str, Any] = {
         "rows": int(len(y_true)),
         "positive_rows": int((y_true == 1).sum()),
         "positive_fraction": float(np.mean(y_true == 1)),
@@ -256,7 +261,6 @@ def regressor_metrics(y_true: np.ndarray, prediction: np.ndarray, weight: np.nda
 def fit_layer(
     layer: str,
     arrays: dict[str, np.ndarray],
-    feature_columns: list[str],
     classifier_params: dict[str, Any],
     regressor_params: dict[str, Any],
     validation_folds: int,
@@ -283,6 +287,7 @@ def fit_layer(
         classifier = HistGradientBoostingClassifier(random_state=random_state + fold, **classifier_params)
         classifier.fit(x[train_idx], presence[train_idx], sample_weight=weight[train_idx])
         probability = classifier.predict_proba(x[val_idx])[:, 1]
+
         positive_train = train_idx[presence[train_idx] == 1]
         if len(positive_train) == 0:
             raise RuntimeError(f"{layer} fold {fold} has no positive density rows")
@@ -292,21 +297,6 @@ def fit_layer(
         final_density = np.clip(probability * conditional, 0.0, density_cap)
         target_density = np.where(presence[val_idx] == 1, density[val_idx], 0.0)
         positive_val_mask = presence[val_idx] == 1
-        if int(positive_val_mask.sum()) > 0:
-            conditional_metrics = regressor_metrics(
-                density[val_idx][positive_val_mask],
-                conditional[positive_val_mask],
-                weight[val_idx][positive_val_mask],
-            )
-        else:
-            conditional_metrics = {
-                "rows": 0,
-                "target_stats": finite_stats(np.empty(0)),
-                "prediction_stats": finite_stats(np.empty(0)),
-                "mae": None,
-                "rmse": None,
-                "r2": None,
-            }
         fold_row = {
             "layer": layer,
             "fold": fold,
@@ -316,7 +306,11 @@ def fit_layer(
             "validation_source_well_count": int(np.unique(groups[val_idx]).size),
             "source_well_overlap_count": int(len(set(groups[train_idx]).intersection(set(groups[val_idx])))),
             "classifier": classifier_metrics(presence[val_idx], probability, weight[val_idx]),
-            "conditional_density": conditional_metrics,
+            "conditional_density": regressor_metrics(
+                density[val_idx][positive_val_mask],
+                conditional[positive_val_mask],
+                weight[val_idx][positive_val_mask],
+            ),
             "combined_density": regressor_metrics(target_density, final_density, weight[val_idx]),
             "elapsed_seconds": float(time.time() - started),
         }
@@ -325,7 +319,7 @@ def fit_layer(
         combined_predictions.append(final_density)
         combined_weights.append(weight[val_idx])
         print(
-            f"[step6a-train] layer={layer} fold={fold}/{split_count} "
+            f"[step6-train] layer={layer} fold={fold}/{split_count} "
             f"auc={fold_row['classifier']['roc_auc']} combined_mae={fold_row['combined_density']['mae']:.6f} "
             f"elapsed_s={fold_row['elapsed_seconds']:.1f}",
             flush=True,
@@ -343,7 +337,11 @@ def fit_layer(
         np.concatenate(combined_weights),
     )
     fold_auc = [row["classifier"]["roc_auc"] for row in fold_rows if row["classifier"]["roc_auc"] is not None]
-    fold_ap = [row["classifier"]["average_precision"] for row in fold_rows if row["classifier"]["average_precision"] is not None]
+    fold_ap = [
+        row["classifier"]["average_precision"]
+        for row in fold_rows
+        if row["classifier"]["average_precision"] is not None
+    ]
     summary = {
         "layer": layer,
         "rows": int(len(x)),
@@ -351,7 +349,7 @@ def fit_layer(
         "positive_fraction": float(positive_all.mean()),
         "source_well_count": int(unique_groups.size),
         "validation_fold_count": int(split_count),
-        "feature_columns": list(feature_columns),
+        "feature_columns": list(FEATURE_COLUMNS),
         "sample_weight_stats": finite_stats(weight),
         "density_positive_stats": finite_stats(density[positive_all]),
         "out_of_fold_combined_density": aggregate,
@@ -364,7 +362,7 @@ def fit_layer(
         "layer": layer,
         "classifier": final_classifier,
         "conditional_density_regressor": final_regressor,
-        "feature_columns": list(feature_columns),
+        "feature_columns": list(FEATURE_COLUMNS),
         "density_cap": float(density_cap),
         "training_summary": summary,
     }
@@ -373,76 +371,70 @@ def fit_layer(
 
 def main() -> int:
     args = parse_args()
-    config = read_json(args.config)
+    config_path = args.config.resolve()
+    config = read_json(config_path)
+    input_csv = Path(config["unified_samples_csv"]).resolve()
+    layer_dir = Path(config["layer_dir"]).resolve()
     output_dir = (args.output_dir or Path(config["output_dir"])).resolve()
+    if not input_csv.exists():
+        raise FileNotFoundError(f"Step5B input not found: {input_csv}")
+    if not layer_dir.exists():
+        raise FileNotFoundError(f"layer directory not found: {layer_dir}")
     output_dir.mkdir(parents=True, exist_ok=True)
     artifact_path = output_dir / "step6_two_stage_density_models.joblib"
     summary_path = output_dir / "step6_two_stage_training_summary.json"
     folds_path = output_dir / "step6_two_stage_grouped_validation.csv"
-    acceptance_path = output_dir / "step6_acceptance_summary.json"
-    for path in (artifact_path, summary_path, folds_path, acceptance_path):
-        if path.exists() and not args.replace_output:
-            raise FileExistsError(f"refusing to overwrite existing Step6A training output: {path}")
+    for path in (artifact_path, summary_path, folds_path):
+        if path.exists():
+            raise FileExistsError(f"refusing to overwrite existing Step6 training output: {path}")
 
     started = time.time()
-    payload = np.load(config["surface_lookup_cache_npz"])
-    lookups: dict[str, cKDTree] = {}
-    for code in ("top", "mid", "base"):
-        lookups[code] = cKDTree(np.column_stack([payload[f"{code}_x"], payload[f"{code}_y"]]))
-    feature_columns = list(config["feature_columns"])
-    data, group_codes = collect_training_data(
-        input_csv=Path(config["unified_samples_csv"]),
+    lookups = load_surface_lookups(layer_dir)
+    data, scan_summary = collect_training_data(
+        input_csv=input_csv,
         lookups=lookups,
-        payload=payload,
-        feature_columns=feature_columns,
-        max_distance=float(config["max_horizon_match_distance_m"]),
-        chunksize=int(config["training_chunksize"]),
-        max_rows=int(args.max_rows),
+        chunksize=int(config.get("training_chunksize", 250000)),
+        max_chunks=int(args.max_chunks),
     )
     model_bundles: dict[str, Any] = {}
     layer_summaries: dict[str, Any] = {}
     fold_rows: list[dict[str, Any]] = []
-    strong_wells = list(config.get("strong_supervision_wells", ["埕北古斜405"]))
-    for offset, layer in enumerate(("上部复合层", "太古界风化壳")):
-        if layer not in data:
-            raise RuntimeError(f"no training rows available for layer {layer}; check Step5 unified samples")
-        layer_config = config["layers"][layer]
+    for offset, layer in enumerate(ALLOWED_LAYERS):
         bundle, rows, layer_summary = fit_layer(
             layer=layer,
             arrays=data[layer],
-            feature_columns=feature_columns,
             classifier_params=dict(config.get("classifier", {})),
             regressor_params=dict(config.get("conditional_density_regressor", {})),
-            validation_folds=int(layer_config["validation_group_folds"]),
-            random_state=int(config["random_state"]) + offset * 100,
-            density_cap=float(config["density_cap"]),
+            validation_folds=int(config.get("validation_group_folds", 3)),
+            random_state=int(config.get("random_state", 42)) + offset * 100,
+            density_cap=float(config.get("density_cap", 10.0)),
         )
         model_bundles[layer] = bundle
         layer_summaries[layer] = layer_summary
         fold_rows.extend(rows)
 
     checks = {
-        "models_for_both_layers": sorted(model_bundles) == sorted(("上部复合层", "太古界风化壳")),
-        "window_code_not_a_feature": "WindowCode" not in feature_columns,
-        "required_mult_attributes_present": all(name in feature_columns for name in ("Coherence", "AntTrack", "CurvatureMax")),
+        "models_for_both_layers": sorted(model_bundles) == sorted(ALLOWED_LAYERS),
+        "curvature_pos_excluded": "CurvaturePos" not in FEATURE_COLUMNS,
+        "ordinary_curvature_included": "CurvatureMax" in FEATURE_COLUMNS,
         "all_folds_source_well_disjoint": all(row["source_well_overlap_count"] == 0 for row in fold_rows),
-        "all_layers_have_positive_density_rows": all(
-            summary["positive_rows"] > 0 for summary in layer_summaries.values()
-        ),
-        "crust_validation_is_3_fold_loo": layer_summaries["太古界风化壳"]["validation_fold_count"] == 3,
+        "all_layers_have_positive_density_rows": all(summary["positive_rows"] > 0 for summary in layer_summaries.values()),
     }
     status = "pass" if all(checks.values()) else "fail"
     artifact = {
-        "contract_version": config["version"],
+        "contract_version": "step6_two_stage_curvature_led_v1",
         "model_logic": "presence_probability_times_conditional_density",
-        "feature_columns": feature_columns,
-        "attribute_columns": ["Coherence", "AntTrack", "CurvatureMax"],
+        "feature_columns": list(FEATURE_COLUMNS),
+        "attribute_columns": list(ATTRIBUTE_COLUMNS),
         "models": model_bundles,
-        "prediction_sample_interval_ms": 2.0,
-        "training_input": str(Path(config["unified_samples_csv"]).resolve()),
+        "prediction_sample_interval_ms": float(config.get("prediction_sample_interval_ms", 2.0)),
+        "training_input": str(input_csv),
+        "training_uses_all_chunks": int(args.max_chunks) == 0,
         "config": config,
     }
-    joblib.dump(artifact, artifact_path, compress=3)
+    temporary_artifact = artifact_path.with_suffix(artifact_path.suffix + ".partial")
+    joblib.dump(artifact, temporary_artifact, compress=3)
+    temporary_artifact.replace(artifact_path)
 
     flat_fold_rows = []
     for row in fold_rows:
@@ -468,8 +460,8 @@ def main() -> int:
     pd.DataFrame(flat_fold_rows).to_csv(folds_path, index=False, encoding="utf-8-sig")
     summary = {
         "status": status,
-        "config_path": str(args.config.resolve()),
-        "training_input": str(Path(config["unified_samples_csv"]).resolve()),
+        "config_path": str(config_path),
+        "training_input": str(input_csv),
         "output_dir": str(output_dir),
         "output_paths": {
             "model_joblib": str(artifact_path),
@@ -477,19 +469,17 @@ def main() -> int:
             "grouped_validation_csv": str(folds_path),
         },
         "model_logic": "presence_probability_times_conditional_density",
-        "prediction_sample_interval_ms": 2.0,
-        "source_well_group_codes": group_codes,
-        "imaging_density_reference": imaging_density_reference(
-            Path(config["step3_groups_root"]), strong_wells
-        ),
+        "prediction_sample_interval_ms": float(config.get("prediction_sample_interval_ms", 2.0)),
+        "training_scan": scan_summary,
         "layer_summaries": layer_summaries,
         "fold_details": fold_rows,
         "checks": checks,
         "elapsed_seconds": float(time.time() - started),
     }
-    write_json(summary_path, summary)
-    write_json(acceptance_path, {"status": status, "summary": str(summary_path), "checks": checks})
-    print(json.dumps(json_ready(summary), ensure_ascii=False, indent=2))
+    summary_path.write_text(json.dumps(json_ready(summary), ensure_ascii=False, indent=2), encoding="utf-8")
+    print(f"[step6-train] model={artifact_path}", flush=True)
+    print(f"[step6-train] summary={summary_path}", flush=True)
+    print(f"[step6-train] status={status} elapsed_s={summary['elapsed_seconds']:.1f}", flush=True)
     return 0 if status == "pass" else 1
 
 

@@ -1,0 +1,68 @@
+{
+  "version": "taigu_step5_attribute_v1",
+  "output_dir": "/home/tyh/projects/petroleum/code/GAN-DFN/太古界/step5_virtual_wells/output/taigu_step5_attribute_v1",
+  "step4_merged_predictions_csv": "/home/tyh/projects/petroleum/code/GAN-DFN/太古界/step4_fracture_prediction/output/taigu_step4_gr_rd_rs_v1/predictions/all_wells_merged_density_prediction.csv",
+  "step2_well_metadata_csv": "/home/tyh/projects/petroleum/code/GAN-DFN/太古界/step2_well_log_segments/output/taigu_step2_regular_v3/taigu_step2_well_metadata.csv",
+  "step3_groups_root": "/home/tyh/projects/petroleum/code/GAN-DFN/太古界/step3_imaging_groups/output/taigu_step3_imaging_v3/groups",
+  "trace_header_csv": "/home/tyh/projects/petroleum/code/GAN-DFN/太古界/common/attribute_trace_contract/output/taigu_attribute_trace_header_v1/attribute_trace_header.csv",
+  "surface_lookup_cache_npz": "/home/tyh/projects/petroleum/code/GAN-DFN/太古界/common/horizon_contract/output/taigu_attribute_full_horizon_contract_v1/surface_lookup_cache.npz",
+  "use_seis_amp": false,
+  "attribute_volume_paths": {
+    "Coherence": "/data/shared/project-oil/wx数据/埕岛太古界/体数据/Chengdao-Taigujie-Eigenstructure Coherence.sgy",
+    "AntTrack": "/data/shared/project-oil/wx数据/埕岛太古界/体数据/Chengdao-Taigujie-AntTracking.sgy",
+    "CurvatureMax": "/data/shared/project-oil/wx数据/埕岛太古界/体数据/Chengdao-Taigujie-Most Positive Curvature.sgy"
+  },
+  "attribute_invalid_rules": {
+    "AntTrack": {"invalid_le": -0.99}
+  },
+  "attribute_time_origins_ms": {"Coherence": 1800.0, "AntTrack": 1800.0, "CurvatureMax": 1800.0},
+  "selected_wells": ["埕北301", "埕北303", "埕北321", "埕北38", "埕北39", "埕北古10", "埕北古16", "埕北古406", "埕北古斜14", "埕北古斜19", "埕北古斜405"],
+  "attribute_weights": {
+    "CurvatureMax": 0.7,
+    "Coherence": 0.15,
+    "AntTrack": 0.15
+  },
+  "attribute_scale_floors": {
+    "CurvatureMax": 0.01,
+    "Coherence": 0.02,
+    "AntTrack": 0.02
+  },
+  "neighborhood_radius": 2,
+  "max_time_shift_ms": 60.0,
+  "max_virtual_neighbor_distance_m": 1000000000.0,
+  "max_sample_distance_m": 30.0,
+  "max_horizon_match_distance_m": 10.0,
+  "confidence": {
+    "regular": 1.0,
+    "imaging_borrow_distance_scale_m": 10000.0,
+    "min_confidence": 0.2
+  },
+  "max_virtual_weight_fraction": 5.0,
+  "strong_supervision_wells": [
+    "埕北310",
+    "埕北313",
+    "埕北816",
+    "埕北古斜405",
+    "桩斜169",
+    "桩海102"
+  ],
+  "continuity": {
+    "enabled": true,
+    "scale_multiplier": 1.0,
+    "scale_floor": 1.0e-6,
+    "min_continuity": 0.0,
+    "evidence_beta": 0.25,
+    "evidence_clip": 2.0,
+    "distance_scale_m": 500.0,
+    "weight_divisor": 25.0
+  },
+  "context_time_offsets_ms": [
+    -4.0,
+    -2.0,
+    0.0,
+    2.0,
+    4.0
+  ],
+  "md_merge_tolerance": 0.011,
+  "write_audit_detail": true
+}

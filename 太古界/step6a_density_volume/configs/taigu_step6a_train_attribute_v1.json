@@ -1,0 +1,60 @@
+{
+  "version": "taigu_step6a_train_attribute_v1",
+  "output_dir": "/home/tyh/projects/petroleum/code/GAN-DFN/太古界/step6a_density_volume/output/taigu_step6a_attribute_v1/models",
+  "unified_samples_csv": "/home/tyh/projects/petroleum/code/GAN-DFN/太古界/step5_virtual_wells/output/taigu_step5_attribute_v1/taigu_step5_unified_samples.csv",
+  "surface_lookup_cache_npz": "/home/tyh/projects/petroleum/code/GAN-DFN/太古界/common/horizon_contract/output/horizon_contract_v1/surface_lookup_cache.npz",
+  "step3_groups_root": "/home/tyh/projects/petroleum/code/GAN-DFN/太古界/step3_imaging_groups/output/taigu_step3_imaging_v3/groups",
+  "strong_supervision_wells": [
+    "埕北310",
+    "埕北313",
+    "埕北816",
+    "埕北古斜405",
+    "桩斜169",
+    "桩海102"
+  ],
+  "layers": {
+    "上部复合层": {
+      "layer_code": 1.0,
+      "validation_group_folds": 5
+    },
+    "太古界风化壳": {
+      "layer_code": 2.0,
+      "validation_group_folds": 3
+    }
+  },
+  "feature_columns": [
+    "SeisAmp",
+    "SeisAmpM4",
+    "SeisAmpM2",
+    "SeisAmpP2",
+    "SeisAmpP4",
+    "AmpMad5",
+    "Coherence",
+    "AntTrack",
+    "CurvatureMax",
+    "LayerCode",
+    "RelativeTimeInLayer",
+    "TimeSinceTop",
+    "TimeToBase",
+    "LayerThickness",
+    "TimeMs"
+  ],
+  "classifier": {
+    "max_iter": 150,
+    "learning_rate": 0.1,
+    "max_depth": 4,
+    "min_samples_leaf": 100,
+    "l2_regularization": 1.0
+  },
+  "conditional_density_regressor": {
+    "max_iter": 150,
+    "learning_rate": 0.1,
+    "max_depth": 4,
+    "min_samples_leaf": 60,
+    "l2_regularization": 1.0
+  },
+  "density_cap": 15.0,
+  "random_state": 42,
+  "training_chunksize": 250000,
+  "max_horizon_match_distance_m": 10.0
+}

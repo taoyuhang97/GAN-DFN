@@ -32,6 +32,7 @@ from typing import Any
 import numpy as np
 import pandas as pd
 import segyio
+from tqdm import tqdm
 
 
 def parse_args() -> argparse.Namespace:
@@ -198,6 +199,8 @@ def main() -> int:
         how="left",
     ).sort_values("TraceIdx").reset_index(drop=True)
     grid["Row"] = np.arange(len(grid))
+    if grid["TraceIdx"].duplicated().any():
+        raise RuntimeError("demo grid has duplicate TraceIdx")
     cell_to_row = {(int(ix), int(iy)): int(row) for ix, iy, row in zip(grid["IX"], grid["IY"], grid["Row"])}
     row_to_ix = grid["IX"].to_numpy(dtype=np.int32)
     row_to_iy = grid["IY"].to_numpy(dtype=np.int32)
@@ -243,7 +246,7 @@ def main() -> int:
 
     with segyio.open(str(density_sgy), "r", ignore_geometry=True) as handle:
         handle.mmap()
-        for ix_start in range(0, x_line_count, block_x_lines):
+        for ix_start in tqdm(range(0, x_line_count, block_x_lines), desc="Step7A density blocks", unit="block"):
             ix_stop = min(ix_start + block_x_lines, x_line_count)
             block = grid[grid["IX"].between(ix_start, ix_stop - 1)].sort_values("TraceIdx")
             start_row = int(block["Row"].min())
@@ -298,6 +301,8 @@ def main() -> int:
         sampled_rows.append(rows[keep])
         sampled_samples.append(samples[keep])
         sampled_density.append(density[keep])
+        if not (len(rows[keep]) == len(samples[keep]) == len(density[keep])):
+            raise RuntimeError(f"sampled candidate length mismatch for layer {name}")
         sampled_layer.extend([name] * int(keep.sum()))
         print(f"[step7a] layer={name} ref={reference:.3f} candidates={len(rows)} sampled={int(keep.sum())}", flush=True)
 
