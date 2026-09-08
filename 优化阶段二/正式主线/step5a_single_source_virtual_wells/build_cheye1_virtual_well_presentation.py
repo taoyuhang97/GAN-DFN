@@ -212,7 +212,10 @@ def plot_section(section: AttributeSection, geometry: CurvedSectionGeometry, out
 
 
 def plot_plan(geometry: CurvedSectionGeometry, index_df: pd.DataFrame, output_path: Path) -> dict[str, int]:
-    fig, ax = plt.subplots(figsize=(10.5, 9.0))
+    # Keep the plan-view figure under the same presentation-size contract as
+    # the XZ/YZ panels.  Older runs used a fixed large canvas here, which made
+    # the newly requested compact PPT version inconsistent across files.
+    fig, ax = plt.subplots(figsize=(geometry.args.fig_width, geometry.args.fig_height))
     ax.plot(geometry.well_df["X"], geometry.well_df["Y"], color="#111827", linewidth=5.0, zorder=3)
     ax.plot(geometry.well_df["X"], geometry.well_df["Y"], color=WELL_COLOR, linewidth=2.8, zorder=4, label="车页1导眼真实井轨迹")
     center_count = 0
