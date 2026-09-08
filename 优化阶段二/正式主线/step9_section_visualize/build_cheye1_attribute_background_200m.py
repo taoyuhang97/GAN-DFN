@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""Build clean Cheye-1 200 m attribute-background sections for PPT.
+"""Build clean Cheye-1 local attribute-background sections for PPT.
 
 Only the sampled seismic attribute, axes and colorbar are rendered.  No well,
 horizon, fracture, DFN or fault overlays are added so these images can be used
@@ -38,7 +38,7 @@ ATTRIBUTE_CMAPS = {"AntTrack": "gray_r", "Coherence": "gray", "CurvatureMax": "g
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Build clean Cheye1 200m geological attribute backgrounds.")
+    parser = argparse.ArgumentParser(description="Build clean Cheye1 local geological attribute backgrounds.")
     parser.add_argument("--config", type=Path, required=True)
     return parser
 
@@ -63,8 +63,8 @@ def local_geometry(base: CurvedSectionGeometry, config: dict[str, Any]) -> Curve
     time_min, time_max = finite_bounds_from_curves(curves, float(config.get("time_padding_ms", 20.0)))
     summary = dict(base.summary)
     summary.update({
-        "scope_name": "cheye1_local_200m_attribute_background",
-        "display_scope": "车页1导眼轨迹外扩200m后取最近地震道",
+        "scope_name": str(config.get("scope_name", "cheye1_local_attribute_background")),
+        "display_scope": str(config.get("display_scope", f"车页1导眼轨迹外扩{radius:g}m后取最近地震道")),
         "display_x_min": float(x_values.min()), "display_x_max": float(x_values.max()),
         "display_y_min": float(y_values.min()), "display_y_max": float(y_values.max()),
         "display_time_min": float(time_min), "display_time_max": float(time_max),
@@ -99,7 +99,8 @@ def plot_background(section, geometry, output_path: Path, scale_info: dict[str, 
     ax.set_xlabel("X / m" if section.projection == "XZ" else "Y / m")
     ax.set_ylabel(str(geometry.args.z_label))
     ax.grid(True, linewidth=0.25, alpha=0.20)
-    ax.set_title(f"车页1导眼井周200m {ATTRIBUTE_LABELS[attribute]}背景 | {section.projection}", fontsize=12)
+    scope_label = str(geometry.config.get("scope_label", "车页1导眼井周属性背景"))
+    ax.set_title(f"{scope_label} {ATTRIBUTE_LABELS[attribute]}背景 | {section.projection}", fontsize=12)
     colorbar_label = f"{ATTRIBUTE_LABELS[attribute]}绝对值" if attribute == "CurvatureMax" else ATTRIBUTE_LABELS[attribute]
     fig.colorbar(mesh, ax=ax, pad=0.02, shrink=0.94, label=colorbar_label)
     fig.tight_layout()
@@ -139,13 +140,14 @@ def main() -> int:
     files: list[dict[str, Any]] = []
     for attribute in attributes:
         xz, yz, _stats = sections[attribute]
-        files.append(plot_background(xz, geometry, output_dir / f"{attribute.lower()}_background_xz_200m.png", scale_summary[attribute]))
-        files.append(plot_background(yz, geometry, output_dir / f"{attribute.lower()}_background_yz_200m.png", scale_summary[attribute]))
+        suffix = str(config.get("file_suffix", "local"))
+        files.append(plot_background(xz, geometry, output_dir / f"{attribute.lower()}_background_xz_{suffix}.png", scale_summary[attribute]))
+        files.append(plot_background(yz, geometry, output_dir / f"{attribute.lower()}_background_yz_{suffix}.png", scale_summary[attribute]))
     checks = {
         "exactly_six_background_pngs": len(files) == 6,
         "all_finite_fraction_positive": all(item["finite_fraction"] > 0 for item in files),
         "no_overlay_layers": True,
-        "local_200m_geometry": geometry.summary.get("scope_name") == "cheye1_local_200m_attribute_background",
+        "configured_local_geometry": geometry.summary.get("scope_name") == str(config.get("scope_name", "cheye1_local_attribute_background")),
     }
     summary = {
         "status": "pass" if all(checks.values()) else "fail",
@@ -154,7 +156,7 @@ def main() -> int:
         "files": files, "checks": checks,
         "render_contract": "attribute raster + axes + colorbar only; no well/horizon/fracture/DFN/fault overlays",
     }
-    write_json(output_dir / "attribute_background_200m_summary.json", summary)
+    write_json(output_dir / f"attribute_background_{config.get('file_suffix', 'local')}_summary.json", summary)
     print(f"[attribute-background] output={output_dir}", flush=True)
     print(f"[attribute-background] status={summary['status']}", flush=True)
     return 0 if summary["status"] == "pass" else 1
