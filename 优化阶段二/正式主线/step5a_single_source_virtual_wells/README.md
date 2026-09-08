@@ -45,6 +45,26 @@
 
 只有显式设置 `write_intermediate_tables=true` 时，才额外输出属性、3x3 上下文、弱标签和置信度明细表。
 
+## 车页1导眼虚拟测井说明图
+
+`build_cheye1_virtual_well_presentation.py` 只用于说明 Step5A 的虚拟测井构造，复用井周 `200 m` 的 Step9 剖面几何和 T4-T7 层位框架，**不读取或叠加 DFN、断层或 Step8 成果**。
+
+图件写入正式 Step5A 输出目录下的 `virtual_well_presentation/`：
+
+当前配置生成的 PPT 版位于其下的 `ppt_200m/`，严格使用车页1导眼轨迹外扩 ±200m 窗口；XZ/YZ 横向道数上限为 82/98 道，但实际使用窗口内存在的有效地震道（当前为 XZ=34、YZ=50 道），不对数据进行插值扩道。PNG 为 300 dpi、15×10 cm（4500×3000 像素）。
+
+- `01_plan_virtual_well_grid.png`：真实车页1导眼与其 `5 x 5`、共25口虚拟测井地震道位置；橙色菱形为中心虚拟井。
+- `02-03`：XZ/YZ 地震振幅背景上的真实井证据。黄色为真实井轨迹；青色短线是具有倾向倾角的成像测井真实裂缝投影；洋红圆点是仅有位置的常规测井预测裂缝，且自动排除成像测井覆盖段。
+- `04-05`：XZ/YZ 曲率体背景上的 Step5 虚拟测井构造。紫色菱形为虚拟测井裂缝事件中心，仅表示位置，不代表倾向倾角；中心虚拟井使用橙色强调。
+- `06-07`：三类证据的综合核对图。
+
+Step4/Step5 的连续正样本会按时间连续性先合并为裂缝事件，每个事件只绘制一个中心点，避免把高采样率标签误画成具有姿态的裂缝线。成像裂缝才保留由 `Frac_Azimuth/Frac_Dip` 计算的方向投影。
+
+```bash
+python 优化阶段二/正式主线/step5a_single_source_virtual_wells/build_cheye1_virtual_well_presentation.py \
+  --config 优化阶段二/正式主线/step5a_single_source_virtual_wells/configs/formal_cheye1_virtual_well_presentation.json
+```
+
 ## 运行
 
 ```bash
