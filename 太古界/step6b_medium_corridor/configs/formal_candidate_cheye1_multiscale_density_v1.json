@@ -51,7 +51,10 @@
   "medium_prior": {
     "score_threshold": 0.52,
     "min_ant_score": 0.58,
-    "min_component_voxels": 35,
+    "min_component_voxels": 20,
+    "fragment_recovery_min_voxels": 15,
+    "fragment_bridge_score": 0.45,
+    "fragment_bridge_iterations": 1,
     "use_26_connectivity": true,
     "ant_weight_base": 0.65,
     "lowcoh_support_weight": 0.20,

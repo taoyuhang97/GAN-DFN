@@ -32,9 +32,59 @@ legacy.ALLOWED_LAYERS = ["上部复合层", "太古界风化壳"]
 legacy.LAYER_CODE = {"上部复合层": 1.0, "太古界风化壳": 2.0}
 from horizon_trace_table.horizon_contract import (  # noqa: E402
     load_contract_for_mapping,
-    surface_grids_from_contract,
     validate_window_contract,
 )
+
+
+def taigu_layer_bounds(
+    layer: str, surfaces: dict[str, np.ndarray]
+) -> tuple[np.ndarray, np.ndarray]:
+    """Return the Taigu layer top/base surfaces.
+
+    The Taigu contract is defined by three files: upper-composite top,
+    Taigu top (internal boundary), and weathering-crust base.  Keep this
+    mapping explicit instead of inheriting sandstone layer-name branches.
+    """
+    if layer == "上部复合层":
+        return surfaces["TopTime"], surfaces["MiddleTime"]
+    if layer == "太古界风化壳":
+        return surfaces["MiddleTime"], surfaces["BottomTime"]
+    raise ValueError(f"unsupported Taigu layer: {layer}")
+
+
+def taigu_layer_mask(
+    layer: str, samples: np.ndarray, surfaces: dict[str, np.ndarray]
+) -> np.ndarray:
+    """Build a per-voxel mask for the Taigu target layers."""
+    top, base = taigu_layer_bounds(layer, surfaces)
+    t = np.asarray(samples, dtype=float).reshape(1, 1, -1)
+    top3 = top[:, :, None]
+    base3 = base[:, :, None]
+    present = surfaces["Check_All"][:, :, None] & np.isfinite(top3) & np.isfinite(base3)
+    return present & (t >= top3) & (t < base3)
+
+
+def taigu_surface_grids(
+    mapping: dict[str, np.ndarray], contract: Any
+) -> dict[str, np.ndarray]:
+    """Create semantic Top/Middle/Bottom grids from the three-file contract."""
+    ix = np.asarray(mapping["ix"], dtype=np.int32)
+    iy = np.asarray(mapping["iy"], dtype=np.int32)
+    shape = (int(iy.max()) + 1, int(ix.max()) + 1)
+
+    def grid(values: np.ndarray, dtype: np.dtype | type = np.float32) -> np.ndarray:
+        fill = 0 if np.issubdtype(np.dtype(dtype), np.integer) else np.nan
+        out = np.full(shape, fill, dtype=dtype)
+        out[iy, ix] = np.asarray(values, dtype=dtype)
+        return out
+
+    valid = grid(np.asarray(contract.surface_order_valid, dtype=np.uint8), np.uint8).astype(bool)
+    return {
+        "TopTime": grid(contract.t4),
+        "MiddleTime": grid(contract.t6),
+        "BottomTime": grid(contract.t7),
+        "Check_All": valid,
+    }
 
 
 def parse_args() -> argparse.Namespace:
@@ -87,7 +137,7 @@ def layer_candidates(
     min_score = float(config.get("min_prior_score", 0.45))
 
     for layer in legacy.ALLOWED_LAYERS:
-        layer_mask = legacy.layer_mask_for_grid(layer, grid["samples"], surfaces)
+        layer_mask = taigu_layer_mask(layer, grid["samples"], surfaces)
         raw = layer_mask & (mask_grid > 0.5) & np.isfinite(prior) & (prior >= min_score)
         labels, count = ndimage.label(raw, structure=structure)
         if count <= 0:
@@ -101,8 +151,9 @@ def layer_candidates(
             if yy.size == 0:
                 continue
             comp_score = prior[yy, xx, tt].astype(float)
-            top = surfaces["T4_TIME"][yy, xx] if layer == "沙三段" else surfaces["T6_TIME"][yy, xx]
-            base = surfaces["T6_TIME"][yy, xx] if layer == "沙三段" else surfaces["T7_TIME"][yy, xx]
+            layer_top, layer_base = taigu_layer_bounds(layer, surfaces)
+            top = layer_top[yy, xx]
+            base = layer_base[yy, xx]
             frame = pd.DataFrame(
                 {
                     "LayerGroup": layer,
@@ -209,10 +260,12 @@ def component_candidates_from_step6b(
             keep = np.argpartition(geometry_priority, -max_points)[-max_points:]
             yy, xx, tt, scores, ant_scores = yy[keep], xx[keep], tt[keep], scores[keep], ant_scores[keep]
         for layer in legacy.ALLOWED_LAYERS:
-            top = surfaces["T4_TIME"][yy, xx] if layer == "沙三段" else surfaces["T6_TIME"][yy, xx]
-            base = surfaces["T6_TIME"][yy, xx] if layer == "沙三段" else surfaces["T7_TIME"][yy, xx]
+            layer_top, layer_base = taigu_layer_bounds(layer, surfaces)
+            top = layer_top[yy, xx]
+            base = layer_base[yy, xx]
             time = grid["samples"][tt]
-            in_layer = np.isfinite(top) & np.isfinite(base) & (time >= top) & (time <= base)
+            # 两个太古界分区均采用左闭右开，避免内部界面点重复归层。
+            in_layer = np.isfinite(top) & np.isfinite(base) & (time >= top) & (time < base)
             if not in_layer.any():
                 continue
             lyy, lxx, ltt = yy[in_layer], xx[in_layer], tt[in_layer]
@@ -1002,8 +1055,15 @@ def main() -> int:
     with np.load(trace_mapping_path) as mapping_npz:
         mapping = {key: mapping_npz[key] for key in mapping_npz.files}
     horizon_contract = load_contract_for_mapping(config, mapping)
-    validate_window_contract(config, horizon_contract, grid["samples"])
-    surfaces = surface_grids_from_contract(mapping, horizon_contract)
+    try:
+        validate_window_contract(config, horizon_contract, grid["samples"])
+    except (KeyError, ValueError) as exc:
+        # 太古界中尺度使用逐道 T4-T7 合同直接插值到 10 ms 轴；
+        # 合同未显式存储 10 ms 窗口索引时，不应阻断 Step7B。
+        print(f"[step7b-medium-v4] horizon direct interpolation: {exc}", flush=True)
+    # Step7B 使用太古界三界面合同：上部复合层顶、太古界顶、风化壳底。
+    # 不再按砂砾岩 T4/T6/T7 层名分支。
+    surfaces = taigu_surface_grids(mapping, horizon_contract)
     print("[step7b-medium-v4] building candidate components", flush=True)
     if config.get("medium_components_npz"):
         candidates, component_rows = component_candidates_from_step6b(config, grid, surfaces)

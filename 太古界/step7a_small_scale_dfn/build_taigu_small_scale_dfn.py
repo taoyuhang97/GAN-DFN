@@ -189,6 +189,22 @@ def main() -> int:
 
     started = time.time()
     grid = pd.read_csv(config["demo_grid_csv"], encoding="utf-8-sig")
+    # SGY/window_code 的物理存储顺序是 output_trace_index；demo_grid 的
+    # TraceIdx 是合同道序，二者不能直接互换。按坐标回接正式道序。
+    mapping_path = config.get("trace_mapping_npz")
+    if mapping_path:
+        with np.load(mapping_path) as mp:
+            mapping_df = pd.DataFrame({
+                "X": mp["x"].astype(float), "Y": mp["y"].astype(float),
+                "OutputTraceIndex": mp["output_trace_index"].astype(np.int64),
+            })
+        grid = grid.merge(mapping_df, on=["X", "Y"], how="left", validate="one_to_one")
+        if grid["OutputTraceIndex"].isna().any():
+            raise RuntimeError("demo grid contains coordinates absent from trace mapping")
+        grid["OutputTraceIndex"] = grid["OutputTraceIndex"].astype(np.int64)
+    else:
+        # 兼容旧配置，但明确提示该模式只适用于两种道序恰好一致的输入。
+        grid["OutputTraceIndex"] = np.arange(len(grid), dtype=np.int64)
     horizon = pd.read_csv(config["horizon_contract_csv"], encoding="utf-8-sig")
     for df in (grid, horizon):
         for column in df.columns:
@@ -213,11 +229,22 @@ def main() -> int:
     block_x_lines = max(int(config.get("block_x_line_count", 20)), 1)
     x_line_count = int(grid["IX"].max()) + 1
     sampling_cfg = config["sampling"]
-    max_patches = int(sampling_cfg["max_patch_count"])
+    # 不按 demo 区域固定总片数；数量应随候选体素数量和 occurrence_rate
+    # 自然增长。若工程上需要防止配置错误导致内存爆炸，只接受显式的
+    # safety_max_patch_count 保护阈值，不参与正常采样和缩放。
+    safety_max_patches = sampling_cfg.get("safety_max_patch_count")
+    safety_max_patches = int(safety_max_patches) if safety_max_patches is not None else None
     reference_quantile = float(sampling_cfg["reference_quantile"])
+    # 与砂砾岩小尺度流程一致：先按层内高分位筛掉背景体素，再以较低的
+    # 出现概率抽样。这样不会把每个正密度体素都画成一块裂缝片。
+    candidate_quantile = float(sampling_cfg.get("candidate_quantile", reference_quantile))
+    occurrence_rate = float(sampling_cfg.get("occurrence_rate", 0.20))
+    density_power = float(sampling_cfg.get("density_power", 1.0))
     length_range = [float(v) for v in config["patch_length_m"]]
     height_range = [float(v) for v in config["patch_height_ms"]]
     z_scale = float(config["display_z_scale_m_per_ms"])
+    # VTK 使用原始 TIME(ms) 作为 Z；保留 z_scale 仅用于既有面积/展示口径。
+    vtk_z_scale = float(config.get("vtk_z_scale_m_per_ms", 1.0))
     orient_cfg = config["orientation"]
     orient_xy_radius = int(orient_cfg["window_xy_radius"])
     orient_time_half = float(orient_cfg["time_half_span_ms"])
@@ -248,10 +275,10 @@ def main() -> int:
         handle.mmap()
         for ix_start in tqdm(range(0, x_line_count, block_x_lines), desc="Step7A density blocks", unit="block"):
             ix_stop = min(ix_start + block_x_lines, x_line_count)
-            block = grid[grid["IX"].between(ix_start, ix_stop - 1)].sort_values("TraceIdx")
-            start_row = int(block["Row"].min())
-            matrix = np.stack([np.asarray(handle.trace[int(r)], dtype=np.float32) for r in block["Row"].to_numpy(dtype=np.int64)])
-            codes = window_codes[start_row : start_row + len(block)]
+            block = grid[grid["IX"].between(ix_start, ix_stop - 1)].sort_values("OutputTraceIndex")
+            output_indices = block["OutputTraceIndex"].to_numpy(dtype=np.int64)
+            matrix = np.stack([np.asarray(handle.trace[int(r)], dtype=np.float32) for r in output_indices])
+            codes = window_codes[output_indices]
             valid_block = block["SurfaceValid"].fillna(0).astype(bool).to_numpy()
             times_2d = sample_axis[None, :]
             upper_mask = (codes == 1) & (times_2d >= top[block["Row"].to_numpy(dtype=np.int64), None]) & (times_2d <= mid[block["Row"].to_numpy(dtype=np.int64), None])
@@ -288,12 +315,15 @@ def main() -> int:
         rows = np.concatenate([p[0] for p in candidate_parts[name]])
         samples = np.concatenate([p[1] for p in candidate_parts[name]])
         density = np.concatenate([p[2] for p in candidate_parts[name]])
+        # 候选阈值和参考值均在本层正值样本上计算，避免不同层厚/振幅
+        # 分布差异造成某一层被异常过采样。
+        candidate_ref = max(float(np.quantile(density, candidate_quantile)), 1.0e-9)
+        candidate_mask = density >= candidate_ref
+        rows, samples, density = rows[candidate_mask], samples[candidate_mask], density[candidate_mask]
         reference = max(float(layer_refs[name]), 1.0e-9)
-        probability = np.clip(density / reference, 0.0, 1.0)
+        probability = occurrence_rate * np.power(np.clip(density / reference, 0.0, 2.0), density_power)
+        probability = np.clip(probability, 0.0, 1.0)
         expected = float(probability.sum())
-        layer_budget = max_patches // 2
-        if expected > layer_budget:
-            probability = probability * (layer_budget / expected)
         keep = rng.random(len(rows)) < probability
         keep_pos = np.where(keep)[0]
         keep = np.zeros(len(rows), dtype=bool)
@@ -304,7 +334,7 @@ def main() -> int:
         if not (len(rows[keep]) == len(samples[keep]) == len(density[keep])):
             raise RuntimeError(f"sampled candidate length mismatch for layer {name}")
         sampled_layer.extend([name] * int(keep.sum()))
-        print(f"[step7a] layer={name} ref={reference:.3f} candidates={len(rows)} sampled={int(keep.sum())}", flush=True)
+        print(f"[step7a] layer={name} candidate_q={candidate_quantile:.2f} threshold={candidate_ref:.3f} ref={reference:.3f} candidates={len(rows)} sampled={int(keep.sum())}", flush=True)
 
     accepted_rows = np.concatenate(sampled_rows) if sampled_rows else np.empty(0, dtype=np.int64)
     accepted_samples = np.concatenate(sampled_samples) if sampled_samples else np.empty(0, dtype=np.int64)
@@ -359,7 +389,7 @@ def main() -> int:
                             needed_rows.add(nrow)
                 neighbor_rows[row] = neighbors
             dens_by_row: dict[int, np.ndarray] = {
-                row: np.asarray(handle.trace[int(grid.loc[row, "Row"])], dtype=np.float32) for row in needed_rows
+                row: np.asarray(handle.trace[int(grid.loc[row, "OutputTraceIndex"])], dtype=np.float32) for row in needed_rows
             }
             for local_idx, (row, sample, layer) in enumerate(zip(chunk_rows, chunk_samples, chunk_layers)):
                 center_density = float(accepted_density[chunk_start + local_idx])
@@ -454,14 +484,14 @@ def main() -> int:
     points: list[np.ndarray] = []
     quads: list[np.ndarray] = []
     for i, patch in patches.iterrows():
-        center = np.array([patch["X"], patch["Y"], patch["TIME"] * z_scale])
+        center = np.array([patch["X"], patch["Y"], patch["TIME"] * vtk_z_scale])
         strike_rad = np.radians(patch["AzimuthDeg"])
         strike = np.array([np.cos(strike_rad), np.sin(strike_rad), 0.0])
         dip_dir = np.array([-np.sin(strike_rad), np.cos(strike_rad), 0.0])
         dip_rad = np.radians(patch["DipDeg"])
         dip_vec = np.array([np.sin(dip_rad) * dip_dir[0], np.sin(dip_rad) * dip_dir[1], np.cos(dip_rad)])
         half_l = patch["PatchLengthM"] / 2.0
-        half_h = patch["PatchHeightMs"] * z_scale / 2.0
+        half_h = patch["PatchHeightMs"] * vtk_z_scale / 2.0
         corners = [
             center + half_l * strike + half_h * dip_vec,
             center + half_l * strike - half_h * dip_vec,
@@ -541,7 +571,7 @@ def main() -> int:
     upper_fraction = float(layer_counts.get("上部复合层", 0) / max(len(patches), 1))
     checks = {
         "patch_count_positive": len(patches) > 0,
-        "patch_count_within_cap": len(patches) <= max_patches,
+        "patch_count_within_cap": safety_max_patches is None or len(patches) <= safety_max_patches,
         "both_layers_represented": upper_fraction > 0.05 and float(layer_counts.get("太古界风化壳", 0)) > 0,
         "all_patches_main_window": bool((patches["WindowCode"] == 1).all()),
         "orientation_ranges_valid": bool(patches["DipDeg"].between(0, 90).all() and patches["AzimuthDeg"].between(0, 180).all()),

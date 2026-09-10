@@ -3,13 +3,14 @@
   "output_dir": "/home/tyh/projects/petroleum/code/GAN-DFN/太古界/step7a_small_scale_dfn/output/taigu_step7a_attribute_v3_full",
   "density_sgy": "/home/tyh/projects/petroleum/code/GAN-DFN/太古界/step6a_density_volume/output/taigu_step6a_attribute_v3_full/volume/predicted_fracture_density.sgy",
   "window_code_npz": "/home/tyh/projects/petroleum/code/GAN-DFN/太古界/step6a_density_volume/output/taigu_step6a_attribute_v3_full/volume/window_code.npz",
+  "trace_mapping_npz": "/home/tyh/projects/petroleum/code/GAN-DFN/太古界/common/trace_contract/output/taigu_demo_grid_v1/trace_mapping.npz",
   "demo_grid_csv": "/home/tyh/projects/petroleum/code/GAN-DFN/太古界/step7a_small_scale_dfn/output/taigu_attribute_demo_grid_v3/demo_grid.csv",
   "horizon_contract_csv": "/home/tyh/projects/petroleum/code/GAN-DFN/太古界/common/horizon_contract/output/taigu_attribute_full_horizon_contract_v1/demo_horizon_contract.csv",
   "step3_groups_root": "/home/tyh/projects/petroleum/code/GAN-DFN/太古界/step3_imaging_groups/output/taigu_step3_imaging_v3/groups",
   "step2_segments_root": "/home/tyh/projects/petroleum/code/GAN-DFN/太古界/step2_well_log_segments/output/taigu_step2_regular_v3",
   "profile_well": "埕北古斜405",
-  "sampling": {"mode": "layered_weighted_probability", "reference_quantile": 0.85, "min_density": 1.0e-6, "max_patch_count": 250000, "random_seed": 20260822},
+  "sampling": {"mode": "layered_weighted_probability", "reference_quantile": 0.95, "candidate_quantile": 0.82, "occurrence_rate": 0.08, "density_power": 1.0, "min_density": 1.0e-6, "random_seed": 20260822},
   "orientation": {"window_xy_radius": 2, "time_half_span_ms": 12.0, "density_fraction": 0.5, "min_planarity": 0.05, "min_local_points": 10, "min_dip_deg": 25.0, "max_dip_deg": 89.0, "azimuth_jitter_std_deg": 10.0, "dip_jitter_std_deg": 6.0, "local_pca_share": 0.5, "random_seed": 20260822, "fallback_family": {"上部复合层": {"azimuth_deg": 80.0, "dip_deg": 55.0}, "太古界风化壳": {"azimuth_deg": 120.0, "dip_deg": 65.0}}},
-  "patch_length_m": [50.0, 150.0], "patch_height_ms": [8.0, 28.0], "display_z_scale_m_per_ms": 2.0,
+  "patch_length_m": [25.0, 80.0], "patch_height_ms": [5.0, 15.0], "display_z_scale_m_per_ms": 1.0, "vtk_z_scale_m_per_ms": 1.0,
   "imaging_match": {"corridor_half_width_m": 500.0, "time_bin_ms": 20.0}, "block_x_line_count": 20
 }

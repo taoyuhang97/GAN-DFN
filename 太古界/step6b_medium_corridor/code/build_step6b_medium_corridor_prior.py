@@ -101,7 +101,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lowcoh-rescue-bridge-iterations", type=int, default=1)
     parser.add_argument("--lowcoh-rescue-bridge-min-lowcoh-score", type=float, default=0.62)
     parser.add_argument("--lowcoh-rescue-bridge-min-combined-score", type=float, default=0.58)
-    parser.add_argument("--min-component-voxels", type=int, default=35)
+    parser.add_argument("--min-component-voxels", type=int, default=20)
+    parser.add_argument("--fragment-recovery-min-voxels", type=int, default=15)
+    parser.add_argument("--fragment-bridge-score", type=float, default=0.45)
+    parser.add_argument("--fragment-bridge-iterations", type=int, default=1)
     parser.add_argument("--max-component-voxels-before-split", type=int, default=12000)
     parser.add_argument("--split-tile-cells", type=int, default=16)
     parser.add_argument("--split-time-samples", type=int, default=8)
@@ -199,6 +202,51 @@ def retain_seeded_growth(seed_grid: np.ndarray, growth_grid: np.ndarray) -> tupl
         "seeded_component_count": int(len(seed_labels)),
         "retained_growth_voxel_count": int(retained.sum()),
         "discarded_unseeded_growth_voxel_count": int(growth.sum() - retained.sum()),
+    }
+
+
+def repair_fragmented_candidates(
+    mask: np.ndarray,
+    score: np.ndarray,
+    valid: np.ndarray,
+    min_component_voxels: int,
+    recovery_min_voxels: int,
+    bridge_score: float,
+    bridge_iterations: int,
+) -> tuple[np.ndarray, dict[str, Any]]:
+    """Conservatively recover fragments near an already viable component."""
+    structure = np.ones((3, 3, 3), dtype=np.uint8)
+    repaired = np.asarray(mask, dtype=bool).copy()
+    labels, count = ndimage.label(repaired, structure=structure)
+    sizes = np.bincount(labels.ravel())
+    large = np.isin(labels, np.where(sizes >= int(min_component_voxels))[0])
+    small_labels = np.where((sizes >= int(recovery_min_voxels)) & (sizes < int(min_component_voxels)))[0]
+    small_labels = small_labels[small_labels > 0]
+    bridge = np.zeros_like(repaired, dtype=bool)
+    recovered_components = 0
+    recovered_voxels = 0
+    near_large = ndimage.binary_dilation(large, structure=structure, iterations=max(int(bridge_iterations), 1))
+    for label_id in small_labels:
+        small = labels == int(label_id)
+        if not np.any(small & near_large):
+            continue
+        local = ndimage.binary_dilation(small, structure=structure, iterations=max(int(bridge_iterations), 1))
+        additions = local & near_large & ~repaired & valid & (score >= float(bridge_score))
+        if not np.any(additions):
+            continue
+        bridge |= additions
+        recovered_components += 1
+        recovered_voxels += int(additions.sum())
+    repaired |= bridge
+    return repaired, {
+        "initial_component_count": int(count),
+        "small_component_count": int(len(small_labels)),
+        "recovered_component_count": int(recovered_components),
+        "bridge_voxel_count": int(recovered_voxels),
+        "repaired_candidate_voxel_count": int(repaired.sum()),
+        "fragment_recovery_min_voxels": int(recovery_min_voxels),
+        "fragment_bridge_score": float(bridge_score),
+        "fragment_bridge_iterations": int(bridge_iterations),
     }
 
 
@@ -419,6 +467,26 @@ def write_component_vtk(
 def main() -> int:
     args = parse_args()
     config = read_json(args.config.resolve())
+    # The formal JSON is the source of truth for medium-scale thresholds.
+    # Keep CLI defaults for backward compatibility, then apply configured
+    # values so reruns cannot silently use stale parser defaults.
+    medium_cfg = dict(config.get("medium_prior", {}))
+    for name in (
+        "min_component_voxels",
+        "fragment_recovery_min_voxels",
+        "fragment_bridge_score",
+        "fragment_bridge_iterations",
+        "min_component_score_mean",
+    ):
+        if name in medium_cfg:
+            setattr(args, name, medium_cfg[name])
+    for key, attr in (
+        ("ant_weight_base", "anttrack_weight"),
+        ("lowcoh_support_weight", "lowcoh_weight"),
+        ("curvature_support_weight", "curvature_weight"),
+    ):
+        if key in medium_cfg:
+            setattr(args, attr, medium_cfg[key])
     output_dir = args.output_dir.resolve()
     ensure_dir(output_dir)
     rng = np.random.default_rng(int(args.random_state))
@@ -542,6 +610,19 @@ def main() -> int:
     support_grid, _, _ = flat_to_grid(local_support.astype(np.float32), mapping)
     mask_grid, _, _ = flat_to_grid(raw_mask_flat.astype(np.float32), mapping)
     mask_grid = mask_grid > 0.5
+    valid_grid, _, _ = flat_to_grid(valid.astype(np.float32), mapping)
+    mask_grid, fragment_repair_summary = repair_fragmented_candidates(
+        mask_grid,
+        medium_grid,
+        valid_grid > 0.5,
+        min_component_voxels=int(args.min_component_voxels),
+        recovery_min_voxels=int(args.fragment_recovery_min_voxels),
+        bridge_score=float(args.fragment_bridge_score),
+        bridge_iterations=int(args.fragment_bridge_iterations),
+    )
+    raw_mask_flat = grid_to_flat(mask_grid.astype(np.float32), mapping) > 0.5
+    branch_code_flat[raw_mask_flat] |= 2
+    branch_code_grid, _, _ = flat_to_grid(branch_code_flat.astype(np.float32), mapping)
     component_id_grid, component_df, component_summary = build_medium_components(
         mask_grid,
         medium_grid,
@@ -626,6 +707,7 @@ def main() -> int:
         "growth_anttrack_floor": float(args.growth_anttrack_floor),
         "growth_medium_score_threshold": float(args.growth_medium_score_threshold),
         "seeded_growth": seeded_growth_summary,
+        "fragment_repair": fragment_repair_summary,
         "score_formula": {
             "formula": "normalized weighted sum with AntTrack dominant",
             "expression": "MediumScore = a*AntTrackScore + b*LowCoherenceScore + c*CurvatureScore + d*Step6ADensityScore",
