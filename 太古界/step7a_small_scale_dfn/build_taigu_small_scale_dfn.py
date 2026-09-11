@@ -7,14 +7,15 @@ Changes vs v1:
     the upper layer -> no more 'one surface' concentration);
   * occurrence probability proportional to density/reference (glutenite
     v2_weighted_probability style, no greedy global suppression);
-  * orientation = layer template (from 405 imaging stats where available,
-    config fallback otherwise) blended with local PCA-if-planar; dip clamped
-    to [min_dip, max_dip];
+  * orientation = multi-well, per-layer orientation families combined with
+    local density-gradient/ridge evidence; manual templates are last-resort
+    fallbacks only;
   * imaging match QC: 405 well-corridor spatial bins + per-well distributional
     comparison for the other imaging wells.
 
 Outputs (config.output_dir):
   fracture_patches.csv / fracture_patches.vtk
+  orientation_families.json / orientation_families.csv
   step7a_imaging_match_qc.csv
   step7a_summary.json    status=pass
 """
@@ -32,7 +33,9 @@ from typing import Any
 import numpy as np
 import pandas as pd
 import segyio
+from scipy.ndimage import gaussian_filter
 from scipy.spatial import cKDTree
+from sklearn.cluster import KMeans
 from tqdm import tqdm
 
 
@@ -139,7 +142,10 @@ def normal_to_dip_azimuth(normal: np.ndarray) -> tuple[float, float]:
     if hnorm < 1.0e-6:
         azimuth = 0.0
     else:
-        azimuth = float(np.degrees(np.arctan2(horizontal[1], horizontal[0]))) % 180.0
+        normal_azimuth = float(np.degrees(np.arctan2(horizontal[1], horizontal[0]))) % 180.0
+        # The DFN geometry interprets AzimuthDeg as strike.  A plane normal's
+        # horizontal projection is the dip direction, so rotate it by 90 deg.
+        azimuth = (normal_azimuth + 90.0) % 180.0
     return dip, azimuth
 
 
@@ -168,35 +174,229 @@ def write_legacy_vtk(path: Path, points: np.ndarray, quads: np.ndarray, cell_dat
     path.write_text("\n".join(lines) + "\n", encoding="ascii")
 
 
-def circular_mean_deg(degrees: np.ndarray) -> float:
-    radians = np.deg2rad(np.asarray(degrees, dtype=np.float64))
-    radians = radians[np.isfinite(radians)]
-    if radians.size == 0:
-        return np.nan
-    mean = np.arctan2(np.mean(np.sin(radians)), np.mean(np.cos(radians)))
-    return float(np.rad2deg(mean) % 360.0)
+def axial_mean_std_deg(degrees: np.ndarray, weights: np.ndarray | None = None) -> tuple[float, float]:
+    """Mean/spread for fracture strike where theta and theta+180 are equal."""
+    angle = np.asarray(degrees, dtype=np.float64)
+    valid = np.isfinite(angle)
+    angle = angle[valid]
+    if not len(angle):
+        return np.nan, np.nan
+    weight = np.ones(len(angle), dtype=np.float64) if weights is None else np.asarray(weights, dtype=np.float64)[valid]
+    weight = weight / max(float(weight.sum()), 1.0e-12)
+    doubled = np.deg2rad(2.0 * angle)
+    vector = np.sum(weight * np.exp(1j * doubled))
+    mean = float((np.rad2deg(np.angle(vector)) / 2.0) % 180.0)
+    resultant = float(np.clip(abs(vector), 1.0e-12, 1.0))
+    std = float(np.rad2deg(np.sqrt(max(-2.0 * np.log(resultant), 0.0))) / 2.0)
+    return mean, std
 
 
-def imaging_orientation_prior(groups_root: Path, well: str, md_tolerance: float = 0.011) -> dict[str, dict[str, float]]:
-    """Per-strata azimuth/dip prior from the imaging well's fracture points."""
-    out: dict[str, dict[str, float]] = {}
-    group_files = sorted(Path(groups_root).glob(f"{well}_*.csv"))
-    for group_file in group_files:
+def load_multiwell_orientation_points(groups_root: Path, allowed_wells: dict[str, list[str]]) -> pd.DataFrame:
+    """Load valid image-log orientations and attach their interpolated well XY."""
+    parts: list[pd.DataFrame] = []
+    allowed = {layer: set(wells) for layer, wells in allowed_wells.items()}
+    for group_file in sorted(Path(groups_root).glob("*.csv")):
         group = pd.read_csv(group_file, encoding="utf-8-sig")
-        if group.empty:
+        required = {"WellName", "StrataName", "GT_POINT_FLAG", "FracAzimuth", "FracDip", "MD", "InputSegmentPath"}
+        if group.empty or not required.issubset(group.columns):
             continue
-        points = group[group["GT_POINT_FLAG"].fillna(0).astype(int) == 1]
-        for strata, sub in points.groupby("StrataName"):
-            az = pd.to_numeric(sub["FracAzimuth"], errors="coerce").dropna().to_numpy()
-            dip = pd.to_numeric(sub["FracDip"], errors="coerce").dropna().to_numpy()
-            if len(az) >= 5 and len(dip) >= 5:
-                out[str(strata)] = {
-                    "azimuth_circular_mean_deg": circular_mean_deg(az),
-                    "dip_mean_deg": float(np.mean(dip)),
-                    "dip_std_deg": float(np.std(dip)),
-                    "n_points": int(len(az)),
+        points = group[group["GT_POINT_FLAG"].fillna(0).astype(int).eq(1)].copy()
+        points["FracAzimuth"] = pd.to_numeric(points["FracAzimuth"], errors="coerce") % 180.0
+        points["FracDip"] = pd.to_numeric(points["FracDip"], errors="coerce")
+        points["MD"] = pd.to_numeric(points["MD"], errors="coerce")
+        points = points.dropna(subset=["FracAzimuth", "FracDip", "MD"])
+        keep = np.asarray(
+            [str(well) in allowed.get(str(layer), set()) for well, layer in zip(points["WellName"], points["StrataName"])],
+            dtype=bool,
+        )
+        points = points.loc[keep].copy()
+        if points.empty:
+            continue
+        for segment_path, sub in points.groupby("InputSegmentPath"):
+            segment = pd.read_csv(segment_path, encoding="utf-8-sig", usecols=["MD", "X", "Y"])
+            for column in ("MD", "X", "Y"):
+                segment[column] = pd.to_numeric(segment[column], errors="coerce")
+            segment = segment.dropna().sort_values("MD")
+            if segment.empty:
+                continue
+            merged = pd.merge_asof(
+                sub.sort_values("MD"), segment, on="MD", direction="nearest", tolerance=0.05
+            )
+            parts.append(merged[["WellName", "StrataName", "FracAzimuth", "FracDip", "X", "Y"]])
+    if not parts:
+        return pd.DataFrame(columns=["WellName", "StrataName", "FracAzimuth", "FracDip", "X", "Y"])
+    return pd.concat(parts, ignore_index=True).dropna()
+
+
+def build_orientation_families(points: pd.DataFrame, config: dict[str, Any]) -> dict[str, list[dict[str, Any]]]:
+    """Cluster axial strike/dip observations with approximately equal well influence."""
+    families: dict[str, list[dict[str, Any]]] = {}
+    random_state = int(config.get("family_random_seed", 20260822))
+    dip_weight = float(config.get("family_dip_feature_weight", 0.7))
+    for layer in ("上部复合层", "太古界风化壳"):
+        sub = points[points["StrataName"].astype(str).eq(layer)].copy().reset_index(drop=True)
+        cluster_count = min(int(config["family_count_by_layer"][layer]), len(sub))
+        if cluster_count <= 0:
+            families[layer] = []
+            continue
+        angle = np.deg2rad(2.0 * sub["FracAzimuth"].to_numpy(dtype=np.float64))
+        dip = sub["FracDip"].to_numpy(dtype=np.float64)
+        features = np.column_stack([np.cos(angle), np.sin(angle), dip_weight * (dip - 55.0) / 25.0])
+        per_well_count = sub.groupby("WellName")["WellName"].transform("size").to_numpy(dtype=np.float64)
+        fit_weight = 1.0 / np.maximum(per_well_count, 1.0)
+        model = KMeans(n_clusters=cluster_count, random_state=random_state, n_init=20)
+        labels = model.fit_predict(features, sample_weight=fit_weight)
+        sub["FamilyLabel"] = labels
+        layer_families: list[dict[str, Any]] = []
+        for label in range(cluster_count):
+            family_points = sub[sub["FamilyLabel"].eq(label)].copy()
+            family_well_count = family_points.groupby("WellName")["WellName"].transform("size").to_numpy(dtype=np.float64)
+            balanced_weight = 1.0 / np.maximum(family_well_count, 1.0)
+            azimuth, azimuth_std = axial_mean_std_deg(
+                family_points["FracAzimuth"].to_numpy(dtype=np.float64), balanced_weight
+            )
+            balanced_weight /= balanced_weight.sum()
+            dip_values = family_points["FracDip"].to_numpy(dtype=np.float64)
+            dip_mean = float(np.sum(balanced_weight * dip_values))
+            dip_std = float(np.sqrt(np.sum(balanced_weight * np.square(dip_values - dip_mean))))
+            contributions = []
+            for well, well_points in family_points.groupby("WellName"):
+                all_well_count = int(sub["WellName"].eq(well).sum())
+                contributions.append(
+                    {
+                        "well": str(well),
+                        "family_point_count": int(len(well_points)),
+                        "well_point_count": all_well_count,
+                        "within_well_fraction": float(len(well_points) / max(all_well_count, 1)),
+                        "x": float(well_points["X"].median()),
+                        "y": float(well_points["Y"].median()),
+                    }
+                )
+            layer_families.append(
+                {
+                    "family_id": f"{layer}_family_{label + 1}",
+                    "azimuth_deg": azimuth,
+                    "azimuth_std_deg": azimuth_std,
+                    "dip_deg": dip_mean,
+                    "dip_std_deg": dip_std,
+                    "point_count": int(len(family_points)),
+                    "well_count": int(family_points["WellName"].nunique()),
+                    "well_contributions": contributions,
                 }
-    return out
+            )
+        layer_families.sort(key=lambda item: (-item["well_count"], -item["point_count"]))
+        for index, family in enumerate(layer_families, start=1):
+            family["family_id"] = f"{layer}_family_{index}"
+        families[layer] = layer_families
+    return families
+
+
+def choose_orientation_family(
+    families: list[dict[str, Any]], x: float, y: float, distance_scale_m: float, rng: np.random.Generator
+) -> tuple[dict[str, Any], float]:
+    scores = []
+    for family in families:
+        score = 0.0
+        for source in family["well_contributions"]:
+            distance = float(np.hypot(x - source["x"], y - source["y"]))
+            score += source["within_well_fraction"] * np.exp(-distance / max(distance_scale_m, 1.0))
+        scores.append(score)
+    probability = np.asarray(scores, dtype=np.float64)
+    if not np.isfinite(probability).all() or probability.sum() <= 0.0:
+        probability = np.ones(len(families), dtype=np.float64)
+    probability /= probability.sum()
+    index = int(rng.choice(len(families), p=probability))
+    return families[index], float(probability[index])
+
+
+def blend_axial_azimuth(family_azimuth: float, local_azimuth: float, local_weight: float) -> float:
+    weight = float(np.clip(local_weight, 0.0, 1.0))
+    family_vector = np.exp(1j * np.deg2rad(2.0 * family_azimuth))
+    local_vector = np.exp(1j * np.deg2rad(2.0 * local_azimuth))
+    return float((np.rad2deg(np.angle((1.0 - weight) * family_vector + weight * local_vector)) / 2.0) % 180.0)
+
+
+def local_gradient_ridge_orientation(
+    row: int,
+    sample: int,
+    center_density: float,
+    cell_to_row: dict[tuple[int, int], int],
+    row_to_ix: np.ndarray,
+    row_to_iy: np.ndarray,
+    dens_by_row: dict[int, np.ndarray],
+    sample_axis: np.ndarray,
+    xy_radius: int,
+    time_radius: int,
+    dx_m: float,
+    dy_m: float,
+    time_scale_m_per_ms: float,
+    density_fraction: float,
+    gradient_quantile: float,
+    smoothing_sigma: float,
+) -> dict[str, float | int]:
+    """Estimate fracture-plane normal from local density edges and ridges."""
+    shape = (2 * xy_radius + 1, 2 * xy_radius + 1, 2 * time_radius + 1)
+    cube = np.full(shape, np.nan, dtype=np.float64)
+    center_ix, center_iy = int(row_to_ix[row]), int(row_to_iy[row])
+    for xi, di in enumerate(range(-xy_radius, xy_radius + 1)):
+        for yi, dj in enumerate(range(-xy_radius, xy_radius + 1)):
+            neighbor = cell_to_row.get((center_ix + di, center_iy + dj))
+            if neighbor is None or neighbor not in dens_by_row:
+                continue
+            trace = dens_by_row[neighbor]
+            for zi, ds in enumerate(range(-time_radius, time_radius + 1)):
+                source_sample = sample + ds
+                if 0 <= source_sample < len(trace):
+                    cube[xi, yi, zi] = float(trace[source_sample])
+    valid = np.isfinite(cube)
+    if int(valid.sum()) < 27:
+        return {"dip": np.nan, "azimuth": np.nan, "anisotropy": 0.0, "gradient_strength": 0.0,
+                "ridge_strength": 0.0, "quality": 0.0, "support_count": int(valid.sum())}
+    fill_value = float(np.nanmedian(cube))
+    filled = np.where(valid, cube, fill_value)
+    smooth = gaussian_filter(filled, sigma=smoothing_sigma, mode="nearest")
+    dz_m = max(float(np.median(np.diff(sample_axis))) * time_scale_m_per_ms, 1.0e-6)
+    gx, gy, gz = np.gradient(smooth, dx_m, dy_m, dz_m, edge_order=1)
+    gradient_magnitude = np.sqrt(gx * gx + gy * gy + gz * gz)
+    finite_gradient = gradient_magnitude[valid]
+    if not len(finite_gradient) or float(np.nanmax(finite_gradient)) <= 0.0:
+        return {"dip": np.nan, "azimuth": np.nan, "anisotropy": 0.0, "gradient_strength": 0.0,
+                "ridge_strength": 0.0, "quality": 0.0, "support_count": int(valid.sum())}
+    gradient_threshold = float(np.quantile(finite_gradient, gradient_quantile))
+    gxx = np.gradient(gx, dx_m, axis=0, edge_order=1)
+    gyy = np.gradient(gy, dy_m, axis=1, edge_order=1)
+    gzz = np.gradient(gz, dz_m, axis=2, edge_order=1)
+    ridge = np.maximum(-(gxx + gyy + gzz), 0.0)
+    evidence = valid & (smooth >= density_fraction * center_density) & (
+        (gradient_magnitude >= gradient_threshold) | (ridge >= np.quantile(ridge[valid], gradient_quantile))
+    )
+    support_count = int(evidence.sum())
+    if support_count < 8:
+        return {"dip": np.nan, "azimuth": np.nan, "anisotropy": 0.0, "gradient_strength": 0.0,
+                "ridge_strength": 0.0, "quality": 0.0, "support_count": support_count}
+    vectors = np.column_stack([gx[evidence], gy[evidence], gz[evidence]])
+    local_gradient = gradient_magnitude[evidence]
+    local_ridge = ridge[evidence]
+    ridge_norm = local_ridge / max(float(np.quantile(ridge[valid], 0.95)), 1.0e-12)
+    weights = local_gradient * (1.0 + np.clip(ridge_norm, 0.0, 2.0))
+    weights /= max(float(weights.sum()), 1.0e-12)
+    tensor = (vectors * weights[:, None]).T @ vectors
+    eigenvalues, eigenvectors = np.linalg.eigh(tensor)
+    order = np.argsort(eigenvalues)[::-1]
+    leading, second = float(eigenvalues[order[0]]), float(eigenvalues[order[1]])
+    anisotropy = max((leading - second) / max(leading, 1.0e-12), 0.0)
+    normal = eigenvectors[:, order[0]]
+    dip, azimuth = normal_to_dip_azimuth(normal)
+    p50 = float(np.quantile(finite_gradient, 0.50))
+    p90 = float(np.quantile(finite_gradient, 0.90))
+    gradient_strength = float(np.clip((p90 - p50) / max(p90, 1.0e-12), 0.0, 1.0))
+    ridge_strength = float(np.clip(np.median(ridge_norm), 0.0, 1.0))
+    quality = float(np.clip(0.65 * anisotropy + 0.25 * gradient_strength + 0.10 * ridge_strength, 0.0, 1.0))
+    return {
+        "dip": dip, "azimuth": azimuth, "anisotropy": anisotropy,
+        "gradient_strength": gradient_strength, "ridge_strength": ridge_strength,
+        "quality": quality, "support_count": support_count,
+    }
 
 
 def load_imaging_density_profile(config: dict[str, Any], well: str) -> pd.DataFrame:
@@ -235,10 +435,13 @@ def main() -> int:
     patches_csv = output_dir / "fracture_patches.csv"
     vtk_path = output_dir / "fracture_patches.vtk"
     qc_csv = output_dir / "step7a_imaging_match_qc.csv"
+    families_json_path = output_dir / "orientation_families.json"
+    families_csv_path = output_dir / "orientation_families.csv"
     sampling_qc_path = output_dir / "step7a_sampling_qc.json"
     summary_path = output_dir / "step7a_summary.json"
     output_paths_to_check = (sampling_qc_path,) if args.sampling_qc_only else (
-        patches_csv, vtk_path, qc_csv, sampling_qc_path, summary_path
+        patches_csv, vtk_path, qc_csv, families_json_path, families_csv_path,
+        sampling_qc_path, summary_path
     )
     for path in output_paths_to_check:
         if path.exists() and not args.replace_output:
@@ -328,13 +531,10 @@ def main() -> int:
     orient_time_half = float(orient_cfg["time_half_span_ms"])
     orient_time_span = int(round(orient_time_half / (sample_axis[1] - sample_axis[0])))
     orient_density_fraction = float(orient_cfg["density_fraction"])
-    min_planarity = float(orient_cfg["min_planarity"])
-    min_local_points = int(orient_cfg["min_local_points"])
     min_dip = float(orient_cfg["min_dip_deg"])
     max_dip = float(orient_cfg["max_dip_deg"])
     az_jitter = float(orient_cfg["azimuth_jitter_std_deg"])
     dip_jitter = float(orient_cfg["dip_jitter_std_deg"])
-    local_pca_share = float(orient_cfg["local_pca_share"])
     sampling_rng = np.random.default_rng(int(sampling_cfg["random_seed"]))
     orientation_rng = np.random.default_rng(int(orient_cfg["random_seed"]))
 
@@ -480,30 +680,60 @@ def main() -> int:
         print(json.dumps(json_ready(sampling_qc), ensure_ascii=False, indent=2))
         return 0 if sampling_qc["status"] == "pass" else 1
 
-    # --- orientation: layer template blended with local PCA-if-planar ---
-    prior = imaging_orientation_prior(Path(config["step3_groups_root"]), config["profile_well"])
-    fallback = config["orientation"]["fallback_family"]
-    template: dict[str, dict[str, float]] = {}
-    for layer in ("上部复合层", "太古界风化壳"):
-        if layer in prior:
-            template[layer] = {
-                "azimuth": float(prior[layer]["azimuth_circular_mean_deg"] % 180.0),
-                "dip": float(prior[layer]["dip_mean_deg"]),
-                "dip_std": float(prior[layer]["dip_std_deg"]),
-            }
-        else:
-            template[layer] = {
-                "azimuth": float(fallback[layer]["azimuth_deg"]),
-                "dip": float(fallback[layer]["dip_deg"]),
-                "dip_std": dip_jitter,
-            }
+    # --- orientation: multi-well families + local gradient/ridge evidence ---
+    imaging_points = load_multiwell_orientation_points(
+        Path(config["step3_groups_root"]), orient_cfg["imaging_wells_by_layer"]
+    )
+    orientation_families = build_orientation_families(imaging_points, orient_cfg)
+    write_json(families_json_path, json_ready({
+        "method": "balanced_multiwell_axial_kmeans",
+        "imaging_wells_by_layer": orient_cfg["imaging_wells_by_layer"],
+        "point_count": int(len(imaging_points)),
+        "families": orientation_families,
+    }))
+    family_table_rows: list[dict[str, Any]] = []
+    for layer, layer_families in orientation_families.items():
+        for family in layer_families:
+            family_row = {key: value for key, value in family.items() if key != "well_contributions"}
+            family_row["LayerGroup"] = layer
+            family_row["source_wells"] = ",".join(item["well"] for item in family["well_contributions"])
+            family_row["well_contributions_json"] = json.dumps(family["well_contributions"], ensure_ascii=False)
+            family_table_rows.append(family_row)
+    pd.DataFrame(family_table_rows).to_csv(families_csv_path, index=False, encoding="utf-8-sig")
+    missing_family_layers = [
+        layer for layer in ("上部复合层", "太古界风化壳") if not orientation_families[layer]
+    ]
+    if missing_family_layers:
+        print(f"[step7a] warning: no imaging family for {missing_family_layers}; using manual fallback", flush=True)
+
+    fallback = orient_cfg["fallback_family"]
+    family_distance_scale = float(orient_cfg["family_distance_scale_m"])
+    gradient_quantile = float(orient_cfg["gradient_quantile"])
+    gradient_smoothing_sigma = float(orient_cfg["gradient_smoothing_sigma"])
+    gradient_time_scale = float(orient_cfg["gradient_time_scale_m_per_ms"])
+    local_high_quality = float(orient_cfg["local_high_quality"])
+    local_medium_quality = float(orient_cfg["local_medium_quality"])
+    medium_weight_min = float(orient_cfg["medium_local_weight_min"])
+    medium_weight_max = float(orient_cfg["medium_local_weight_max"])
+    dx_candidates = grid.groupby("IX")["X"].median().sort_index().diff().abs().dropna()
+    dy_candidates = grid.groupby("IY")["Y"].median().sort_index().diff().abs().dropna()
+    dx_m = float(dx_candidates[dx_candidates > 0].median())
+    dy_m = float(dy_candidates[dy_candidates > 0].median())
+    if not np.isfinite(dx_m) or not np.isfinite(dy_m):
+        raise RuntimeError("cannot derive physical attribute-grid spacing for local orientation")
 
     dips: list[float] = []
     azimuths: list[float] = []
     local_dips: list[float] = []
     local_azimuths: list[float] = []
-    base_sources: list[str] = []
-    families: list[str] = []
+    local_gradient_strengths: list[float] = []
+    local_anisotropies: list[float] = []
+    local_ridge_strengths: list[float] = []
+    local_support_counts: list[int] = []
+    orientation_sources: list[str] = []
+    selected_family_ids: list[str] = []
+    orientation_confidences: list[float] = []
+    family_probabilities: list[float] = []
     orientation_chunk = 5000
     with segyio.open(str(density_sgy), "r", ignore_geometry=True) as handle:
         for chunk_start in range(0, len(accepted_rows), orientation_chunk):
@@ -511,82 +741,84 @@ def main() -> int:
             chunk_rows = accepted_rows[chunk_start:chunk_end].tolist()
             chunk_samples = accepted_samples[chunk_start:chunk_end].tolist()
             chunk_layers = accepted_layer[chunk_start:chunk_end].tolist()
-            neighbor_rows: dict[int, list[int]] = {}
             needed_rows: set[int] = set()
             for row in chunk_rows:
                 ix = int(row_to_ix[row])
                 iy = int(row_to_iy[row])
-                neighbors: list[int] = []
                 for di in range(-orient_xy_radius, orient_xy_radius + 1):
                     for dj in range(-orient_xy_radius, orient_xy_radius + 1):
                         nrow = cell_to_row.get((ix + di, iy + dj))
                         if nrow is not None:
-                            neighbors.append(nrow)
                             needed_rows.add(nrow)
-                neighbor_rows[row] = neighbors
             dens_by_row: dict[int, np.ndarray] = {
                 row: np.asarray(handle.trace[int(grid.loc[row, "OutputTraceIndex"])], dtype=np.float32) for row in needed_rows
             }
             for local_idx, (row, sample, layer) in enumerate(zip(chunk_rows, chunk_samples, chunk_layers)):
                 center_density = float(accepted_density[chunk_start + local_idx])
-                local_pts: list[np.ndarray] = []
-                weights: list[float] = []
-                for nrow in neighbor_rows[row]:
-                    dens_trace = dens_by_row[nrow]
-                    for ds in range(-orient_time_span, orient_time_span + 1):
-                        s = sample + ds
-                        if 0 <= s < len(sample_axis) and np.isfinite(dens_trace[s]):
-                            value = float(dens_trace[s])
-                            if value >= orient_density_fraction * center_density:
-                                local_pts.append(
-                                    np.array(
-                                        [
-                                            float(grid.loc[nrow, "X"]),
-                                            float(grid.loc[nrow, "Y"]),
-                                            float(sample_axis[s]) * z_scale,
-                                        ]
-                                    )
-                                )
-                                weights.append(value)
-                local_dip = np.nan
-                local_az = np.nan
-                if len(local_pts) >= min_local_points:
-                    coords = np.stack(local_pts)
-                    weights_arr = np.asarray(weights, dtype=np.float64)
-                    weights_arr = weights_arr / weights_arr.sum()
-                    centered = coords - (coords * weights_arr[:, None]).sum(axis=0)
-                    covariance = (centered * weights_arr[:, None]).T @ centered
-                    eigenvalues, eigenvectors = np.linalg.eigh(covariance)
-                    evals = np.sort(eigenvalues)
-                    planarity = 1.0 - evals[0] / max(evals[1], 1.0e-12) if evals[1] > 0 else 0.0
-                    if planarity >= min_planarity:
-                        normal = eigenvectors[:, np.argmin(eigenvalues)]
-                        local_dip, local_az = normal_to_dip_azimuth(normal)
-                local_dips.append(local_dip)
-                local_azimuths.append(local_az)
-                use_local = (
-                    np.isfinite(local_dip)
-                    and np.isfinite(local_az)
-                    and min_dip <= local_dip <= max_dip
-                    and orientation_rng.random() < local_pca_share
+                local = local_gradient_ridge_orientation(
+                    row=row, sample=sample, center_density=center_density,
+                    cell_to_row=cell_to_row, row_to_ix=row_to_ix, row_to_iy=row_to_iy,
+                    dens_by_row=dens_by_row, sample_axis=sample_axis,
+                    xy_radius=orient_xy_radius, time_radius=orient_time_span,
+                    dx_m=dx_m, dy_m=dy_m, time_scale_m_per_ms=gradient_time_scale,
+                    density_fraction=orient_density_fraction, gradient_quantile=gradient_quantile,
+                    smoothing_sigma=gradient_smoothing_sigma,
                 )
-                if use_local:
-                    base_azimuth = local_az
-                    base_dip = local_dip
-                    base_source = "local_pca_if_planar"
-                    family = "local_pca"
+                layer_families = orientation_families[layer]
+                if layer_families:
+                    selected_family, family_probability = choose_orientation_family(
+                        layer_families, float(grid.loc[row, "X"]), float(grid.loc[row, "Y"]),
+                        family_distance_scale, orientation_rng,
+                    )
+                    family_id = str(selected_family["family_id"])
+                    family_azimuth = float(selected_family["azimuth_deg"])
+                    family_dip = float(selected_family["dip_deg"])
+                    family_az_jitter = min(az_jitter, max(2.0, 0.35 * float(selected_family["azimuth_std_deg"])))
+                    family_dip_jitter = min(dip_jitter, max(1.0, 0.35 * float(selected_family["dip_std_deg"])))
                 else:
-                    base_azimuth = float(template[layer]["azimuth"])
-                    base_dip = float(template[layer]["dip"])
-                    base_source = "layer_template"
-                    family = "layer_template"
-                azimuth = float((base_azimuth + orientation_rng.normal(0.0, az_jitter)) % 180.0)
-                dip = float(np.clip(base_dip + orientation_rng.normal(0.0, float(template[layer].get("dip_std", dip_jitter))), min_dip, max_dip))
+                    selected_family = None
+                    family_probability = 1.0
+                    family_id = f"{layer}_manual_fallback"
+                    family_azimuth = float(fallback[layer]["azimuth_deg"])
+                    family_dip = float(fallback[layer]["dip_deg"])
+                    family_az_jitter, family_dip_jitter = az_jitter, dip_jitter
+                local_dip = float(local["dip"])
+                local_az = float(local["azimuth"])
+                local_valid = np.isfinite(local_dip) and np.isfinite(local_az) and min_dip <= local_dip <= max_dip
+                quality = float(local["quality"])
+                if local_valid and quality >= local_high_quality:
+                    base_azimuth, base_dip = local_az, local_dip
+                    source, confidence = "local_gradient_ridge", quality
+                    azimuth_noise = family_az_jitter * 0.25 * (1.0 - quality)
+                    dip_noise = family_dip_jitter * 0.25 * (1.0 - quality)
+                elif local_valid and quality >= local_medium_quality:
+                    fraction = (quality - local_medium_quality) / max(local_high_quality - local_medium_quality, 1.0e-12)
+                    local_weight = medium_weight_min + fraction * (medium_weight_max - medium_weight_min)
+                    base_azimuth = blend_axial_azimuth(family_azimuth, local_az, local_weight)
+                    base_dip = (1.0 - local_weight) * family_dip + local_weight * local_dip
+                    source, confidence = "multiwell_local_blend", 0.5 * quality + 0.5 * family_probability
+                    azimuth_noise = family_az_jitter * (1.0 - local_weight)
+                    dip_noise = family_dip_jitter * (1.0 - local_weight)
+                else:
+                    base_azimuth, base_dip = family_azimuth, family_dip
+                    source = "multiwell_family" if selected_family is not None else "manual_fallback"
+                    confidence = family_probability
+                    azimuth_noise, dip_noise = family_az_jitter, family_dip_jitter
+                azimuth = float((base_azimuth + orientation_rng.normal(0.0, azimuth_noise)) % 180.0)
+                dip = float(np.clip(base_dip + orientation_rng.normal(0.0, dip_noise), min_dip, max_dip))
                 azimuths.append(azimuth)
                 dips.append(dip)
-                base_sources.append(base_source)
-                families.append(family)
-            del dens_by_row, neighbor_rows
+                local_dips.append(local_dip)
+                local_azimuths.append(local_az)
+                local_gradient_strengths.append(float(local["gradient_strength"]))
+                local_anisotropies.append(float(local["anisotropy"]))
+                local_ridge_strengths.append(float(local["ridge_strength"]))
+                local_support_counts.append(int(local["support_count"]))
+                orientation_sources.append(source)
+                selected_family_ids.append(family_id)
+                orientation_confidences.append(float(confidence))
+                family_probabilities.append(float(family_probability))
+            del dens_by_row
             gc.collect()
             print(f"[step7a] orientation chunk {chunk_start}:{chunk_end} of {len(accepted_rows)}", flush=True)
 
@@ -604,10 +836,21 @@ def main() -> int:
             "Density": accepted_density,
             "DipDeg": dips,
             "AzimuthDeg": azimuths,
+            "LocalGradientDipDeg": local_dips,
+            "LocalGradientAzimuthDeg": local_azimuths,
+            # Compatibility aliases for consumers of the previous Step7A
+            # schema. They now expose gradient/ridge estimates, not PCA fits.
             "LocalPcaDipDeg": local_dips,
             "LocalPcaAzimuthDeg": local_azimuths,
-            "OrientationBaseSource": base_sources,
-            "OrientationFamily": families,
+            "LocalGradientStrength": local_gradient_strengths,
+            "LocalAnisotropy": local_anisotropies,
+            "LocalRidgeStrength": local_ridge_strengths,
+            "LocalSupportCount": local_support_counts,
+            "OrientationSource": orientation_sources,
+            "OrientationBaseSource": orientation_sources,
+            "OrientationFamily": selected_family_ids,
+            "OrientationConfidence": orientation_confidences,
+            "OrientationFamilyProbability": family_probabilities,
             "PatchLengthM": lengths,
             "PatchHeightMs": heights,
             "PatchAreaM2": areas,
@@ -649,6 +892,17 @@ def main() -> int:
         "LayerCode": patches["LayerGroup"].map({"上部复合层": 1, "太古界风化壳": 2}).to_numpy(dtype=np.int32),
         "FractureScale": np.full(len(patches), 1, dtype=np.int32),
         "WindowCode": np.full(len(patches), 1, dtype=np.int32),
+        "OrientationSourceCode": patches["OrientationSource"].map({
+            "local_gradient_ridge": 1,
+            "multiwell_local_blend": 2,
+            "multiwell_family": 3,
+            "manual_fallback": 4,
+        }).to_numpy(dtype=np.int32),
+        "OrientationFamilyCode": pd.factorize(patches["OrientationFamily"], sort=True)[0].astype(np.int32) + 1,
+        "OrientationConfidence": patches["OrientationConfidence"].to_numpy(dtype=np.float64),
+        "LocalGradientStrength": patches["LocalGradientStrength"].to_numpy(dtype=np.float64),
+        "LocalAnisotropy": patches["LocalAnisotropy"].to_numpy(dtype=np.float64),
+        "LocalRidgeStrength": patches["LocalRidgeStrength"].to_numpy(dtype=np.float64),
     }
     write_legacy_vtk(vtk_path, np.stack(points) if points else np.empty((0, 3)), np.stack(quads) if quads else np.empty((0, 4), dtype=np.int64), cell_data)
 
@@ -751,6 +1005,8 @@ def main() -> int:
             "patches_vtk": str(vtk_path),
             "imaging_match_qc_csv": str(qc_csv),
             "sampling_qc_json": str(sampling_qc_path),
+            "orientation_families_json": str(families_json_path),
+            "orientation_families_csv": str(families_csv_path),
             "summary_json": str(summary_path),
         },
         "step6a_input": {
@@ -782,9 +1038,12 @@ def main() -> int:
             },
         },
         "orientation": {
-            "imaging_prior": prior,
-            "template": template,
+            "method": "multiwell_families_plus_local_gradient_ridge",
+            "imaging_point_count": int(len(imaging_points)),
+            "family_definitions": orientation_families,
+            "source_counts": patches["OrientationSource"].value_counts().to_dict(),
             "family_counts": patches["OrientationFamily"].value_counts().to_dict(),
+            "local_quality_thresholds": {"medium": local_medium_quality, "high": local_high_quality},
             "dip_stats": {"min": float(patches["DipDeg"].min()), "max": float(patches["DipDeg"].max()), "mean": float(patches["DipDeg"].mean())},
             "azimuth_stats": {"min": float(patches["AzimuthDeg"].min()), "max": float(patches["AzimuthDeg"].max()), "mean": float(patches["AzimuthDeg"].mean())},
         },
