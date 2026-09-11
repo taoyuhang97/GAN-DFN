@@ -18,7 +18,7 @@ def inspect(name, path, invalid_le, time_origin_ms, probe_count):
         if n == 0 or samples.size < 2: raise ValueError(f"{name}: empty SEG-Y")
         indices = np.unique(np.linspace(0, n - 1, min(probe_count, n), dtype=int))
         xy = np.asarray([read_xy(f.header[int(i)]) for i in indices], dtype=float)
-        first_values, invalid_counts = [], []
+        first_values, invalid_counts, minus_one_counts = [], [], []
         for i in indices:
             trace = np.asarray(f.trace[int(i)], dtype=np.float32)
             finite = np.isfinite(trace)
@@ -26,6 +26,7 @@ def inspect(name, path, invalid_le, time_origin_ms, probe_count):
             bad = ~finite
             if invalid_le is not None: bad |= trace <= invalid_le
             invalid_counts.append(int(bad.sum()))
+            minus_one_counts.append(int(np.count_nonzero(np.isclose(trace, -1.0, atol=1e-6))))
         dt = float(np.median(np.diff(samples)))
         effective_samples = samples - samples[0] + float(time_origin_ms)
         return {"path": str(path.resolve()), "trace_count": int(n),
@@ -34,6 +35,7 @@ def inspect(name, path, invalid_le, time_origin_ms, probe_count):
                 "sample_interval_ms": dt, "regular_time_axis": bool(np.allclose(np.diff(samples), dt, atol=1e-6)),
                 "probe_indices": [int(i) for i in indices], "probe_xy": xy.tolist(),
                 "probe_first_finite_value": first_values, "probe_invalid_sample_counts": invalid_counts,
+                "probe_minus_one_sample_counts": minus_one_counts,
                 "invalid_le": invalid_le, "configured_time_origin_ms": time_origin_ms}
 
 def main():
@@ -50,7 +52,8 @@ def main():
         results[name] = inspect(name, path, cfg.get("invalid_rules", {}).get(name, {}).get("invalid_le"), origin, args.probe_count)
     names = list(results); counts_ok = len({results[n]["trace_count"] for n in names}) == 1; axes_ok = all(results[n]["regular_time_axis"] and results[n]["sample_interval_ms"] > 0 for n in names); time_ok = all(1799.0 <= results[n]["time_min_ms"] <= 1801.0 for n in names)
     ref = np.asarray(results[names[0]]["probe_xy"]); xy_ok = all(np.allclose(ref, np.asarray(results[n]["probe_xy"]), rtol=0.0, atol=1.1, equal_nan=True) for n in names[1:])
-    checks = {"all_volumes_present": True, "trace_counts_match": counts_ok, "regular_positive_time_axes": axes_ok, "time_origin_about_1800ms": time_ok, "probe_coordinates_match": xy_ok}
+    ant_minus_one_seen = any(v > 0 for v in results.get("AntTrack", {}).get("probe_minus_one_sample_counts", []))
+    checks = {"all_volumes_present": True, "trace_counts_match": counts_ok, "regular_positive_time_axes": axes_ok, "time_origin_about_1800ms": time_ok, "probe_coordinates_match": xy_ok, "anttrack_minus_one_observed_as_raw_value": ant_minus_one_seen}
     summary = {"status": "pass" if all(checks.values()) else "fail", "config": str(args.config.resolve()), "volumes": results, "checks": checks, "probe_count": args.probe_count, "elapsed_seconds": time.time() - started, "note": "Header/sample spot check only; not a full-volume coverage test."}
     summary_path.write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8"); print(json.dumps(summary, ensure_ascii=False, indent=2)); return 0 if summary["status"] == "pass" else 1
 

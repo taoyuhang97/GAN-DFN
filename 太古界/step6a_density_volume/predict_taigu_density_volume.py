@@ -41,6 +41,7 @@ if str(COMMON_DIR / "seismic_sampling") not in sys.path:
 if str(COMMON_DIR / "attribute_sampling") not in sys.path:
     sys.path.insert(0, str(COMMON_DIR / "attribute_sampling"))
 from attribute_sampling import MultiAttributeSampler  # noqa: E402
+from attribute_contract import layer_score  # noqa: E402
 
 
 class _NoAmplitudeSampler:
@@ -53,9 +54,9 @@ class _NoAmplitudeSampler:
 
 
 FEATURE_COLUMNS = [
-    "Coherence",
-    "AntTrack",
-    "CurvatureMax",
+    "CoherenceScore",
+    "AntTrackScore",
+    "CurvatureMaxScore",
     "LayerCode",
     "RelativeTimeInLayer",
     "TimeSinceTop",
@@ -122,9 +123,16 @@ def build_layer_features(
     base: np.ndarray,
     valid: np.ndarray,
     layer_code: float,
+    layer_name: str,
+    normalization_contract: dict[str, Any],
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     times = samples[None, :]
-    mask = valid[:, None] & (times >= top[:, None]) & (times <= base[:, None]) & np.isfinite(attributes["CurvatureMax"])
+    scores = {
+        name: layer_score(values, name, normalization_contract, layer_name)
+        for name, values in attributes.items()
+    }
+    attribute_finite = np.logical_and.reduce([np.isfinite(values) for values in scores.values()])
+    mask = valid[:, None] & (times >= top[:, None]) & (times <= base[:, None]) & attribute_finite
     row_idx, time_idx = np.where(mask)
     if row_idx.size == 0:
         return np.empty((0, len(FEATURE_COLUMNS)), dtype=np.float32), row_idx, time_idx
@@ -136,9 +144,9 @@ def build_layer_features(
     to_base = local_base - local_time
     features = np.column_stack(
         [
-            attributes["Coherence"][row_idx, time_idx],
-            attributes["AntTrack"][row_idx, time_idx],
-            attributes["CurvatureMax"][row_idx, time_idx],
+            scores["Coherence"][row_idx, time_idx],
+            scores["AntTrack"][row_idx, time_idx],
+            scores["CurvatureMax"][row_idx, time_idx],
             np.full(row_idx.size, layer_code, dtype=np.float32),
             since_top / thickness,
             since_top,
@@ -200,10 +208,11 @@ def main() -> int:
     output_sgy = output_dir / "predicted_fracture_density.sgy"
     partial_sgy = output_dir / "predicted_fracture_density.sgy.partial"
     window_npz = output_dir / "window_code.npz"
+    trace_mapping_npz = output_dir / "trace_mapping.npz"
     block_qc_path = output_dir / "prediction_block_qc.csv"
     summary_path = output_dir / "prediction_summary.json"
     horizon_qc_path = output_dir / "horizon_fill_qc.csv"
-    for path in (output_sgy, partial_sgy, window_npz, block_qc_path, summary_path, horizon_qc_path):
+    for path in (output_sgy, partial_sgy, window_npz, trace_mapping_npz, block_qc_path, summary_path, horizon_qc_path):
         if path.exists() and not args.replace_output:
             raise FileExistsError(f"refusing to overwrite existing prediction output: {path}")
 
@@ -211,6 +220,14 @@ def main() -> int:
     artifact = joblib.load(model_path)
     if tuple(artifact["feature_columns"]) != tuple(FEATURE_COLUMNS):
         raise ValueError(f"model feature contract mismatch: {artifact['feature_columns']}")
+    normalization_contract_path = Path(config["attribute_normalization_contract_json"]).resolve()
+    normalization_contract = read_json(normalization_contract_path)
+    model_contract = artifact.get("attribute_normalization_contract", {})
+    if model_contract.get("version") != normalization_contract.get("version"):
+        raise ValueError(
+            f"training/prediction attribute contract mismatch: {model_contract.get('version')} "
+            f"!= {normalization_contract.get('version')}"
+        )
     interval_ms = float(config.get("sample_interval_ms", 2.0))
     ext_window_ms = float(config.get("ext_window_ms", 50.0))
     density_cap = float(config.get("density_cap", 15.0))
@@ -228,6 +245,10 @@ def main() -> int:
     grid = grid.sort_values("TraceIdx").reset_index(drop=True)
     if len(grid) != int(grid["TraceIdx"].nunique()):
         raise RuntimeError("demo grid has duplicate TraceIdx")
+    if args.max_x_lines > 0:
+        grid = grid[grid["IX"] < int(args.max_x_lines)].copy().reset_index(drop=True)
+        if grid.empty:
+            raise RuntimeError("--max-x-lines selected no demo-grid traces")
 
     max_fill_distance = float(config.get("max_horizon_fill_distance_m", 25.0))
     min_thickness = float(config.get("min_horizon_thickness_ms", 1.0))
@@ -267,6 +288,8 @@ def main() -> int:
     stats_main = RunningStats()
     stats_ext = RunningStats()
     layer_total = {"上部复合层": 0, "太古界风化壳": 0}
+    anttrack_minus_one_count = 0
+    anttrack_finite_count = 0
     started = time.time()
 
     attr_sampler = MultiAttributeSampler(
@@ -293,6 +316,9 @@ def main() -> int:
             output_handle.bin[segyio.BinField.Samples] = int(len(sample_axis))
             output_handle.bin[segyio.BinField.Format] = 5
             window_codes = np.zeros((len(grid), len(sample_axis)), dtype=np.uint8)
+            output_trace_idx = np.empty(len(grid), dtype=np.int64)
+            output_x = np.empty(len(grid), dtype=np.float64)
+            output_y = np.empty(len(grid), dtype=np.float64)
             output_cursor = 0
             for block_index, ix_start in enumerate(range(0, x_line_count, block_x_lines), start=1):
                 ix_stop = min(ix_start + block_x_lines, x_line_count)
@@ -305,12 +331,16 @@ def main() -> int:
                     np.tile(sample_axis, len(block)),
                 )
                 attr_arrays = {name: attrs[name].reshape(len(block), len(sample_axis)) for name in ("Coherence", "AntTrack", "CurvatureMax")}
+                anttrack = attr_arrays["AntTrack"]
+                anttrack_finite_count += int(np.isfinite(anttrack).sum())
+                anttrack_minus_one_count += int(np.isclose(anttrack, -1.0, equal_nan=False).sum())
                 predicted = np.full((len(block), len(sample_axis)), np.nan, dtype=np.float32)
                 codes = np.zeros((len(block), len(sample_axis)), dtype=np.uint8)
                 block_valid = block["FilledSurfaceValid"].fillna(0).astype(bool).to_numpy()
 
                 features, row_idx, time_idx = build_layer_features(
-                    attr_arrays, sample_axis, block["TopTimeMs"].to_numpy(), block["MidTimeMs"].to_numpy(), block_valid, 1.0
+                    attr_arrays, sample_axis, block["TopTimeMs"].to_numpy(), block["MidTimeMs"].to_numpy(),
+                    block_valid, 1.0, "上部复合层", normalization_contract
                 )
                 if len(row_idx):
                     prob = model_upper["classifier"].predict_proba(features)[:, 1]
@@ -320,7 +350,8 @@ def main() -> int:
                     layer_total["上部复合层"] += int(len(row_idx))
 
                 features, row_idx, time_idx = build_layer_features(
-                    attr_arrays, sample_axis, block["MidTimeMs"].to_numpy(), block["BaseTimeMs"].to_numpy(), block_valid, 2.0
+                    attr_arrays, sample_axis, block["MidTimeMs"].to_numpy(), block["BaseTimeMs"].to_numpy(),
+                    block_valid, 2.0, "太古界风化壳", normalization_contract
                 )
                 if len(row_idx):
                     prob = model_crust["classifier"].predict_proba(features)[:, 1]
@@ -336,6 +367,8 @@ def main() -> int:
                     block["BaseTimeMs"].to_numpy() + ext_window_ms,
                     block_valid,
                     2.0,
+                    "太古界风化壳",
+                    normalization_contract,
                 )
                 if len(row_idx):
                     prob = model_crust["classifier"].predict_proba(features)[:, 1]
@@ -364,6 +397,9 @@ def main() -> int:
                     output_handle.header[output_cursor] = header
                     output_handle.trace[output_cursor] = predicted[local_index]
                     window_codes[output_cursor] = codes[local_index]
+                    output_trace_idx[output_cursor] = source_index
+                    output_x[output_cursor] = float(row["X"])
+                    output_y[output_cursor] = float(row["Y"])
                     output_cursor += 1
                 finite_count = int(np.isfinite(predicted).sum())
                 block_rows.append(
@@ -401,12 +437,15 @@ def main() -> int:
                     f"elapsed={elapsed/60.0:.1f}min eta={eta/60.0:.1f}min partial={partial_mb:.1f}MB",
                     flush=True,
                 )
-                if args.max_x_lines > 0 and ix_stop >= args.max_x_lines:
-                    grid = grid[grid["IX"] < ix_stop].copy()
-                    window_codes = window_codes[: output_cursor]
-                    break
         partial_sgy.replace(output_sgy)
         np.savez_compressed(window_npz, window_code=window_codes, sample_axis=sample_axis.astype(np.float32))
+        np.savez_compressed(
+            trace_mapping_npz,
+            trace_idx=output_trace_idx[:output_cursor],
+            x=output_x[:output_cursor],
+            y=output_y[:output_cursor],
+            output_trace_index=np.arange(output_cursor, dtype=np.int64),
+        )
         print(
             f"[step6a-predict] volume_written sgy={output_sgy} elapsed={(time.time()-run_started)/60.0:.1f}min",
             flush=True,
@@ -423,10 +462,13 @@ def main() -> int:
         "ext50_predictions_exist": int((window_codes == 2).sum()) > 0,
         "output_sgy_exists": output_sgy.exists(),
         "window_code_npz_exists": window_npz.exists(),
+        "trace_mapping_npz_exists": trace_mapping_npz.exists(),
         "sgy_trace_count_matches": int(handle.tracecount) == int(len(grid)),
         "sgy_sample_axis_matches": len(samples) == len(sample_axis) and bool(np.allclose(samples, sample_axis, atol=1.0e-6)),
         "sampled_output_contains_finite": bool(np.isfinite(sampled).any()),
         "sampled_output_contains_nan": bool(np.isnan(sampled).any()),
+        "common_contract_version_matches_model": model_contract.get("version") == normalization_contract.get("version"),
+        "anttrack_minus_one_retained": anttrack_minus_one_count > 0,
     }
     status = "pass" if all(checks.values()) else "fail"
     summary = {
@@ -435,9 +477,17 @@ def main() -> int:
         "model_joblib": str(model_path),
         "model_contract_version": artifact.get("contract_version"),
         "model_logic": artifact.get("model_logic"),
+        "attribute_normalization_contract_path": str(normalization_contract_path),
+        "attribute_normalization_contract_version": normalization_contract.get("version"),
+        "anttrack_semantics": "-1_is_valid_low_fracture_evidence",
+        "attribute_sampling_audit": {
+            "anttrack_finite_count": anttrack_finite_count,
+            "anttrack_minus_one_count": anttrack_minus_one_count,
+        },
         "output_paths": {
             "density_sgy": str(output_sgy),
             "window_code_npz": str(window_npz),
+            "trace_mapping_npz": str(trace_mapping_npz),
             "prediction_block_qc_csv": str(block_qc_path),
             "prediction_summary_json": str(summary_path),
             "horizon_fill_qc_csv": str(horizon_qc_path),

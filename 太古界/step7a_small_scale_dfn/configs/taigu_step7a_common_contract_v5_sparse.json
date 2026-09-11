@@ -1,0 +1,41 @@
+{
+  "version": "taigu_step7a_common_contract_v5_sparse",
+  "output_dir": "/home/tyh/projects/petroleum/code/GAN-DFN/太古界/step7a_small_scale_dfn/output/taigu_step7a_common_contract_v5_sparse_full",
+  "density_sgy": "/home/tyh/projects/petroleum/code/GAN-DFN/太古界/step6a_density_volume/output/taigu_step6a_common_contract_v4/volume/predicted_fracture_density.sgy",
+  "window_code_npz": "/home/tyh/projects/petroleum/code/GAN-DFN/太古界/step6a_density_volume/output/taigu_step6a_common_contract_v4/volume/window_code.npz",
+  "step6a_prediction_summary_json": "/home/tyh/projects/petroleum/code/GAN-DFN/太古界/step6a_density_volume/output/taigu_step6a_common_contract_v4/volume/prediction_summary.json",
+  "expected_step6a_model_contract_version": "taigu_step6a_common_contract_v4",
+  "trace_mapping_npz": "/home/tyh/projects/petroleum/code/GAN-DFN/太古界/step6a_density_volume/output/taigu_step6a_common_contract_v4/volume/trace_mapping.npz",
+  "demo_grid_csv": "/home/tyh/projects/petroleum/code/GAN-DFN/太古界/step7a_small_scale_dfn/output/taigu_attribute_demo_grid_v3/demo_grid.csv",
+  "horizon_contract_csv": "/home/tyh/projects/petroleum/code/GAN-DFN/太古界/common/horizon_contract/output/taigu_attribute_full_horizon_contract_v1/demo_horizon_contract.csv",
+  "step3_groups_root": "/home/tyh/projects/petroleum/code/GAN-DFN/太古界/step3_imaging_groups/output/taigu_step3_imaging_v3/groups",
+  "step2_segments_root": "/home/tyh/projects/petroleum/code/GAN-DFN/太古界/step2_well_log_segments/output/taigu_step2_regular_v3",
+  "profile_well": "埕北古斜405",
+  "sampling": {
+    "mode": "layered_weighted_probability_with_3d_spacing",
+    "reference_quantile": 0.95,
+    "candidate_quantile": {"上部复合层": 0.90, "太古界风化壳": 0.90},
+    "occurrence_rate": {"上部复合层": 0.015, "太古界风化壳": 0.010},
+    "density_power": 1.5,
+    "min_center_distance_m": 20.0,
+    "spacing_time_scale_m_per_ms": 2.0,
+    "min_density": 1e-06,
+    "random_seed": 20260822
+  },
+  "orientation": {
+    "window_xy_radius": 2, "time_half_span_ms": 12.0, "density_fraction": 0.5,
+    "min_planarity": 0.05, "min_local_points": 10, "min_dip_deg": 25.0,
+    "max_dip_deg": 89.0, "azimuth_jitter_std_deg": 10.0, "dip_jitter_std_deg": 6.0,
+    "local_pca_share": 0.5, "random_seed": 20260822,
+    "fallback_family": {
+      "上部复合层": {"azimuth_deg": 80.0, "dip_deg": 55.0},
+      "太古界风化壳": {"azimuth_deg": 120.0, "dip_deg": 65.0}
+    }
+  },
+  "patch_length_m": [25.0, 80.0],
+  "patch_height_ms": [5.0, 15.0],
+  "display_z_scale_m_per_ms": 1.0,
+  "vtk_z_scale_m_per_ms": 1.0,
+  "imaging_match": {"corridor_half_width_m": 500.0, "time_bin_ms": 20.0},
+  "block_x_line_count": 20
+}

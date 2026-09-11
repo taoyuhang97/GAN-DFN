@@ -10,6 +10,7 @@ missing density with zero.
 from __future__ import annotations
 import argparse, json
 from pathlib import Path
+import numpy as np
 import pandas as pd
 
 REQUIRED = ["SourceKind", "SourceWellName", "TrackWellName", "X", "Y", "TIME", "LayerGroup", "PresenceLabel", "DensityLabel", "PointConfidence", "SampleWeight", "Coherence", "AntTrack", "CurvatureMax"]
@@ -26,7 +27,8 @@ def main() -> int:
         p = pd.to_numeric(df["PresenceLabel"], errors="coerce")
         d = pd.to_numeric(df["DensityLabel"], errors="coerce")
         kinds = set(df["SourceKind"].astype(str))
-        checks.update({"binary_presence": bool(p.isin([0,1]).all()), "density_only_on_positive": bool(d[p.eq(0)].isna().all() and d[p.eq(1)].notna().all()), "positive_weights": bool(pd.to_numeric(df["SampleWeight"], errors="coerce").gt(0).all()), "finite_curvature": bool(pd.to_numeric(df["CurvatureMax"], errors="coerce").notna().all()), "real_and_virtual_present": bool(bool(kinds.intersection({"weak_real","real_well"})) and "weak_virtual" in kinds)})
+        anttrack = pd.to_numeric(df["AntTrack"], errors="coerce")
+        checks.update({"binary_presence": bool(p.isin([0,1]).all()), "density_only_on_positive": bool(d[p.eq(0)].isna().all() and d[p.eq(1)].notna().all()), "positive_weights": bool(pd.to_numeric(df["SampleWeight"], errors="coerce").gt(0).all()), "finite_curvature": bool(pd.to_numeric(df["CurvatureMax"], errors="coerce").notna().all()), "finite_anttrack": bool(anttrack.notna().all()), "anttrack_minus_one_retained": bool(np.isclose(anttrack.to_numpy(dtype=float), -1.0, atol=1.0e-6).any()), "real_and_virtual_present": bool(bool(kinds.intersection({"weak_real","real_well"})) and "weak_virtual" in kinds)})
     out = args.output_dir / "taigu_step5b_unified_samples.csv"; summary_path = args.output_dir / "taigu_step5b_acceptance_summary.json"
     if out.exists() or summary_path.exists(): raise FileExistsError("Step5B output exists; choose a new versioned directory")
     df.to_csv(out, index=False, encoding="utf-8-sig")

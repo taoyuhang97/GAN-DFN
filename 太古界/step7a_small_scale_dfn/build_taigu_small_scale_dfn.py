@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-"""Step7A (太古界 v2): small-scale fracture patches with layered weighted
-probability sampling and geologic orientation families.
+"""Step7A (太古界): small-scale fracture patches with layered weighted
+probability sampling, density-priority 3D spacing, and geologic orientations.
 
 Changes vs v1:
   * per-layer candidate reference quantile (no global threshold that removed
@@ -32,6 +32,7 @@ from typing import Any
 import numpy as np
 import pandas as pd
 import segyio
+from scipy.spatial import cKDTree
 from tqdm import tqdm
 
 
@@ -41,6 +42,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-dir", type=Path, default=None)
     parser.add_argument("--replace-output", action="store_true")
     parser.add_argument("--max-blocks", type=int, default=0, help="Smoke-test cap.")
+    parser.add_argument(
+        "--sampling-qc-only",
+        action="store_true",
+        help="Stop after candidate sampling and spatial thinning; skip orientation/VTK.",
+    )
     return parser.parse_args()
 
 
@@ -75,6 +81,53 @@ def rss_mb() -> float:
     except OSError:
         pass
     return 0.0
+
+
+def layer_parameter(value: Any, layer: str) -> float:
+    """Read either a scalar or a per-layer numeric configuration value."""
+    if isinstance(value, dict):
+        if layer not in value:
+            raise KeyError(f"missing per-layer sampling parameter for {layer}")
+        return float(value[layer])
+    return float(value)
+
+
+def thin_by_3d_spacing(
+    rows: np.ndarray,
+    samples: np.ndarray,
+    priority: np.ndarray,
+    row_xy: np.ndarray,
+    sample_axis: np.ndarray,
+    min_distance_m: float,
+    time_scale_m_per_ms: float,
+) -> np.ndarray:
+    """Greedily retain stronger candidates separated in scaled XYZ space."""
+    if min_distance_m <= 0.0 or len(rows) <= 1:
+        return np.arange(len(rows), dtype=np.int64)
+    points = np.column_stack(
+        [row_xy[rows, 0], row_xy[rows, 1], sample_axis[samples] * time_scale_m_per_ms]
+    )
+    order = np.argsort(-priority, kind="stable")
+    buckets: dict[tuple[int, int, int], list[int]] = {}
+    retained: list[int] = []
+    threshold_sq = min_distance_m * min_distance_m
+    offsets = [(i, j, k) for i in (-1, 0, 1) for j in (-1, 0, 1) for k in (-1, 0, 1)]
+    for candidate_index in tqdm(order, desc="Step7A 3D spacing", unit="candidate"):
+        point = points[candidate_index]
+        key = tuple(np.floor(point / min_distance_m).astype(np.int64))
+        too_close = False
+        for di, dj, dk in offsets:
+            for accepted_index in buckets.get((key[0] + di, key[1] + dj, key[2] + dk), ()):
+                delta = point - points[accepted_index]
+                if float(delta @ delta) < threshold_sq:
+                    too_close = True
+                    break
+            if too_close:
+                break
+        if not too_close:
+            retained.append(int(candidate_index))
+            buckets.setdefault(key, []).append(int(candidate_index))
+    return np.asarray(retained, dtype=np.int64)
 
 
 def normal_to_dip_azimuth(normal: np.ndarray) -> tuple[float, float]:
@@ -182,8 +235,12 @@ def main() -> int:
     patches_csv = output_dir / "fracture_patches.csv"
     vtk_path = output_dir / "fracture_patches.vtk"
     qc_csv = output_dir / "step7a_imaging_match_qc.csv"
+    sampling_qc_path = output_dir / "step7a_sampling_qc.json"
     summary_path = output_dir / "step7a_summary.json"
-    for path in (patches_csv, vtk_path, qc_csv, summary_path):
+    output_paths_to_check = (sampling_qc_path,) if args.sampling_qc_only else (
+        patches_csv, vtk_path, qc_csv, sampling_qc_path, summary_path
+    )
+    for path in output_paths_to_check:
         if path.exists() and not args.replace_output:
             raise FileExistsError(f"refusing to overwrite existing Step7A output: {path}")
 
@@ -226,6 +283,25 @@ def main() -> int:
     window_codes = windows["window_code"]
     sample_axis = windows["sample_axis"].astype(np.float64)
     density_sgy = Path(config["density_sgy"]).resolve()
+    prediction_summary_path = Path(config["step6a_prediction_summary_json"]).resolve()
+    prediction_summary = read_json(prediction_summary_path)
+    if prediction_summary.get("status") != "pass":
+        raise RuntimeError("Step6A prediction summary is not pass")
+    if Path(prediction_summary["output_paths"]["density_sgy"]).resolve() != density_sgy:
+        raise RuntimeError("Step7A density_sgy does not match the declared Step6A prediction summary")
+    expected_step6a_contract = config.get("expected_step6a_model_contract_version")
+    if expected_step6a_contract and prediction_summary.get("model_contract_version") != expected_step6a_contract:
+        raise RuntimeError(
+            f"Step6A model contract mismatch: {prediction_summary.get('model_contract_version')} "
+            f"!= {expected_step6a_contract}"
+        )
+    with segyio.open(str(density_sgy), "r", ignore_geometry=True) as density_handle:
+        if density_handle.tracecount != len(grid):
+            raise RuntimeError("Step6A density trace count does not match Step7A demo grid")
+        if len(density_handle.samples) != len(sample_axis) or not np.allclose(density_handle.samples, sample_axis):
+            raise RuntimeError("Step6A density sample axis does not match window_code sample axis")
+    if window_codes.shape != (len(grid), len(sample_axis)):
+        raise RuntimeError("window_code shape does not match Step7A grid/sample axis")
     block_x_lines = max(int(config.get("block_x_line_count", 20)), 1)
     x_line_count = int(grid["IX"].max()) + 1
     sampling_cfg = config["sampling"]
@@ -237,9 +313,11 @@ def main() -> int:
     reference_quantile = float(sampling_cfg["reference_quantile"])
     # 与砂砾岩小尺度流程一致：先按层内高分位筛掉背景体素，再以较低的
     # 出现概率抽样。这样不会把每个正密度体素都画成一块裂缝片。
-    candidate_quantile = float(sampling_cfg.get("candidate_quantile", reference_quantile))
-    occurrence_rate = float(sampling_cfg.get("occurrence_rate", 0.20))
+    candidate_quantile_cfg = sampling_cfg.get("candidate_quantile", reference_quantile)
+    occurrence_rate_cfg = sampling_cfg.get("occurrence_rate", 0.20)
     density_power = float(sampling_cfg.get("density_power", 1.0))
+    min_center_distance_m = float(sampling_cfg.get("min_center_distance_m", 0.0))
+    spacing_time_scale = float(sampling_cfg.get("spacing_time_scale_m_per_ms", 2.0))
     length_range = [float(v) for v in config["patch_length_m"]]
     height_range = [float(v) for v in config["patch_height_ms"]]
     z_scale = float(config["display_z_scale_m_per_ms"])
@@ -257,7 +335,8 @@ def main() -> int:
     az_jitter = float(orient_cfg["azimuth_jitter_std_deg"])
     dip_jitter = float(orient_cfg["dip_jitter_std_deg"])
     local_pca_share = float(orient_cfg["local_pca_share"])
-    rng = np.random.default_rng(int(orient_cfg["random_seed"]))
+    sampling_rng = np.random.default_rng(int(sampling_cfg["random_seed"]))
+    orientation_rng = np.random.default_rng(int(orient_cfg["random_seed"]))
 
     # per-layer positive-density samples for reference quantiles
     layer_refs: dict[str, float] = {}
@@ -308,7 +387,9 @@ def main() -> int:
     sampled_rows: list[np.ndarray] = []
     sampled_samples: list[np.ndarray] = []
     sampled_density: list[np.ndarray] = []
+    sampled_priority: list[np.ndarray] = []
     sampled_layer: list[str] = []
+    layer_sampling_audit: dict[str, dict[str, Any]] = {}
     for name in ("上部复合层", "太古界风化壳"):
         if not candidate_parts[name]:
             continue
@@ -317,6 +398,9 @@ def main() -> int:
         density = np.concatenate([p[2] for p in candidate_parts[name]])
         # 候选阈值和参考值均在本层正值样本上计算，避免不同层厚/振幅
         # 分布差异造成某一层被异常过采样。
+        positive_count = int(len(density))
+        candidate_quantile = layer_parameter(candidate_quantile_cfg, name)
+        occurrence_rate = layer_parameter(occurrence_rate_cfg, name)
         candidate_ref = max(float(np.quantile(density, candidate_quantile)), 1.0e-9)
         candidate_mask = density >= candidate_ref
         rows, samples, density = rows[candidate_mask], samples[candidate_mask], density[candidate_mask]
@@ -324,25 +408,77 @@ def main() -> int:
         probability = occurrence_rate * np.power(np.clip(density / reference, 0.0, 2.0), density_power)
         probability = np.clip(probability, 0.0, 1.0)
         expected = float(probability.sum())
-        keep = rng.random(len(rows)) < probability
+        keep = sampling_rng.random(len(rows)) < probability
         keep_pos = np.where(keep)[0]
         keep = np.zeros(len(rows), dtype=bool)
         keep[keep_pos] = True
         sampled_rows.append(rows[keep])
         sampled_samples.append(samples[keep])
         sampled_density.append(density[keep])
+        sampled_priority.append((density[keep] / reference).astype(np.float32))
         if not (len(rows[keep]) == len(samples[keep]) == len(density[keep])):
             raise RuntimeError(f"sampled candidate length mismatch for layer {name}")
         sampled_layer.extend([name] * int(keep.sum()))
+        layer_sampling_audit[name] = {
+            "positive_voxel_count": positive_count,
+            "candidate_quantile": candidate_quantile,
+            "candidate_threshold": candidate_ref,
+            "candidate_count": int(len(rows)),
+            "reference_quantile": reference_quantile,
+            "reference_density": reference,
+            "occurrence_rate": occurrence_rate,
+            "density_power": density_power,
+            "expected_before_spacing": expected,
+            "sampled_before_spacing": int(keep.sum()),
+        }
         print(f"[step7a] layer={name} candidate_q={candidate_quantile:.2f} threshold={candidate_ref:.3f} ref={reference:.3f} candidates={len(rows)} sampled={int(keep.sum())}", flush=True)
 
     accepted_rows = np.concatenate(sampled_rows) if sampled_rows else np.empty(0, dtype=np.int64)
     accepted_samples = np.concatenate(sampled_samples) if sampled_samples else np.empty(0, dtype=np.int64)
     accepted_density = np.concatenate(sampled_density) if sampled_density else np.empty(0, dtype=np.float32)
+    accepted_priority = np.concatenate(sampled_priority) if sampled_priority else np.empty(0, dtype=np.float32)
     accepted_layer = np.asarray(sampled_layer)
     if len(accepted_rows) == 0:
         raise RuntimeError("layered weighted probability sampling produced zero patches")
-    print(f"[step7a] accepted_patches={len(accepted_rows)} rss_mb={rss_mb():.0f}", flush=True)
+    pre_spacing_count = int(len(accepted_rows))
+    retained = thin_by_3d_spacing(
+        accepted_rows,
+        accepted_samples,
+        accepted_priority,
+        row_xy,
+        sample_axis,
+        min_center_distance_m,
+        spacing_time_scale,
+    )
+    accepted_rows = accepted_rows[retained]
+    accepted_samples = accepted_samples[retained]
+    accepted_density = accepted_density[retained]
+    accepted_priority = accepted_priority[retained]
+    accepted_layer = accepted_layer[retained]
+    post_counts = pd.Series(accepted_layer).value_counts().to_dict()
+    for layer, audit in layer_sampling_audit.items():
+        audit["retained_after_spacing"] = int(post_counts.get(layer, 0))
+    sampling_qc = {
+        "status": "pass" if len(accepted_rows) > 0 else "fail",
+        "config_path": str(args.config.resolve()),
+        "mode": sampling_cfg["mode"],
+        "layer_audit": layer_sampling_audit,
+        "pre_spacing_patch_count": pre_spacing_count,
+        "post_spacing_patch_count": int(len(accepted_rows)),
+        "spacing_removed_count": int(pre_spacing_count - len(accepted_rows)),
+        "min_center_distance_m": min_center_distance_m,
+        "spacing_time_scale_m_per_ms": spacing_time_scale,
+        "fixed_total_patch_cap_used": False,
+    }
+    write_json(sampling_qc_path, json_ready(sampling_qc))
+    print(
+        f"[step7a] sampled_before_spacing={pre_spacing_count} "
+        f"retained_after_spacing={len(accepted_rows)} rss_mb={rss_mb():.0f}",
+        flush=True,
+    )
+    if args.sampling_qc_only:
+        print(json.dumps(json_ready(sampling_qc), ensure_ascii=False, indent=2))
+        return 0 if sampling_qc["status"] == "pass" else 1
 
     # --- orientation: layer template blended with local PCA-if-planar ---
     prior = imaging_orientation_prior(Path(config["step3_groups_root"]), config["profile_well"])
@@ -432,7 +568,7 @@ def main() -> int:
                     np.isfinite(local_dip)
                     and np.isfinite(local_az)
                     and min_dip <= local_dip <= max_dip
-                    and rng.random() < local_pca_share
+                    and orientation_rng.random() < local_pca_share
                 )
                 if use_local:
                     base_azimuth = local_az
@@ -444,8 +580,8 @@ def main() -> int:
                     base_dip = float(template[layer]["dip"])
                     base_source = "layer_template"
                     family = "layer_template"
-                azimuth = float((base_azimuth + rng.normal(0.0, az_jitter)) % 180.0)
-                dip = float(np.clip(base_dip + rng.normal(0.0, float(template[layer].get("dip_std", dip_jitter))), min_dip, max_dip))
+                azimuth = float((base_azimuth + orientation_rng.normal(0.0, az_jitter)) % 180.0)
+                dip = float(np.clip(base_dip + orientation_rng.normal(0.0, float(template[layer].get("dip_std", dip_jitter))), min_dip, max_dip))
                 azimuths.append(azimuth)
                 dips.append(dip)
                 base_sources.append(base_source)
@@ -454,8 +590,8 @@ def main() -> int:
             gc.collect()
             print(f"[step7a] orientation chunk {chunk_start}:{chunk_end} of {len(accepted_rows)}", flush=True)
 
-    lengths = rng.uniform(length_range[0], length_range[1], size=len(accepted_rows))
-    heights = rng.uniform(height_range[0], height_range[1], size=len(accepted_rows))
+    lengths = orientation_rng.uniform(length_range[0], length_range[1], size=len(accepted_rows))
+    heights = orientation_rng.uniform(height_range[0], height_range[1], size=len(accepted_rows))
     areas = lengths * heights * z_scale
     patches = pd.DataFrame(
         {
@@ -507,6 +643,10 @@ def main() -> int:
         "DipDeg": patches["DipDeg"].to_numpy(dtype=np.float64),
         "AzimuthDeg": patches["AzimuthDeg"].to_numpy(dtype=np.float64),
         "PatchAreaM2": patches["PatchAreaM2"].to_numpy(dtype=np.float64),
+        "PatchLengthM": patches["PatchLengthM"].to_numpy(dtype=np.float64),
+        "PatchHeightMs": patches["PatchHeightMs"].to_numpy(dtype=np.float64),
+        "CenterTimeMs": patches["TIME"].to_numpy(dtype=np.float64),
+        "LayerCode": patches["LayerGroup"].map({"上部复合层": 1, "太古界风化壳": 2}).to_numpy(dtype=np.int32),
         "FractureScale": np.full(len(patches), 1, dtype=np.int32),
         "WindowCode": np.full(len(patches), 1, dtype=np.int32),
     }
@@ -569,6 +709,23 @@ def main() -> int:
 
     layer_counts = patches["LayerGroup"].value_counts().to_dict()
     upper_fraction = float(layer_counts.get("上部复合层", 0) / max(len(patches), 1))
+    spacing_points = np.column_stack(
+        [
+            patches["X"].to_numpy(dtype=np.float64),
+            patches["Y"].to_numpy(dtype=np.float64),
+            patches["TIME"].to_numpy(dtype=np.float64) * spacing_time_scale,
+        ]
+    )
+    if len(spacing_points) > 1:
+        nearest_distance = cKDTree(spacing_points).query(spacing_points, k=2, workers=-1)[0][:, 1]
+    else:
+        nearest_distance = np.asarray([np.nan])
+    cell_counts = (
+        patches.assign(CellI=np.floor(patches["X"] / 300.0), CellJ=np.floor(patches["Y"] / 300.0))
+        .groupby(["CellI", "CellJ"])
+        .size()
+        .to_numpy(dtype=np.int64)
+    )
     checks = {
         "patch_count_positive": len(patches) > 0,
         "patch_count_within_cap": safety_max_patches is None or len(patches) <= safety_max_patches,
@@ -579,6 +736,11 @@ def main() -> int:
         "geometry_finite": bool(np.isfinite(patches[["X", "Y", "TIME", "PatchAreaM2"]]).all().all()),
         "imaging_match_qc_exists": qc_csv.exists(),
         "vtk_exists": vtk_path.exists(),
+        "minimum_3d_spacing_respected": bool(
+            min_center_distance_m <= 0.0
+            or len(patches) <= 1
+            or float(np.nanmin(nearest_distance)) >= min_center_distance_m - 1.0e-6
+        ),
     }
     status = "pass" if all(checks.values()) else "fail"
     summary = {
@@ -588,13 +750,36 @@ def main() -> int:
             "patches_csv": str(patches_csv),
             "patches_vtk": str(vtk_path),
             "imaging_match_qc_csv": str(qc_csv),
+            "sampling_qc_json": str(sampling_qc_path),
             "summary_json": str(summary_path),
+        },
+        "step6a_input": {
+            "prediction_summary_json": str(prediction_summary_path),
+            "model_contract_version": prediction_summary.get("model_contract_version"),
+            "attribute_normalization_contract_version": prediction_summary.get("attribute_normalization_contract_version"),
         },
         "sampling": {
             "mode": sampling_cfg["mode"],
             "reference_quantiles": layer_refs,
+            "layer_audit": layer_sampling_audit,
             "layer_patch_counts": layer_counts,
             "upper_layer_fraction": upper_fraction,
+            "pre_spacing_patch_count": pre_spacing_count,
+            "post_spacing_patch_count": int(len(patches)),
+            "min_center_distance_m": min_center_distance_m,
+            "spacing_time_scale_m_per_ms": spacing_time_scale,
+            "nearest_neighbor_distance_m": {
+                "min": float(np.nanmin(nearest_distance)),
+                "median": float(np.nanmedian(nearest_distance)),
+                "p90": float(np.nanquantile(nearest_distance, 0.90)),
+            },
+            "patches_per_300m_cell": {
+                "cell_count": int(len(cell_counts)),
+                "mean": float(np.mean(cell_counts)),
+                "median": float(np.median(cell_counts)),
+                "p90": float(np.quantile(cell_counts, 0.90)),
+                "max": int(np.max(cell_counts)),
+            },
         },
         "orientation": {
             "imaging_prior": prior,

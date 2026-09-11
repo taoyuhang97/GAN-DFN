@@ -48,6 +48,7 @@ if str(COMMON_DIR / "attribute_sampling") not in sys.path:
     sys.path.insert(0, str(COMMON_DIR / "attribute_sampling"))
 
 from attribute_sampling import MultiAttributeSampler  # noqa: E402
+from attribute_contract import score_attribute  # noqa: E402
 
 
 class _NoAmplitudeSampler:
@@ -302,6 +303,14 @@ def write_per_well_outputs(
 def main() -> int:
     args = parse_args()
     config = read_json(args.config)
+    normalization_path = Path(config["attribute_normalization_contract_json"])
+    normalization_contract = read_json(normalization_path)
+    expected_contract = str(config.get("attribute_normalization_contract_version", ""))
+    if expected_contract and normalization_contract.get("version") != expected_contract:
+        raise ValueError(
+            f"attribute normalization contract mismatch: expected={expected_contract}, "
+            f"actual={normalization_contract.get('version')}"
+        )
     output_dir = (args.output_dir or Path(config["output_dir"])).resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
     unified_path = output_dir / "taigu_step5_unified_samples.csv"
@@ -399,6 +408,18 @@ def main() -> int:
             )
             ctx = sample_context(sampler, nearest_trace, rows["TIME"].to_numpy(dtype=np.float64), context_offsets)
             source_attrs = attr_sampler.sample_at_xy(rows["X"].to_numpy(dtype=float), rows["Y"].to_numpy(dtype=float), rows["TIME"].to_numpy(dtype=float))
+            source_scores = {
+                name: np.full(len(rows), np.nan, dtype=np.float32)
+                for name in ("Coherence", "AntTrack", "CurvatureMax")
+            }
+            for layer in ("上部复合层", "太古界风化壳"):
+                layer_mask = rows["StrataName"].astype(str).eq(layer).to_numpy()
+                for name in source_scores:
+                    source_scores[name][layer_mask] = score_attribute(
+                        source_attrs[name][layer_mask],
+                        name,
+                        normalization_contract["layers"][layer][name],
+                    )
             center = ctx[:, list(context_offsets).index(0.0)]
             real_center_amps[well] = center
             mad5 = np.nanmedian(np.abs(ctx - center[:, None]), axis=1)
@@ -502,18 +523,11 @@ def main() -> int:
             source_amps = center
             finite_amps = source_amps[np.isfinite(source_amps)]
             amp_scale = max(float(np.median(np.abs(finite_amps - np.median(finite_amps))) * 1.4826), scale_floor) * scale_multiplier
-            # Use robust per-well scales for each attribute.  A fixed floor is
-            # only a safeguard for constant or sparse source values.
             attr_scales = {"SeisAmp": amp_scale}
             for attr_name in ("Coherence", "AntTrack", "CurvatureMax"):
-                values = np.asarray(source_attrs[attr_name], dtype=float)
-                values = values[np.isfinite(values)]
-                if values.size:
-                    robust = float(np.median(np.abs(values - np.median(values))) * 1.4826)
-                else:
-                    robust = 0.0
-                floor = float(config.get("attribute_scale_floors", {}).get(attr_name, 1.0))
-                attr_scales[attr_name] = max(robust, floor, scale_floor) * scale_multiplier
+                attr_scales[attr_name] = float(
+                    config.get("attribute_score_scales", {}).get(attr_name, 0.20)
+                )
             virt_meta: list[dict[str, Any]] = []
             virt_xy_list: list[np.ndarray] = []
             virt_trace_list: list[int] = []
@@ -587,6 +601,19 @@ def main() -> int:
                     sampler, np.asarray(virt_trace_list, dtype=np.int64), virtual_times, context_offsets
                 )
                 vattrs = attr_sampler.sample_at_xy(virt_xy[:, 0], virt_xy[:, 1], virtual_times)
+                virtual_scores = {
+                    name: np.full(len(virt_meta), np.nan, dtype=np.float32)
+                    for name in ("Coherence", "AntTrack", "CurvatureMax")
+                }
+                virtual_layers = np.asarray([str(meta["layer"]) for meta in virt_meta])
+                for layer in ("上部复合层", "太古界风化壳"):
+                    layer_mask = virtual_layers == layer
+                    for name in virtual_scores:
+                        virtual_scores[name][layer_mask] = score_attribute(
+                            vattrs[name][layer_mask],
+                            name,
+                            normalization_contract["layers"][layer][name],
+                        )
                 for k, meta in enumerate(virt_meta):
                     if meta["layer"] == "上部复合层":
                         layer_top_v, layer_base_v = vtop[k], vmid[k]
@@ -637,11 +664,13 @@ def main() -> int:
                     weight_sum = 0.0
                     source_attr_row = {name: source_attrs[name][meta["row_pos"]] for name in ("Coherence", "AntTrack", "CurvatureMax")}
                     virtual_attr_row = {name: vattrs[name][k] for name in ("Coherence", "AntTrack", "CurvatureMax")}
+                    source_score_row = {name: source_scores[name][meta["row_pos"]] for name in source_scores}
+                    virtual_score_row = {name: virtual_scores[name][k] for name in virtual_scores}
                     source_attr_row["SeisAmp"] = source_amps[meta["row_pos"]]
                     virtual_attr_row["SeisAmp"] = virtual_center
                     attr_valid_count = 0
                     for name, weight in attr_weights.items():
-                        sv, vv = float(source_attr_row.get(name, np.nan)), float(virtual_attr_row.get(name, np.nan))
+                        sv, vv = float(source_score_row.get(name, np.nan)), float(virtual_score_row.get(name, np.nan))
                         if np.isfinite(sv) and np.isfinite(vv):
                             scale = attr_scales.get(name, float(config.get("attribute_scale_floors", {}).get(name, 1.0)))
                             score = float(np.exp(-abs(sv - vv) / max(scale, 1.0e-12)))
@@ -682,19 +711,16 @@ def main() -> int:
                                     "ExcludeReason": "missing_primary_curvature" if not curvature_ok else "insufficient_attribute_support"})
                         continue
                     distance_weight = math.exp(-meta["dist_m"] / max(distance_scale_m, 1.0e-6))
-                    # Attribute differences control confidence, while signed
-                    # local evidence controls whether density is weakened or strengthened.
-                    evidence_signs = config.get("continuity", {}).get(
-                        "evidence_signs", {"CurvatureMax": 1.0, "Coherence": -1.0, "AntTrack": 1.0}
-                    )
+                    # All common scores share one polarity: larger means
+                    # stronger fracture evidence.  Their signed score change
+                    # can therefore strengthen or weaken the inherited label.
                     evidence_sum = 0.0
                     evidence_weight = 0.0
                     for name, weight in attr_weights.items():
-                        sv, vv = float(source_attr_row.get(name, np.nan)), float(virtual_attr_row.get(name, np.nan))
+                        sv, vv = float(source_score_row.get(name, np.nan)), float(virtual_score_row.get(name, np.nan))
                         if np.isfinite(sv) and np.isfinite(vv):
-                            scale = max(attr_scales.get(name, 1.0), 1.0e-12)
-                            delta = np.clip((vv - sv) / scale, -2.0, 2.0)
-                            evidence_sum += float(weight) * float(evidence_signs.get(name, 0.0)) * delta
+                            delta = np.clip(vv - sv, -1.0, 1.0)
+                            evidence_sum += float(weight) * delta
                             evidence_weight += float(weight)
                     evidence_score = evidence_sum / evidence_weight if evidence_weight else 0.0
                     evidence_clip = float(config.get("continuity", {}).get("evidence_clip", 2.0))
@@ -894,8 +920,9 @@ def main() -> int:
     expected_outside = {"埕北305", "埕北310", "埕北313", "埕北816", "桩斜169", "桩海102"}
     strong_wells_in_table = set(unified.loc[unified["SourceKind"] == "imaging_supervision", "SourceWellName"])
     checks = {
-        "seismic_amplitude_used": use_seis_amp,
+        "attribute_only_mode": not use_seis_amp,
         "all_rows_have_finite_primary_curvature": bool(unified["CurvatureMax"].notna().all()),
+        "all_rows_have_finite_anttrack": bool(unified["AntTrack"].notna().all()),
         "density_label_only_on_positive": bool(unified.loc[~positive, "DensityLabel"].isna().all())
         and bool(unified.loc[positive, "DensityLabel"].notna().all()),
         "confidence_in_range": bool(unified["PointConfidence"].between(0.0, 1.0).all()),
@@ -925,11 +952,15 @@ def main() -> int:
         "sample_weight_by_kind": {str(k): float(v) for k, v in weight_by_kind.items()},
         "positive_rows": int(positive.sum()),
         "positive_fraction": float(positive.mean()) if len(unified) else 0.0,
+        "anttrack_minus_one_rows": int(np.isclose(unified["AntTrack"], -1.0, atol=1.0e-6).sum()),
         "strong_supervision_rows": int(len(strong_full)),
         "strong_supervision_wells": sorted(strong_full["SourceWellName"].unique().tolist()) if not strong_full.empty else [],
         "continuity_stats": {
             "enabled": continuity_enabled,
-            "scale": float(amp_scale) if "amp_scale" in dir() else None,
+            "comparison_basis": "common_layer_normalized_scores",
+            "normalization_contract": str(normalization_path.resolve()),
+            "normalization_contract_version": normalization_contract.get("version"),
+            "attribute_score_scales": config.get("attribute_score_scales", {}),
             "min_continuity": min_continuity,
             "virtual_continuity": {
                 "min": float(unified.loc[unified["SourceKind"] == "weak_virtual", "AttributeContinuity"].min()),

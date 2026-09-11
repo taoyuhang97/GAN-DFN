@@ -44,6 +44,13 @@ from sklearn.metrics import (
 from sklearn.model_selection import GroupKFold
 
 
+CURRENT_DIR = Path(__file__).resolve().parent
+ATTRIBUTE_COMMON_DIR = CURRENT_DIR.parent / "common" / "attribute_sampling"
+if str(ATTRIBUTE_COMMON_DIR) not in sys.path:
+    sys.path.insert(0, str(ATTRIBUTE_COMMON_DIR))
+from attribute_contract import layer_score  # noqa: E402
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train Step6A two-stage density models (太古界).")
     parser.add_argument("--config", type=Path, required=True)
@@ -155,7 +162,8 @@ def collect_training_data(
     max_distance: float,
     chunksize: int,
     max_rows: int,
-) -> dict[str, dict[str, np.ndarray]]:
+    normalization_contract: dict[str, Any],
+) -> tuple[dict[str, dict[str, np.ndarray]], dict[str, int], dict[str, Any]]:
     usecols = [
         "SourceKind",
         "SourceWellName",
@@ -189,7 +197,32 @@ def collect_training_data(
     work = frame[frame["LayerGroup"].astype(str).isin(["上部复合层", "太古界风化壳"])].copy()
     work = attach_layer_features(work, lookups, payload, max_distance)
     if work.empty:
-        return {}, {}
+        return {}, {}, {}
+    score_columns = {
+        "Coherence": "CoherenceScore",
+        "AntTrack": "AntTrackScore",
+        "CurvatureMax": "CurvatureMaxScore",
+    }
+    normalization_audit: dict[str, Any] = {
+        "contract_version": normalization_contract["version"],
+        "anttrack_semantics": "-1_is_valid_low_fracture_evidence",
+        "layers": {},
+    }
+    for layer in ("上部复合层", "太古界风化壳"):
+        layer_mask = work["LayerGroup"].astype(str).eq(layer)
+        layer_audit: dict[str, Any] = {"rows": int(layer_mask.sum())}
+        for raw_column, score_column in score_columns.items():
+            raw = work.loc[layer_mask, raw_column].to_numpy(dtype=np.float64)
+            score = layer_score(raw, raw_column, normalization_contract, layer)
+            work.loc[layer_mask, score_column] = score
+            layer_audit[raw_column] = {
+                "raw_finite": int(np.isfinite(raw).sum()),
+                "raw_minus_one": int(np.isclose(raw, -1.0, equal_nan=False).sum()),
+                "score_finite": int(np.isfinite(score).sum()),
+                "score_min": float(np.nanmin(score)) if np.isfinite(score).any() else None,
+                "score_max": float(np.nanmax(score)) if np.isfinite(score).any() else None,
+            }
+        normalization_audit["layers"][layer] = layer_audit
     for column in feature_columns:
         work[column] = pd.to_numeric(work[column], errors="coerce")
     valid = work[feature_columns].notna().all(axis=1)
@@ -218,7 +251,7 @@ def collect_training_data(
     data: dict[str, dict[str, np.ndarray]] = {}
     for layer, part in parts.items():
         data[layer] = {key: np.concatenate(value, axis=0) for key, value in part.items()}
-    return data, group_codes
+    return data, group_codes, normalization_audit
 
 
 def classifier_metrics(y_true: np.ndarray, probability: np.ndarray, weight: np.ndarray) -> dict[str, Any]:
@@ -386,11 +419,19 @@ def main() -> int:
 
     started = time.time()
     payload = np.load(config["surface_lookup_cache_npz"])
+    normalization_contract_path = Path(config["attribute_normalization_contract_json"]).resolve()
+    normalization_contract = read_json(normalization_contract_path)
+    expected_contract_version = config.get("attribute_normalization_contract_version")
+    if expected_contract_version and normalization_contract.get("version") != expected_contract_version:
+        raise ValueError(
+            f"attribute normalization contract mismatch: {normalization_contract.get('version')} "
+            f"!= {expected_contract_version}"
+        )
     lookups: dict[str, cKDTree] = {}
     for code in ("top", "mid", "base"):
         lookups[code] = cKDTree(np.column_stack([payload[f"{code}_x"], payload[f"{code}_y"]]))
     feature_columns = list(config["feature_columns"])
-    data, group_codes = collect_training_data(
+    data, group_codes, normalization_audit = collect_training_data(
         input_csv=Path(config["unified_samples_csv"]),
         lookups=lookups,
         payload=payload,
@@ -398,6 +439,7 @@ def main() -> int:
         max_distance=float(config["max_horizon_match_distance_m"]),
         chunksize=int(config["training_chunksize"]),
         max_rows=int(args.max_rows),
+        normalization_contract=normalization_contract,
     )
     model_bundles: dict[str, Any] = {}
     layer_summaries: dict[str, Any] = {}
@@ -424,7 +466,22 @@ def main() -> int:
     checks = {
         "models_for_both_layers": sorted(model_bundles) == sorted(("上部复合层", "太古界风化壳")),
         "window_code_not_a_feature": "WindowCode" not in feature_columns,
-        "required_mult_attributes_present": all(name in feature_columns for name in ("Coherence", "AntTrack", "CurvatureMax")),
+        "required_mult_attributes_present": all(
+            name in feature_columns for name in ("CoherenceScore", "AntTrackScore", "CurvatureMaxScore")
+        ),
+        "raw_attributes_not_model_features": not any(
+            name in feature_columns for name in ("Coherence", "AntTrack", "CurvatureMax")
+        ),
+        "common_contract_version_matches": normalization_contract.get("version") == expected_contract_version,
+        "anttrack_minus_one_retained": sum(
+            layer["AntTrack"]["raw_minus_one"] for layer in normalization_audit["layers"].values()
+        ) > 0,
+        "all_attribute_scores_finite": all(
+            attribute["score_finite"] == layer["rows"]
+            for layer in normalization_audit["layers"].values()
+            for attribute_name, attribute in layer.items()
+            if attribute_name in ("Coherence", "AntTrack", "CurvatureMax")
+        ),
         "all_folds_source_well_disjoint": all(row["source_well_overlap_count"] == 0 for row in fold_rows),
         "all_layers_have_positive_density_rows": all(
             summary["positive_rows"] > 0 for summary in layer_summaries.values()
@@ -436,7 +493,10 @@ def main() -> int:
         "contract_version": config["version"],
         "model_logic": "presence_probability_times_conditional_density",
         "feature_columns": feature_columns,
-        "attribute_columns": ["Coherence", "AntTrack", "CurvatureMax"],
+        "raw_attribute_columns": ["Coherence", "AntTrack", "CurvatureMax"],
+        "attribute_score_columns": ["CoherenceScore", "AntTrackScore", "CurvatureMaxScore"],
+        "attribute_normalization_contract": normalization_contract,
+        "attribute_normalization_contract_path": str(normalization_contract_path),
         "models": model_bundles,
         "prediction_sample_interval_ms": 2.0,
         "training_input": str(Path(config["unified_samples_csv"]).resolve()),
@@ -482,6 +542,7 @@ def main() -> int:
         "imaging_density_reference": imaging_density_reference(
             Path(config["step3_groups_root"]), strong_wells
         ),
+        "attribute_normalization_audit": normalization_audit,
         "layer_summaries": layer_summaries,
         "fold_details": fold_rows,
         "checks": checks,

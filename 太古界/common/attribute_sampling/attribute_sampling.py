@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""Streaming nearest-trace sampler for 太古界 seismic attributes.
+"""Streaming unified-TraceIdx sampler for 太古界 seismic attributes.
 
-The attribute SEG-Y files use their own full-grid trace headers and a 1 ms
-time axis.  This module deliberately does not assume that their trace order is
-the OBN trace order.  X/Y are read from each attribute file, and samples are
-interpolated in TWT milliseconds.
+The three attribute SEG-Y files share the project attribute-grid TraceIdx;
+this is deliberately independent of the OBN trace order.  X/Y is used once
+to locate that reference TraceIdx, then all three attributes are read using
+the same index and interpolated in absolute TWT milliseconds.
 """
 
 from __future__ import annotations
@@ -19,6 +19,7 @@ from scipy.spatial import cKDTree
 
 
 ATTRIBUTE_NAMES = ("Coherence", "AntTrack", "CurvatureMax")
+REFERENCE_ATTRIBUTE = "CurvatureMax"
 
 
 def _header_xy(handle: Any) -> np.ndarray:
@@ -130,7 +131,16 @@ class MultiAttributeSampler:
     ):
         invalid_rules = invalid_rules or {}
         time_origins_ms = time_origins_ms or {}
-        first_name = ATTRIBUTE_NAMES[0]
+        first_name = REFERENCE_ATTRIBUTE
+        # AntTrack=-1 is a valid low-fracture response, not a SEG-Y null.
+        # Reject stale caller configurations explicitly instead of silently
+        # converting physical low values into missing data.
+        ant_rule = invalid_rules.get("AntTrack", {})
+        if ant_rule.get("invalid_le") is not None:
+            raise ValueError(
+                "AntTrack invalid_le is forbidden: -1 is valid low fracture evidence; "
+                "remove this stale invalid-value rule."
+            )
         first = SegyAttributeSampler(
             first_name,
             Path(volume_paths[first_name]),
@@ -138,7 +148,9 @@ class MultiAttributeSampler:
             time_origin_ms=time_origins_ms.get(first_name),
         )
         self.samplers = {first_name: first}
-        for name in ATTRIBUTE_NAMES[1:]:
+        for name in ATTRIBUTE_NAMES:
+            if name == first_name:
+                continue
             self.samplers[name] = SegyAttributeSampler(
                 name,
                 Path(volume_paths[name]),
@@ -158,12 +170,20 @@ class MultiAttributeSampler:
         self.close()
 
     def sample_at_xy(self, x: np.ndarray, y: np.ndarray, times_ms: np.ndarray) -> dict[str, np.ndarray]:
-        output: dict[str, np.ndarray] = {}
+        x = np.asarray(x, dtype=np.float64)
+        y = np.asarray(y, dtype=np.float64)
+        times = np.asarray(times_ms, dtype=np.float64)
+        trace_idx, distance = self.samplers[REFERENCE_ATTRIBUTE].nearest_trace(x, y)
+        output: dict[str, np.ndarray] = {
+            "TraceIdx": trace_idx,
+            "NearestTraceDistM": distance,
+        }
         for name, sampler in self.samplers.items():
-            values = sampler.sample_at_xy(x, y, times_ms)
-            output[name] = values[name]
-            output[f"{name}TraceIdx"] = values["TraceIdx"]
-            output[f"{name}NearestTraceDistM"] = values["NearestTraceDistM"]
+            output[name] = sampler.sample_at_trace(trace_idx, times)
+            # Kept temporarily for downstream compatibility; all are equal
+            # by construction under the unified TraceIdx contract.
+            output[f"{name}TraceIdx"] = trace_idx
+            output[f"{name}NearestTraceDistM"] = distance
         return output
 
     def metadata(self) -> dict[str, Any]:

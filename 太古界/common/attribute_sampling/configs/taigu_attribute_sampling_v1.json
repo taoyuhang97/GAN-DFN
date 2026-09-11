@@ -5,9 +5,7 @@
     "AntTrack": "/data/shared/project-oil/wx数据/埕岛太古界/体数据/Chengdao-Taigujie-AntTracking.sgy",
     "CurvatureMax": "/data/shared/project-oil/wx数据/埕岛太古界/体数据/Chengdao-Taigujie-Most Positive Curvature.sgy"
   },
-  "invalid_rules": {
-    "AntTrack": {"invalid_le": -0.99}
-  },
+  "invalid_rules": {},
   "time_origins_ms": {
     "Coherence": 1800.0,
     "AntTrack": 1800.0,

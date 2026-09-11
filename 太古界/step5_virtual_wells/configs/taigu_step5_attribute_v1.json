@@ -1,6 +1,6 @@
 {
-  "version": "taigu_step5_attribute_v1",
-  "output_dir": "/home/tyh/projects/petroleum/code/GAN-DFN/太古界/step5_virtual_wells/output/taigu_step5_attribute_v1",
+  "version": "taigu_step5_attribute_v2_common_contract",
+  "output_dir": "/home/tyh/projects/petroleum/code/GAN-DFN/太古界/step5_virtual_wells/output/taigu_step5_attribute_v2_common_contract",
   "step4_merged_predictions_csv": "/home/tyh/projects/petroleum/code/GAN-DFN/太古界/step4_fracture_prediction/output/taigu_step4_gr_rd_rs_v1/predictions/all_wells_merged_density_prediction.csv",
   "step2_well_metadata_csv": "/home/tyh/projects/petroleum/code/GAN-DFN/太古界/step2_well_log_segments/output/taigu_step2_regular_v3/taigu_step2_well_metadata.csv",
   "step3_groups_root": "/home/tyh/projects/petroleum/code/GAN-DFN/太古界/step3_imaging_groups/output/taigu_step3_imaging_v3/groups",
@@ -12,20 +12,20 @@
     "AntTrack": "/data/shared/project-oil/wx数据/埕岛太古界/体数据/Chengdao-Taigujie-AntTracking.sgy",
     "CurvatureMax": "/data/shared/project-oil/wx数据/埕岛太古界/体数据/Chengdao-Taigujie-Most Positive Curvature.sgy"
   },
-  "attribute_invalid_rules": {
-    "AntTrack": {"invalid_le": -0.99}
-  },
+  "attribute_invalid_rules": {},
   "attribute_time_origins_ms": {"Coherence": 1800.0, "AntTrack": 1800.0, "CurvatureMax": 1800.0},
+  "attribute_normalization_contract_json": "/home/tyh/projects/petroleum/code/GAN-DFN/太古界/common/attribute_sampling/output/taigu_attribute_contract_v2/attribute_normalization_contract.json",
+  "attribute_normalization_contract_version": "taigu_attribute_contract_v2",
   "selected_wells": ["埕北301", "埕北303", "埕北321", "埕北38", "埕北39", "埕北古10", "埕北古16", "埕北古406", "埕北古斜14", "埕北古斜19", "埕北古斜405"],
   "attribute_weights": {
     "CurvatureMax": 0.7,
     "Coherence": 0.15,
     "AntTrack": 0.15
   },
-  "attribute_scale_floors": {
-    "CurvatureMax": 0.01,
-    "Coherence": 0.02,
-    "AntTrack": 0.02
+  "attribute_score_scales": {
+    "CurvatureMax": 0.2,
+    "Coherence": 0.2,
+    "AntTrack": 0.2
   },
   "neighborhood_radius": 2,
   "max_time_shift_ms": 60.0,
