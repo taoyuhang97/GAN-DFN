@@ -18,13 +18,10 @@ from scipy.spatial import cKDTree
 CURRENT_DIR = Path(__file__).resolve().parent
 FORMAL_ROOT = CURRENT_DIR.parent
 REPO_ROOT = CURRENT_DIR.parents[2]
-LEGACY_STEP7B_DIR = CURRENT_DIR.parent / "step7b_initial_dfn_3d"
 DEFAULT_CONFIG = CURRENT_DIR / "configs/formal_candidate_cheye1_step7c_large_v1.json"
 if str(FORMAL_ROOT) not in sys.path:
     sys.path.insert(0, str(FORMAL_ROOT))
-if str(LEGACY_STEP7B_DIR) not in sys.path:
-    sys.path.insert(0, str(LEGACY_STEP7B_DIR))
-import build_initial_dfn_from_3d_density_sgy as legacy  # noqa: E402
+from common.dfn_geometry import initial_dfn_geometry as geometry  # noqa: E402
 from common.horizon_trace_table.horizon_contract import (  # noqa: E402
     HorizonSpatialLookup,
     build_spatial_lookup,
@@ -445,7 +442,7 @@ def make_patch(
         "DensityCellID": f"{source_type}_{patch_id}",
         "DensityCellPatchOrdinal": int(max(ordinal, 1)),
         "LayerGroup": layer,
-        "LayerCode": legacy.LAYER_CODE.get(layer, 0),
+        "LayerCode": geometry.LAYER_CODE.get(layer, 0),
         "CenterX": float(center[0]),
         "CenterY": float(center[1]),
         "CenterTime": float(center[2]),
@@ -1006,8 +1003,8 @@ def build_large_lowcoh_supplements(config: dict[str, Any]) -> pd.DataFrame:
 
     if not config.get("large_prior_sgy"):
         return pd.DataFrame()
-    grid = legacy.load_density_grid(Path(config["large_prior_sgy"]).resolve(), Path(config["trace_mapping_npz"]).resolve())
-    mask_grid = legacy.load_density_grid(Path(config["large_mask_sgy"]).resolve(), Path(config["trace_mapping_npz"]).resolve())["density"]
+    grid = geometry.load_density_grid(Path(config["large_prior_sgy"]).resolve(), Path(config["trace_mapping_npz"]).resolve())
+    mask_grid = geometry.load_density_grid(Path(config["large_mask_sgy"]).resolve(), Path(config["trace_mapping_npz"]).resolve())["density"]
     trace_mapping_path = Path(config["trace_mapping_npz"]).resolve()
     with np.load(trace_mapping_path) as mapping_npz:
         mapping = {key: mapping_npz[key] for key in mapping_npz.files}
@@ -1035,7 +1032,7 @@ def build_large_lowcoh_supplements(config: dict[str, Any]) -> pd.DataFrame:
         length = float(np.clip(length, float(config.get("min_lowcoh_length_m", 120.0)), float(config.get("max_lowcoh_length_m", 480.0))))
         height = float(np.clip(height, float(config.get("min_lowcoh_height_ms", 35.0)), float(config.get("max_lowcoh_height_ms", 180.0))))
         layer = "沙三段"
-        if legacy.layer_mask_for_grid("沙四段", grid["samples"], surfaces)[yy, xx, tt].sum() > yy.size / 2:
+        if geometry.layer_mask_for_grid("沙四段", grid["samples"], surfaces)[yy, xx, tt].sum() > yy.size / 2:
             layer = "沙四段"
         rows.append(
             make_patch(

@@ -6,7 +6,7 @@
   "step6a_prediction_summary_json": "/home/tyh/projects/petroleum/code/GAN-DFN/太古界/step6a_density_volume/output/taigu_step6a_common_contract_v4/volume/prediction_summary.json",
   "expected_step6a_model_contract_version": "taigu_step6a_common_contract_v4",
   "trace_mapping_npz": "/home/tyh/projects/petroleum/code/GAN-DFN/太古界/step6a_density_volume/output/taigu_step6a_common_contract_v4/volume/trace_mapping.npz",
-  "demo_grid_csv": "/home/tyh/projects/petroleum/code/GAN-DFN/太古界/step7a_small_scale_dfn/output/taigu_attribute_demo_grid_v3/demo_grid.csv",
+  "demo_grid_csv": "/home/tyh/projects/petroleum/code/GAN-DFN/太古界/common/attribute_demo_grid/output/taigu_attribute_demo_grid_v1/attribute_demo_grid.csv",
   "horizon_contract_csv": "/home/tyh/projects/petroleum/code/GAN-DFN/太古界/common/horizon_contract/output/taigu_attribute_full_horizon_contract_v1/demo_horizon_contract.csv",
   "step3_groups_root": "/home/tyh/projects/petroleum/code/GAN-DFN/太古界/step3_imaging_groups/output/taigu_step3_imaging_v3/groups",
   "step2_segments_root": "/home/tyh/projects/petroleum/code/GAN-DFN/太古界/step2_well_log_segments/output/taigu_step2_regular_v3",

@@ -10,6 +10,7 @@ import numpy as np
 import pandas as pd
 import pyvista as pv
 from scipy import ndimage
+from tqdm import tqdm
 
 CURRENT_DIR = Path(__file__).resolve().parent
 TAIGU_ROOT = CURRENT_DIR.parents[1]
@@ -35,6 +36,7 @@ from common.multiscale_density.build_multiscale_density_bundle import (
     write_sgy_like,
 )
 from common.multiscale_density.build_multiscale_density_bundle import _resample_matrix
+from common.attribute_sampling.attribute_contract import score_attribute
 
 
 FORMAL_ROOT = CURRENT_DIR.parent
@@ -42,12 +44,14 @@ if str(FORMAL_ROOT) not in sys.path:
     sys.path.insert(0, str(FORMAL_ROOT))
 
 from horizon_trace_table.horizon_contract import (  # noqa: E402
+    HorizonTraceContract,
     apply_validity_inplace,
     contract_summary,
     load_contract_for_mapping,
     surface_grids_from_contract,
     validate_window_contract,
 )
+from step6a_density_volume.predict_taigu_density_volume import fill_missing_horizons_nearest  # noqa: E402
 
 DEFAULT_CONFIG = CURRENT_DIR.parent / "configs/formal_candidate_cheye1_multiscale_density_v1.json"
 DEFAULT_OUTPUT_DIR = CURRENT_DIR.parent / "output/default/step6b_medium"
@@ -66,16 +70,203 @@ def quantile_bounds(values: np.ndarray, low_q: float, high_q: float) -> tuple[fl
     return low, high
 
 
+def load_attribute_matrix(
+    path: Path,
+    source_trace_idx: np.ndarray,
+    absolute_samples: np.ndarray,
+    label: str,
+    absolute_time_origin_ms: float,
+) -> tuple[np.ndarray, dict[str, Any]]:
+    """Read an attribute on the project absolute-TWT axis."""
+    raw_samples, raw_summary = read_sgy_sample_axis(path)
+    raw_target = np.asarray(absolute_samples, dtype=np.float64) - float(absolute_time_origin_ms) + float(raw_samples[0])
+    matrix, _, load_summary = load_trace_matrix(path, source_trace_idx, raw_target, label)
+    load_summary.update(
+        {
+            "raw_time_min_ms": float(raw_samples[0]),
+            "raw_time_max_ms": float(raw_samples[-1]),
+            "absolute_time_origin_ms": float(absolute_time_origin_ms),
+            "absolute_time_min_ms": float(raw_samples[0] - raw_samples[0] + absolute_time_origin_ms),
+            "absolute_time_max_ms": float(raw_samples[-1] - raw_samples[0] + absolute_time_origin_ms),
+            "target_absolute_time_min_ms": float(absolute_samples[0]),
+            "target_absolute_time_max_ms": float(absolute_samples[-1]),
+            "source_trace_count": int(raw_summary["trace_count"]),
+        }
+    )
+    return matrix, load_summary
+
+
+def load_taigu_horizon_contract(
+    config: dict[str, Any], mapping: dict[str, np.ndarray]
+) -> HorizonTraceContract:
+    """Load the semantic three-surface table and reproduce Step6A horizon fill."""
+    csv_value = config.get("horizon_contract_csv")
+    if not csv_value:
+        return load_contract_for_mapping(config, mapping)
+    path = Path(str(csv_value)).resolve()
+    source_trace_idx = np.asarray(mapping["source_trace_idx"], dtype=np.int64)
+    contract_trace_idx = source_trace_idx
+    table = pd.read_csv(
+        path,
+        encoding="utf-8-sig",
+        usecols=["TraceIdx", "TopTimeMs", "MidTimeMs", "BaseTimeMs", "SurfaceValid"],
+    )
+    for column in table.columns:
+        table[column] = pd.to_numeric(table[column], errors="coerce")
+    if len(table) == 0 or int(contract_trace_idx.min()) < 0 or int(contract_trace_idx.max()) >= len(table):
+        raise ValueError("attribute trace mapping exceeds semantic horizon contract")
+    selected = table.iloc[contract_trace_idx].copy().reset_index(drop=True)
+    if not np.array_equal(selected["TraceIdx"].to_numpy(dtype=np.int64), contract_trace_idx):
+        raise ValueError("semantic horizon contract row index does not equal TraceIdx")
+    selected["X"] = np.asarray(mapping["x"], dtype=np.float64)
+    selected["Y"] = np.asarray(mapping["y"], dtype=np.float64)
+    if bool(config.get("horizon_fill_enabled", True)):
+        selected = fill_missing_horizons_nearest(
+            selected,
+            max_distance_m=float(config.get("max_horizon_fill_distance_m", 25.0)),
+            min_thickness_ms=float(config.get("min_horizon_thickness_ms", 1.0)),
+        )
+        valid = selected["FilledSurfaceValid"].to_numpy(dtype=bool, copy=True)
+        correction = selected["HorizonFillUsed"].to_numpy(dtype=np.uint8)
+    else:
+        valid = selected["SurfaceValid"].fillna(0).to_numpy(dtype=bool, copy=True)
+        correction = np.zeros(len(selected), dtype=np.uint8)
+    top = selected["TopTimeMs"].to_numpy(dtype=np.float32)
+    middle = selected["MidTimeMs"].to_numpy(dtype=np.float32)
+    bottom = selected["BaseTimeMs"].to_numpy(dtype=np.float32)
+    min_thickness = float(config.get("min_horizon_thickness_ms", 1.0))
+    valid &= np.isfinite(top) & np.isfinite(middle) & np.isfinite(bottom)
+    valid &= (middle - top >= min_thickness) & (bottom - middle >= min_thickness)
+    return HorizonTraceContract(
+        table_path=path,
+        trace_idx=source_trace_idx.copy(),
+        t4=top,
+        t5=middle.copy(),
+        t6=middle,
+        t7=bottom,
+        surface_order_valid=valid,
+        shasan_present=valid.copy(),
+        shasi_present=valid.copy(),
+        correction_code=correction,
+    )
+
+
+def validate_attribute_mapping_contract(
+    mapping: dict[str, np.ndarray],
+    attribute_header_csv: Path,
+    step6a_mapping_npz: Path,
+    density_trace_count: int,
+    xy_tolerance_m: float,
+) -> dict[str, Any]:
+    """Reject OBN indices and any reordering between Step6A and Step6B."""
+    lengths = {key: len(np.asarray(mapping[key])) for key in ("source_trace_idx", "x", "y", "ix", "iy", "output_trace_index")}
+    if len(set(lengths.values())) != 1:
+        raise ValueError(f"attribute mapping arrays have different lengths: {lengths}")
+    trace_count = lengths["source_trace_idx"]
+    trace_idx = np.asarray(mapping["source_trace_idx"], dtype=np.int64)
+    output_idx = np.asarray(mapping["output_trace_index"], dtype=np.int64)
+    ix = np.asarray(mapping["ix"], dtype=np.int32)
+    iy = np.asarray(mapping["iy"], dtype=np.int32)
+    if density_trace_count != trace_count:
+        raise ValueError(f"Step6A density trace count differs from attribute grid: {density_trace_count} != {trace_count}")
+    if not np.array_equal(output_idx, np.arange(trace_count, dtype=np.int64)):
+        raise ValueError("attribute mapping output_trace_index is not sequential")
+    if len(np.unique(trace_idx)) != trace_count:
+        raise ValueError("attribute mapping contains duplicate source TraceIdx")
+    if len(np.unique(np.column_stack([ix, iy]), axis=0)) != trace_count:
+        raise ValueError("attribute mapping contains duplicate IX/IY cells")
+    expected_count = int((ix.max() + 1) * (iy.max() + 1))
+    if trace_count != expected_count:
+        raise ValueError(f"attribute mapping is not a complete rectangle: {trace_count} != {expected_count}")
+
+    header = pd.read_csv(attribute_header_csv, usecols=["TraceIdx", "X", "Y"], encoding="utf-8-sig")
+    for column in ("TraceIdx", "X", "Y"):
+        header[column] = pd.to_numeric(header[column], errors="coerce")
+    header = header.dropna().drop_duplicates("TraceIdx").set_index("TraceIdx")
+    selected = header.reindex(trace_idx)
+    if selected[["X", "Y"]].isna().any().any():
+        raise ValueError("Step6B mapping contains TraceIdx absent from the attribute trace header")
+    header_distance = np.hypot(
+        selected["X"].to_numpy(float) - np.asarray(mapping["x"], dtype=float),
+        selected["Y"].to_numpy(float) - np.asarray(mapping["y"], dtype=float),
+    )
+    if float(header_distance.max()) > xy_tolerance_m:
+        raise ValueError(
+            "Step6B TraceIdx does not match attribute-header X/Y: "
+            f"max_distance={float(header_distance.max()):.3f}m; an OBN mapping may have been supplied"
+        )
+
+    with np.load(step6a_mapping_npz) as step6a_mapping:
+        required = {"trace_idx", "x", "y", "output_trace_index"}
+        missing = sorted(required.difference(step6a_mapping.files))
+        if missing:
+            raise ValueError(f"Step6A trace mapping missing fields: {missing}")
+        step6a_trace_idx = np.asarray(step6a_mapping["trace_idx"], dtype=np.int64)
+        step6a_output_idx = np.asarray(step6a_mapping["output_trace_index"], dtype=np.int64)
+        step6a_x = np.asarray(step6a_mapping["x"], dtype=float)
+        step6a_y = np.asarray(step6a_mapping["y"], dtype=float)
+    if not np.array_equal(step6a_output_idx, output_idx):
+        raise ValueError("Step6A output order differs from the Common attribute demo grid")
+    if not np.array_equal(step6a_trace_idx, trace_idx):
+        raise ValueError("Step6A attribute TraceIdx differs from the Common attribute demo grid")
+    step6a_distance = np.hypot(step6a_x - np.asarray(mapping["x"], float), step6a_y - np.asarray(mapping["y"], float))
+    if float(step6a_distance.max()) > xy_tolerance_m:
+        raise ValueError("Step6A coordinates differ from the Common attribute demo grid")
+    return {
+        "status": "pass",
+        "contract": "attribute_trace_idx_only_no_obn_trace_idx",
+        "trace_count": trace_count,
+        "x_line_count": int(ix.max() + 1),
+        "y_line_count": int(iy.max() + 1),
+        "attribute_header_xy_distance_max_m": float(header_distance.max()),
+        "attribute_header_xy_distance_median_m": float(np.median(header_distance)),
+        "step6a_grid_xy_distance_max_m": float(step6a_distance.max()),
+        "step6a_trace_order_identical": True,
+    }
+
+
+def score_by_semantic_layer(
+    values: np.ndarray,
+    valid: np.ndarray,
+    attribute: str,
+    contract: dict[str, Any],
+    horizons: HorizonTraceContract,
+    samples: np.ndarray,
+) -> tuple[np.ndarray, dict[str, Any]]:
+    """Apply the saved Common normalization limits separately by layer."""
+    score = np.zeros_like(values, dtype=np.float32)
+    axis = np.asarray(samples, dtype=np.float64)[None, :]
+    layer_masks = {
+        "上部复合层": horizons.surface_order_valid[:, None] & (axis >= horizons.t4[:, None]) & (axis < horizons.t6[:, None]),
+        "太古界风化壳": horizons.surface_order_valid[:, None] & (axis >= horizons.t6[:, None]) & (axis <= horizons.t7[:, None]),
+    }
+    layer_summary: dict[str, Any] = {}
+    for layer, layer_mask in layer_masks.items():
+        mask = layer_mask & valid
+        scored = score_attribute(values, attribute, contract["layers"][layer][attribute])
+        score[mask] = scored[mask]
+        layer_summary[layer] = {
+            "valid_count": int(mask.sum()),
+            "clip_low": float(contract["layers"][layer][attribute]["clip_low"]),
+            "clip_high": float(contract["layers"][layer][attribute]["clip_high"]),
+            "polarity": str(contract["layers"][layer][attribute]["polarity"]),
+            "score_stats": finite_stats(score[mask]),
+        }
+    score[~valid] = 0.0
+    return score, {"contract_version": contract.get("version"), "layers": layer_summary}
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Step6B medium-scale fracture corridor prior.")
     parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
-    parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
+    parser.add_argument("--output-dir", type=Path, default=None)
+    parser.add_argument("--max-x-lines", type=int, default=0, help="Smoke-test cap; 0 uses the full grid.")
     parser.add_argument("--candidate-quantile", type=float, default=0.0, help=argparse.SUPPRESS)
     parser.add_argument("--anttrack-high-quantile", type=float, default=0.90)
     parser.add_argument("--anttrack-weight", type=float, default=0.70)
     parser.add_argument("--lowcoh-weight", type=float, default=0.20)
     parser.add_argument("--curvature-weight", type=float, default=0.10)
-    parser.add_argument("--density-weight", type=float, default=0.15)
+    parser.add_argument("--density-weight", type=float, default=0.0, help=argparse.SUPPRESS)
     parser.add_argument("--seed-medium-score-threshold", type=float, default=0.62)
     parser.add_argument("--growth-anttrack-floor", type=float, default=0.28)
     parser.add_argument("--growth-medium-score-threshold", type=float, default=0.52)
@@ -105,6 +296,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--fragment-recovery-min-voxels", type=int, default=15)
     parser.add_argument("--fragment-bridge-score", type=float, default=0.45)
     parser.add_argument("--fragment-bridge-iterations", type=int, default=1)
+    parser.add_argument("--fragment-recovery-min-anttrack-mean", type=float, default=0.80)
+    parser.add_argument("--fragment-bridge-min-anttrack-score", type=float, default=0.35)
     parser.add_argument("--max-component-voxels-before-split", type=int, default=12000)
     parser.add_argument("--split-tile-cells", type=int, default=16)
     parser.add_argument("--split-time-samples", type=int, default=8)
@@ -208,11 +401,14 @@ def retain_seeded_growth(seed_grid: np.ndarray, growth_grid: np.ndarray) -> tupl
 def repair_fragmented_candidates(
     mask: np.ndarray,
     score: np.ndarray,
+    anttrack_score: np.ndarray,
     valid: np.ndarray,
     min_component_voxels: int,
     recovery_min_voxels: int,
     bridge_score: float,
     bridge_iterations: int,
+    recovery_min_anttrack_mean: float,
+    bridge_min_anttrack_score: float,
 ) -> tuple[np.ndarray, dict[str, Any]]:
     """Conservatively recover fragments near an already viable component."""
     structure = np.ones((3, 3, 3), dtype=np.uint8)
@@ -225,16 +421,35 @@ def repair_fragmented_candidates(
     bridge = np.zeros_like(repaired, dtype=bool)
     recovered_components = 0
     recovered_voxels = 0
-    near_large = ndimage.binary_dilation(large, structure=structure, iterations=max(int(bridge_iterations), 1))
-    for label_id in small_labels:
-        small = labels == int(label_id)
-        if not np.any(small & near_large):
+    rejected_weak_anttrack_components = 0
+    iterations = max(int(bridge_iterations), 1)
+    near_large = ndimage.binary_dilation(large, structure=structure, iterations=iterations)
+    component_slices = ndimage.find_objects(labels, max_label=count)
+    for label_id in tqdm(small_labels, desc="Step6B fragment repair", unit="component"):
+        component_slice = component_slices[int(label_id) - 1]
+        if component_slice is None:
             continue
-        local = ndimage.binary_dilation(small, structure=structure, iterations=max(int(bridge_iterations), 1))
-        additions = local & near_large & ~repaired & valid & (score >= float(bridge_score))
+        padded_slice = tuple(
+            slice(max(int(axis.start) - iterations, 0), min(int(axis.stop) + iterations, labels.shape[dim]))
+            for dim, axis in enumerate(component_slice)
+        )
+        small = labels[padded_slice] == int(label_id)
+        local_anttrack = anttrack_score[padded_slice]
+        if float(np.mean(local_anttrack[small])) < float(recovery_min_anttrack_mean):
+            rejected_weak_anttrack_components += 1
+            continue
+        local = ndimage.binary_dilation(small, structure=structure, iterations=iterations)
+        additions = (
+            local
+            & near_large[padded_slice]
+            & ~repaired[padded_slice]
+            & valid[padded_slice]
+            & (score[padded_slice] >= float(bridge_score))
+            & (local_anttrack >= float(bridge_min_anttrack_score))
+        )
         if not np.any(additions):
             continue
-        bridge |= additions
+        bridge[padded_slice] |= additions
         recovered_components += 1
         recovered_voxels += int(additions.sum())
     repaired |= bridge
@@ -242,11 +457,14 @@ def repair_fragmented_candidates(
         "initial_component_count": int(count),
         "small_component_count": int(len(small_labels)),
         "recovered_component_count": int(recovered_components),
+        "rejected_weak_anttrack_component_count": int(rejected_weak_anttrack_components),
         "bridge_voxel_count": int(recovered_voxels),
         "repaired_candidate_voxel_count": int(repaired.sum()),
         "fragment_recovery_min_voxels": int(recovery_min_voxels),
         "fragment_bridge_score": float(bridge_score),
         "fragment_bridge_iterations": int(bridge_iterations),
+        "fragment_recovery_min_anttrack_mean": float(recovery_min_anttrack_mean),
+        "fragment_bridge_min_anttrack_score": float(bridge_min_anttrack_score),
     }
 
 
@@ -285,7 +503,7 @@ def build_medium_components(
     # becomes prohibitively expensive for the 10 km / 2 ms grid.  Compute the
     # component bounding boxes once and search only inside each local box.
     component_slices = ndimage.find_objects(raw_labels, max_label=raw_count)
-    for raw_id in range(1, raw_count + 1):
+    for raw_id in tqdm(range(1, raw_count + 1), desc="Step6B component QC", unit="component"):
         if int(sizes[raw_id]) <= 0:
             continue
         component_slice = component_slices[raw_id - 1]
@@ -476,7 +694,14 @@ def main() -> int:
         "fragment_recovery_min_voxels",
         "fragment_bridge_score",
         "fragment_bridge_iterations",
+        "fragment_recovery_min_anttrack_mean",
+        "fragment_bridge_min_anttrack_score",
+        "seed_medium_score_threshold",
+        "growth_anttrack_floor",
+        "growth_medium_score_threshold",
         "min_component_score_mean",
+        "min_component_dip_deg",
+        "min_component_linearity",
     ):
         if name in medium_cfg:
             setattr(args, name, medium_cfg[name])
@@ -487,28 +712,62 @@ def main() -> int:
     ):
         if key in medium_cfg:
             setattr(args, attr, medium_cfg[key])
-    output_dir = args.output_dir.resolve()
+    output_dir = (args.output_dir or Path(config.get("output_dir", DEFAULT_OUTPUT_DIR))).resolve()
     ensure_dir(output_dir)
     rng = np.random.default_rng(int(args.random_state))
 
     input_density_sgy = Path(config["input_density_sgy"]).resolve()
+    step6a_summary: dict[str, Any] | None = None
+    if config.get("step6a_prediction_summary_json"):
+        step6a_summary_path = Path(config["step6a_prediction_summary_json"]).resolve()
+        step6a_summary = read_json(step6a_summary_path)
+        if step6a_summary.get("status") != "pass":
+            raise RuntimeError("configured Step6A prediction summary is not pass")
+        declared_density = Path(step6a_summary["output_paths"]["density_sgy"]).resolve()
+        if declared_density != input_density_sgy:
+            raise RuntimeError(f"Step6B density input mismatch: {input_density_sgy} != {declared_density}")
+        expected_contract = config.get("expected_step6a_model_contract_version")
+        if expected_contract and step6a_summary.get("model_contract_version") != expected_contract:
+            raise RuntimeError(
+                f"Step6A contract mismatch: {step6a_summary.get('model_contract_version')} != {expected_contract}"
+            )
     trace_mapping_npz = Path(config["trace_mapping_npz"]).resolve()
     volume_paths = {key: Path(value).resolve() for key, value in dict(config["volume_paths"]).items()}
     mapping = load_mapping(trace_mapping_npz)
     source_trace_idx = mapping["source_trace_idx"].astype(np.int64)
     source_samples, density_load = read_sgy_sample_axis(input_density_sgy)
+    attribute_mapping_qc = validate_attribute_mapping_contract(
+        mapping,
+        Path(config["attribute_trace_header_csv"]).resolve(),
+        Path(config["step6a_trace_mapping_npz"]).resolve(),
+        int(density_load["trace_count"]),
+        float(config.get("attribute_grid_xy_tolerance_m", 2.0)),
+    )
+    if args.max_x_lines > 0:
+        keep = np.asarray(mapping["ix"], dtype=np.int32) < int(args.max_x_lines)
+        if not keep.any():
+            raise ValueError("--max-x-lines selected no attribute-grid traces")
+        full_count = len(keep)
+        mapping = {
+            key: np.asarray(value)[keep] if np.asarray(value).ndim == 1 and len(np.asarray(value)) == full_count else value
+            for key, value in mapping.items()
+        }
+        source_trace_idx = np.asarray(mapping["source_trace_idx"], dtype=np.int64)
     interval_ms = float(dict(config.get("medium_evidence", {})).get("sample_interval_ms", 10.0))
     samples = regular_sample_axis(source_samples, interval_ms)
     # Step6A 预测 SGY 已经是 demo 属性网格顺序，不是原始属性体 TraceIdx 顺序；
     # 因此直接按输出道序读取，不能再用 source_trace_idx 二次索引。
-    background_density, density_samples, background_load = load_trace_matrix(input_density_sgy, None, None, "Step6A density")
+    density_output_indices = np.asarray(mapping["output_trace_index"], dtype=np.int64)
+    background_density, density_samples, background_load = load_trace_matrix(
+        input_density_sgy, density_output_indices, samples, "Step6A density"
+    )
     if len(density_samples) != len(samples) or not np.allclose(density_samples, samples, atol=1.0e-6):
         background_density = _resample_matrix(background_density, density_samples, samples)
         background_load["target_sample_count"] = int(len(samples))
         background_load["target_sample_interval_ms"] = float(interval_ms)
     density_load["target_sample_count"] = int(len(samples))
     density_load["target_sample_interval_ms"] = interval_ms
-    horizon_contract = load_contract_for_mapping(config, mapping)
+    horizon_contract = load_taigu_horizon_contract(config, mapping)
     try:
         horizon_axis_qc = validate_window_contract(config, horizon_contract, samples)
     except (KeyError, ValueError) as exc:
@@ -516,17 +775,39 @@ def main() -> int:
         # 缺少专用窗口文件不应把中尺度流程整体判为无效。
         horizon_axis_qc = {"status": "contract_direct_interpolation", "warning": str(exc)}
 
-    print("[step6b-medium] loading seismic attributes", flush=True)
-    coherence, _, coh_load = load_trace_matrix(volume_paths["Coherence"], source_trace_idx, samples, "Coherence")
-    anttrack, _, ant_load = load_trace_matrix(volume_paths["AntTrack"], source_trace_idx, samples, "AntTrack")
-    curvmax, _, curvmax_load = load_trace_matrix(volume_paths["CurvatureMax"], source_trace_idx, samples, "CurvatureMax")
+    print("[step6b-medium] loading seismic attributes on absolute TWT axis", flush=True)
+    time_origins = {key: float(value) for key, value in dict(config["attribute_time_origins_ms"]).items()}
+    for attribute in ("Coherence", "AntTrack", "CurvatureMax"):
+        if attribute not in time_origins:
+            raise ValueError(f"attribute_time_origins_ms missing {attribute}")
+    coherence, coh_load = load_attribute_matrix(
+        volume_paths["Coherence"], source_trace_idx, samples, "Coherence", time_origins["Coherence"]
+    )
+    anttrack, ant_load = load_attribute_matrix(
+        volume_paths["AntTrack"], source_trace_idx, samples, "AntTrack", time_origins["AntTrack"]
+    )
+    curvmax, curvmax_load = load_attribute_matrix(
+        volume_paths["CurvatureMax"], source_trace_idx, samples, "CurvatureMax", time_origins["CurvatureMax"]
+    )
     if "CurvaturePos" in volume_paths:
-        curvpos, _, curvpos_load = load_trace_matrix(volume_paths["CurvaturePos"], source_trace_idx, samples, "CurvaturePos")
+        if "CurvaturePos" not in time_origins:
+            raise ValueError("attribute_time_origins_ms missing CurvaturePos")
+        curvpos, curvpos_load = load_attribute_matrix(
+            volume_paths["CurvaturePos"], source_trace_idx, samples, "CurvaturePos", time_origins["CurvaturePos"]
+        )
     else:
         curvpos = None
         curvpos_load = {"status": "not_configured"}
 
     score_cfg = dict(config.get("score_config", {}))
+    normalization_contract_path = Path(config["attribute_normalization_contract_json"]).resolve()
+    normalization_contract = read_json(normalization_contract_path)
+    expected_normalization_version = config.get("expected_attribute_normalization_contract_version")
+    if expected_normalization_version and normalization_contract.get("version") != expected_normalization_version:
+        raise RuntimeError(
+            f"attribute normalization contract mismatch: {normalization_contract.get('version')} "
+            f"!= {expected_normalization_version}"
+        )
     ant_cfg = dict(score_cfg.get("anttrack_score", {"low_quantile": 0.20, "high_quantile": 0.96}))
     coh_cfg = dict(score_cfg.get("coherence_score", {"valid_min": 0.0, "low_quantile": 0.05, "high_quantile": 0.95}))
     curvmax_cfg = dict(score_cfg.get("curvaturemax_score", {"low_quantile": 0.50, "high_quantile": 0.98}))
@@ -540,13 +821,21 @@ def main() -> int:
     apply_validity_inplace(curvmax_valid, horizon_contract, samples)
     if curvpos_valid is not None:
         apply_validity_inplace(curvpos_valid, horizon_contract, samples)
+    ant_minus_one_mask = np.isfinite(anttrack) & (anttrack <= -0.999)
+    ant_minus_one_inside_count = int(np.sum(ant_minus_one_mask & ant_valid))
     # 太古界属性局部缺失较多：候选有效性不再要求三属性同时存在；至少蚂蚁体、
     # 相干体或曲率体之一有效即可，综合评分按有效属性重新归一化。
     valid = ant_valid | coh_valid | curvmax_valid | (curvpos_valid if curvpos_valid is not None else False)
 
-    ant_score, ant_summary = high_score(anttrack, ant_valid, ant_cfg)
-    lowcoh_score, lowcoh_summary = low_score(coherence, coh_valid, coh_cfg)
-    curvmax_score, curvmax_summary = high_score(curvmax, curvmax_valid, curvmax_cfg)
+    ant_score, ant_summary = score_by_semantic_layer(
+        anttrack, ant_valid, "AntTrack", normalization_contract, horizon_contract, samples
+    )
+    lowcoh_score, lowcoh_summary = score_by_semantic_layer(
+        coherence, coh_valid, "Coherence", normalization_contract, horizon_contract, samples
+    )
+    curvmax_score, curvmax_summary = score_by_semantic_layer(
+        curvmax, curvmax_valid, "CurvatureMax", normalization_contract, horizon_contract, samples
+    )
     if curvpos is not None and curvpos_valid is not None:
         curvpos_score, curvpos_summary = high_score(curvpos, curvpos_valid, curvpos_cfg)
         curv_score = np.maximum(curvmax_score, curvpos_score).astype(np.float32)
@@ -557,11 +846,6 @@ def main() -> int:
     ant_grid, _, _ = flat_to_grid(ant_score, mapping)
     lowcoh_grid, _, _ = flat_to_grid(lowcoh_score, mapping)
     curv_grid, _, _ = flat_to_grid(curv_score, mapping)
-    density_valid = valid_values(background_density)
-    density_finite = background_density[density_valid]
-    dlow, dhigh = quantile_bounds(density_finite, 0.05, 0.95)
-    density_score = np.clip((background_density - dlow) / max(dhigh - dlow, 1.0e-6), 0.0, 1.0).astype(np.float32)
-    density_score[~density_valid] = 0.0
     local_support_grid, local_support_fraction_grid = build_local_support_grids(
         lowcoh_grid,
         curv_grid,
@@ -570,16 +854,18 @@ def main() -> int:
     )
     local_support = grid_to_flat(local_support_grid, mapping)
     local_support_fraction = grid_to_flat(local_support_fraction_grid, mapping)
+    if abs(float(args.density_weight)) > 1.0e-12:
+        raise ValueError("Step6A density must not participate in Step6B medium-scale scoring")
     weights = np.asarray(
-        [float(args.anttrack_weight), float(args.lowcoh_weight), float(args.curvature_weight), float(args.density_weight)],
+        [float(args.anttrack_weight), float(args.lowcoh_weight), float(args.curvature_weight)],
         dtype=np.float64,
     )
     if np.any(weights < 0.0) or float(weights.sum()) <= 0.0:
         raise ValueError("Step6B evidence weights must be non-negative and have a positive sum")
     weights /= float(weights.sum())
     # 有效属性逐体素重归一化，避免单个缺失属性把整条候选带判为无效。
-    score_terms = np.stack([ant_score, lowcoh_score, curv_score, density_score], axis=0)
-    valid_terms = np.stack([ant_valid, coh_valid, curvmax_valid | (curvpos_valid if curvpos_valid is not None else False), density_valid], axis=0)
+    score_terms = np.stack([ant_score, lowcoh_score, curv_score], axis=0)
+    valid_terms = np.stack([ant_valid, coh_valid, curvmax_valid | (curvpos_valid if curvpos_valid is not None else False)], axis=0)
     weight_grid = weights[:, None, None]
     medium_score = np.sum(score_terms * (weight_grid * valid_terms), axis=0)
     medium_score /= np.maximum(np.sum(weight_grid * valid_terms, axis=0), 1.0e-6)
@@ -614,11 +900,14 @@ def main() -> int:
     mask_grid, fragment_repair_summary = repair_fragmented_candidates(
         mask_grid,
         medium_grid,
+        ant_grid,
         valid_grid > 0.5,
         min_component_voxels=int(args.min_component_voxels),
         recovery_min_voxels=int(args.fragment_recovery_min_voxels),
         bridge_score=float(args.fragment_bridge_score),
         bridge_iterations=int(args.fragment_bridge_iterations),
+        recovery_min_anttrack_mean=float(args.fragment_recovery_min_anttrack_mean),
+        bridge_min_anttrack_score=float(args.fragment_bridge_min_anttrack_score),
     )
     raw_mask_flat = grid_to_flat(mask_grid.astype(np.float32), mapping) > 0.5
     branch_code_flat[raw_mask_flat] |= 2
@@ -640,6 +929,14 @@ def main() -> int:
     component_id_flat = grid_to_flat(component_id_grid.astype(np.float32), mapping).astype(np.int32)
     medium_score_filtered = medium_score.copy()
     medium_score_filtered[kept_mask_flat <= 0.0] = 0.0
+
+    x_pair_count = int(np.sum(kept_mask_grid[:, :-1, :] & kept_mask_grid[:, 1:, :]))
+    y_pair_count = int(np.sum(kept_mask_grid[:-1, :, :] & kept_mask_grid[1:, :, :]))
+    x_possible = max(int(np.sum(kept_mask_grid[:, :-1, :])), 1)
+    y_possible = max(int(np.sum(kept_mask_grid[:-1, :, :])), 1)
+    x_continuity = float(x_pair_count / x_possible)
+    y_continuity = float(y_pair_count / y_possible)
+    continuity_ratio = float(max(x_continuity, y_continuity) / max(min(x_continuity, y_continuity), 1.0e-9))
 
     write_sgy_like(output_dir / "medium_corridor_prior.sgy", input_density_sgy, medium_score_filtered, samples)
     component_df.to_csv(output_dir / "medium_corridor_component_summary.csv", index=False, encoding="utf-8-sig")
@@ -683,10 +980,31 @@ def main() -> int:
     )
     summary = {
         "status": "pass",
+        "version": config.get("version"),
         "input_density_sgy": str(input_density_sgy),
+        "step6a_input_contract": {
+            "summary_json": str(Path(config["step6a_prediction_summary_json"]).resolve())
+            if config.get("step6a_prediction_summary_json") else None,
+            "model_contract_version": step6a_summary.get("model_contract_version") if step6a_summary else None,
+            "attribute_normalization_contract_version": step6a_summary.get("attribute_normalization_contract_version")
+            if step6a_summary else None,
+        },
         "output_dir": str(output_dir),
+        "attribute_mapping_contract": attribute_mapping_qc,
+        "attribute_normalization_contract": {
+            "path": str(normalization_contract_path),
+            "version": normalization_contract.get("version"),
+            "mode": "saved Common limits applied separately in upper-composite and weathered-crust windows",
+            "full_normalized_volumes_saved": False,
+        },
         "sample_interval_ms": interval_ms,
         "sample_count": int(len(samples)),
+        "execution_grid": {
+            "trace_count": int(len(source_trace_idx)),
+            "x_line_count": int(np.asarray(mapping["ix"]).max() + 1),
+            "y_line_count": int(np.asarray(mapping["iy"]).max() + 1),
+            "max_x_lines_smoke_cap": int(args.max_x_lines),
+        },
         "horizon_contract": contract_summary(horizon_contract),
         "horizon_axis_qc": horizon_axis_qc,
         "horizon_mask_qc": horizon_mask_qc,
@@ -710,18 +1028,40 @@ def main() -> int:
         "fragment_repair": fragment_repair_summary,
         "score_formula": {
             "formula": "normalized weighted sum with AntTrack dominant",
-            "expression": "MediumScore = a*AntTrackScore + b*LowCoherenceScore + c*CurvatureScore + d*Step6ADensityScore",
+            "expression": "MediumScore = 0.70*AntTrackScore + 0.20*LowCoherenceScore + 0.10*CurvatureScore (renormalized over available attributes)",
             "anttrack_weight": float(weights[0]),
             "lowcoh_weight": float(weights[1]),
             "curvature_weight": float(weights[2]),
-            "density_weight": float(weights[3]),
+            "density_weight": 0.0,
+            "step6a_density_role": "grid, sample axis, and SGY output template only; excluded from medium-scale evidence",
             "candidate_logic": "strong AntTrack seeds plus lower-threshold weighted growth; retain only growth components containing seeds",
             "anttrack_polarity": "high normalized AntTrack response is fracture evidence",
+            "anttrack_minus_one_semantics": "valid weak/no-fracture response; included in normalization, not missing",
+            "anttrack_valid_min_inclusive": float(ant_cfg.get("valid_min", -1.0e30)),
+            "anttrack_minus_one_inside_valid_window_count": ant_minus_one_inside_count,
             "support_score_threshold": float(args.support_score_threshold),
             "support_neighborhood_cells": int(args.support_neighborhood_cells),
             "deprecated_rescue_flags_ignored": bool(
                 args.enable_supported_rescue_branch or args.enable_lowcoh_structure_rescue
             ),
+        },
+        "effective_component_filters": {
+            "min_component_voxels": int(args.min_component_voxels),
+            "min_component_dip_deg": float(args.min_component_dip_deg),
+            "min_component_linearity": float(args.min_component_linearity),
+            "min_component_score_mean": float(args.min_component_score_mean),
+            "fragment_recovery_min_voxels": int(args.fragment_recovery_min_voxels),
+            "fragment_recovery_min_anttrack_mean": float(args.fragment_recovery_min_anttrack_mean),
+            "fragment_bridge_min_anttrack_score": float(args.fragment_bridge_min_anttrack_score),
+        },
+        "spatial_continuity_qc": {
+            "x_neighbor_continuity": x_continuity,
+            "y_neighbor_continuity": y_continuity,
+            "directional_ratio": continuity_ratio,
+            "maximum_allowed_directional_ratio": float(config.get("max_directional_continuity_ratio", 3.0)),
+            "minimum_required_neighbor_continuity": float(config.get("min_neighbor_continuity", 0.10)),
+            "not_single_trace_fragmented": min(x_continuity, y_continuity) >= float(config.get("min_neighbor_continuity", 0.10)),
+            "not_directionally_overmerged": continuity_ratio <= float(config.get("max_directional_continuity_ratio", 3.0)),
         },
         "raw_candidate_voxel_count": int(raw_mask_flat.sum()),
         "raw_candidate_voxel_fraction": float(raw_mask_flat.mean()),
@@ -761,7 +1101,7 @@ def main() -> int:
             "low_coherence": lowcoh_summary,
             "curvaturemax": curvmax_summary,
             "curvaturepos": curvpos_summary,
-            "step6a_density": background_load,
+            "step6a_density_grid_contract": background_load,
         },
         "vtk": vtk_summary,
         "reflection": (
@@ -773,6 +1113,9 @@ def main() -> int:
     if max_component_fraction > 0.40:
         summary["status"] = "warn"
         summary["warning"] = "largest medium component still exceeds 40% of kept voxels; Step7B must handle local continuity carefully"
+    if not summary["spatial_continuity_qc"]["not_single_trace_fragmented"] or not summary["spatial_continuity_qc"]["not_directionally_overmerged"]:
+        summary["status"] = "warn"
+        summary["warning"] = "medium components failed spatial continuity QC"
     write_json(output_dir / "medium_corridor_qc.json", summary)
     print(json.dumps(summary, ensure_ascii=False, indent=2))
     return 0

@@ -13,11 +13,11 @@ from scipy.ndimage import generate_binary_structure, label
 
 CURRENT_DIR = Path(__file__).resolve().parent
 DEFAULT_CONFIG = CURRENT_DIR / "configs/formal_candidate_cheye1_multiscale_preview_v1.json"
-LEGACY_STEP7B_DIR = CURRENT_DIR.parent / "step7b_initial_dfn_3d"
-if str(LEGACY_STEP7B_DIR) not in sys.path:
-    sys.path.insert(0, str(LEGACY_STEP7B_DIR))
+TAIGU_ROOT = CURRENT_DIR.parent
+if str(TAIGU_ROOT) not in sys.path:
+    sys.path.insert(0, str(TAIGU_ROOT))
 
-import build_initial_dfn_from_3d_density_sgy as legacy  # noqa: E402
+from common.dfn_geometry import initial_dfn_geometry as geometry  # noqa: E402
 
 
 SCALE_CODE = {"small": 1, "medium": 2, "large": 3}
@@ -25,7 +25,7 @@ NULL_ABS_LIMIT = 1.0e6
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Preview multiscale Step7B initial DFN without modifying legacy Step7B.")
+    parser = argparse.ArgumentParser(description="Preview the multiscale Step7B initial DFN.")
     parser.add_argument("--config", default=str(DEFAULT_CONFIG), help="Path to JSON config.")
     return parser.parse_args()
 
@@ -39,7 +39,7 @@ def ensure_dir(path: Path) -> None:
 
 
 def finite_stats(values: pd.Series | np.ndarray | list[float]) -> dict[str, float | int | None]:
-    return legacy.finite_stats(values)
+    return geometry.finite_stats(values)
 
 
 def output_paths(output_dir: Path) -> dict[str, Path]:
@@ -93,7 +93,7 @@ def load_attribute_grids(config: dict[str, Any], grid: dict[str, Any]) -> tuple[
         if not path.exists():
             raise FileNotFoundError(f"{attr} SGY not found: {path}")
         print(f"[step7b-multiscale] loading {attr}", flush=True)
-        matrix, load_summary = legacy.load_guidance_grid(path, grid["source_trace_idx"], grid["samples"])
+        matrix, load_summary = geometry.load_guidance_grid(path, grid["source_trace_idx"], grid["samples"])
         matrix[np.abs(matrix) >= NULL_ABS_LIMIT] = np.nan
         out[attr] = matrix
         summary[attr] = load_summary
@@ -133,7 +133,7 @@ def voxels_to_frame(
     out = pd.DataFrame(
         {
             "LayerGroup": layer,
-            "LayerCode": legacy.LAYER_CODE[layer],
+            "LayerCode": geometry.LAYER_CODE[layer],
             "IY": yy.astype(np.int32),
             "IX": xx.astype(np.int32),
             "IT": tt.astype(np.int32),
@@ -171,7 +171,7 @@ def azimuth_from_axis(axis: np.ndarray, fallback: float) -> float:
 
 
 def component_stats(group: pd.DataFrame, grid: dict[str, Any], time_scale: float) -> dict[str, Any]:
-    stats = legacy._component_axis_stats(group, grid["x_values"], grid["y_values"], time_scale)
+    stats = geometry._component_axis_stats(group, grid["x_values"], grid["y_values"], time_scale)
     stats["azimuth_deg"] = azimuth_from_axis(stats["axis"], fallback=55.0)
     return stats
 
@@ -651,8 +651,8 @@ def build_scale_candidates(
 ) -> tuple[dict[str, pd.DataFrame], dict[str, Any]]:
     density = grid["density"]
     valid = np.isfinite(density) & (density > float(config.get("min_density", 1.0e-6)))
-    for layer in legacy.ALLOWED_LAYERS:
-        valid |= legacy.layer_mask_for_grid(layer, grid["samples"], surfaces)
+    for layer in geometry.ALLOWED_LAYERS:
+        valid |= geometry.layer_mask_for_grid(layer, grid["samples"], surfaces)
     valid_attr = valid & np.isfinite(attributes["Coherence"]) & np.isfinite(attributes["AntTrack"])
     lowcoh, low_summary = score_low(attributes["Coherence"], valid_attr, 0.05, 0.95, power=1.2)
     ant, ant_summary = score_high(attributes["AntTrack"], valid_attr, 0.50, 0.95, power=1.0)
@@ -677,8 +677,8 @@ def build_scale_candidates(
     large_cfg = dict(config.get("large_prior", {}))
     small_cfg = dict(config.get("small_prior", {}))
 
-    for layer in legacy.ALLOWED_LAYERS:
-        layer_mask = legacy.layer_mask_for_grid(layer, grid["samples"], surfaces) & valid_attr
+    for layer in geometry.ALLOWED_LAYERS:
+        layer_mask = geometry.layer_mask_for_grid(layer, grid["samples"], surfaces) & valid_attr
         if not layer_mask.any():
             continue
         layer_density = density[layer_mask]
@@ -828,7 +828,7 @@ def build_summary(
         "has_medium_or_large": bool((patch_df["FractureScale"].astype(str) != "small").any()),
         "raw_vtk_exists": paths["raw_vtk"].exists(),
         "csv_exists": paths["dfn_csv"].exists(),
-        "legacy_step7b_not_modified": True,
+        "shared_geometry_module": True,
     }
     continuity_rows: list[dict[str, Any]] = []
     band_patch_df = patch_df[patch_df["FractureScale"].astype(str).isin(["large", "medium"])].copy()
@@ -924,11 +924,11 @@ def main() -> int:
     rng = np.random.default_rng(int(config.get("random_seed", 20260714)))
 
     print("[step7b-multiscale] loading density", flush=True)
-    grid = legacy.load_density_grid(Path(config["density_sgy"]).resolve(), Path(config["trace_mapping_npz"]).resolve())
+    grid = geometry.load_density_grid(Path(config["density_sgy"]).resolve(), Path(config["trace_mapping_npz"]).resolve())
     print("[step7b-multiscale] loading attributes", flush=True)
     attributes, attr_summary = load_attribute_grids(config, grid)
     print("[step7b-multiscale] loading surfaces", flush=True)
-    surfaces = legacy.attach_surface_grids(Path(config["layer_dir"]).resolve(), grid["x_values"], grid["y_values"])
+    surfaces = geometry.attach_surface_grids(Path(config["layer_dir"]).resolve(), grid["x_values"], grid["y_values"])
     print("[step7b-multiscale] building scale candidates", flush=True)
     scale_candidates, candidate_summary = build_scale_candidates(grid, surfaces, attributes, config)
     candidate_summary["attribute_load"] = attr_summary
@@ -944,7 +944,7 @@ def main() -> int:
     selected = assign_patch_ordinals(pd.concat(selected_parts, ignore_index=True))
 
     print(f"[step7b-multiscale] building patches={len(selected)}", flush=True)
-    patch_df, patch_build_summary = legacy.build_patch_table(
+    patch_df, patch_build_summary = geometry.build_patch_table(
         selected=selected,
         density=grid["density"],
         x_values=grid["x_values"],
@@ -972,13 +972,13 @@ def main() -> int:
         mask = patch_df["PatchShapeMode"].astype(str).eq("rectangular_local_band_pca_v3")
         patch_df.loc[mask, "OrientationSource"] = "local_band_candidate_pca_plane"
     patch_df["GenerationStage"] = "multiscale_step7b_preview"
-    audit_df = legacy.build_audit(patch_df)
+    audit_df = geometry.build_audit(patch_df)
     audit_df["ActionReason"] = "multiscale_preview_from_density_anttrack_coherence_curvature"
 
     patch_df.to_csv(paths["dfn_csv"], index=False, encoding="utf-8-sig")
     audit_df.to_csv(paths["audit_csv"], index=False, encoding="utf-8-sig")
     geometry_time_scale = float(config.get("geometry_time_scale_m_per_ms", config.get("orientation_time_scale_m_per_ms", 1.0)))
-    legacy.write_legacy_vtk(
+    geometry.write_patch_vtk(
         paths["raw_vtk"],
         patch_df,
         "multiscale_initial_dfn_preview_raw_time",

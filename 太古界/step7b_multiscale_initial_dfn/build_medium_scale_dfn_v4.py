@@ -10,11 +10,11 @@ import numpy as np
 import pandas as pd
 from scipy import ndimage
 from scipy.spatial import cKDTree
+from tqdm import tqdm
 
 
 CURRENT_DIR = Path(__file__).resolve().parent
 FORMAL_ROOT = CURRENT_DIR.parent
-LEGACY_STEP7B_DIR = CURRENT_DIR.parent / "step7b_initial_dfn_3d"
 TAIGU_ROOT = CURRENT_DIR.parent
 FORMAL_MAINLINE_ROOT = TAIGU_ROOT.parent / "优化阶段二" / "正式主线"
 if str(FORMAL_MAINLINE_ROOT / "common") not in sys.path:
@@ -22,17 +22,14 @@ if str(FORMAL_MAINLINE_ROOT / "common") not in sys.path:
 if str(FORMAL_ROOT) not in sys.path:
     sys.path.insert(0, str(FORMAL_ROOT))
 DEFAULT_CONFIG = CURRENT_DIR / "configs/formal_candidate_cheye1_step7b_medium_v4.json"
-if str(LEGACY_STEP7B_DIR) not in sys.path:
-    sys.path.insert(0, str(LEGACY_STEP7B_DIR))
 if str(TAIGU_ROOT / "step1_strata_contracts") not in sys.path:
     sys.path.insert(0, str(TAIGU_ROOT / "step1_strata_contracts"))
 
-import build_initial_dfn_from_3d_density_sgy as legacy  # noqa: E402
-legacy.ALLOWED_LAYERS = ["上部复合层", "太古界风化壳"]
-legacy.LAYER_CODE = {"上部复合层": 1.0, "太古界风化壳": 2.0}
+from common.dfn_geometry import initial_dfn_geometry as geometry  # noqa: E402
+geometry.ALLOWED_LAYERS = ["上部复合层", "太古界风化壳"]
+geometry.LAYER_CODE = {"上部复合层": 1.0, "太古界风化壳": 2.0}
 from horizon_trace_table.horizon_contract import (  # noqa: E402
-    load_contract_for_mapping,
-    validate_window_contract,
+    HorizonTraceContract,
 )
 
 
@@ -87,6 +84,77 @@ def taigu_surface_grids(
     }
 
 
+def load_step6b_contract(
+    config: dict[str, Any],
+    mapping: dict[str, np.ndarray],
+    grid: dict[str, Any],
+) -> tuple[HorizonTraceContract, dict[str, Any]]:
+    """Use exactly the mapping, sample axis and filled horizons accepted by Step6B."""
+    qc_path = Path(config["step6b_qc_json"]).resolve()
+    step6b_qc = read_json(qc_path)
+    if step6b_qc.get("status") != "pass":
+        raise RuntimeError("configured Step6B QC is not pass")
+    declared = step6b_qc.get("output_contract", {})
+    if Path(declared.get("medium_prior_sgy", "")).resolve() != Path(config["medium_prior_sgy"]).resolve():
+        raise RuntimeError("Step7B medium prior does not match the Step6B QC declaration")
+    if Path(declared.get("component_npz", "")).resolve() != Path(config["medium_components_npz"]).resolve():
+        raise RuntimeError("Step7B component NPZ does not match the Step6B QC declaration")
+    mapping_qc = step6b_qc.get("attribute_mapping_contract", {})
+    if mapping_qc.get("status") != "pass" or mapping_qc.get("contract") != "attribute_trace_idx_only_no_obn_trace_idx":
+        raise RuntimeError("Step6B did not pass the attribute-grid mapping contract")
+
+    with np.load(Path(config["medium_components_npz"]).resolve()) as payload:
+        required = {"source_trace_idx", "x", "y", "ix", "iy", "samples", "t4_time", "t6_time", "t7_time", "shasan_present", "shasi_present"}
+        missing = sorted(required.difference(payload.files))
+        if missing:
+            raise ValueError(f"Step6B component contract missing fields: {missing}")
+        trace_idx = np.asarray(payload["source_trace_idx"], dtype=np.int64)
+        x = np.asarray(payload["x"], dtype=float)
+        y = np.asarray(payload["y"], dtype=float)
+        ix = np.asarray(payload["ix"], dtype=np.int32)
+        iy = np.asarray(payload["iy"], dtype=np.int32)
+        samples = np.asarray(payload["samples"], dtype=float)
+        top = np.asarray(payload["t4_time"], dtype=np.float32)
+        middle = np.asarray(payload["t6_time"], dtype=np.float32)
+        bottom = np.asarray(payload["t7_time"], dtype=np.float32)
+        upper_present = np.asarray(payload["shasan_present"], dtype=bool)
+        crust_present = np.asarray(payload["shasi_present"], dtype=bool)
+    comparisons = {
+        "trace_idx": np.array_equal(trace_idx, np.asarray(mapping["source_trace_idx"], dtype=np.int64)),
+        "x": np.array_equal(x, np.asarray(mapping["x"], dtype=float)),
+        "y": np.array_equal(y, np.asarray(mapping["y"], dtype=float)),
+        "ix": np.array_equal(ix, np.asarray(mapping["ix"], dtype=np.int32)),
+        "iy": np.array_equal(iy, np.asarray(mapping["iy"], dtype=np.int32)),
+        "samples": np.array_equal(samples, np.asarray(grid["samples"], dtype=float)),
+    }
+    if not all(comparisons.values()):
+        raise ValueError(f"Step6B component contract differs from Step7B grid: {comparisons}")
+    valid = upper_present & crust_present & np.isfinite(top) & np.isfinite(middle) & np.isfinite(bottom)
+    valid &= (top < middle) & (middle < bottom)
+    contract = HorizonTraceContract(
+        table_path=Path(config["medium_components_npz"]).resolve(),
+        trace_idx=trace_idx,
+        t4=top,
+        t5=middle.copy(),
+        t6=middle,
+        t7=bottom,
+        surface_order_valid=valid,
+        shasan_present=valid.copy(),
+        shasi_present=valid.copy(),
+        correction_code=np.zeros(len(trace_idx), dtype=np.uint8),
+    )
+    return contract, {
+        "status": "pass",
+        "step6b_qc_json": str(qc_path),
+        "mapping_contract": mapping_qc.get("contract"),
+        "mapping_and_sample_comparisons": comparisons,
+        "trace_count": int(len(trace_idx)),
+        "sample_count": int(len(samples)),
+        "valid_horizon_trace_count": int(valid.sum()),
+        "horizon_source": "Step6B v4 effective Top/Middle/Base arrays after Common-contract fill",
+    }
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Build Step7B medium-scale DFN from local candidate-band voxel geometry.")
     parser.add_argument("--config", default=str(DEFAULT_CONFIG), help="Path to JSON config.")
@@ -118,7 +186,7 @@ def load_optional_grid(path_text: str | None, source_trace_idx: np.ndarray, samp
     path = Path(path_text).resolve()
     if not path.exists():
         return None
-    grid, _summary = legacy.load_guidance_grid(path, source_trace_idx, samples)
+    grid, _summary = geometry.load_guidance_grid(path, source_trace_idx, samples)
     grid[np.abs(grid) > 1.0e6] = np.nan
     return grid
 
@@ -136,7 +204,7 @@ def layer_candidates(
     min_voxels = int(config.get("min_component_voxels", 45))
     min_score = float(config.get("min_prior_score", 0.45))
 
-    for layer in legacy.ALLOWED_LAYERS:
+    for layer in geometry.ALLOWED_LAYERS:
         layer_mask = taigu_layer_mask(layer, grid["samples"], surfaces)
         raw = layer_mask & (mask_grid > 0.5) & np.isfinite(prior) & (prior >= min_score)
         labels, count = ndimage.label(raw, structure=structure)
@@ -157,7 +225,7 @@ def layer_candidates(
             frame = pd.DataFrame(
                 {
                     "LayerGroup": layer,
-                    "LayerCode": legacy.LAYER_CODE[layer],
+                    "LayerCode": geometry.LAYER_CODE[layer],
                     "IY": yy.astype(np.int32),
                     "IX": xx.astype(np.int32),
                     "IT": tt.astype(np.int32),
@@ -239,7 +307,7 @@ def component_candidates_from_step6b(
     min_score = float(config.get("min_prior_score", 0.65))
     rows: list[pd.DataFrame] = []
     component_rows: list[dict[str, Any]] = []
-    for comp_row in summary.itertuples(index=False):
+    for comp_row in tqdm(summary.itertuples(index=False), total=len(summary), desc="Step7B candidate components", unit="component"):
         component_id = int(comp_row.component_id)
         component_slice = slices[component_id - 1] if 0 < component_id <= len(slices) else None
         if component_slice is None:
@@ -259,7 +327,7 @@ def component_candidates_from_step6b(
             geometry_priority = 0.8 * ant_scores + 0.2 * scores
             keep = np.argpartition(geometry_priority, -max_points)[-max_points:]
             yy, xx, tt, scores, ant_scores = yy[keep], xx[keep], tt[keep], scores[keep], ant_scores[keep]
-        for layer in legacy.ALLOWED_LAYERS:
+        for layer in geometry.ALLOWED_LAYERS:
             layer_top, layer_base = taigu_layer_bounds(layer, surfaces)
             top = layer_top[yy, xx]
             base = layer_base[yy, xx]
@@ -273,7 +341,7 @@ def component_candidates_from_step6b(
             frame = pd.DataFrame(
                 {
                     "LayerGroup": layer,
-                    "LayerCode": legacy.LAYER_CODE[layer],
+                    "LayerCode": geometry.LAYER_CODE[layer],
                     "IY": lyy.astype(np.int32),
                     "IX": lxx.astype(np.int32),
                     "IT": ltt.astype(np.int32),
@@ -700,7 +768,9 @@ def select_medium_patches(candidates: pd.DataFrame, grid: dict[str, Any], config
     if max_components > 0:
         component_items = component_items[:max_components]
     total_mass = max(sum(item[0] for item in component_items), 1.0e-9)
-    for rank, (mass, layer, component_id, group) in enumerate(component_items, start=1):
+    for rank, (mass, layer, component_id, group) in enumerate(
+        tqdm(component_items, desc="Step7B patch selection", unit="component"), start=1
+    ):
         ridge_order, ridge_summary = anttrack_ridge_order(group, config)
         ridge_length = ridge_extent_m(group, ridge_order, grid, time_scale)
         if max_total > 0:
@@ -897,6 +967,7 @@ def build_summary(
     patch_df: pd.DataFrame,
     bands: list[dict[str, Any]],
     grid: dict[str, Any],
+    upstream_contract_qc: dict[str, Any],
 ) -> dict[str, Any]:
     candidate_components = candidates[["LayerGroup", "ComponentID"]].drop_duplicates()
     selected_components = selected[["LayerGroup", "ComponentID"]].drop_duplicates() if len(selected) else pd.DataFrame()
@@ -956,6 +1027,17 @@ def build_summary(
     spatial_tile_coverage_fraction = float(len(covered_candidate_tiles) / max(len(active_candidate_tiles), 1))
     requested_selection_mode = str(config.get("component_selection_mode", "hybrid_anttrack_spatial")).strip().lower()
     recorded_selection_modes = sorted({str(item.get("SelectionMode", "")) for item in bands})
+    vertical_margin = np.minimum(
+        patch_df["CenterTime"].to_numpy(dtype=float) - patch_df["TimeWindowMin"].to_numpy(dtype=float),
+        patch_df["TimeWindowMax"].to_numpy(dtype=float) - patch_df["CenterTime"].to_numpy(dtype=float),
+    )
+    patch_within_layer = patch_df["HeightTimeMs"].to_numpy(dtype=float) <= 2.0 * vertical_margin + 1.0e-6
+    azimuth = np.mod(patch_df["AzimuthDeg"].to_numpy(dtype=float), 90.0)
+    axis_distance = np.minimum(azimuth, 90.0 - azimuth)
+    axis_locked_fraction = float(np.mean(axis_distance <= float(config.get("axis_lock_tolerance_deg", 5.0))))
+    length_median = float(patch_df["LengthM"].median())
+    target_length_median_min = float(config.get("target_length_median_min", 0.0))
+    target_length_median_max = float(config.get("target_length_median_max", np.inf))
     checks = {
         "has_patches": len(patch_df) > 0,
         "all_medium_scale": bool(patch_df["FractureScale"].astype(str).eq("medium").all()),
@@ -964,11 +1046,17 @@ def build_summary(
         "candidate_components_vtk_exists": bool(not config.get("write_intermediate_vtk", False) or paths["candidate_components_vtk"].exists()),
         "orientation_varies": bool(patch_df["AzimuthDeg"].round(2).nunique() > 10 and patch_df["DipDeg"].round(2).nunique() > 10),
         "size_varies": bool(patch_df["LengthM"].std(ddof=0) > 5.0 and patch_df["HeightTimeMs"].std(ddof=0) > 1.0),
+        "length_median_in_target_range": target_length_median_min <= length_median <= target_length_median_max,
+        "length_respects_configured_maximum": bool(
+            float(patch_df["LengthM"].max()) <= float(config.get("max_length_m", np.inf)) + 1.0e-6
+        ),
         "covers_candidate_components": bool(candidate_component_count == 0 or selected_component_count / candidate_component_count >= float(config.get("min_component_coverage_fraction", 0.70))),
         "covers_upstream_components": bool(upstream_component_count == 0 or upstream_component_coverage >= float(config.get("min_upstream_component_coverage_fraction", 0.65))),
         "covers_spatial_quadrants": bool(len(quadrant_counts) >= int(config.get("min_quadrants_covered", 3))),
         "centers_respect_minimum_spacing": bool(nearest.size == 0 or float(np.quantile(nearest, 0.05)) >= 0.5 * float(config.get("min_patch_center_separation_m", 25.0))),
         "component_selection_mode_applied": recorded_selection_modes == [requested_selection_mode],
+        "all_patch_extents_within_layer": bool(patch_within_layer.all()),
+        "orientation_not_locked_to_xy_axes": axis_locked_fraction <= float(config.get("max_axis_locked_fraction", 0.50)),
         "covers_candidate_spatial_tiles": bool(
             not active_candidate_tiles
             or spatial_tile_coverage_fraction >= float(config.get("min_spatial_tile_coverage_fraction", 0.60))
@@ -978,6 +1066,7 @@ def build_summary(
         "status": "pass" if all(checks.values()) else "fail",
         "config_path": str(config_path),
         "generation_logic": "step7b_hybrid_anttrack_ridge_and_spatial_coverage_with_local_geometry_pca_v6",
+        "upstream_contract_qc": upstream_contract_qc,
         "component_selection": {
             "requested_mode": requested_selection_mode,
             "recorded_modes": recorded_selection_modes,
@@ -1013,20 +1102,32 @@ def build_summary(
         },
         "layer_counts": layer_counts,
         "candidate_branch_counts": branch_counts,
-        "nearest_center_distance": legacy.finite_stats(nearest),
+        "nearest_center_distance": geometry.finite_stats(nearest),
+        "axis_lock_qc": {
+            "tolerance_deg": float(config.get("axis_lock_tolerance_deg", 5.0)),
+            "axis_locked_fraction": axis_locked_fraction,
+            "maximum_allowed_fraction": float(config.get("max_axis_locked_fraction", 0.50)),
+        },
+        "size_target_qc": {
+            "length_median_m": length_median,
+            "target_length_median_min_m": target_length_median_min,
+            "target_length_median_max_m": target_length_median_max,
+            "configured_max_length_m": float(config.get("max_length_m", np.inf)),
+        },
         "global_spacing_nms": selected.attrs.get("global_spacing_nms", {}),
         "band_examples": bands[:30],
         "patch_stats": {
-            "length_m": legacy.finite_stats(patch_df["LengthM"]),
-            "height_time_ms": legacy.finite_stats(patch_df["HeightTimeMs"]),
-            "area_m2": legacy.finite_stats(patch_df["PatchAreaM2"]),
-            "azimuth_deg": legacy.finite_stats(patch_df["AzimuthDeg"]),
-            "dip_deg": legacy.finite_stats(patch_df["DipDeg"]),
-            "raw_dip_deg": legacy.finite_stats(patch_df["RawDipDeg"]) if "RawDipDeg" in patch_df else {},
-            "local_band_width_m": legacy.finite_stats(patch_df["LocalBandWidthM"]) if "LocalBandWidthM" in patch_df else {},
-            "local_band_thickness_ms": legacy.finite_stats(patch_df["LocalBandThicknessMs"]) if "LocalBandThicknessMs" in patch_df else {},
+            "length_m": geometry.finite_stats(patch_df["LengthM"]),
+            "height_time_ms": geometry.finite_stats(patch_df["HeightTimeMs"]),
+            "area_m2": geometry.finite_stats(patch_df["PatchAreaM2"]),
+            "azimuth_deg": geometry.finite_stats(patch_df["AzimuthDeg"]),
+            "dip_deg": geometry.finite_stats(patch_df["DipDeg"]),
+            "raw_dip_deg": geometry.finite_stats(patch_df["RawDipDeg"]) if "RawDipDeg" in patch_df else {},
+            "local_band_width_m": geometry.finite_stats(patch_df["LocalBandWidthM"]) if "LocalBandWidthM" in patch_df else {},
+            "local_band_thickness_ms": geometry.finite_stats(patch_df["LocalBandThicknessMs"]) if "LocalBandThicknessMs" in patch_df else {},
+            "center_adjustment_ms": geometry.finite_stats(patch_df["CenterAdjustmentMs"]),
         },
-        "orientation_source_distribution": legacy.layer_distribution(patch_df["OrientationSource"]),
+        "orientation_source_distribution": geometry.layer_distribution(patch_df["OrientationSource"]),
         "low_dip_policy": {
             "reject_low_dip_patches": bool(config.get("reject_low_dip_patches", False)),
             "reject_dip_below_deg": float(config.get("reject_dip_below_deg", -1.0)),
@@ -1048,32 +1149,41 @@ def main() -> int:
     paths = output_paths(output_dir)
     rng = np.random.default_rng(int(config.get("random_seed", 20260715)))
 
-    print("[step7b-medium-v4] loading medium prior", flush=True)
+    run_label = str(config.get("version", "step7b-medium"))
+    print(f"[{run_label}] loading medium prior", flush=True)
     trace_mapping_path = Path(config["trace_mapping_npz"]).resolve()
-    grid = legacy.load_density_grid(Path(config["medium_prior_sgy"]).resolve(), trace_mapping_path)
-    print("[step7b-medium-v4] loading surfaces", flush=True)
+    grid = geometry.load_density_grid(Path(config["medium_prior_sgy"]).resolve(), trace_mapping_path)
+    print(f"[{run_label}] loading surfaces", flush=True)
     with np.load(trace_mapping_path) as mapping_npz:
         mapping = {key: mapping_npz[key] for key in mapping_npz.files}
-    horizon_contract = load_contract_for_mapping(config, mapping)
-    try:
-        validate_window_contract(config, horizon_contract, grid["samples"])
-    except (KeyError, ValueError) as exc:
-        # 太古界中尺度使用逐道 T4-T7 合同直接插值到 10 ms 轴；
-        # 合同未显式存储 10 ms 窗口索引时，不应阻断 Step7B。
-        print(f"[step7b-medium-v4] horizon direct interpolation: {exc}", flush=True)
-    # Step7B 使用太古界三界面合同：上部复合层顶、太古界顶、风化壳底。
-    # 不再按砂砾岩 T4/T6/T7 层名分支。
+    horizon_contract, upstream_contract_qc = load_step6b_contract(config, mapping, grid)
+    # Step7B直接继承Step6B已核验的三界面有效窗口。
     surfaces = taigu_surface_grids(mapping, horizon_contract)
-    print("[step7b-medium-v4] building candidate components", flush=True)
+    print(f"[{run_label}] building candidate components", flush=True)
     if config.get("medium_components_npz"):
         candidates, component_rows = component_candidates_from_step6b(config, grid, surfaces)
     else:
-        mask_grid = legacy.load_density_grid(Path(config["medium_mask_sgy"]).resolve(), Path(config["trace_mapping_npz"]).resolve())["density"]
+        mask_grid = geometry.load_density_grid(Path(config["medium_mask_sgy"]).resolve(), Path(config["trace_mapping_npz"]).resolve())["density"]
         candidates, component_rows = layer_candidates(grid["density"], mask_grid, grid, surfaces, config)
-    print("[step7b-medium-v4] selecting local band patches", flush=True)
+    print(f"[{run_label}] selecting local band patches", flush=True)
     selected, bands = select_medium_patches(candidates, grid, config, rng)
-    print(f"[step7b-medium-v4] building patches={len(selected)}", flush=True)
-    patch_df, _patch_summary = legacy.build_patch_table(selected, grid["density"], grid["x_values"], grid["y_values"], config, rng)
+    print(f"[{run_label}] building patches={len(selected)}", flush=True)
+    patch_df, _patch_summary = geometry.build_patch_table(selected, grid["density"], grid["x_values"], grid["y_values"], config, rng)
+    original_center = patch_df["CenterTime"].to_numpy(dtype=float)
+    half_height = 0.5 * patch_df["HeightTimeMs"].to_numpy(dtype=float)
+    lower_center = patch_df["TimeWindowMin"].to_numpy(dtype=float) + half_height
+    upper_center = patch_df["TimeWindowMax"].to_numpy(dtype=float) - half_height
+    valid_geometry = np.isfinite(lower_center) & np.isfinite(upper_center) & (lower_center <= upper_center)
+    patch_df = patch_df.loc[valid_geometry].copy().reset_index(drop=True)
+    selected = selected.loc[valid_geometry].copy().reset_index(drop=True)
+    adjusted_center = np.clip(original_center[valid_geometry], lower_center[valid_geometry], upper_center[valid_geometry])
+    patch_df["CenterTimeOriginal"] = original_center[valid_geometry]
+    patch_df["CenterTime"] = adjusted_center
+    patch_df["CenterAdjustmentMs"] = adjusted_center - original_center[valid_geometry]
+    geometry_time_scale = float(config.get("geometry_time_scale_m_per_ms", config.get("orientation_time_scale_m_per_ms", 1.0)))
+    patch_df["HeightM"] = patch_df["HeightTimeMs"] * geometry_time_scale
+    patch_df["PatchAreaM2"] = patch_df["LengthM"] * patch_df["HeightM"]
+    patch_df["PatchEquivalentRadiusM"] = np.sqrt(np.maximum(patch_df["PatchAreaM2"], 0.0) / np.pi)
     for column in [
         "LocalBandWidthM",
         "LocalBandThicknessMs",
@@ -1103,22 +1213,21 @@ def main() -> int:
     patch_df["ConstraintLevel"] = "seismic_prior"
     patch_df.loc[:, "OrientationSource"] = "local_anttrack_ridge_geometry_pca"
     patch_df["Confidence"] = np.clip(pd.to_numeric(patch_df["SamplingWeight"], errors="coerce").fillna(0.0), 0.0, 1.0)
-    audit_df = legacy.build_audit(patch_df)
+    audit_df = geometry.build_audit(patch_df)
     audit_df["ActionReason"] = "medium_scale_patch_centered_on_step6b_anttrack_ridge_or_spatial_coverage"
 
     patch_df.to_csv(paths["dfn_csv"], index=False, encoding="utf-8-sig")
     audit_df.to_csv(paths["audit_csv"], index=False, encoding="utf-8-sig")
     pd.DataFrame(component_rows).to_csv(paths["component_summary_csv"], index=False, encoding="utf-8-sig")
     pd.DataFrame(bands).to_csv(output_dir / "medium_band_summary.csv", index=False, encoding="utf-8-sig")
-    geometry_time_scale = float(config.get("geometry_time_scale_m_per_ms", config.get("orientation_time_scale_m_per_ms", 1.0)))
     if bool(config.get("write_intermediate_vtk", False)):
-        legacy.write_legacy_vtk(paths["raw_vtk"], patch_df, "step7b_medium_dfn_raw_time", display=False, display_z_scale=float(config.get("display_z_scale", 5.0)), geometry_time_scale_m_per_ms=geometry_time_scale)
+        geometry.write_patch_vtk(paths["raw_vtk"], patch_df, "step7b_medium_dfn_raw_time", display=False, display_z_scale=float(config.get("display_z_scale", 5.0)), geometry_time_scale_m_per_ms=geometry_time_scale)
         write_candidate_components_vtk(paths["candidate_components_vtk"], bands, candidates, grid, "medium_candidate_components_raw_time")
-    summary = build_summary(config_path, config, paths, candidates, selected, patch_df, bands, grid)
+    summary = build_summary(config_path, config, paths, candidates, selected, patch_df, bands, grid, upstream_contract_qc)
     paths["summary_json"].write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
-    print(f"[step7b-medium-v4] CSV: {paths['dfn_csv']}", flush=True)
-    print(f"[step7b-medium-v4] VTK: {paths['raw_vtk']}", flush=True)
-    print(f"[step7b-medium-v4] status={summary['status']} patch_count={len(patch_df)}", flush=True)
+    print(f"[{run_label}] CSV: {paths['dfn_csv']}", flush=True)
+    print(f"[{run_label}] VTK: {paths['raw_vtk']}", flush=True)
+    print(f"[{run_label}] status={summary['status']} patch_count={len(patch_df)}", flush=True)
     return 0 if summary["status"] == "pass" else 1
 
 

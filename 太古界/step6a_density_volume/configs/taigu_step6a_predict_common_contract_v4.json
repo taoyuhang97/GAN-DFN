@@ -2,10 +2,11 @@
   "version": "taigu_step6a_predict_common_contract_v4",
   "output_dir": "/home/tyh/projects/petroleum/code/GAN-DFN/太古界/step6a_density_volume/output/taigu_step6a_common_contract_v4/volume",
   "model_joblib": "/home/tyh/projects/petroleum/code/GAN-DFN/太古界/step6a_density_volume/output/taigu_step6a_common_contract_v4/models/step6_two_stage_density_models.joblib",
-  "demo_grid_csv": "/home/tyh/projects/petroleum/code/GAN-DFN/太古界/step7a_small_scale_dfn/output/taigu_attribute_demo_grid_v3/demo_grid.csv",
+  "demo_grid_csv": "/home/tyh/projects/petroleum/code/GAN-DFN/太古界/common/attribute_demo_grid/output/taigu_attribute_demo_grid_v1/attribute_demo_grid.csv",
   "horizon_contract_csv": "/home/tyh/projects/petroleum/code/GAN-DFN/太古界/common/horizon_contract/output/taigu_attribute_full_horizon_contract_v1/demo_horizon_contract.csv",
   "horizon_windows_npz": "/home/tyh/projects/petroleum/code/GAN-DFN/太古界/common/horizon_contract/output/taigu_attribute_full_horizon_contract_v1/horizon_windows_2ms.npz",
   "trace_header_csv": "/home/tyh/projects/petroleum/code/GAN-DFN/太古界/common/attribute_trace_contract/output/taigu_attribute_trace_header_v1/attribute_trace_header.csv",
+  "attribute_grid_xy_tolerance_m": 2.0,
   "attribute_normalization_contract_json": "/home/tyh/projects/petroleum/code/GAN-DFN/太古界/common/attribute_sampling/output/taigu_attribute_contract_v2/attribute_normalization_contract.json",
   "attribute_volume_paths": {
     "Coherence": "/data/shared/project-oil/wx数据/埕岛太古界/体数据/Chengdao-Taigujie-Eigenstructure Coherence.sgy",

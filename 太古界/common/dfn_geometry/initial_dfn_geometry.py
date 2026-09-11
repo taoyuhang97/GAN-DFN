@@ -1,3 +1,9 @@
+"""Shared DFN patch geometry, grid loading, VTK export, and QC helpers.
+
+This module originated in the early Step7B prototype. It now belongs to
+Common because both the formal Step7B and Step7C workflows reuse it.
+"""
+
 from __future__ import annotations
 
 import argparse
@@ -14,8 +20,8 @@ from scipy.spatial import cKDTree
 
 
 CURRENT_DIR = Path(__file__).resolve().parent
-DEFAULT_CONFIG = CURRENT_DIR / "configs/formal_initial_dfn_3d_candidate_cheye1.json"
-SURFACE_TOOL_DIR = CURRENT_DIR.parent / "step1_surface_framework"
+TAIGU_ROOT = CURRENT_DIR.parents[1]
+SURFACE_TOOL_DIR = TAIGU_ROOT / "step1_strata_contracts"
 if str(SURFACE_TOOL_DIR) not in sys.path:
     sys.path.insert(0, str(SURFACE_TOOL_DIR))
 
@@ -27,8 +33,8 @@ LAYER_CODE = {"沙三段": 3, "沙四段": 4}
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Build initial DFN from Step6B 3D density SGY.")
-    parser.add_argument("--config", default=str(DEFAULT_CONFIG), help="Path to JSON config.")
+    parser = argparse.ArgumentParser(description="Run the shared DFN geometry builder with an explicit compatible config.")
+    parser.add_argument("--config", required=True, help="Path to a compatible JSON config.")
     return parser.parse_args()
 
 
@@ -1496,7 +1502,7 @@ def patch_vertices(row: pd.Series, display: bool, display_z_scale: float, geomet
     return corners
 
 
-def write_legacy_vtk(path: Path, patch_df: pd.DataFrame, title: str, display: bool, display_z_scale: float, geometry_time_scale_m_per_ms: float) -> None:
+def write_patch_vtk(path: Path, patch_df: pd.DataFrame, title: str, display: bool, display_z_scale: float, geometry_time_scale_m_per_ms: float) -> None:
     points: list[tuple[float, float, float]] = []
     polygons: list[list[int]] = []
     for _, row in patch_df.iterrows():
@@ -1525,7 +1531,7 @@ def write_legacy_vtk(path: Path, patch_df: pd.DataFrame, title: str, display: bo
             values = pd.to_numeric(patch_df[optional_name], errors="coerce").to_numpy(dtype=float)
             if np.isfinite(values).any():
                 scalar_columns.append((optional_name, values, "float"))
-    for optional_name in ["FractureScaleCode", "SmallDomainCode", "BandPatchOrdinal", "BandVoxelCount", "OrientationFamilyCode"]:
+    for optional_name in ["ComponentID", "FractureScaleCode", "SmallDomainCode", "BandPatchOrdinal", "BandVoxelCount", "OrientationFamilyCode"]:
         if optional_name in patch_df.columns:
             scalar_columns.append((optional_name, patch_df[optional_name].to_numpy(), "int"))
     for optional_name in [
@@ -1544,6 +1550,8 @@ def write_legacy_vtk(path: Path, patch_df: pd.DataFrame, title: str, display: bo
         "LocalPcaDipDeg",
         "OrientationAzimuthOffsetDeg",
         "OrientationDipOffsetDeg",
+        "CenterTimeOriginal",
+        "CenterAdjustmentMs",
     ]:
         if optional_name in patch_df.columns:
             scalar_columns.append((optional_name, patch_df[optional_name].to_numpy(), "float"))
@@ -1891,7 +1899,7 @@ def main() -> int:
     audit_df.to_csv(paths["audit_csv"], index=False, encoding="utf-8-sig")
     display_z_scale = float(config.get("display_z_scale", 5.0))
     geometry_time_scale = float(config.get("geometry_time_scale_m_per_ms", config.get("orientation_time_scale_m_per_ms", 1.0)))
-    write_legacy_vtk(paths["raw_vtk"], patch_df, "initial_3d_dfn_raw_time", display=False, display_z_scale=display_z_scale, geometry_time_scale_m_per_ms=geometry_time_scale)
+    write_patch_vtk(paths["raw_vtk"], patch_df, "initial_3d_dfn_raw_time", display=False, display_z_scale=display_z_scale, geometry_time_scale_m_per_ms=geometry_time_scale)
     band_summaries = list(sampling_summary.get("band_summaries", []))
     if band_summaries:
         write_band_centerline_vtk(paths["band_centerline_vtk"], band_summaries)

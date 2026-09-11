@@ -1,6 +1,7 @@
 # Step 7B Multiscale Initial DFN
 
-本目录是新版 Step7B 的独立实现目录，旧目录 `step7b_initial_dfn_3d` 保留不动。
+本目录是太古界唯一的正式 Step7B 实现目录。裂缝片几何、VTK导出和统计等公共能力已迁移到
+`common/dfn_geometry`，不再保留第二个Step7B目录。
 
 ## 定位
 
@@ -10,7 +11,15 @@
 - 中尺度：裂缝带/小断层组合，主要来自蚂蚁体高值，并由低相干、曲率辅助约束。
 - 大尺度：断层/断裂带，主要来自低相干连续带；后续正式版还会接入原始断层解释硬约束。
 
-当前脚本是预览版，目的是先看新版 Step7B 的 DFN 视觉效果。正式 Step6A/Step6B/Step6C/Step6D 完成后，再把输入切换为 Step6D 输出的多尺度密度包。
+当前中尺度正式流程由 `build_medium_scale_dfn_v4.py` 实现，当前待验收配置为
+`configs/taigu_step7b_medium_v5_scale_separation.json`。它只消费Step6B v5的中尺度连通体，
+与小尺度Step7A、未完成的大尺度和最终融合模块分离。
+
+Step6B v5保存的属性道号、10 ms时间轴和有效Top/Middle/Base层位窗口是Step7B的唯一上游合同。
+Step7B不再重新读取OBN道号或重新执行层位填补。VTK的Z坐标直接使用TWT `TIME(ms)`。
+
+v5将中尺度片长目标中位数设为80至100 m、上限145 m，脊线片间距设为50 m，
+全局最小中心间距设为45 m。片高仍由局部裂缝带时间厚度控制，不随片长同比压缩。
 
 ## 运行
 
@@ -62,11 +71,11 @@
 - `fracture_band_summary.csv`
 - `initial_dfn_summary.json`
 
-## 与旧 Step7B 的差异
+## 与早期 Step7B 原型的差异
 
 - 旧 Step7B：从一个三维密度体中抽样，尺度标签主要由连通体形态后判别。
 - 新 Step7B：先按小/中/大尺度证据分组，再分别生成裂缝片。
-- 旧 Step7B 目录和输出不被覆盖。
+- 早期原型不再作为独立步骤保留，可复用能力已归入公共几何模块。
 
 ## v2 修正点
 

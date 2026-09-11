@@ -19,7 +19,7 @@ def main() -> int:
     patch_df = pd.read_csv(paths["dfn_csv"], low_memory=False)
     if "IsWellControlPatch" not in patch_df.columns:
         patch_df["IsWellControlPatch"] = 0
-    step7b.legacy.write_legacy_vtk(
+    step7b.geometry.write_patch_vtk(
         paths["raw_vtk"],
         patch_df,
         "step7b_medium_dfn_raw_time",

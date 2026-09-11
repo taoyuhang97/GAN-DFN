@@ -83,6 +83,58 @@ def write_json(path: Path, payload: dict[str, Any]) -> None:
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
+def validate_attribute_grid_contract(
+    grid: pd.DataFrame,
+    horizon: pd.DataFrame,
+    trace_header_csv: Path,
+    xy_tolerance_m: float,
+) -> dict[str, Any]:
+    required_grid = {"TraceIdx", "X", "Y", "IX", "IY"}
+    missing = sorted(required_grid.difference(grid.columns))
+    if missing:
+        raise ValueError(f"attribute demo grid missing columns: {missing}")
+    if grid[list(required_grid)].isna().any().any():
+        raise ValueError("attribute demo grid contains null contract fields")
+    if grid["TraceIdx"].duplicated().any():
+        raise ValueError("attribute demo grid contains duplicate TraceIdx")
+    if grid[["IX", "IY"]].duplicated().any():
+        raise ValueError("attribute demo grid contains duplicate IX/IY cells")
+    expected_count = int(grid["IX"].nunique() * grid["IY"].nunique())
+    if len(grid) != expected_count:
+        raise ValueError(f"attribute demo grid is not rectangular: {len(grid)} != {expected_count}")
+
+    header = pd.read_csv(trace_header_csv, usecols=["TraceIdx", "X", "Y"], encoding="utf-8-sig")
+    for column in ("TraceIdx", "X", "Y"):
+        header[column] = pd.to_numeric(header[column], errors="coerce")
+    header = header.dropna().drop_duplicates("TraceIdx").set_index("TraceIdx")
+    source = header.reindex(grid["TraceIdx"].to_numpy(dtype=np.int64))
+    if source[["X", "Y"]].isna().any().any():
+        raise ValueError("attribute demo grid contains TraceIdx absent from attribute trace header")
+    distance = np.hypot(
+        source["X"].to_numpy(dtype=float) - grid["X"].to_numpy(dtype=float),
+        source["Y"].to_numpy(dtype=float) - grid["Y"].to_numpy(dtype=float),
+    )
+    maximum_distance = float(distance.max())
+    if maximum_distance > xy_tolerance_m:
+        raise ValueError(
+            "demo grid TraceIdx does not match attribute-header X/Y: "
+            f"max_distance={maximum_distance:.3f}m > {xy_tolerance_m:.3f}m; "
+            "an OBN trace index may have been supplied"
+        )
+    horizon_ids = set(pd.to_numeric(horizon["TraceIdx"], errors="coerce").dropna().astype(np.int64))
+    missing_horizon_count = int(sum(int(value) not in horizon_ids for value in grid["TraceIdx"]))
+    if missing_horizon_count:
+        raise ValueError(f"attribute demo grid has {missing_horizon_count} TraceIdx absent from horizon contract")
+    return {
+        "status": "pass",
+        "trace_count": int(len(grid)),
+        "attribute_xy_tolerance_m": float(xy_tolerance_m),
+        "attribute_xy_distance_max_m": maximum_distance,
+        "attribute_xy_distance_median_m": float(np.median(distance)),
+        "missing_horizon_trace_count": missing_horizon_count,
+    }
+
+
 class RunningStats:
     def __init__(self) -> None:
         self.count = 0
@@ -232,11 +284,20 @@ def main() -> int:
     ext_window_ms = float(config.get("ext_window_ms", 50.0))
     density_cap = float(config.get("density_cap", 15.0))
 
-    grid = pd.read_csv(config["demo_grid_csv"], encoding="utf-8-sig")
-    horizon = pd.read_csv(config["horizon_contract_csv"], encoding="utf-8-sig")
+    demo_grid_path = Path(config["demo_grid_csv"]).resolve()
+    trace_header_path = Path(config["trace_header_csv"]).resolve()
+    horizon_contract_path = Path(config["horizon_contract_csv"]).resolve()
+    grid = pd.read_csv(demo_grid_path, encoding="utf-8-sig")
+    horizon = pd.read_csv(horizon_contract_path, encoding="utf-8-sig")
     for df in (grid, horizon):
         for column in df.columns:
             df[column] = pd.to_numeric(df[column], errors="coerce")
+    grid_contract_qc = validate_attribute_grid_contract(
+        grid,
+        horizon,
+        trace_header_path,
+        float(config.get("attribute_grid_xy_tolerance_m", 2.0)),
+    )
     grid = grid.merge(
         horizon[["TraceIdx", "TopTimeMs", "MidTimeMs", "BaseTimeMs", "SurfaceValid"]],
         on="TraceIdx",
@@ -479,6 +540,8 @@ def main() -> int:
         "model_logic": artifact.get("model_logic"),
         "attribute_normalization_contract_path": str(normalization_contract_path),
         "attribute_normalization_contract_version": normalization_contract.get("version"),
+        "attribute_demo_grid_csv": str(demo_grid_path),
+        "attribute_grid_contract_qc": grid_contract_qc,
         "anttrack_semantics": "-1_is_valid_low_fracture_evidence",
         "attribute_sampling_audit": {
             "anttrack_finite_count": anttrack_finite_count,
