@@ -42,14 +42,135 @@ FORMAL_ROOT = CURRENT_DIR.parent
 if str(FORMAL_ROOT) not in sys.path:
     sys.path.insert(0, str(FORMAL_ROOT))
 
-from horizon_trace_table.horizon_contract import (  # noqa: E402
-    apply_validity_inplace,
-    apply_window_inplace,
-    contract_summary,
-    load_contract_for_mapping,
-    surface_grids_from_contract,
-    validate_window_contract,
-)
+# Step6C uses the Taigu three-surface contract directly.  The copied
+# sandstone implementation expected T4/T5/T6/T7 and would silently attach
+# the wrong layer semantics, so keep this small adapter local to Step6C.
+from dataclasses import dataclass
+
+
+@dataclass(frozen=True)
+class TaiguHorizonContract:
+    table_path: Path
+    trace_idx: np.ndarray
+    t4: np.ndarray  # Top: 上部复合层 T-a-1
+    t5: np.ndarray  # Mid: 太古界顶 Art_1
+    t6: np.ndarray  # Mid alias retained for existing layer helpers
+    t7: np.ndarray  # Base: 风化壳底 Art_d1-1
+    surface_order_valid: np.ndarray
+    shasan_present: np.ndarray  # upper composite layer
+    shasi_present: np.ndarray  # weathering crust
+    correction_code: np.ndarray
+
+    @property
+    def trace_count(self) -> int:
+        return int(len(self.trace_idx))
+
+
+def load_contract_for_mapping(config: dict[str, Any], mapping: dict[str, np.ndarray]) -> TaiguHorizonContract:
+    path = Path(str(config["horizon_contract_table"])).resolve()
+    if not path.exists():
+        raise FileNotFoundError(f"Taigu horizon contract table not found: {path}")
+    table = pd.read_csv(path, encoding="utf-8-sig")
+    required = {"TraceIdx", "TopTimeMs", "MidTimeMs", "BaseTimeMs", "SurfaceValid"}
+    missing = sorted(required - set(table.columns))
+    if missing:
+        raise ValueError(f"Taigu horizon contract missing fields: {missing}")
+    table = table.sort_values("TraceIdx").reset_index(drop=True)
+    source = np.asarray(mapping.get("source_trace_idx", mapping.get("trace_idx")), dtype=np.int64)
+    if source.ndim != 1 or len(source) == 0:
+        raise ValueError("trace mapping has no source trace indices")
+    lookup = table.set_index("TraceIdx")
+    if not np.isin(source, lookup.index.to_numpy(dtype=np.int64)).all():
+        raise ValueError("source TraceIdx exceeds Taigu horizon contract")
+    rows = lookup.loc[source]
+    valid = rows["SurfaceValid"].to_numpy(dtype=bool)
+    top = rows["TopTimeMs"].to_numpy(dtype=np.float32)
+    mid = rows["MidTimeMs"].to_numpy(dtype=np.float32)
+    base = rows["BaseTimeMs"].to_numpy(dtype=np.float32)
+    return TaiguHorizonContract(
+        table_path=path,
+        trace_idx=source.copy(),
+        t4=top,
+        t5=mid,
+        t6=mid.copy(),
+        t7=base,
+        surface_order_valid=valid,
+        shasan_present=valid.copy(),
+        shasi_present=valid.copy(),
+        correction_code=np.zeros(len(source), dtype=np.uint8),
+    )
+
+
+def validate_window_contract(config: dict[str, Any], contract: TaiguHorizonContract, samples: np.ndarray) -> dict[str, Any]:
+    if len(samples) < 1 or (len(samples) > 1 and not np.allclose(np.diff(samples), np.median(np.diff(samples)))):
+        raise ValueError("Step6C sample axis must be regular")
+    valid = contract.surface_order_valid
+    inside = valid & (contract.t4 < contract.t6) & (contract.t6 < contract.t7)
+    if not inside.any():
+        raise ValueError("Taigu horizon contract has no valid Top-Mid-Base windows")
+    return {
+        "status": "pass",
+        "path": str(contract.table_path),
+        "window_semantics": "Top(T-a-1)->Mid(Art_1)->Base(Art_d1-1)",
+        "sample_min_ms": float(samples[0]), "sample_max_ms": float(samples[-1]),
+        "sample_interval_ms": float(np.median(np.diff(samples))) if len(samples) > 1 else 0.0,
+        "sample_count": int(len(samples)), "trace_count": contract.trace_count,
+        "valid_trace_count": int(inside.sum()),
+    }
+
+
+def _taigu_window_mask(contract: TaiguHorizonContract, samples: np.ndarray, layer: str) -> np.ndarray:
+    axis = np.asarray(samples, dtype=np.float64)[None, :]
+    top, mid, base = contract.t4[:, None], contract.t6[:, None], contract.t7[:, None]
+    valid = contract.surface_order_valid[:, None] & (top < mid) & (mid < base)
+    if layer in {"Shasan", "upper_composite"}:
+        return valid & (axis >= top) & (axis <= mid)
+    if layer in {"Shasi", "weathering_crust"}:
+        return valid & (axis >= mid) & (axis <= base)
+    if layer in {"T4-T7", "main"}:
+        return valid & (axis >= top) & (axis <= base)
+    raise ValueError(f"unsupported Taigu horizon layer: {layer}")
+
+
+def apply_window_inplace(values: np.ndarray, contract: TaiguHorizonContract, samples: np.ndarray, *, fill_value: float | int | bool = 0, layer: str = "T4-T7", **_: Any) -> dict[str, Any]:
+    if values.shape != (contract.trace_count, len(samples)):
+        raise ValueError(f"horizon mask shape mismatch: {values.shape}")
+    valid = _taigu_window_mask(contract, samples, layer)
+    kept = int(valid.sum())
+    values[~valid] = fill_value
+    total = int(values.size)
+    return {"layer": layer, "voxel_count": total, "inside_voxel_count": kept, "outside_voxel_count": total - kept, "inside_fraction": float(kept / total) if total else 0.0}
+
+
+def apply_validity_inplace(valid: np.ndarray, contract: TaiguHorizonContract, samples: np.ndarray, *, layer: str = "T4-T7", **kwargs: Any) -> dict[str, Any]:
+    return apply_window_inplace(valid, contract, samples, fill_value=False, layer=layer, **kwargs)
+
+
+def surface_grids_from_contract(mapping: dict[str, np.ndarray], contract: TaiguHorizonContract) -> dict[str, np.ndarray]:
+    ix = np.asarray(mapping["ix"], dtype=np.int32); iy = np.asarray(mapping["iy"], dtype=np.int32)
+    shape = (int(iy.max()) + 1, int(ix.max()) + 1)
+    def grid(values: np.ndarray, dtype: Any = np.float32) -> np.ndarray:
+        out = np.zeros(shape, dtype=dtype); out[iy, ix] = values; return out
+    return {"T4_TIME": grid(contract.t4), "T5_TIME": grid(contract.t5), "T6_TIME": grid(contract.t6), "T7_TIME": grid(contract.t7), "SurfaceOrderValid": grid(contract.surface_order_valid.astype(np.uint8), np.uint8), "ShasanPresent": grid(contract.shasan_present.astype(np.uint8), np.uint8), "ShasiPresent": grid(contract.shasi_present.astype(np.uint8), np.uint8), "Check_All": grid(contract.surface_order_valid.astype(np.uint8), np.uint8).astype(bool), "SourceTraceIdx": grid(contract.trace_idx.astype(np.int32), np.int32)}
+
+
+def contract_summary(contract: TaiguHorizonContract) -> dict[str, Any]:
+    return {"path": str(contract.table_path), "trace_count": contract.trace_count, "window_semantics": "Top(T-a-1)->Mid(Art_1)->Base(Art_d1-1)", "valid_trace_count": int((contract.surface_order_valid & (contract.t4 < contract.t6) & (contract.t6 < contract.t7)).sum())}
+
+
+def load_taigu_attribute(path: Path, source_trace_idx: np.ndarray, samples: np.ndarray, label: str, config: dict[str, Any]):
+    """Read an attribute onto the absolute Taigu axis.
+
+    Some delivered volumes have a file-header axis of 0--3000 ms while the
+    project contract defines the same samples as 1800--4800 ms.  The offset is
+    explicit in config so this cannot be guessed differently per step.
+    """
+    offsets = dict(config.get("volume_time_offsets_ms", {}))
+    offset = float(offsets.get(label, 0.0))
+    matrix, _, load = load_trace_matrix(path, source_trace_idx, np.asarray(samples, dtype=np.float64) - offset, label)
+    load["project_time_offset_ms"] = offset
+    load["project_sample_axis_ms"] = [float(samples[0]), float(samples[-1]), int(len(samples))]
+    return matrix, load
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 DEFAULT_CONFIG = CURRENT_DIR.parent / "configs/formal_candidate_cheye1_multiscale_density_v1.json"
@@ -156,14 +277,45 @@ def grid_axis_values(mapping: dict[str, np.ndarray]) -> tuple[np.ndarray, np.nda
     return x_values, y_values
 
 
-def load_fault_overlap(input_qc_dir: Path) -> pd.DataFrame:
+def load_fault_overlap(input_qc_dir: Path, patch_root: Path | None = None, mapping: dict[str, np.ndarray] | None = None) -> pd.DataFrame:
     path = input_qc_dir / "fault_patch_demo_overlap.csv"
-    if not path.exists():
-        raise FileNotFoundError(f"Stage 0 fault overlap CSV not found: {path}")
-    return pd.read_csv(path)
+    if path.exists():
+        return pd.read_csv(path)
+    # Taigu common preprocessing intentionally keeps a compact patch index;
+    # derive the demo overlap from fixed 300 m cells when the old sandstone
+    # audit CSV is absent.
+    if patch_root is None or mapping is None:
+        raise FileNotFoundError(f"fault overlap CSV not found and no Taigu patch index fallback: {path}")
+    index_path = patch_root.parent / "fault_patch_index.csv"
+    if not index_path.exists():
+        raise FileNotFoundError(f"Taigu fault patch index not found: {index_path}")
+    frame = pd.read_csv(index_path, encoding="utf-8-sig")
+    required = {"FaultName", "CellI", "CellJ", "PatchPath", "Valid"}
+    missing = sorted(required - set(frame.columns))
+    if missing:
+        raise ValueError(f"Taigu fault patch index missing fields: {missing}")
+    origin_x, origin_y, cell_size = 658800.0, 4231500.0, 300.0
+    x_min, x_max = float(np.min(mapping["x"])), float(np.max(mapping["x"]))
+    y_min, y_max = float(np.min(mapping["y"])), float(np.max(mapping["y"]))
+    cell_i = pd.to_numeric(frame["CellI"], errors="coerce")
+    cell_j = pd.to_numeric(frame["CellJ"], errors="coerce")
+    cx0, cx1 = origin_x + cell_i * cell_size, origin_x + (cell_i + 1) * cell_size
+    cy0, cy1 = origin_y + cell_j * cell_size, origin_y + (cell_j + 1) * cell_size
+    keep = frame["Valid"].astype(bool) & (cx1 >= x_min) & (cx0 <= x_max) & (cy1 >= y_min) & (cy0 <= y_max)
+    selected = frame.loc[keep].copy()
+    selected["fault_name"] = selected["FaultName"].astype(str)
+    selected["cell_i"] = cell_i.loc[selected.index].astype(int)
+    selected["cell_j"] = cell_j.loc[selected.index].astype(int)
+    selected["patch_path"] = selected["PatchPath"].astype(str)
+    selected["area_3d"] = np.nan
+    selected["dip_deg"] = np.nan
+    selected["intersects_demo_xy"] = True
+    return selected.reset_index(drop=True)
 
 
 def vtp_path_for_row(root: Path, row: pd.Series) -> Path:
+    if "patch_path" in row.index and str(row.get("patch_path", "")) not in {"", "nan", "None"}:
+        return root.parent / str(row["patch_path"])
     fault_name = str(row["fault_name"])
     return root / fault_name / f"{fault_name}__i{int(row['cell_i'])}_j{int(row['cell_j'])}.vtp"
 
@@ -540,7 +692,7 @@ def layer_relative_stats(
         relative_std = float("nan")
         relative_span = float("nan")
     return {
-        "dominant_layer": {0: "unknown", 1: "沙三段", 2: "沙四段"}[dominant_code],
+        "dominant_layer": {0: "unknown", 1: "上部复合层", 2: "太古界风化壳"}[dominant_code],
         "dominant_layer_fraction": dominant_fraction,
         "relative_position_std": relative_std,
         "relative_position_span": relative_span,
@@ -1342,7 +1494,7 @@ def write_irregular_surface_candidate_vtk(
 def main() -> int:
     args = parse_args()
     config = read_json(args.config.resolve())
-    output_dir = args.output_dir.resolve()
+    output_dir = Path(config.get("output_dir", args.output_dir)).resolve()
     ensure_dir(output_dir)
     rng = np.random.default_rng(int(args.random_state))
 
@@ -1352,15 +1504,23 @@ def main() -> int:
     mapping = load_mapping(trace_mapping_npz)
     source_trace_idx = mapping["source_trace_idx"].astype(np.int64)
     source_samples, density_load = read_sgy_sample_axis(input_density_sgy)
-    interval_ms = float(dict(config.get("large_evidence", {})).get("sample_interval_ms", 10.0))
-    samples = regular_sample_axis(source_samples, interval_ms)
+    evidence_cfg = dict(config.get("large_evidence", {}))
+    interval_ms = float(evidence_cfg.get("sample_interval_ms", 2.0))
+    # Attribute volumes and the Taigu horizon contract use the absolute
+    # 1800--4800 ms axis.  Do not inherit the shortened Step6A template axis.
+    axis_start = float(evidence_cfg.get("sample_start_ms", source_samples[0]))
+    axis_stop = float(evidence_cfg.get("sample_stop_ms", source_samples[-1]))
+    if axis_stop <= axis_start:
+        raise ValueError("large_evidence sample_stop_ms must exceed sample_start_ms")
+    samples = np.arange(axis_start, axis_stop + interval_ms * 0.5, interval_ms, dtype=np.float64)
     density_load["target_sample_count"] = int(len(samples))
     density_load["target_sample_interval_ms"] = interval_ms
     horizon_contract = load_contract_for_mapping(config, mapping)
     horizon_axis_qc = validate_window_contract(config, horizon_contract, samples)
     horizon_surfaces = surface_grids_from_contract(mapping, horizon_contract)
 
-    selected_faults = load_fault_overlap(args.input_qc_dir.resolve())
+    patch_root = Path(config.get("fault_patch_root", args.fault_patch_root)).resolve()
+    selected_faults = load_fault_overlap(args.input_qc_dir.resolve(), patch_root, mapping)
     selected_faults = selected_faults[selected_faults["intersects_demo_xy"].astype(bool)].copy()
     original_vtk_summary = merge_fault_vtps(
         selected_faults,
@@ -1387,11 +1547,11 @@ def main() -> int:
     fault_audit.to_csv(output_dir / "original_fault_rasterization_audit.csv", index=False, encoding="utf-8-sig")
 
     print("[step6c-large] loading seismic attributes", flush=True)
-    coherence, _, coh_load = load_trace_matrix(volume_paths["Coherence"], source_trace_idx, samples, "Coherence")
-    anttrack, _, ant_load = load_trace_matrix(volume_paths["AntTrack"], source_trace_idx, samples, "AntTrack")
-    curvmax, _, curvmax_load = load_trace_matrix(volume_paths["CurvatureMax"], source_trace_idx, samples, "CurvatureMax")
+    coherence, coh_load = load_taigu_attribute(volume_paths["Coherence"], source_trace_idx, samples, "Coherence", config)
+    anttrack, ant_load = load_taigu_attribute(volume_paths["AntTrack"], source_trace_idx, samples, "AntTrack", config)
+    curvmax, curvmax_load = load_taigu_attribute(volume_paths["CurvatureMax"], source_trace_idx, samples, "CurvatureMax", config)
     if "CurvaturePos" in volume_paths:
-        curvpos, _, curvpos_load = load_trace_matrix(volume_paths["CurvaturePos"], source_trace_idx, samples, "CurvaturePos")
+        curvpos, curvpos_load = load_taigu_attribute(volume_paths["CurvaturePos"], source_trace_idx, samples, "CurvaturePos", config)
     else:
         curvpos = None
         curvpos_load = {"status": "not_configured"}
@@ -1601,7 +1761,7 @@ def main() -> int:
         "original_fault": {
             "selected_patch_count": int(len(selected_faults)),
             "selection_contract": "demo_xy_intersection_only; source geometry is not time or horizon clipped",
-            "influence_contract": "triangle-rasterized derivative is clipped to per-trace T4-T7 before Step6D",
+            "influence_contract": "triangle-rasterized Taigu fault prior is clipped to Top(T-a-1)-Base(Art_d1-1) before Step6D",
             "rasterized_voxel_count": int(original_fault_mask.sum()),
             "rasterized_voxel_fraction": float(original_fault_mask.mean()),
             "vtk": original_vtk_summary,
