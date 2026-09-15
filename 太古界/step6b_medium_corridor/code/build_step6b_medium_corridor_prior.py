@@ -1028,7 +1028,11 @@ def main() -> int:
         "fragment_repair": fragment_repair_summary,
         "score_formula": {
             "formula": "normalized weighted sum with AntTrack dominant",
-            "expression": "MediumScore = 0.70*AntTrackScore + 0.20*LowCoherenceScore + 0.10*CurvatureScore (renormalized over available attributes)",
+            "expression": (
+                f"MediumScore = {float(weights[0]):.2f}*AntTrackScore + "
+                f"{float(weights[1]):.2f}*LowCoherenceScore + "
+                f"{float(weights[2]):.2f}*CurvatureScore (renormalized over available attributes)"
+            ),
             "anttrack_weight": float(weights[0]),
             "lowcoh_weight": float(weights[1]),
             "curvature_weight": float(weights[2]),
@@ -1105,7 +1109,9 @@ def main() -> int:
         },
         "vtk": vtk_summary,
         "reflection": (
-            "Step6B uses AntTrack-dominant additive evidence. Strong AntTrack voxels seed lower-threshold weighted growth, "
+            "Step6B uses normalized weighted additive evidence "
+            f"(AntTrack={float(weights[0]):.2f}, LowCoherence={float(weights[1]):.2f}, Curvature={float(weights[2]):.2f}). "
+            "Strong AntTrack voxels seed lower-threshold weighted growth, "
             "and coherence or curvature cannot veto a strong AntTrack response. Components still reject low-dip and "
             "stratigraphically conformable anomalies."
         ),

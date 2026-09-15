@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import importlib.util
 import json
 import shutil
 import sys
@@ -17,27 +18,92 @@ from scipy.spatial import cKDTree
 
 CURRENT_DIR = Path(__file__).resolve().parent
 FORMAL_ROOT = CURRENT_DIR.parent
-REPO_ROOT = CURRENT_DIR.parents[2]
-DEFAULT_CONFIG = CURRENT_DIR / "configs/formal_candidate_cheye1_step7c_large_v1.json"
+REPO_ROOT = CURRENT_DIR.parents[1]
+DEFAULT_CONFIG = CURRENT_DIR / "configs/taigu_step7c_large_v3_attribute_v3.json"
 if str(FORMAL_ROOT) not in sys.path:
     sys.path.insert(0, str(FORMAL_ROOT))
 from common.dfn_geometry import initial_dfn_geometry as geometry  # noqa: E402
-from common.horizon_trace_table.horizon_contract import (  # noqa: E402
-    HorizonSpatialLookup,
-    build_spatial_lookup,
-    load_contract_for_mapping,
-    surface_grids_from_contract,
-    validate_window_contract,
-)
-from common.unified_dfn_vtk import (  # noqa: E402
-    geometry_fingerprint,
-    unified_vtk_summary,
-    write_unified_dfn_vtk,
-)
+
+UNIFIED_VTK_MODULE = REPO_ROOT / "优化阶段二" / "正式主线" / "common" / "unified_dfn_vtk.py"
+_unified_spec = importlib.util.spec_from_file_location("taigu_step7c_unified_dfn_vtk", UNIFIED_VTK_MODULE)
+if _unified_spec is None or _unified_spec.loader is None:
+    raise ImportError(f"cannot load unified VTK helper: {UNIFIED_VTK_MODULE}")
+_unified_module = importlib.util.module_from_spec(_unified_spec)
+_unified_spec.loader.exec_module(_unified_module)
+geometry_fingerprint = _unified_module.geometry_fingerprint
+unified_vtk_summary = _unified_module.unified_vtk_summary
+write_unified_dfn_vtk = _unified_module.write_unified_dfn_vtk
+
+
+UPPER_LAYER = "上部复合层"
+CRUST_LAYER = "太古界风化壳"
+LAYER_CODE = {UPPER_LAYER: 1, CRUST_LAYER: 2}
+
+
+class TaiguHorizonSpatialLookup:
+    """Nearest-trace lookup for the Taigu Top/Mid/Base horizon contract."""
+
+    def __init__(self, table_path: Path, target_block: dict[str, Any] | None = None):
+        usecols = ["TraceIdx", "X", "Y", "TopTimeMs", "MidTimeMs", "BaseTimeMs", "SurfaceValid"]
+        frame = pd.read_csv(table_path, usecols=usecols, encoding="utf-8-sig", low_memory=False)
+        for column in usecols:
+            frame[column] = pd.to_numeric(frame[column], errors="coerce")
+        if target_block:
+            frame = frame[
+                frame["X"].between(float(target_block["x_min"]), float(target_block["x_max"]))
+                & frame["Y"].between(float(target_block["y_min"]), float(target_block["y_max"]))
+            ].copy()
+        frame = frame.dropna(subset=["TraceIdx", "X", "Y"]).reset_index(drop=True)
+        if frame.empty:
+            raise ValueError("Taigu horizon spatial lookup contains no traces")
+        self.table_path = table_path
+        self.frame = frame
+        self.xy = frame[["X", "Y"]].to_numpy(dtype=np.float64)
+        self.tree = cKDTree(self.xy)
+
+    def query(self, x: float, y: float) -> dict[str, Any]:
+        distance, position = self.tree.query(np.asarray([[float(x), float(y)]], dtype=np.float64), k=1)
+        row = self.frame.iloc[int(np.asarray(position).reshape(-1)[0])]
+        top = float(row["TopTimeMs"])
+        mid = float(row["MidTimeMs"])
+        base = float(row["BaseTimeMs"])
+        valid = bool(int(row["SurfaceValid"])) and np.isfinite([top, mid, base]).all() and top < mid < base
+        return {
+            "TraceIdx": int(row["TraceIdx"]),
+            "DistanceM": float(np.asarray(distance).reshape(-1)[0]),
+            "TopTimeMs": top,
+            "MidTimeMs": mid,
+            "BaseTimeMs": base,
+            "SurfaceValid": valid,
+            "UpperPresent": bool(valid and mid > top),
+            "CrustPresent": bool(valid and base > mid),
+        }
+
+    def interval(self, x: float, y: float, time_ms: float) -> str | None:
+        row = self.query(x, y)
+        time = float(time_ms)
+        if row["UpperPresent"] and row["TopTimeMs"] <= time < row["MidTimeMs"]:
+            return "Top->Mid"
+        if row["CrustPresent"] and row["MidTimeMs"] <= time <= row["BaseTimeMs"]:
+            return "Mid->Base"
+        return None
+
+    def layer_group(self, x: float, y: float, time_ms: float) -> str | None:
+        return {"Top->Mid": UPPER_LAYER, "Mid->Base": CRUST_LAYER}.get(self.interval(x, y, time_ms))
+
+
+def build_taigu_spatial_lookup(config: dict[str, Any]) -> TaiguHorizonSpatialLookup:
+    path_value = config.get("horizon_contract_table") or config.get("horizon_trace_table_path")
+    if not path_value:
+        raise KeyError("configuration must define horizon_contract_table")
+    path = Path(str(path_value)).resolve()
+    if not path.exists():
+        raise FileNotFoundError(f"Taigu horizon contract not found: {path}")
+    return TaiguHorizonSpatialLookup(path, dict(config.get("target_block") or {}) or None)
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Build Step7C large fault/fault-zone DFN from original fault sticks and Step6C prior.")
+    parser = argparse.ArgumentParser(description="Build Taigu Step7C large-fault DFN from 300 m fault units and Step6C attribute evidence.")
     parser.add_argument("--config", default=str(DEFAULT_CONFIG), help="Path to JSON config.")
     return parser.parse_args()
 
@@ -48,14 +114,14 @@ def read_json(path: Path) -> dict[str, Any]:
 
 def contract_layer_for_center(config: dict[str, Any], center: np.ndarray) -> str | None:
     lookup = config.get("_horizon_spatial_lookup")
-    if not isinstance(lookup, HorizonSpatialLookup):
+    if not isinstance(lookup, TaiguHorizonSpatialLookup):
         raise RuntimeError("Step7C horizon spatial lookup is not initialized")
     return lookup.layer_group(float(center[0]), float(center[1]), float(center[2]))
 
 
 def enforce_center_horizon_contract(
     frame: pd.DataFrame,
-    lookup: HorizonSpatialLookup,
+    lookup: TaiguHorizonSpatialLookup,
 ) -> tuple[pd.DataFrame, dict[str, int]]:
     if frame.empty:
         return frame.copy(), {"input_count": 0, "kept_count": 0, "rejected_count": 0}
@@ -68,7 +134,7 @@ def enforce_center_horizon_contract(
         interval = lookup.interval(float(row["CenterX"]), float(row["CenterY"]), float(row["CenterTime"]))
         if interval is None:
             # Voxel-coverage validated panels: the panel body (>=90% of its
-            # evidence voxels) lies inside per-trace T4-T7 windows even though
+            # evidence voxels) lies inside per-trace Top-Base windows even though
             # the panel centroid projects outside the window of its own trace.
             # Keep them so mine-scale display does not lose valid inferred
             # fault surfaces. LayerGroup was assigned from the dominant layer.
@@ -80,19 +146,19 @@ def enforce_center_horizon_contract(
                 continue
         else:
             row["CenterInWindow"] = 1
-            row["LayerGroup"] = "沙三段" if interval == "T4->T6" else "沙四段"
-            row["LayerCode"] = 1 if interval == "T4->T6" else 2
+            row["LayerGroup"] = UPPER_LAYER if interval == "Top->Mid" else CRUST_LAYER
+            row["LayerCode"] = LAYER_CODE[row["LayerGroup"]]
         row["SourceTraceIdx"] = int(local["TraceIdx"])
-        row["LocalT4Time"] = float(local["T4"])
-        row["LocalT6Time"] = float(local["T6"])
-        row["LocalT7Time"] = float(local["T7"])
-        row["LocalShasanPresent"] = int(local["ShasanPresent"])
-        row["LocalShasiPresent"] = int(local["ShasiPresent"])
+        row["LocalTopTimeMs"] = float(local["TopTimeMs"])
+        row["LocalMidTimeMs"] = float(local["MidTimeMs"])
+        row["LocalBaseTimeMs"] = float(local["BaseTimeMs"])
+        row["LocalUpperPresent"] = int(local["UpperPresent"])
+        row["LocalCrustPresent"] = int(local["CrustPresent"])
         rows.append(row)
     output = pd.DataFrame(rows, columns=list(frame.columns) + [
         name for name in [
-            "SourceTraceIdx", "LocalT4Time", "LocalT6Time", "LocalT7Time", "CenterInWindow",
-            "LocalShasanPresent", "LocalShasiPresent",
+            "SourceTraceIdx", "LocalTopTimeMs", "LocalMidTimeMs", "LocalBaseTimeMs", "CenterInWindow",
+            "LocalUpperPresent", "LocalCrustPresent",
         ] if name not in frame.columns
     ])
     return output.reset_index(drop=True), {
@@ -442,7 +508,7 @@ def make_patch(
         "DensityCellID": f"{source_type}_{patch_id}",
         "DensityCellPatchOrdinal": int(max(ordinal, 1)),
         "LayerGroup": layer,
-        "LayerCode": geometry.LAYER_CODE.get(layer, 0),
+        "LayerCode": LAYER_CODE.get(layer, 0),
         "CenterX": float(center[0]),
         "CenterY": float(center[1]),
         "CenterTime": float(center[2]),
@@ -553,7 +619,7 @@ def build_fault_surface_panels(fault_df: pd.DataFrame, config: dict[str, Any]) -
                 continue
             patch_idx += 1
             patch_id = f"large_fault_surface_{patch_idx:05d}"
-            rows.append(make_patch(patch_id, center, axis1, axis2, length, height, azimuth, dip, "沙三段", "large_original_fault_surface", "hard", 1.0, 1.0, str(fault_name), int(flag), patch_idx))
+            rows.append(make_patch(patch_id, center, axis1, axis2, length, height, azimuth, dip, UPPER_LAYER, "large_original_fault_surface", "hard", 1.0, 1.0, str(fault_name), int(flag), patch_idx))
             half_l = 0.5 * length
             half_h = 0.5 * height
             vertices = np.asarray(
@@ -580,7 +646,7 @@ def build_fault_surface_panels(fault_df: pd.DataFrame, config: dict[str, Any]) -
                         height * float(config.get("damage_zone_height_multiplier", 0.80)),
                         azimuth,
                         dip,
-                        "沙三段",
+                        UPPER_LAYER,
                         "large_original_fault_damage_zone",
                         "hard_influence",
                         0.85,
@@ -661,7 +727,7 @@ def standard_original_fault_panel_row(panel_row: pd.Series, patch_idx: int) -> d
         height=height,
         azimuth=float(panel_row.get("StrikeDeg", azimuth)),
         dip=float(panel_row.get("DipDeg", dip)),
-        layer="沙四段",
+        layer=CRUST_LAYER,
         source_type="large_original_fault_panel",
         constraint="hard",
         confidence=1.0,
@@ -710,7 +776,7 @@ def standard_surface_fragment_rows(surface_csv: Path) -> pd.DataFrame:
             height=float(src_row.get("PatchHeight", height)),
             azimuth=float(src_row.get("Azimuth", azimuth)),
             dip=float(src_row.get("Dip", dip)),
-            layer="沙四段",
+            layer=CRUST_LAYER,
             source_type="large_original_fault_surface_fragment",
             constraint="hard",
             confidence=0.98,
@@ -780,7 +846,7 @@ def build_fault_panel_and_influence_rows(panel_csv: Path, config: dict[str, Any]
                 height=max(float(panel_row.get("PanelHeight", main["HeightTimeMs"])) * height_multiplier, 1.0),
                 azimuth=float(panel_row.get("StrikeDeg", main["AzimuthDeg"])),
                 dip=float(panel_row.get("DipDeg", main["DipDeg"])),
-                layer="沙四段",
+                layer=CRUST_LAYER,
                 source_type="large_original_fault_damage_zone",
                 constraint="hard_influence",
                 confidence=0.85,
@@ -862,7 +928,7 @@ def build_segmented_fault_panels(config: dict[str, Any]) -> tuple[pd.DataFrame, 
                 height,
                 azimuth,
                 dip,
-                "沙三段",
+                UPPER_LAYER,
                 "large_original_fault_panel",
                 "hard",
                 1.0,
@@ -897,7 +963,7 @@ def build_segmented_fault_panels(config: dict[str, Any]) -> tuple[pd.DataFrame, 
                     height * float(config.get("damage_zone_height_multiplier", 0.75)),
                     azimuth,
                     dip,
-                    "沙三段",
+                    UPPER_LAYER,
                     "large_original_fault_damage_zone",
                     "hard_influence",
                     0.85,
@@ -935,7 +1001,7 @@ def build_large_lowcoh_supplements(config: dict[str, Any]) -> pd.DataFrame:
         missing = sorted(required.difference(component_df.columns))
         if missing:
             raise ValueError(f"{summary_path} missing large component columns: {missing}")
-        max_components = int(config.get("max_lowcoh_supplement_components", 8))
+        max_components = config.get("max_lowcoh_supplement_components")
         min_voxels = int(config.get("min_lowcoh_component_voxels", 80))
         min_dip = float(config.get("min_lowcoh_dip_deg", 45.0))
         component_df = component_df[
@@ -948,7 +1014,9 @@ def build_large_lowcoh_supplements(config: dict[str, Any]) -> pd.DataFrame:
             pd.to_numeric(component_df["voxel_count"], errors="coerce").fillna(0).astype(float)
             * pd.to_numeric(component_df["score_mean"], errors="coerce").fillna(0).astype(float)
         )
-        component_df = component_df.sort_values("selection_score", ascending=False).head(max_components)
+        component_df = component_df.sort_values("selection_score", ascending=False)
+        if max_components is not None:
+            component_df = component_df.head(int(max_components))
         rows: list[dict[str, Any]] = []
         for ordinal, row in enumerate(component_df.itertuples(index=False), start=1):
             center = np.asarray(
@@ -991,7 +1059,7 @@ def build_large_lowcoh_supplements(config: dict[str, Any]) -> pd.DataFrame:
                     dip,
                     layer,
                     "large_lowcoh_inferred",
-                    "seismic_prior",
+                    "attribute_prior",
                     0.65,
                     float(row.score_mean),
                     f"large_lowcoh_component_{int(row.component_id)}",
@@ -1001,60 +1069,7 @@ def build_large_lowcoh_supplements(config: dict[str, Any]) -> pd.DataFrame:
             )
         return pd.DataFrame(rows)
 
-    if not config.get("large_prior_sgy"):
-        return pd.DataFrame()
-    grid = geometry.load_density_grid(Path(config["large_prior_sgy"]).resolve(), Path(config["trace_mapping_npz"]).resolve())
-    mask_grid = geometry.load_density_grid(Path(config["large_mask_sgy"]).resolve(), Path(config["trace_mapping_npz"]).resolve())["density"]
-    trace_mapping_path = Path(config["trace_mapping_npz"]).resolve()
-    with np.load(trace_mapping_path) as mapping_npz:
-        mapping = {key: mapping_npz[key] for key in mapping_npz.files}
-    horizon_contract = load_contract_for_mapping(config, mapping)
-    validate_window_contract(config, horizon_contract, grid["samples"])
-    surfaces = surface_grids_from_contract(mapping, horizon_contract)
-    structure = np.ones((3, 3, 3), dtype=np.uint8)
-    labels, count = ndimage.label(mask_grid > 0.5, structure=structure)
-    rows: list[dict[str, Any]] = []
-    max_components = int(config.get("max_lowcoh_supplement_components", 8))
-    min_voxels = int(config.get("min_lowcoh_component_voxels", 80))
-    sizes = np.bincount(labels.ravel()) if count else np.asarray([], dtype=int)
-    component_ids = [idx for idx in range(1, count + 1) if int(sizes[idx]) >= min_voxels]
-    component_ids.sort(key=lambda idx: float(grid["density"][labels == idx].sum()), reverse=True)
-    for ordinal, component_id in enumerate(component_ids[:max_components], start=1):
-        yy, xx, tt = np.where(labels == component_id)
-        if yy.size < 3:
-            continue
-        coords = np.column_stack([grid["x_values"][xx], grid["y_values"][yy], grid["samples"][tt]]).astype(float)
-        axis1, axis2, _normal, azimuth, dip = plane_axes(coords)
-        center = coords.mean(axis=0)
-        proj1 = (coords - center) @ axis1
-        length = float(np.quantile(proj1, 0.92) - np.quantile(proj1, 0.08))
-        height = float(np.quantile(coords[:, 2], 0.92) - np.quantile(coords[:, 2], 0.08))
-        length = float(np.clip(length, float(config.get("min_lowcoh_length_m", 120.0)), float(config.get("max_lowcoh_length_m", 480.0))))
-        height = float(np.clip(height, float(config.get("min_lowcoh_height_ms", 35.0)), float(config.get("max_lowcoh_height_ms", 180.0))))
-        layer = "沙三段"
-        if geometry.layer_mask_for_grid("沙四段", grid["samples"], surfaces)[yy, xx, tt].sum() > yy.size / 2:
-            layer = "沙四段"
-        rows.append(
-            make_patch(
-                f"large_lowcoh_supplement_{ordinal:05d}",
-                center,
-                axis1,
-                axis2,
-                length,
-                height,
-                azimuth,
-                dip,
-                layer,
-                "large_lowcoh_inferred",
-                "seismic_prior",
-                0.65,
-                float(np.mean(grid["density"][yy, xx, tt])),
-                f"large_lowcoh_component_{component_id}",
-                int(component_id),
-                ordinal,
-            )
-        )
-    return pd.DataFrame(rows)
+    raise RuntimeError("Taigu Step7C requires the Step6C component summary; the SEG-Y fallback is disabled")
 
 
 def build_lowcoh_component_panels(config: dict[str, Any]) -> pd.DataFrame:
@@ -1090,7 +1105,7 @@ def build_lowcoh_component_panels(config: dict[str, Any]) -> pd.DataFrame:
     x_values = npz["x"].astype(float)
     y_values = npz["y"].astype(float)
     samples = npz["samples"].astype(float)
-    max_components = int(config.get("max_lowcoh_supplement_components", 12))
+    max_components = config.get("max_lowcoh_supplement_components")
     min_voxels = int(config.get("min_lowcoh_component_voxels", 500))
     min_dip = float(config.get("min_lowcoh_dip_deg", 45.0))
     target_length = float(config.get("lowcoh_target_panel_length_m", 180.0))
@@ -1110,7 +1125,9 @@ def build_lowcoh_component_panels(config: dict[str, Any]) -> pd.DataFrame:
         pd.to_numeric(summary_df["voxel_count"], errors="coerce").fillna(0).astype(float)
         * pd.to_numeric(summary_df["score_mean"], errors="coerce").fillna(0).astype(float)
     )
-    summary_df = summary_df.sort_values("selection_score", ascending=False).head(max_components)
+    summary_df = summary_df.sort_values("selection_score", ascending=False)
+    if max_components is not None:
+        summary_df = summary_df.head(int(max_components))
 
     selected_component_ids = summary_df["component_id"].astype(int).tolist()
     component_positions: dict[int, tuple[np.ndarray, ...]] = {}
@@ -1217,7 +1234,7 @@ def build_lowcoh_component_panels(config: dict[str, Any]) -> pd.DataFrame:
                     dip=float(seg_dip),
                     layer=layer,
                     source_type="large_lowcoh_inferred_panel",
-                    constraint="seismic_prior",
+                    constraint="attribute_prior",
                     confidence=0.65,
                     source_density=float(comp_row.score_mean),
                     fault_name=f"large_lowcoh_component_{comp_id}",
@@ -1264,7 +1281,7 @@ def build_inferred_surface_panels(config: dict[str, Any]) -> pd.DataFrame:
         dominant_fraction = float(surface_row.get("dominant_layer_fraction", np.nan))
         min_window_fraction = float(config.get("inferred_surface_min_window_voxel_fraction", 0.90))
         window_validation_mode = "center_fallback"
-        if dominant_layer in ("沙三段", "沙四段") and np.isfinite(dominant_fraction) and dominant_fraction >= min_window_fraction:
+        if dominant_layer in (UPPER_LAYER, CRUST_LAYER) and np.isfinite(dominant_fraction) and dominant_fraction >= min_window_fraction:
             layer = dominant_layer
             window_validation_mode = "voxel_coverage"
         else:
@@ -1293,7 +1310,7 @@ def build_inferred_surface_panels(config: dict[str, Any]) -> pd.DataFrame:
             dip=dip,
             layer=layer,
             source_type="large_inferred_fault_local_panel",
-            constraint="seismic_prior",
+            constraint="attribute_prior",
             confidence=confidence,
             source_density=score_mean,
             fault_name=panel_chain_id,
@@ -1415,7 +1432,8 @@ def main() -> int:
     args = parse_args()
     config_path = Path(args.config).resolve()
     config = read_json(config_path)
-    horizon_lookup = build_spatial_lookup(config)
+    print("[step7c-large] loading Taigu Top/Mid/Base horizon contract", flush=True)
+    horizon_lookup = build_taigu_spatial_lookup(config)
     config["_horizon_spatial_lookup"] = horizon_lookup
     output_dir = Path(config["output_dir"]).resolve()
     ensure_dir(output_dir)
@@ -1463,7 +1481,7 @@ def main() -> int:
 
     lowcoh_patches = build_inferred_surface_panels(config)
     if lowcoh_patches.empty:
-        raise RuntimeError("no seismic-inferred local fault panels generated from Step6C")
+        raise RuntimeError("no attribute-inferred local fault panels generated from Step6C")
     upstream_inferred_df = read_csv_flexible(Path(config["large_component_summary_csv"]).resolve())
     upstream_inferred_ids = set(
         pd.to_numeric(
@@ -1563,11 +1581,11 @@ def main() -> int:
     summary = {
         "status": "pass",
         "config_path": str(config_path),
-        "generation_logic": "immutable_demo_original_fault_surfaces_plus_t4_t7_seismic_inferred_fault_panels",
+        "generation_logic": "immutable_taigu_original_fault_surfaces_plus_top_base_attribute_inferred_fault_panels",
         "inputs": {
             "original_fault_surface_vtk": str(source_surface),
             "original_fault_manifest_csv": str(source_manifest),
-            "fault_patch_overlap_csv": str(Path(config["fault_patch_overlap_csv"]).resolve()),
+            "fault_patch_overlap_csv": str(Path(config["fault_patch_overlap_csv"]).resolve()) if config.get("fault_patch_overlap_csv") else "",
             "large_prior_sgy": str(Path(config["large_prior_sgy"]).resolve()),
             "large_mask_sgy": str(Path(config["large_mask_sgy"]).resolve()) if config.get("large_mask_sgy") else "",
             "large_prior_components_npz": str(Path(config["large_prior_components_npz"]).resolve()),
@@ -1588,6 +1606,10 @@ def main() -> int:
         "patch_count": int(len(patch_df)),
         "unified_vtk": {**unified_write, **unified_summary},
         "damage_zone_included_in_formal_dfn": False,
+        "layer_semantics": {
+            UPPER_LAYER: "Top(T-a-1)->Mid(Art_1)",
+            CRUST_LAYER: "Mid(Art_1)->Base(Art_d1-1)",
+        },
         "horizon_contract_qc": {
             "original_fault_surface": "not_applied_by_contract",
             "inferred_lowcoh": lowcoh_horizon_qc,
@@ -1648,6 +1670,15 @@ def main() -> int:
                 == "predicted_patch_area_median_not_physical_triangle_area"
             ),
             "formal_dfn_excludes_damage_zone": True,
+            "uses_only_taigu_layer_names": bool(
+                set(patch_df["LayerGroup"].dropna().astype(str)).issubset({UPPER_LAYER, CRUST_LAYER})
+            ),
+            "inferred_centers_inside_taigu_window": bool(
+                patch_df.get("CenterInWindow", pd.Series(dtype=int)).fillna(0).eq(1).all()
+            ),
+            "both_taigu_layers_represented": bool(
+                {UPPER_LAYER, CRUST_LAYER}.issubset(set(patch_df["LayerGroup"].dropna().astype(str)))
+            ),
             "covers_all_step6c_inferred_components": bool(
                 not upstream_inferred_ids or classified_component_coverage_fraction >= 1.0
             ),

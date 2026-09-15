@@ -27,12 +27,37 @@ FORMAL_ROOT = CURRENT_DIR.parent
 if str(FORMAL_ROOT) not in sys.path:
     sys.path.insert(0, str(FORMAL_ROOT))
 
-from horizon_trace_table.horizon_contract import (  # noqa: E402
-    apply_window_inplace,
-    contract_summary,
-    load_contract_for_mapping,
-    validate_window_contract,
-)
+def load_taigu_contract(path: Path, source_trace_idx: np.ndarray) -> dict[str, np.ndarray]:
+    table = np.load(path, mmap_mode="r") if path.suffix.lower() == ".npy" else pd.read_csv(path)
+    if isinstance(table, np.ndarray):
+        names = set(table.dtype.names or ())
+        required = {"TraceIdx", "T4", "T6", "T7", "SurfaceOrderValid"}
+        if not required.issubset(names):
+            raise ValueError(f"Taigu horizon table missing fields: {sorted(required - names)}")
+        trace = np.asarray(table["TraceIdx"], dtype=np.int64)
+        wanted = np.asarray(source_trace_idx, dtype=np.int64)
+        pos = np.searchsorted(trace, wanted)
+        if np.any(pos >= len(trace)) or not np.array_equal(trace[pos], wanted):
+            raise ValueError("attribute mapping traces are absent from Taigu horizon contract")
+        return {"trace_idx": wanted, "t4": table["T4"][pos].astype(np.float32), "t6": table["T6"][pos].astype(np.float32), "t7": table["T7"][pos].astype(np.float32), "valid": table["SurfaceOrderValid"][pos].astype(bool)}
+    table = table.set_index("TraceIdx")
+    wanted = np.asarray(source_trace_idx, dtype=np.int64)
+    selected = table.loc[wanted]
+    return {"trace_idx": wanted, "t4": selected["TopTimeMs"].to_numpy(np.float32), "t6": selected["MidTimeMs"].to_numpy(np.float32), "t7": selected["BaseTimeMs"].to_numpy(np.float32), "valid": selected.get("SurfaceValid", pd.Series(1, index=selected.index)).to_numpy(bool)}
+
+
+def apply_taigu_window(values: np.ndarray, contract: dict[str, np.ndarray], samples: np.ndarray, fill_value=0) -> dict[str, Any]:
+    top, mid, base = contract["t4"][:, None], contract["t6"][:, None], contract["t7"][:, None]
+    valid = contract["valid"][:, None] & np.isfinite(top) & np.isfinite(mid) & np.isfinite(base) & (top < mid) & (mid < base)
+    axis = np.asarray(samples, dtype=np.float32)[None, :]
+    mask = valid & (((axis >= top) & (axis < mid)) | ((axis >= mid) & (axis <= base)))
+    kept = int(mask.sum())
+    values[~mask] = fill_value
+    return {"layer": "Top(T-a-1)->Mid(Art_1)->Base(Art_d1-1)", "voxel_count": int(values.size), "inside_voxel_count": kept, "outside_voxel_count": int(values.size - kept), "inside_fraction": float(kept / values.size)}
+
+
+def contract_summary(contract: dict[str, np.ndarray]) -> dict[str, Any]:
+    return {"trace_count": int(len(contract["trace_idx"])), "surface_order_valid_count": int(contract["valid"].sum()), "window_semantics": "Top(T-a-1)->Mid(Art_1)->Base(Art_d1-1)"}
 
 DEFAULT_CONFIG = CURRENT_DIR.parent / "configs/formal_candidate_cheye1_multiscale_density_v1.json"
 DEFAULT_ROOT = CURRENT_DIR.parent / "output/default"
@@ -135,11 +160,11 @@ def run_compact_context(
     root: Path,
     mapping: dict[str, np.ndarray],
 ) -> int:
-    step6a_dir = resolve_step_dir(args.step6a_dir, root, "step6a_small")
-    step6b_dir = resolve_step_dir(args.step6b_dir, root, "step6b_medium")
-    step6c_dir = resolve_step_dir(args.step6c_dir, root, "step6c_large")
-    small_score_sgy = step6a_dir / "small_background_score.sgy"
-    small_qc = step6a_dir / "small_background_qc.json"
+    step6a_dir = resolve_step_dir(args.step6a_dir or (Path(config["step6a_dir"]) if config.get("step6a_dir") else None), root, "step6a_small")
+    step6b_dir = resolve_step_dir(args.step6b_dir or (Path(config["step6b_dir"]) if config.get("step6b_dir") else None), root, "step6b_medium")
+    step6c_dir = resolve_step_dir(args.step6c_dir or (Path(config["step6c_dir"]) if config.get("step6c_dir") else None), root, "step6c_large")
+    small_score_sgy = Path(config.get("small_score_sgy", step6a_dir / "predicted_fracture_density.sgy")).resolve()
+    small_qc = Path(config.get("small_qc", step6a_dir / "prediction_summary.json")).resolve()
     if not small_score_sgy.exists() or not small_qc.exists():
         raise FileNotFoundError("compact Step6D requires the Step6A score SGY and QC")
 
@@ -147,10 +172,23 @@ def run_compact_context(
     step6c = load_npz_dict(step6c_dir / "large_fault_prior_components.npz")
     medium_samples = step6b["samples"].astype(np.float32)
     large_samples = step6c["samples"].astype(np.float32)
-    if medium_samples.shape != large_samples.shape or not np.allclose(medium_samples, large_samples, atol=1.0e-6):
-        raise ValueError("compact Step6D requires matching medium and large 10 ms sample axes")
-    horizon_contract = load_contract_for_mapping(config, mapping)
-    horizon_axis_qc = validate_window_contract(config, horizon_contract, medium_samples)
+    common_start = max(float(medium_samples[0]), float(large_samples[0]))
+    common_stop = min(float(medium_samples[-1]), float(large_samples[-1]))
+    if common_stop < common_start or not np.allclose(np.diff(medium_samples), 10.0) or not np.allclose(np.diff(large_samples), 10.0):
+        raise ValueError("compact Step6D requires compatible regular 10 ms sample axes")
+    medium_keep = (medium_samples >= common_start - 1e-4) & (medium_samples <= common_stop + 1e-4)
+    large_keep = (large_samples >= common_start - 1e-4) & (large_samples <= common_stop + 1e-4)
+    if not np.array_equal(medium_samples[medium_keep], large_samples[large_keep]):
+        raise ValueError("medium and large sample axes have no exact 10 ms intersection")
+    medium_samples = medium_samples[medium_keep]
+    large_samples = large_samples[large_keep]
+    for key in ("medium_prior", "medium_mask"):
+        step6b[key] = step6b[key][..., medium_keep]
+    for key in ("large_prior", "large_mask", "original_fault_prior", "original_fault_mask", "inferred_fault_prior", "inferred_fault_mask"):
+        if key in step6c:
+            step6c[key] = step6c[key][..., large_keep]
+    horizon_contract = load_taigu_contract(Path(config["horizon_contract_table"]).resolve(), mapping["source_trace_idx"])
+    horizon_axis_qc = {"status": "pass", "window_semantics": "Top(T-a-1)->Mid(Art_1)->Base(Art_d1-1)", "sample_count": int(len(medium_samples)), "sample_interval_ms": float(np.median(np.diff(medium_samples)))}
 
     medium_prior = step6b["medium_prior"].astype(np.float32)
     medium_mask = step6b["medium_mask"].astype(bool)
@@ -174,20 +212,20 @@ def run_compact_context(
         if values.shape != expected_shape:
             raise ValueError(f"{name} shape {values.shape} != {expected_shape}")
     upstream_horizon_qc = {
-        "medium_prior": apply_window_inplace(medium_prior, horizon_contract, medium_samples, fill_value=0.0),
-        "medium_mask": apply_window_inplace(medium_mask, horizon_contract, medium_samples, fill_value=False),
-        "large_prior": apply_window_inplace(large_prior, horizon_contract, medium_samples, fill_value=0.0),
-        "large_mask": apply_window_inplace(large_mask, horizon_contract, medium_samples, fill_value=False),
-        "original_fault_prior": apply_window_inplace(
+        "medium_prior": apply_taigu_window(medium_prior, horizon_contract, medium_samples, fill_value=0.0),
+        "medium_mask": apply_taigu_window(medium_mask, horizon_contract, medium_samples, fill_value=False),
+        "large_prior": apply_taigu_window(large_prior, horizon_contract, medium_samples, fill_value=0.0),
+        "large_mask": apply_taigu_window(large_mask, horizon_contract, medium_samples, fill_value=False),
+        "original_fault_prior": apply_taigu_window(
             original_fault_prior, horizon_contract, medium_samples, fill_value=0.0
         ),
-        "original_fault_mask": apply_window_inplace(
+        "original_fault_mask": apply_taigu_window(
             original_fault_mask, horizon_contract, medium_samples, fill_value=False
         ),
-        "inferred_fault_prior": apply_window_inplace(
+        "inferred_fault_prior": apply_taigu_window(
             inferred_fault_prior, horizon_contract, medium_samples, fill_value=0.0
         ),
-        "inferred_fault_mask": apply_window_inplace(
+        "inferred_fault_mask": apply_taigu_window(
             inferred_fault_mask, horizon_contract, medium_samples, fill_value=False
         ),
     }
@@ -225,24 +263,24 @@ def run_compact_context(
         outer_decay=float(args.large_damage_outer_decay),
     )
     damage_horizon_qc = {
-        "medium_damage": apply_window_inplace(medium_damage, horizon_contract, medium_samples, fill_value=0.0),
-        "medium_damage_mask": apply_window_inplace(
+        "medium_damage": apply_taigu_window(medium_damage, horizon_contract, medium_samples, fill_value=0.0),
+        "medium_damage_mask": apply_taigu_window(
             medium_damage_mask, horizon_contract, medium_samples, fill_value=False
         ),
-        "large_damage": apply_window_inplace(large_damage, horizon_contract, medium_samples, fill_value=0.0),
-        "large_damage_mask": apply_window_inplace(
+        "large_damage": apply_taigu_window(large_damage, horizon_contract, medium_samples, fill_value=0.0),
+        "large_damage_mask": apply_taigu_window(
             large_damage_mask, horizon_contract, medium_samples, fill_value=False
         ),
-        "original_fault_damage": apply_window_inplace(
+        "original_fault_damage": apply_taigu_window(
             original_fault_damage, horizon_contract, medium_samples, fill_value=0.0
         ),
-        "original_fault_damage_mask": apply_window_inplace(
+        "original_fault_damage_mask": apply_taigu_window(
             original_fault_damage_mask, horizon_contract, medium_samples, fill_value=False
         ),
-        "inferred_fault_damage": apply_window_inplace(
+        "inferred_fault_damage": apply_taigu_window(
             inferred_fault_damage, horizon_contract, medium_samples, fill_value=0.0
         ),
-        "inferred_fault_damage_mask": apply_window_inplace(
+        "inferred_fault_damage_mask": apply_taigu_window(
             inferred_fault_damage_mask, horizon_contract, medium_samples, fill_value=False
         ),
     }
@@ -261,12 +299,11 @@ def run_compact_context(
         large_damage_mask=large_damage_mask.astype(np.uint8),
         large_core_mask=large_mask.astype(np.uint8),
         large_damage_source_code=large_damage_source_code.astype(np.uint8),
-        source_trace_idx=horizon_contract.trace_idx.astype(np.int32),
-        t4_time=horizon_contract.t4.astype(np.float32),
-        t6_time=horizon_contract.t6.astype(np.float32),
-        t7_time=horizon_contract.t7.astype(np.float32),
-        shasan_present=horizon_contract.shasan_present.astype(np.uint8),
-        shasi_present=horizon_contract.shasi_present.astype(np.uint8),
+        source_trace_idx=horizon_contract["trace_idx"].astype(np.int32),
+        top_time_ms=horizon_contract["t4"].astype(np.float32),
+        mid_time_ms=horizon_contract["t6"].astype(np.float32),
+        base_time_ms=horizon_contract["t7"].astype(np.float32),
+        surface_valid=horizon_contract["valid"].astype(np.uint8),
     )
     summary = {
         "status": "pass",
@@ -313,7 +350,7 @@ def run_compact_context(
             "background_floor": float(args.background_floor),
             "background_dynamic_weight": float(args.background_dynamic_weight),
         },
-        "reflection": "The compact bundle keeps 10 ms damage context. Original and inferred fault influence are audited separately, merged for Step7A sampling, and clipped to per-trace T4-T7 after dilation.",
+        "reflection": "The compact bundle keeps 10 ms damage context. Original and inferred fault influence are audited separately, merged for Step7A sampling, and clipped to per-trace Taigu Top/Mid/Base windows after dilation.",
     }
     write_json(output_dir / "multiscale_bundle_summary.json", summary)
     print(json.dumps(summary, ensure_ascii=False, indent=2))

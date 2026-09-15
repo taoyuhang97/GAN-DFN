@@ -15,7 +15,7 @@ import numpy as np
 import pandas as pd
 import segyio
 
-from attribute_contract import POLARITY, robust_limits, score_attribute
+from attribute_contract import POLARITY, robust_limits, score_attribute, scoring_values
 
 
 LAYERS = {
@@ -30,7 +30,8 @@ def write_json(path: Path, data: Any) -> None:
 
 
 def stats(values: np.ndarray, low_q: float, high_q: float, attribute: str) -> dict[str, Any]:
-    values = np.asarray(values, dtype=np.float64)
+    raw_values = np.asarray(values, dtype=np.float64)
+    values = scoring_values(raw_values, attribute)
     finite = values[np.isfinite(values)]
     limits = robust_limits(finite, low_q, high_q)
     quantiles = np.quantile(finite, [0.02, 0.05, 0.50, 0.95, 0.98])
@@ -48,6 +49,9 @@ def stats(values: np.ndarray, low_q: float, high_q: float, attribute: str) -> di
         "p98": float(quantiles[4]),
         **limits,
         "polarity": POLARITY[attribute],
+        "scoring_transform": "absolute_value" if attribute == "CurvatureMax" else "identity",
+        "raw_min": float(np.nanmin(raw_values)),
+        "raw_max": float(np.nanmax(raw_values)),
     }
 
 
@@ -123,6 +127,11 @@ def main() -> int:
             "reference_attribute": cfg["reference_attribute"],
             "trace_alignment_assumption": "Coherence/AntTrack/CurvatureMax share the CurvatureMax TraceIdx",
             "normalization_quantiles": {"low": low_q, "high": high_q},
+            "scoring_semantics": {
+                "AntTrack": "identity_then_high_value_is_fracture_evidence",
+                "Coherence": "identity_then_low_value_is_discontinuity_evidence",
+                "CurvatureMax": "abs_then_high_value_is_fracture_evidence",
+            },
             "layers": {},
         }
         for layer in LAYERS:
@@ -155,6 +164,7 @@ def main() -> int:
                 for name in ATTRIBUTES:
                     raw = float(np.interp(time_ms, axes[name], np.asarray(handles[name].trace[int(row.TraceIdx)])))
                     record[f"{name}Raw"] = raw
+                    record[f"{name}ScoringValue"] = float(scoring_values(np.array([raw]), name)[0])
                     record[f"{name}Score"] = float(score_attribute(np.array([raw]), name, contract["layers"][layer][name])[0])
                 representative.append(record)
     finally:
@@ -172,11 +182,30 @@ def main() -> int:
         "anttrack_minus_one_retained": all(
             contract["layers"][layer]["AntTrack"]["minus_one_count"] > 0 for layer in LAYERS
         ),
-        "representative_values_finite": bool(np.isfinite(representative_df.filter(regex="Raw$|Score$").to_numpy()).all()),
+        "representative_values_finite": bool(np.isfinite(representative_df.filter(regex="Raw$|ScoringValue$|Score$").to_numpy()).all()),
         "representative_scores_in_0_1": bool(
             ((representative_df.filter(regex="Score$") >= 0) & (representative_df.filter(regex="Score$") <= 1)).all().all()
         ),
         "no_normalized_volume_written": True,
+        "curvature_uses_absolute_value": all(
+            contract["layers"][layer]["CurvatureMax"].get("scoring_transform") == "absolute_value" for layer in LAYERS
+        ),
+        "curvature_sign_symmetric_score": all(
+            np.allclose(
+                score_attribute(
+                    np.array([-0.5 * contract["layers"][layer]["CurvatureMax"]["clip_high"]]),
+                    "CurvatureMax",
+                    contract["layers"][layer]["CurvatureMax"],
+                ),
+                score_attribute(
+                    np.array([0.5 * contract["layers"][layer]["CurvatureMax"]["clip_high"]]),
+                    "CurvatureMax",
+                    contract["layers"][layer]["CurvatureMax"],
+                ),
+                atol=1.0e-7,
+            )
+            for layer in LAYERS
+        ),
     }
     qc = {
         "status": "pass" if all(checks.values()) else "fail",

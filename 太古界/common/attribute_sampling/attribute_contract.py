@@ -17,6 +17,19 @@ POLARITY = {
 }
 
 
+def scoring_values(values: np.ndarray, attribute: str) -> np.ndarray:
+    """Return the physical quantity used for crack-evidence normalization.
+
+    AntTrack and Coherence retain their delivered values.  Curvature sign
+    describes bending direction, not anomaly strength, so both signs must map
+    to the same evidence magnitude.
+    """
+    if attribute not in POLARITY:
+        raise KeyError(f"unsupported attribute: {attribute}")
+    raw = np.asarray(values, dtype=np.float64)
+    return np.abs(raw) if attribute == "CurvatureMax" else raw
+
+
 def robust_limits(values: np.ndarray, low_quantile: float = 0.02, high_quantile: float = 0.98) -> dict[str, float]:
     """Return finite-value quantile limits; AntTrack=-1 remains finite."""
     values = np.asarray(values, dtype=np.float64)
@@ -38,10 +51,11 @@ def score_attribute(values: np.ndarray, attribute: str, limits: dict[str, Any]) 
     if attribute not in POLARITY:
         raise KeyError(f"unsupported attribute: {attribute}")
     raw = np.asarray(values, dtype=np.float64)
+    mapped = scoring_values(raw, attribute)
     low, high = float(limits["clip_low"]), float(limits["clip_high"])
     if high <= low:
         raise ValueError(f"invalid normalization limits for {attribute}")
-    score = np.clip((raw - low) / (high - low), 0.0, 1.0)
+    score = np.clip((mapped - low) / (high - low), 0.0, 1.0)
     if POLARITY[attribute].startswith("low_is"):
         score = 1.0 - score
     score[~np.isfinite(raw)] = np.nan

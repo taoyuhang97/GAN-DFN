@@ -1,6 +1,6 @@
 {
-  "input_density_sgy": "/home/tyh/projects/petroleum/code/GAN-DFN/太古界/step6a_density_volume/output/taigu_step6a_common_contract_v4/volume/predicted_fracture_density.sgy",
-  "trace_mapping_npz": "/home/tyh/projects/petroleum/code/GAN-DFN/太古界/common/trace_contract/output/taigu_demo_grid_v1/trace_mapping.npz",
+  "input_density_sgy": "/home/tyh/projects/petroleum/code/GAN-DFN/太古界/step6a_density_volume/output/taigu_step6a_attribute_v3_full/volume/predicted_fracture_density.sgy",
+  "trace_mapping_npz": "/home/tyh/projects/petroleum/code/GAN-DFN/太古界/common/attribute_demo_grid/output/taigu_attribute_demo_grid_v1/attribute_demo_grid_mapping.npz",
   "horizon_contract_table": "/home/tyh/projects/petroleum/code/GAN-DFN/太古界/common/horizon_contract/output/taigu_attribute_full_horizon_contract_v1/demo_horizon_contract.csv",
   "fault_patch_root": "/home/tyh/projects/petroleum/code/GAN-DFN/太古界/common/fault_preprocessing_300m/patches",
   "volume_paths": {
@@ -9,8 +9,8 @@
     "CurvatureMax": "/data/shared/project-oil/wx数据/埕岛太古界/体数据/Chengdao-Taigujie-Most Positive Curvature.sgy"
   },
   "volume_time_offsets_ms": {"Coherence": 1800.0, "AntTrack": 0.0, "CurvatureMax": 1800.0},
-  "output_dir": "/home/tyh/projects/petroleum/code/GAN-DFN/太古界/step6c_large_fault/output/taigu_step6c_large_v1",
-  "large_evidence": {"sample_start_ms": 1800.0, "sample_stop_ms": 4800.0, "sample_interval_ms": 2.0},
+  "output_dir": "/home/tyh/projects/petroleum/code/GAN-DFN/太古界/step6c_large_fault/output/taigu_step6c_large_v3_attribute_v3",
+  "large_evidence": {"sample_start_ms": 2248.0, "sample_stop_ms": 3446.0, "sample_interval_ms": 10.0},
   "small_density_sgy_name": "taigu_small_density.sgy",
   "small_prior_sgy_name": "taigu_small_prior.sgy",
   "medium_prior_sgy_name": "taigu_medium_prior.sgy",
@@ -74,6 +74,9 @@
     "mask_score_floor_multiplier": 0.65,
     "summary_component_limit": 30
   },
+  "version": "taigu_step6c_large_v3_attribute_v3",
+  "attribute_normalization_contract_json": "/home/tyh/projects/petroleum/code/GAN-DFN/太古界/common/attribute_sampling/output/taigu_attribute_contract_v3/attribute_normalization_contract.json",
+  "expected_attribute_normalization_contract_version": "taigu_attribute_contract_v3",
   "integration": {
     "small_weight": 1.0,
     "medium_additive_density": 4.0,

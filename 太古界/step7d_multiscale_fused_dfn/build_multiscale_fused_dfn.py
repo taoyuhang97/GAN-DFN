@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import json
 import sys
 from pathlib import Path
@@ -14,17 +15,22 @@ from scipy.spatial import cKDTree
 
 CURRENT_DIR = Path(__file__).resolve().parent
 FORMAL_ROOT = CURRENT_DIR.parent
-DEFAULT_CONFIG = CURRENT_DIR / "configs/formal_candidate_cheye1_step7d_fused_v1.json"
+REPO_ROOT = CURRENT_DIR.parents[1]
+DEFAULT_CONFIG = CURRENT_DIR / "configs/taigu_step7d_fused_v1.json"
 CSV_ENCODINGS = ("utf-8-sig", "utf-8", "gb18030", "gbk")
 if str(FORMAL_ROOT) not in sys.path:
     sys.path.insert(0, str(FORMAL_ROOT))
-from common.unified_dfn_vtk import (  # noqa: E402
-    ORIGINAL_FAULT_GEOMETRY_GROUP_CODE,
-    extract_geometry_group,
-    geometry_fingerprint,
-    unified_vtk_summary,
-    write_unified_dfn_vtk,
-)
+_vtk_path = REPO_ROOT / "优化阶段二" / "正式主线" / "common" / "unified_dfn_vtk.py"
+_spec = importlib.util.spec_from_file_location("taigu_step7d_unified_vtk", _vtk_path)
+if _spec is None or _spec.loader is None:
+    raise ImportError(f"cannot load unified VTK helper: {_vtk_path}")
+_vtk = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(_vtk)
+ORIGINAL_FAULT_GEOMETRY_GROUP_CODE = _vtk.ORIGINAL_FAULT_GEOMETRY_GROUP_CODE
+extract_geometry_group = _vtk.extract_geometry_group
+geometry_fingerprint = _vtk.geometry_fingerprint
+unified_vtk_summary = _vtk.unified_vtk_summary
+write_unified_dfn_vtk = _vtk.write_unified_dfn_vtk
 
 
 def parse_args() -> argparse.Namespace:
@@ -76,6 +82,10 @@ def output_paths(output_dir: Path) -> dict[str, Path]:
 
 def normalize_input(df: pd.DataFrame, scale: str, source_file: Path) -> pd.DataFrame:
     out = df.copy()
+    aliases = {"X": "CenterX", "Y": "CenterY", "TIME": "CenterTime", "PatchLengthM": "LengthM", "PatchHeightMs": "HeightTimeMs"}
+    for source, target in aliases.items():
+        if target not in out.columns and source in out.columns:
+            out[target] = out[source]
     required = ["PatchID", "CenterX", "CenterY", "CenterTime", "LengthM", "HeightTimeMs", "AzimuthDeg", "DipDeg"]
     missing = [col for col in required if col not in out.columns]
     if missing:
@@ -182,7 +192,27 @@ def add_render_columns(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
-def patch_vertices(row: pd.Series) -> list[tuple[float, float, float]]:
+def taigu_input_qc(frames: dict[str, pd.DataFrame], config: dict[str, Any]) -> dict[str, Any]:
+    allowed = {"上部复合层", "太古界风化壳"}
+    target = config.get("target_block") or {"x_min": 660500.0, "x_max": 665500.0, "y_min": 4238400.0, "y_max": 4243400.0}
+    result: dict[str, Any] = {"layers": {}, "ranges": {}, "unknown_layer_rows": 0, "outside_xy_rows": 0}
+    for name, frame in frames.items():
+        layers = set(frame.get("LayerGroup", pd.Series(dtype=str)).dropna().astype(str))
+        result["layers"][name] = sorted(layers)
+        result["unknown_layer_rows"] += int((~frame.get("LayerGroup", pd.Series(dtype=str)).astype(str).isin(allowed)).sum())
+        result["ranges"][name] = {
+            "x": [float(frame["CenterX"].min()), float(frame["CenterX"].max())],
+            "y": [float(frame["CenterY"].min()), float(frame["CenterY"].max())],
+            "time": [float(frame["CenterTime"].min()), float(frame["CenterTime"].max())],
+        }
+        result["outside_xy_rows"] += int((~frame["CenterX"].between(float(target["x_min"]), float(target["x_max"])) | ~frame["CenterY"].between(float(target["y_min"]), float(target["y_max"]))).sum())
+    result["allowed_layers"] = sorted(allowed)
+    result["target_block"] = target
+    result["status"] = "pass" if result["unknown_layer_rows"] == 0 and result["outside_xy_rows"] == 0 else "fail"
+    return result
+
+
+def patch_vertices(row: pd.Series, geometry_time_scale: float = 1.0) -> list[tuple[float, float, float]]:
     vertex_cols = [f"V{vertex_idx}{axis}" for vertex_idx in range(1, 5) for axis in ("X", "Y", "Z")]
     if all(col in row.index and pd.notna(row.get(col)) for col in vertex_cols):
         return [
@@ -195,7 +225,7 @@ def patch_vertices(row: pd.Series) -> list[tuple[float, float, float]]:
     half_height_time = 0.5 * float(row["HeightTimeMs"])
     strike = np.asarray([np.cos(azimuth), np.sin(azimuth)], dtype=float)
     dip_horizontal = np.asarray([-np.sin(azimuth), np.cos(azimuth)], dtype=float)
-    horizontal_dip_half = half_height_time / max(np.tan(dip), 1.0e-6)
+    horizontal_dip_half = (half_height_time * float(geometry_time_scale)) / max(np.tan(dip), 1.0e-6)
     center_xy = np.asarray([float(row["CenterX"]), float(row["CenterY"])], dtype=float)
     center_t = float(row["CenterTime"])
     corners = []
@@ -205,12 +235,12 @@ def patch_vertices(row: pd.Series) -> list[tuple[float, float, float]]:
     return corners
 
 
-def write_vtk(path: Path, df: pd.DataFrame, title: str) -> None:
+def write_vtk(path: Path, df: pd.DataFrame, title: str, geometry_time_scale: float = 1.0) -> None:
     points: list[tuple[float, float, float]] = []
     polygons: list[list[int]] = []
     for _, row in df.iterrows():
         base = len(points)
-        points.extend(patch_vertices(row))
+        points.extend(patch_vertices(row, geometry_time_scale=geometry_time_scale))
         polygons.append([base, base + 1, base + 2, base + 3])
     lines = ["# vtk DataFile Version 3.0", title, "ASCII", "DATASET POLYDATA", f"POINTS {len(points)} float"]
     lines.extend(f"{x:.6f} {y:.6f} {z:.6f}" for x, y, z in points)
@@ -249,6 +279,9 @@ def main() -> int:
     small = normalize_input(read_csv_flexible(Path(config["small_dfn_csv"]).resolve()), "small", Path(config["small_dfn_csv"]).resolve())
     medium = normalize_input(read_csv_flexible(Path(config["medium_dfn_csv"]).resolve()), "medium", Path(config["medium_dfn_csv"]).resolve())
     large = normalize_input(read_csv_flexible(Path(config["large_dfn_csv"]).resolve()), "large", Path(config["large_dfn_csv"]).resolve())
+    input_qc = taigu_input_qc({"small": small, "medium": medium, "large": large}, config)
+    if input_qc["status"] != "pass":
+        raise ValueError(f"Taigu Step7D input QC failed: {input_qc}")
     large_dfn_vtk = Path(str(config["large_dfn_vtk"])).resolve()
     if not large_dfn_vtk.exists():
         raise FileNotFoundError(f"Step7C unified VTK not found: {large_dfn_vtk}")
@@ -280,7 +313,7 @@ def main() -> int:
     write_vtk_enabled = bool(config.get("write_vtk", True))
     if write_vtk_enabled:
         predicted_vtk = output_dir / ".fused_multiscale_predicted_only_raw_time.vtk"
-        write_vtk(predicted_vtk, fused, "step7d_fused_multiscale_predicted_only_raw_time")
+        write_vtk(predicted_vtk, fused, "step7d_fused_multiscale_predicted_only_raw_time", geometry_time_scale=float(config.get("geometry_time_scale_m_per_ms", 2.0)))
         unified_write = write_unified_dfn_vtk(paths["raw_vtk"], predicted_vtk, large_dfn_vtk)
         predicted_vtk.unlink(missing_ok=True)
         unified_summary = unified_vtk_summary(paths["raw_vtk"])
@@ -301,6 +334,7 @@ def main() -> int:
         "outputs": {key: str(value) for key, value in paths.items()},
         "input_counts": {"small": int(len(small)), "medium": int(len(medium)), "large": int(len(large))},
         "small_relation_summary": small_relation_summary,
+        "taigu_input_qc": input_qc,
         "patch_count": int(len(fused)),
         "unified_vtk": {**unified_write, **unified_summary},
         "scale_counts": {str(k): int(v) for k, v in fused["FractureScale"].value_counts(dropna=False).items()},
@@ -335,6 +369,7 @@ def main() -> int:
                 == "predicted_patch_area_median_not_physical_triangle_area"
             ),
             "original_fault_manifest_passthrough_exists": bool(config.get("original_fault_manifest_csv") and Path(str(config["original_fault_manifest_csv"])).resolve().exists()),
+            "taigu_input_qc_pass": input_qc["status"] == "pass",
         },
     }
     summary["status"] = "pass" if all(bool(v) for v in summary["checks"].values()) else "fail"

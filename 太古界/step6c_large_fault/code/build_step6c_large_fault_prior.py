@@ -36,6 +36,7 @@ from common.multiscale_density.build_multiscale_density_bundle import (
     valid_values,
     write_sgy_like,
 )
+from common.attribute_sampling.attribute_contract import score_attribute
 
 
 FORMAL_ROOT = CURRENT_DIR.parent
@@ -171,6 +172,36 @@ def load_taigu_attribute(path: Path, source_trace_idx: np.ndarray, samples: np.n
     load["project_time_offset_ms"] = offset
     load["project_sample_axis_ms"] = [float(samples[0]), float(samples[-1]), int(len(samples))]
     return matrix, load
+
+
+def score_taigu_attribute_v3(
+    values: np.ndarray,
+    valid: np.ndarray,
+    attribute: str,
+    contract: dict[str, Any],
+    horizons: TaiguHorizonContract,
+    samples: np.ndarray,
+) -> tuple[np.ndarray, dict[str, Any]]:
+    """Apply the Common v3 polarity/absolute-value semantics per layer."""
+    out = np.zeros_like(values, dtype=np.float32)
+    axis = np.asarray(samples, dtype=np.float64)[None, :]
+    masks = {
+        "上部复合层": horizons.surface_order_valid[:, None] & (axis >= horizons.t4[:, None]) & (axis <= horizons.t6[:, None]),
+        "太古界风化壳": horizons.surface_order_valid[:, None] & (axis >= horizons.t6[:, None]) & (axis <= horizons.t7[:, None]),
+    }
+    summary: dict[str, Any] = {"contract_version": contract.get("version"), "layers": {}}
+    for layer, layer_mask in masks.items():
+        mask = layer_mask & valid
+        scored = score_attribute(values, attribute, contract["layers"][layer][attribute])
+        out[mask] = scored[mask]
+        summary["layers"][layer] = {
+            "valid_count": int(mask.sum()),
+            "polarity": contract["layers"][layer][attribute].get("polarity"),
+            "scoring_transform": contract["layers"][layer][attribute].get("scoring_transform"),
+            "score_stats": finite_stats(out[mask]),
+        }
+    out[~valid] = 0.0
+    return out, summary
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 DEFAULT_CONFIG = CURRENT_DIR.parent / "configs/formal_candidate_cheye1_multiscale_density_v1.json"
@@ -1570,9 +1601,27 @@ def main() -> int:
     apply_validity_inplace(curvmax_valid, horizon_contract, samples)
     if curvpos_valid is not None:
         apply_validity_inplace(curvpos_valid, horizon_contract, samples)
-    lowcoh_score, lowcoh_summary = low_score(coherence, coh_valid, coh_cfg)
-    ant_score, ant_summary = high_score(anttrack, ant_valid, ant_cfg)
-    curvmax_score, curvmax_summary = high_score(curvmax, curvmax_valid, curvmax_cfg)
+    normalization_path = config.get("attribute_normalization_contract_json")
+    if normalization_path:
+        normalization_contract = read_json(Path(str(normalization_path)).resolve())
+        expected_norm = config.get("expected_attribute_normalization_contract_version")
+        if expected_norm and normalization_contract.get("version") != expected_norm:
+            raise RuntimeError(
+                f"Step6C attribute contract mismatch: {normalization_contract.get('version')} != {expected_norm}"
+            )
+        lowcoh_score, lowcoh_summary = score_taigu_attribute_v3(
+            coherence, coh_valid, "Coherence", normalization_contract, horizon_contract, samples
+        )
+        ant_score, ant_summary = score_taigu_attribute_v3(
+            anttrack, ant_valid, "AntTrack", normalization_contract, horizon_contract, samples
+        )
+        curvmax_score, curvmax_summary = score_taigu_attribute_v3(
+            curvmax, curvmax_valid, "CurvatureMax", normalization_contract, horizon_contract, samples
+        )
+    else:
+        lowcoh_score, lowcoh_summary = low_score(coherence, coh_valid, coh_cfg)
+        ant_score, ant_summary = high_score(anttrack, ant_valid, ant_cfg)
+        curvmax_score, curvmax_summary = high_score(curvmax, curvmax_valid, curvmax_cfg)
     if curvpos is not None and curvpos_valid is not None:
         curvpos_score, curvpos_summary = high_score(curvpos, curvpos_valid, curvpos_cfg)
         curv_score = np.maximum(curvmax_score, curvpos_score).astype(np.float32)
