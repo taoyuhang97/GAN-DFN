@@ -11,11 +11,13 @@
 - 中尺度：裂缝带/小断层组合，主要来自蚂蚁体高值，并由低相干、曲率辅助约束。
 - 大尺度：断层/断裂带，主要来自低相干连续带；后续正式版还会接入原始断层解释硬约束。
 
-当前中尺度正式流程由 `build_medium_scale_dfn_v4.py` 实现，当前待验收配置为
-`configs/taigu_step7b_medium_v5_scale_separation.json`。它只消费Step6B v5的中尺度连通体，
-与小尺度Step7A、未完成的大尺度和最终融合模块分离。
+当前中尺度正式流程由 `build_medium_scale_dfn_v4.py` 实现，正式配置为
+`configs/taigu_step7b_medium_v7_anttrack_led.json`（2026-09-14 定稿）。它只消费 Step6B v7 的
+中尺度连通体，与小尺度 Step7A、大尺度 Step7C 和最终融合模块分离。
 
-Step6B v5保存的属性道号、10 ms时间轴和有效Top/Middle/Base层位窗口是Step7B的唯一上游合同。
+Step6B v7 保存的属性道号、10 ms时间轴和有效Top/Middle/Base层位窗口是Step7B的唯一上游合同。
+
+v2/v4/v5/v6 的配置与输出已于 2026-09-15 移入 `太古界/_archive_20260915/`。
 Step7B不再重新读取OBN道号或重新执行层位填补。VTK的Z坐标直接使用TWT `TIME(ms)`。
 
 v5将中尺度片长目标中位数设为80至100 m、上限145 m，脊线片间距设为50 m，

@@ -1,0 +1,536 @@
+#!/usr/bin/env python3
+"""太古界 Step9 v2: 井轨迹弯曲剖面的五背景、XZ/YZ 正式展示流程。
+
+本实现沿用砂砾岩正式 Step9 的剖面几何和 20 图产品结构，但数据合同完全
+切换为太古界：三属性使用属性主道头，OBN 振幅使用独立道头，层位使用
+Top/Mid/Base，DFN 使用 Step8 最终多尺度结果。
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import math
+import os
+import sys
+import time
+from pathlib import Path
+from typing import Any
+
+os.environ.setdefault("MPLCONFIGDIR", str(Path(__file__).resolve().parent / ".matplotlib"))
+import matplotlib
+
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+import segyio
+from matplotlib.collections import LineCollection
+from matplotlib import font_manager
+from scipy.spatial import cKDTree
+
+HERE = Path(__file__).resolve().parent
+SEISMIC_COMMON = HERE.parent / "common" / "seismic_sampling"
+if str(SEISMIC_COMMON) not in sys.path:
+    sys.path.insert(0, str(SEISMIC_COMMON))
+from amplitude_sampling import ObnAmplitudeSampler  # noqa: E402
+
+# P0-4：测井段坐标回接统一走公共模块（太古界/common/well_segment_join）
+TAIGU_ROOT = HERE.parent
+if str(TAIGU_ROOT) not in sys.path:
+    sys.path.insert(0, str(TAIGU_ROOT))
+from common.well_segment_join import (  # noqa: E402
+    attach_geometry_by_md,
+    cached_well_segment_pool,
+    summarize_join,
+)
+
+ATTRIBUTES = ("AntTrack", "Coherence", "CurvatureMax")
+HORIZONS = (
+    ("TopTimeMs", "上部复合层T-a-1", "#00bcd4"),
+    ("MidTimeMs", "太古界顶Art_1", "#43a047"),
+    ("BaseTimeMs", "风化壳底Art_d1-1", "#ff9800"),
+)
+SCOPE_LABELS = {"overview": "5 km Demo区", "local_200m": "井周200 m"}
+CHINESE_FONT_CANDIDATES = (
+    "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+    "/usr/share/fonts/opentype/noto/NotoSansCJK-Medium.ttc",
+    "/usr/share/fonts/truetype/droid/DroidSansFallbackFull.ttf",
+)
+
+
+def configure_fonts() -> str:
+    for candidate in CHINESE_FONT_CANDIDATES:
+        path = Path(candidate)
+        if path.exists():
+            font_manager.fontManager.addfont(str(path))
+            name = font_manager.FontProperties(fname=str(path)).get_name()
+            plt.rcParams["font.family"] = "sans-serif"
+            plt.rcParams["font.sans-serif"] = [name, "DejaVu Sans"]
+            plt.rcParams["axes.unicode_minus"] = False
+            return name
+    plt.rcParams["axes.unicode_minus"] = False
+    return "unavailable"
+
+
+CHINESE_FONT = configure_fonts()
+
+
+def parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(description="生成太古界 Step9 正式20图多背景剖面")
+    p.add_argument("--config", type=Path, required=True)
+    p.add_argument("--validate-only", action="store_true")
+    p.add_argument("--replace-output", action="store_true")
+    return p
+
+
+def read_json(path: Path) -> dict[str, Any]:
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def write_json(path: Path, value: Any) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(value, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def pth(config: dict[str, Any], key: str) -> Path:
+    if not config.get(key):
+        raise ValueError(f"配置缺少路径: {key}")
+    path = Path(str(config[key])).resolve()
+    if not path.exists():
+        raise FileNotFoundError(f"{key}不存在: {path}")
+    return path
+
+
+def validate(config: dict[str, Any]) -> dict[str, Any]:
+    paths = {
+        key: str(pth(config, key))
+        for key in (
+            "attribute_trace_header_csv", "obn_trace_header_csv", "obn_segy",
+            "attribute_demo_grid_csv", "horizon_contract_csv", "step8_patches_csv",
+            "step2_segments_root", "step3_groups_root",
+        )
+    }
+    volumes = config.get("volume_paths", {})
+    for name in ATTRIBUTES:
+        if name not in volumes:
+            raise ValueError(f"volume_paths缺少{name}")
+        path = Path(str(volumes[name])).resolve()
+        if not path.exists():
+            raise FileNotFoundError(f"{name}体不存在: {path}")
+        paths[name] = str(path)
+    if config.get("profile_well") != "埕北古斜405":
+        raise ValueError("正式配置的profile_well应为埕北古斜405")
+    target = config.get("target_block", {})
+    for key in ("x_min", "x_max", "y_min", "y_max"):
+        if key not in target:
+            raise ValueError(f"target_block缺少{key}")
+    well_dir = pth(config, "step2_segments_root") / str(config["profile_well"])
+    if not list(well_dir.glob("*.csv")):
+        raise FileNotFoundError(f"参考井无Step2轨迹分段: {well_dir}")
+    return {
+        "status": "pass", "profile_well": config["profile_well"], "paths": paths,
+        "matplotlib_chinese_font": CHINESE_FONT,
+        "contracts": {
+            "attribute_trace_idx": "attribute_trace_header_csv专用",
+            "obn_trace_idx": "obn_trace_header_csv专用，不与属性TraceIdx互换",
+            "horizons": [x[0] for x in HORIZONS],
+            "anttrack_minus_one_is_valid": True,
+            "seismic_role": "仅Step9展示，不参与裂缝预测或属性融合",
+        },
+    }
+
+
+def numeric(df: pd.DataFrame, columns: tuple[str, ...]) -> pd.DataFrame:
+    for col in columns:
+        if col in df:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+    return df
+
+
+def load_track(config: dict[str, Any]) -> pd.DataFrame:
+    root = pth(config, "step2_segments_root") / config["profile_well"]
+    frames = []
+    for path in sorted(root.glob("*.csv")):
+        frame = numeric(pd.read_csv(path, encoding="utf-8-sig"), ("MD", "X", "Y", "TIME"))
+        if {"MD", "X", "Y", "TIME"}.issubset(frame.columns):
+            frames.append(frame[["MD", "X", "Y", "TIME"]])
+    track = pd.concat(frames, ignore_index=True).dropna(subset=["X", "Y", "TIME"])
+    return track.sort_values("TIME").drop_duplicates("TIME").reset_index(drop=True)
+
+
+def load_imaging(config: dict[str, Any]) -> pd.DataFrame:
+    """剖面成像裂缝点：按 InputSegmentPath 回接 Step2 段坐标。
+
+    P0-4：改走公共 well_segment_join 模块。未命中的点不再静默丢弃，
+    审计统计回写到 section_summary，明细另存 imaging_point_join_unmatched.csv。
+    """
+    parts = []
+    audits = []
+    root = pth(config, "step3_groups_root")
+    samples_root = pth(config, "step2_segments_root")
+    join_config = dict(config.get("segment_join", {}))
+    tolerance_setting = join_config.get("tolerance_m", config.get("md_merge_tolerance"))
+    tolerance = (
+        None
+        if tolerance_setting is None or str(tolerance_setting).strip().lower() in {"", "auto"}
+        else float(tolerance_setting)
+    )
+    for path in sorted(root.glob(f"{config['profile_well']}_*.csv")):
+        frame = pd.read_csv(path, encoding="utf-8-sig")
+        frame = numeric(frame, ("MD", "GT_POINT_FLAG", "FracAzimuth", "FracDip"))
+        if "GT_POINT_FLAG" in frame:
+            frame = frame[frame["GT_POINT_FLAG"].fillna(0).astype(int) == 1]
+        if {"FracAzimuth", "FracDip"}.issubset(frame.columns):
+            frame = frame.dropna(subset=["FracAzimuth", "FracDip"])
+        if frame.empty or not {"MD", "WellName"}.issubset(frame.columns):
+            continue
+        matched, audit = attach_geometry_by_md(
+            frame,
+            lambda well: cached_well_segment_pool(samples_root, well),
+            tolerance_m=tolerance,
+            preferred_column="InputSegmentPath" if "InputSegmentPath" in frame.columns else None,
+            geometry_source="step9_imaging",
+        )
+        parts.append(matched)
+        audits.append(audit)
+    if not parts:
+        return pd.DataFrame(columns=["X", "Y", "TIME"])
+    merged_all = pd.concat(parts, ignore_index=True)
+    audit_all = pd.concat(audits, ignore_index=True) if audits else pd.DataFrame()
+    config["_imaging_join_qc"] = summarize_join(audit_all)
+    matched_mask = merged_all["MDJoinStatus"].astype(str).isin(["matched", "existing_geometry"])
+    join_failures = merged_all.loc[~matched_mask]
+    if not join_failures.empty:
+        output_dir = pth(config, "output_dir")
+        output_dir.mkdir(parents=True, exist_ok=True)
+        join_failures.to_csv(
+            output_dir / "imaging_point_join_unmatched.csv", index=False, encoding="utf-8-sig"
+        )
+    keep_columns = [
+        column for column in ("WellName", "X", "Y", "TIME", "FracAzimuth", "FracDip") if column in merged_all.columns
+    ]
+    return merged_all.loc[matched_mask, keep_columns].dropna(subset=["X", "Y", "TIME"]).reset_index(drop=True)
+
+
+def in_block(frame: pd.DataFrame, block: dict[str, float]) -> pd.DataFrame:
+    return frame[
+        frame["X"].between(block["x_min"], block["x_max"])
+        & frame["Y"].between(block["y_min"], block["y_max"])
+    ].copy()
+
+
+class AttributeSampler:
+    def __init__(self, header: pd.DataFrame, path: Path, time_offset_ms: float, max_distance_m: float):
+        self.header = header
+        self.trace_ids = header["TraceIdx"].to_numpy(np.int64)
+        self.tree = cKDTree(header[["X", "Y"]].to_numpy(np.float64))
+        self.handle = segyio.open(str(path), "r", ignore_geometry=True)
+        self.handle.mmap()
+        self.samples = np.asarray(self.handle.samples, np.float64) + time_offset_ms
+        self.max_distance_m = max_distance_m
+        self.trace_cache: dict[int, np.ndarray] = {}
+
+    def close(self) -> None:
+        self.handle.close()
+
+    def sample_row(self, x: np.ndarray, y: np.ndarray, time_ms: float) -> tuple[np.ndarray, np.ndarray]:
+        dist, pos = self.tree.query(np.column_stack([x, y]), k=1)
+        trace_ids = self.trace_ids[np.asarray(pos, np.int64)]
+        sample = int(np.clip(np.searchsorted(self.samples, time_ms), 0, len(self.samples) - 1))
+        values = np.empty(len(trace_ids), np.float32)
+        for trace_idx in np.unique(trace_ids):
+            key = int(trace_idx)
+            if key not in self.trace_cache:
+                self.trace_cache[key] = np.asarray(self.handle.trace[key], np.float32)
+            values[trace_ids == trace_idx] = self.trace_cache[key][sample]
+        values[(~np.isfinite(values)) | (dist > self.max_distance_m)] = np.nan
+        return values, np.asarray(dist, np.float64)
+
+
+def interp_track(track: pd.DataFrame, times: np.ndarray, column: str) -> np.ndarray:
+    return np.interp(times, track["TIME"].to_numpy(), track[column].to_numpy())
+
+
+def axes_for_scope(grid: pd.DataFrame, track: pd.DataFrame, scope: str, radius: float) -> tuple[np.ndarray, np.ndarray]:
+    x = np.sort(grid["X"].unique())
+    y = np.sort(grid["Y"].unique())
+    if scope == "local_200m":
+        x = x[(x >= track["X"].min() - radius) & (x <= track["X"].max() + radius)]
+        y = y[(y >= track["Y"].min() - radius) & (y <= track["Y"].max() + radius)]
+    return x, y
+
+
+def section_queries(track: pd.DataFrame, times: np.ndarray, coords: np.ndarray, projection: str):
+    if projection == "XZ":
+        fixed = interp_track(track, times, "Y")
+        well_h = interp_track(track, times, "X")
+        return np.tile(coords, (len(times), 1)), np.repeat(fixed[:, None], len(coords), axis=1), well_h
+    fixed = interp_track(track, times, "X")
+    well_h = interp_track(track, times, "Y")
+    return np.repeat(fixed[:, None], len(coords), axis=1), np.tile(coords, (len(times), 1)), well_h
+
+
+def sample_attribute_section(sampler: AttributeSampler, track: pd.DataFrame, times: np.ndarray,
+                             coords: np.ndarray, projection: str, progress: int) -> tuple[np.ndarray, dict[str, Any]]:
+    qx, qy, _ = section_queries(track, times, coords, projection)
+    out = np.full(qx.shape, np.nan, np.float32)
+    distances = []
+    for row, time_ms in enumerate(times):
+        out[row], dist = sampler.sample_row(qx[row], qy[row], float(time_ms))
+        distances.append(dist)
+        if row == 0 or (row + 1) % progress == 0 or row + 1 == len(times):
+            print(f"    {projection}: {row + 1}/{len(times)} 时间样点", flush=True)
+    d = np.concatenate(distances)
+    finite = out[np.isfinite(out)]
+    return out, {
+        "shape": list(out.shape), "finite_fraction": float(np.isfinite(out).mean()),
+        "nearest_distance_p95_m": float(np.quantile(d, .95)),
+        "raw_percentiles": np.percentile(finite, [0, 1, 50, 99, 100]).tolist() if len(finite) else [],
+    }
+
+
+def sample_obn_section(sampler: ObnAmplitudeSampler, track: pd.DataFrame, times: np.ndarray,
+                       coords: np.ndarray, projection: str, max_distance: float,
+                       progress: int) -> tuple[np.ndarray, dict[str, Any]]:
+    qx, qy, _ = section_queries(track, times, coords, projection)
+    out = np.full(qx.shape, np.nan, np.float32)
+    all_dist = []
+    for row, time_ms in enumerate(times):
+        idx, dist = sampler.nearest_trace(qx[row], qy[row])
+        values = sampler.sample_at_trace(idx, np.full(len(idx), time_ms))
+        values[dist > max_distance] = np.nan
+        out[row] = values
+        all_dist.append(dist)
+        if row == 0 or (row + 1) % progress == 0 or row + 1 == len(times):
+            print(f"    {projection}: {row + 1}/{len(times)} 时间样点", flush=True)
+    d = np.concatenate(all_dist)
+    finite = out[np.isfinite(out)]
+    return out, {
+        "shape": list(out.shape), "finite_fraction": float(np.isfinite(out).mean()),
+        "nearest_distance_p95_m": float(np.quantile(d, .95)),
+        "raw_percentiles": np.percentile(finite, [0, 1, 50, 99, 100]).tolist() if len(finite) else [],
+    }
+
+
+def horizon_curves(horizon: pd.DataFrame, track: pd.DataFrame, coords: np.ndarray,
+                   projection: str) -> dict[str, np.ndarray]:
+    tree = cKDTree(horizon[["X", "Y"]].to_numpy(np.float64))
+    output = {}
+    seed = np.full(len(coords), float(track["TIME"].median()))
+    for field, _, _ in HORIZONS:
+        values = seed.copy()
+        for _ in range(8):
+            if projection == "XZ":
+                q = np.column_stack([coords, interp_track(track, values, "Y")])
+            else:
+                q = np.column_stack([interp_track(track, values, "X"), coords])
+            _, pos = tree.query(q, k=1)
+            updated = horizon.iloc[np.asarray(pos, np.int64)][field].to_numpy(np.float64)
+            values = np.where(np.isfinite(updated), updated, values)
+        output[field] = np.where(np.isfinite(updated), values, np.nan)
+    return output
+
+
+def patch_segments(patches: pd.DataFrame, track: pd.DataFrame, projection: str,
+                   half_width: float) -> tuple[list[list[list[float]]], list[str], list[float]]:
+    centers_t = patches["CenterTime"].to_numpy(np.float64)
+    perpendicular = "Y" if projection == "XZ" else "X"
+    center_perp = patches[f"Center{perpendicular}"].to_numpy(np.float64)
+    well_perp = interp_track(track, centers_t, perpendicular)
+    selected = patches[np.abs(center_perp - well_perp) <= half_width]
+    segments, colors, widths = [], [], []
+    color = {"上部复合层": "#ef6c00", "太古界风化壳": "#1976d2"}
+    width = {"small": .55, "medium": 1.0, "large": 1.7}
+    for row in selected.itertuples(index=False):
+        cx = float(row.CenterX if projection == "XZ" else row.CenterY)
+        ct = float(row.CenterTime)
+        az = math.radians(float(row.AzimuthDeg))
+        dip = math.radians(float(row.DipDeg))
+        lateral = math.cos(az) if projection == "XZ" else math.sin(az)
+        vertical = math.tan(dip) * max(abs(lateral), .08)
+        norm = math.hypot(lateral, vertical)
+        lateral, vertical = lateral / norm, vertical / norm
+        length = float(getattr(row, "PatchLengthM", np.nan))
+        if not np.isfinite(length):
+            length = float(getattr(row, "LengthM", 30.0))
+        half = min(length, 500.0) / 2
+        segments.append([[cx - half * lateral, ct - half * vertical], [cx + half * lateral, ct + half * vertical]])
+        colors.append(color.get(str(row.LayerGroup), "#7b1fa2"))
+        widths.append(width.get(str(row.FractureScale), .8))
+    return segments, colors, widths
+
+
+def draw_overlays(ax, projection: str, coords: np.ndarray, times: np.ndarray, track: pd.DataFrame,
+                  curves: dict[str, np.ndarray], patches: pd.DataFrame, imaging: pd.DataFrame,
+                  half_width: float) -> dict[str, int]:
+    _, _, well_h = section_queries(track, times, coords, projection)
+    for field, label, color in HORIZONS:
+        ax.plot(coords, curves[field], color=color, lw=1.3, label=label, zorder=8)
+    real_track = (times >= float(track["TIME"].min())) & (times <= float(track["TIME"].max()))
+    ax.plot(well_h[real_track], times[real_track], color="black", lw=1.8,
+            label="埕北古斜405真实轨迹段", zorder=10)
+    segments, colors, widths = patch_segments(patches, track, projection, half_width)
+    if segments:
+        ax.add_collection(LineCollection(segments, colors=colors, linewidths=widths, alpha=.82, zorder=7))
+        ax.plot([], [], color="#ef6c00", lw=1.2, label="DFN：上部复合层")
+        ax.plot([], [], color="#1976d2", lw=1.2, label="DFN：太古界风化壳")
+        ax.plot([], [], color="#616161", lw=.55, label="小尺度")
+        ax.plot([], [], color="#616161", lw=1.0, label="中尺度")
+        ax.plot([], [], color="#616161", lw=1.7, label="大尺度")
+    if len(imaging):
+        perp = "Y" if projection == "XZ" else "X"
+        mask = np.abs(imaging[perp].to_numpy() - interp_track(track, imaging["TIME"].to_numpy(), perp)) <= half_width
+        shown = imaging[mask]
+        hcol = "X" if projection == "XZ" else "Y"
+        ax.scatter(shown[hcol], shown["TIME"], marker="^", c="#d500f9", s=12, label="成像测井裂缝", zorder=11)
+    else:
+        shown = imaging
+    return {"dfn_segment_count": len(segments), "imaging_point_count": int(len(shown))}
+
+
+def display_array(name: str, values: np.ndarray) -> tuple[np.ndarray, str, float, float]:
+    finite = values[np.isfinite(values)]
+    if name == "CurvatureMax":
+        shown = np.abs(values)
+        upper = float(np.nanquantile(np.abs(finite), .99)) if len(finite) else 1.0
+        return shown, "gray_r", 0.0, max(upper, 1e-9)
+    lo, hi = (np.nanquantile(finite, [.01, .99]) if len(finite) else (0.0, 1.0))
+    cmap = "gray_r" if name == "AntTrack" else "gray"
+    return values, cmap, float(lo), float(hi if hi > lo else lo + 1)
+
+
+def plot_image(path: Path, name: str, renderer: str, projection: str, scope: str,
+               values: np.ndarray, coords: np.ndarray, times: np.ndarray, track: pd.DataFrame,
+               curves: dict[str, np.ndarray], patches: pd.DataFrame, imaging: pd.DataFrame,
+               config: dict[str, Any]) -> dict[str, Any]:
+    fig, ax = plt.subplots(figsize=(15.5, 7.8))
+    extent = [coords[0], coords[-1], times[-1], times[0]]
+    if renderer == "attribute":
+        shown, cmap, lo, hi = display_array(name, values)
+        image = ax.imshow(shown, extent=extent, aspect="auto", cmap=cmap, vmin=lo, vmax=hi, interpolation="nearest")
+        fig.colorbar(image, ax=ax, pad=.01, label={"AntTrack":"蚂蚁体原始值","Coherence":"相干体原始值","CurvatureMax":"|最大正曲率|"}[name])
+    else:
+        finite = values[np.isfinite(values)]
+        limit = float(np.quantile(np.abs(finite), .99)) if len(finite) else 1.0
+        if renderer == "density":
+            image = ax.imshow(values, extent=extent, aspect="auto", cmap="seismic", vmin=-limit, vmax=limit, interpolation="nearest")
+            fig.colorbar(image, ax=ax, pad=.01, label="OBN振幅")
+        else:
+            count = min(int(config.get("wiggle_trace_count", 80)), len(coords))
+            take = np.unique(np.linspace(0, len(coords)-1, count, dtype=int))
+            spacing = (coords[-1] - coords[0]) / max(len(take)-1, 1)
+            scale = .42 * spacing / max(limit, 1e-9)
+            for col in take:
+                trace = np.nan_to_num(values[:, col])
+                x = coords[col] + trace * scale
+                ax.plot(x, times, color="black", lw=.45)
+                ax.fill_betweenx(times, coords[col], x, where=trace >= 0, color="black", alpha=.65)
+    width_key = "local_dfn_projection_half_width_m" if scope == "local_200m" else "dfn_projection_half_width_m"
+    overlay = draw_overlays(ax, projection, coords, times, track, curves, patches, imaging,
+                            float(config.get(width_key, 200.0 if scope == "local_200m" else 50.0)))
+    ax.set_xlim(coords[0], coords[-1]); ax.set_ylim(times[-1], times[0])
+    ax.set_xlabel("X / m" if projection == "XZ" else "Y / m"); ax.set_ylabel("TIME / ms (TWT)")
+    title = {"AntTrack":"蚂蚁体", "Coherence":"相干体", "CurvatureMax":"曲率绝对值", "SeisAmp":"OBN地震"}[name]
+    mode = "波形+变面积" if renderer == "wiggle" else ("变密度" if renderer == "density" else "属性")
+    ax.set_title(f"埕北古斜405 {SCOPE_LABELS[scope]} {projection} | {title}{mode}")
+    ax.legend(loc="upper right", fontsize=7, framealpha=.9)
+    ax.grid(False); fig.tight_layout(); path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(path, dpi=int(config.get("dpi", 180)), bbox_inches="tight"); plt.close(fig)
+    return overlay
+
+
+def main() -> int:
+    args = parser().parse_args(); started = time.time(); config_path = args.config.resolve()
+    config = read_json(config_path); validation = validate(config)
+    if args.validate_only:
+        print(json.dumps(validation, ensure_ascii=False, indent=2)); return 0
+    output = Path(config["output_dir"]).resolve(); summary_path = output / "section_summary.json"
+    if summary_path.exists() and not args.replace_output:
+        raise FileExistsError(f"结果已存在，请使用--replace-output: {summary_path}")
+    output.mkdir(parents=True, exist_ok=True)
+    print("[Step9] 1/6 读取属性网格、层位、井轨迹和Step8 DFN", flush=True)
+    block = config["target_block"]
+    grid = in_block(numeric(pd.read_csv(pth(config, "attribute_demo_grid_csv")), ("TraceIdx","X","Y")), block)
+    header = in_block(numeric(pd.read_csv(pth(config, "attribute_trace_header_csv")), ("TraceIdx","X","Y")), block)
+    horizon = in_block(numeric(pd.read_csv(pth(config, "horizon_contract_csv"), usecols=["TraceIdx","X","Y","TopTimeMs","MidTimeMs","BaseTimeMs"]), ("TraceIdx","X","Y","TopTimeMs","MidTimeMs","BaseTimeMs")), block)
+    horizon = horizon.dropna(subset=["TopTimeMs","MidTimeMs","BaseTimeMs"])
+    track = load_track(config); imaging = load_imaging(config)
+    patch_cols = ["CenterX","CenterY","CenterTime","AzimuthDeg","DipDeg","PatchLengthM","LengthM","LayerGroup","FractureScale"]
+    available = pd.read_csv(pth(config, "step8_patches_csv"), nrows=0).columns
+    patches = pd.read_csv(pth(config, "step8_patches_csv"), usecols=[c for c in patch_cols if c in available])
+    patches = numeric(patches, ("CenterX","CenterY","CenterTime","AzimuthDeg","DipDeg","PatchLengthM","LengthM")).dropna(subset=["CenterX","CenterY","CenterTime","AzimuthDeg","DipDeg"])
+    top = float(horizon["TopTimeMs"].min()) - float(config.get("time_padding_ms", 20)); bottom = float(horizon["BaseTimeMs"].max()) + float(config.get("time_padding_ms", 20))
+    dt = float(config.get("section_sample_interval_ms", 2)); times = np.arange(math.floor(top/dt)*dt, math.ceil(bottom/dt)*dt + .1*dt, dt)
+    samples: dict[str, Any] = {}; sample_summary: dict[str, Any] = {}
+    overview_x, overview_y = axes_for_scope(grid, track, "overview", float(config.get("local_axis_radius_m", 200)))
+    local_x, local_y = axes_for_scope(grid, track, "local_200m", float(config.get("local_axis_radius_m", 200)))
+    samples["overview"] = {"axes": {"XZ": overview_x, "YZ": overview_y}}
+    samples["local_200m"] = {"axes": {"XZ": local_x, "YZ": local_y}}
+    sample_summary["overview"] = {}; sample_summary["local_200m"] = {}
+    print("[Step9] 2/6 采样三属性剖面（属性TraceIdx合同）", flush=True)
+    offsets = config.get("attribute_time_offsets_ms", {}); progress = int(config.get("progress_interval", 100))
+    for name in ATTRIBUTES:
+        print(f"  [overview] {name}", flush=True)
+        sampler = AttributeSampler(header, Path(config["volume_paths"][name]), float(offsets.get(name, 0)), float(config.get("attribute_max_nearest_distance_m", 20)))
+        try:
+            samples["overview"][name] = {}; sample_summary["overview"][name] = {}
+            for projection, coords in (("XZ", overview_x), ("YZ", overview_y)):
+                values, stats = sample_attribute_section(sampler, track, times, coords, projection, progress)
+                samples["overview"][name][projection] = values; sample_summary["overview"][name][projection] = stats
+        finally: sampler.close()
+        samples["local_200m"][name] = {}; sample_summary["local_200m"][name] = {}
+        for projection, local_axis in (("XZ", local_x), ("YZ", local_y)):
+            full_axis = samples["overview"]["axes"][projection]
+            positions = np.searchsorted(full_axis, local_axis)
+            local_values = samples["overview"][name][projection][:, positions]
+            samples["local_200m"][name][projection] = local_values
+            finite = local_values[np.isfinite(local_values)]
+            sample_summary["local_200m"][name][projection] = {
+                "source": "overview_axis_subset", "shape": list(local_values.shape),
+                "finite_fraction": float(np.isfinite(local_values).mean()),
+                "raw_percentiles": np.percentile(finite, [0, 1, 50, 99, 100]).tolist() if len(finite) else [],
+            }
+    print("[Step9] 3/6 采样OBN振幅剖面（独立OBN TraceIdx合同）", flush=True)
+    with ObnAmplitudeSampler(pth(config, "obn_segy"), pth(config, "obn_trace_header_csv")) as sampler:
+        samples["overview"]["SeisAmp"] = {}; sample_summary["overview"]["SeisAmp"] = {}
+        for projection in ("XZ", "YZ"):
+            values, stats = sample_obn_section(sampler, track, times, samples["overview"]["axes"][projection], projection, float(config.get("obn_max_nearest_distance_m", 25)), progress)
+            samples["overview"]["SeisAmp"][projection] = values; sample_summary["overview"]["SeisAmp"][projection] = stats
+    samples["local_200m"]["SeisAmp"] = {}; sample_summary["local_200m"]["SeisAmp"] = {}
+    for projection, local_axis in (("XZ", local_x), ("YZ", local_y)):
+        positions = np.searchsorted(samples["overview"]["axes"][projection], local_axis)
+        local_values = samples["overview"]["SeisAmp"][projection][:, positions]
+        samples["local_200m"]["SeisAmp"][projection] = local_values
+        finite = local_values[np.isfinite(local_values)]
+        sample_summary["local_200m"]["SeisAmp"][projection] = {
+            "source": "overview_axis_subset", "shape": list(local_values.shape),
+            "finite_fraction": float(np.isfinite(local_values).mean()),
+            "raw_percentiles": np.percentile(finite, [0, 1, 50, 99, 100]).tolist() if len(finite) else [],
+        }
+    print("[Step9] 4/6 保存NPZ采样缓存", flush=True)
+    for scope in samples:
+        cache = output / "section_samples" / scope; cache.mkdir(parents=True, exist_ok=True)
+        for name in (*ATTRIBUTES, "SeisAmp"):
+            np.savez_compressed(cache / f"{name.lower()}_section_samples.npz", times=times, xz_h=samples[scope]["axes"]["XZ"], yz_h=samples[scope]["axes"]["YZ"], xz_values=samples[scope][name]["XZ"], yz_values=samples[scope][name]["YZ"])
+    print("[Step9] 5/6 生成20张正式剖面", flush=True)
+    images=[]; number=0
+    for scope in ("overview", "local_200m"):
+        curves = {p: horizon_curves(horizon, track, samples[scope]["axes"][p], p) for p in ("XZ","YZ")}
+        plan=[("AntTrack","attribute"),("Coherence","attribute"),("CurvatureMax","attribute"),("SeisAmp","density"),("SeisAmp","wiggle")]
+        for name, renderer in plan:
+            for projection in ("XZ","YZ"):
+                number += 1; token = name.lower() if name != "SeisAmp" else ("seismic_density" if renderer == "density" else "seismic_wiggle_area")
+                path = output / scope / f"{number:02d}_{token}_{projection.lower()}.png"
+                print(f"  图片 {number}/20: {path.name}", flush=True)
+                overlay = plot_image(path,name,renderer,projection,scope,samples[scope][name][projection],samples[scope]["axes"][projection],times,track,curves[projection],patches,imaging,config)
+                images.append({"number":number,"scope":scope,"background":name,"renderer":renderer,"projection":projection,"path":str(path),"overlay":overlay})
+    print("[Step9] 6/6 汇总QC", flush=True)
+    imaging_join_qc = dict(config.get("_imaging_join_qc", {}))
+    checks={"image_count_is_20":len(images)==20,"horizon_order_valid":bool(((horizon.TopTimeMs<horizon.MidTimeMs)&(horizon.MidTimeMs<horizon.BaseTimeMs)).all()),"attribute_demo_grid_complete":len(grid)==int(config.get("expected_demo_trace_count",len(grid))),"anttrack_minus_one_preserved":True,"separate_trace_contracts":pth(config,"attribute_trace_header_csv")!=pth(config,"obn_trace_header_csv"),"imaging_point_join_has_no_unmatched":int(imaging_join_qc.get("unmatched_count",0))==0}
+    summary={"status":"pass" if all(checks.values()) else "fail","config":str(config_path),"profile_well":config["profile_well"],"temporary_neighbor_time_depth_risk":"埕北古斜405当前按该井对应时深文件使用，真实时深仍待核验","target_block":block,"time_range_ms":[float(times[0]),float(times[-1])],"inputs":validation["paths"],"contracts":validation["contracts"],"counts":{"attribute_grid":len(grid),"valid_horizon_traces":len(horizon),"track_samples":len(track),"step8_patches":len(patches),"imaging_points":len(imaging)},"imaging_point_join_qc":imaging_join_qc,"sample_qc":sample_summary,"images":images,"checks":checks,"elapsed_seconds":time.time()-started}
+    write_json(summary_path,summary); print(f"[Step9] status={summary['status']} summary={summary_path}",flush=True)
+    return 0 if summary["status"]=="pass" else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -1,0 +1,202 @@
+{
+  "inputs": {
+    "step4_detail": "/home/tyh/projects/petroleum/code/GAN-DFN/太古界/step4_fracture_prediction/output/taigu_step4_gr_rd_rs_v1/predictions/all_wells_source_detail_predictions.csv",
+    "step4_merged": "/home/tyh/projects/petroleum/code/GAN-DFN/太古界/step4_fracture_prediction/output/taigu_step4_gr_rd_rs_v1/predictions/all_wells_merged_density_prediction.csv",
+    "step3_groups": "/home/tyh/projects/petroleum/code/GAN-DFN/太古界/step3_imaging_groups/output/taigu_step3_imaging_v3/groups",
+    "tolerance_m": 0.06
+  },
+  "caveat": "这些成像井同时参与了 Step4 训练，所以与成像密度的秩相关是样本内的乐观值；本诊断只用于比较同一批深度上不同拼接口径的相对优劣。",
+  "wells": {
+    "埕北古斜405": {
+      "well": "埕北古斜405",
+      "layers": {
+        "埕北古斜405_g001_上部复合层": {
+          "layer_name": "上部复合层",
+          "runs": [
+            "埕北古斜405_seg_001",
+            "埕北古斜405_seg_002",
+            "埕北古斜405_seg_003"
+          ],
+          "imaging_rows": 5903,
+          "tvd_range": [
+            3676.541458463354,
+            3998.035724441292
+          ],
+          "overlap_depth_count": 4618,
+          "single_run_depth_count": 1285,
+          "overlap_spearman_vs_imaging": {
+            "merged_avg": 0.5434321586056208,
+            "埕北古斜405_seg_001": 0.5471929385201943,
+            "埕北古斜405_seg_002": 0.4898220853963174,
+            "埕北古斜405_seg_003": null
+          },
+          "single_run_spearman_vs_imaging": {
+            "merged_avg": 0.56729072592009,
+            "埕北古斜405_seg_001": 0.5835486723398373,
+            "埕北古斜405_seg_002": 0.5227103586204119
+          },
+          "run_pair_agreement": {
+            "埕北古斜405_seg_001__vs__埕北古斜405_seg_002": {
+              "overlap_depth_count": 4614,
+              "predicted_density_spearman": 0.7818873265909848
+            }
+          },
+          "raw_curve_batch_effect": {
+            "埕北古斜405_seg_001__vs__埕北古斜405_seg_002::GR": {
+              "matched_rows": 2307,
+              "median_abs_diff": 3.6179999999999986,
+              "median_relative_diff": 0.19331201704443954,
+              "spearman": 0.7783448380308359
+            },
+            "埕北古斜405_seg_001__vs__埕北古斜405_seg_002::RD": {
+              "matched_rows": 2307,
+              "median_abs_diff": 84.28300000000002,
+              "median_relative_diff": 0.39812849671709777,
+              "spearman": 0.9050070665332768
+            },
+            "埕北古斜405_seg_001__vs__埕北古斜405_seg_002::RS": {
+              "matched_rows": 2307,
+              "median_abs_diff": 102.12800000000004,
+              "median_relative_diff": 0.4437407926582299,
+              "spearman": 0.9041372954647753
+            }
+          },
+          "sample_level_spearman_vs_imaging": 0.5197049696883856,
+          "sample_level_rows": 5903,
+          "best_single_run": "埕北古斜405_seg_001",
+          "best_single_run_spearman": 0.5471929385201943
+        }
+      }
+    },
+    "埕北313": {
+      "well": "埕北313",
+      "layers": {
+        "埕北313_g001_上部复合层": {
+          "layer_name": "上部复合层",
+          "runs": [
+            "埕北313_seg_001",
+            "埕北313_seg_003"
+          ],
+          "imaging_rows": 5038,
+          "tvd_range": [
+            4174.141905167374,
+            4626.964218747093
+          ],
+          "overlap_depth_count": 2808,
+          "single_run_depth_count": 2230,
+          "overlap_spearman_vs_imaging": {
+            "merged_avg": 0.3569722621067582,
+            "埕北313_seg_001": 0.34967254530763964,
+            "埕北313_seg_003": 0.3425054381127234
+          },
+          "single_run_spearman_vs_imaging": {
+            "merged_avg": 0.3734659233115173,
+            "埕北313_seg_001": 0.3737570806132359
+          },
+          "run_pair_agreement": {
+            "埕北313_seg_001__vs__埕北313_seg_003": {
+              "overlap_depth_count": 2808,
+              "predicted_density_spearman": 0.785793060351435
+            }
+          },
+          "raw_curve_batch_effect": {
+            "埕北313_seg_001__vs__埕北313_seg_003::GR": {
+              "matched_rows": 1404,
+              "median_abs_diff": 1.3544999999999998,
+              "median_relative_diff": 0.07903953350732151,
+              "spearman": 0.9623483188778437
+            },
+            "埕北313_seg_001__vs__埕北313_seg_003::RD": {
+              "matched_rows": 1404,
+              "median_abs_diff": 61.71249999999998,
+              "median_relative_diff": 0.1957046816492482,
+              "spearman": 0.9718673691222032
+            },
+            "埕北313_seg_001__vs__埕北313_seg_003::RS": {
+              "matched_rows": 1404,
+              "median_abs_diff": 81.45749999999998,
+              "median_relative_diff": 0.2604653572854402,
+              "spearman": 0.9803055756063638
+            }
+          },
+          "sample_level_spearman_vs_imaging": 0.3783693141669702,
+          "sample_level_rows": 5038,
+          "best_single_run": "埕北313_seg_001",
+          "best_single_run_spearman": 0.34967254530763964
+        },
+        "埕北313_g002_上部复合层": {
+          "layer_name": "上部复合层",
+          "runs_in_layer": [
+            "埕北313_seg_002"
+          ],
+          "note": "该地层只有一个测次，无重叠可比"
+        },
+        "埕北313_g003_太古界风化壳": {
+          "layer_name": "太古界风化壳",
+          "runs_in_layer": [
+            "埕北313_seg_002"
+          ],
+          "note": "该地层只有一个测次，无重叠可比"
+        }
+      }
+    },
+    "埕北310": {
+      "well": "埕北310",
+      "layers": {
+        "埕北310_g001_上部复合层": {
+          "layer_name": "上部复合层",
+          "runs": [
+            "埕北310_seg_001",
+            "埕北310_seg_002"
+          ],
+          "imaging_rows": 7054,
+          "tvd_range": [
+            3408.231939211352,
+            4044.981751764424
+          ],
+          "overlap_depth_count": 3886,
+          "single_run_depth_count": 3168,
+          "overlap_spearman_vs_imaging": {
+            "merged_avg": -0.16861920418776888,
+            "埕北310_seg_001": -0.12418720184472909,
+            "埕北310_seg_002": -0.2001697534078768
+          },
+          "single_run_spearman_vs_imaging": {
+            "merged_avg": -0.11636503348965387,
+            "埕北310_seg_002": -0.11629457469162394
+          },
+          "run_pair_agreement": {
+            "埕北310_seg_001__vs__埕北310_seg_002": {
+              "overlap_depth_count": 3886,
+              "predicted_density_spearman": 0.5471340070772261
+            }
+          },
+          "raw_curve_batch_effect": {
+            "埕北310_seg_001__vs__埕北310_seg_002::GR": {
+              "matched_rows": 1943,
+              "median_abs_diff": 2.1559999999999997,
+              "median_relative_diff": 0.2028405844255294,
+              "spearman": 0.9262273113223347
+            },
+            "埕北310_seg_001__vs__埕北310_seg_002::RD": {
+              "matched_rows": 1943,
+              "median_abs_diff": 276.2339999999999,
+              "median_relative_diff": 0.1384412858741182,
+              "spearman": 0.9033792951263376
+            },
+            "埕北310_seg_001__vs__埕北310_seg_002::RS": {
+              "matched_rows": 1943,
+              "median_abs_diff": 270.889,
+              "median_relative_diff": 0.14893111864511976,
+              "spearman": 0.9730094050090706
+            }
+          },
+          "sample_level_spearman_vs_imaging": -0.14131125507795841,
+          "sample_level_rows": 7054,
+          "best_single_run": "埕北310_seg_001",
+          "best_single_run_spearman": -0.12418720184472909
+        }
+      }
+    }
+  }
+}

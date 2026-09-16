@@ -1,0 +1,329 @@
+{
+  "wells": {
+    "埕北古斜405": {
+      "rows": 5903,
+      "features": {
+        "GRResidual0p5MZ": {
+          "rows_compared": 5672,
+          "spearman_feature_vs_imaging_cross_segment": 0.0023920474363785236,
+          "spearman_feature_vs_imaging_per_segment": 0.0011763682113414694,
+          "feature_cross_vs_per_segment_spearman": -0.002644323982671317,
+          "feature_median_abs_change": 1.8913176530348506
+        },
+        "GRResidual1p0MZ": {
+          "rows_compared": 5670,
+          "spearman_feature_vs_imaging_cross_segment": 0.011027854486807794,
+          "spearman_feature_vs_imaging_per_segment": 0.0031927815395951724,
+          "feature_cross_vs_per_segment_spearman": -0.021175749649544294,
+          "feature_median_abs_change": 1.49753897853825
+        },
+        "GRResidual3p0MZ": {
+          "rows_compared": 5670,
+          "spearman_feature_vs_imaging_cross_segment": 0.023263877859209983,
+          "spearman_feature_vs_imaging_per_segment": -0.015897079218788874,
+          "feature_cross_vs_per_segment_spearman": 0.0017345032909352625,
+          "feature_median_abs_change": 1.3628110568427214
+        },
+        "GRResidual5p0MZ": {
+          "rows_compared": 5670,
+          "spearman_feature_vs_imaging_cross_segment": 0.026657438204724056,
+          "spearman_feature_vs_imaging_per_segment": -0.022917336453450208,
+          "feature_cross_vs_per_segment_spearman": 0.009412715277411844,
+          "feature_median_abs_change": 1.327083133133995
+        },
+        "GRMAD1MZ": {
+          "rows_compared": 5901,
+          "spearman_feature_vs_imaging_cross_segment": -0.10703904181223667,
+          "spearman_feature_vs_imaging_per_segment": 0.033299241103238626,
+          "feature_cross_vs_per_segment_spearman": -0.0631616912237467,
+          "feature_median_abs_change": 1.178910932669576
+        },
+        "GRMAD3MZ": {
+          "rows_compared": 5901,
+          "spearman_feature_vs_imaging_cross_segment": -0.09351771591445604,
+          "spearman_feature_vs_imaging_per_segment": 0.07557158454021162,
+          "feature_cross_vs_per_segment_spearman": -0.13380847284785374,
+          "feature_median_abs_change": 1.1938075283736795
+        },
+        "GRMAD5MZ": {
+          "rows_compared": 5901,
+          "spearman_feature_vs_imaging_cross_segment": -0.11852117257057862,
+          "spearman_feature_vs_imaging_per_segment": 0.07134638268673187,
+          "feature_cross_vs_per_segment_spearman": -0.06425701941283526,
+          "feature_median_abs_change": 1.0154368347225482
+        },
+        "RDeepResidual0p5MZ": {
+          "rows_compared": 5672,
+          "spearman_feature_vs_imaging_cross_segment": -0.0035017847899869847,
+          "spearman_feature_vs_imaging_per_segment": 0.007100911808551807,
+          "feature_cross_vs_per_segment_spearman": -0.0023158013513319914,
+          "feature_median_abs_change": 0.6856989903689612
+        },
+        "RDeepResidual1p0MZ": {
+          "rows_compared": 5670,
+          "spearman_feature_vs_imaging_cross_segment": -0.011840158754818845,
+          "spearman_feature_vs_imaging_per_segment": 0.005597370678573596,
+          "feature_cross_vs_per_segment_spearman": 0.006665497554397066,
+          "feature_median_abs_change": 1.679937842467663
+        },
+        "RDeepResidual3p0MZ": {
+          "rows_compared": 5670,
+          "spearman_feature_vs_imaging_cross_segment": -0.027134542030238396,
+          "spearman_feature_vs_imaging_per_segment": -0.006185847842648236,
+          "feature_cross_vs_per_segment_spearman": 0.013260247122712359,
+          "feature_median_abs_change": 1.2042320700336147
+        },
+        "RDeepMAD1MZ": {
+          "rows_compared": 5901,
+          "spearman_feature_vs_imaging_cross_segment": -0.02936643958108585,
+          "spearman_feature_vs_imaging_per_segment": 0.025323513590732562,
+          "feature_cross_vs_per_segment_spearman": -0.025818376121493288,
+          "feature_median_abs_change": 1.1457432374226155
+        },
+        "RDeepMAD3MZ": {
+          "rows_compared": 5901,
+          "spearman_feature_vs_imaging_cross_segment": -0.10450122541636929,
+          "spearman_feature_vs_imaging_per_segment": -0.05891857493762482,
+          "feature_cross_vs_per_segment_spearman": -0.05170709061181671,
+          "feature_median_abs_change": 1.1270708343099627
+        },
+        "GRGradientZ": {
+          "rows_compared": 5237,
+          "spearman_feature_vs_imaging_cross_segment": 0.06785208109224504,
+          "spearman_feature_vs_imaging_per_segment": -0.009955060944191484,
+          "feature_cross_vs_per_segment_spearman": -0.027854037377004287,
+          "feature_median_abs_change": 1.4585899098710633
+        },
+        "RDeepGradientZ": {
+          "rows_compared": 5237,
+          "spearman_feature_vs_imaging_cross_segment": 0.03568108813567158,
+          "spearman_feature_vs_imaging_per_segment": -0.027587948800764234,
+          "feature_cross_vs_per_segment_spearman": -0.005740044582151548,
+          "feature_median_abs_change": 1.2337254996920282
+        }
+      }
+    },
+    "埕北313": {
+      "rows": 5992,
+      "features": {
+        "GRResidual0p5MZ": {
+          "rows_compared": 5992,
+          "spearman_feature_vs_imaging_cross_segment": 0.009483340492487242,
+          "spearman_feature_vs_imaging_per_segment": -0.002247116577531289,
+          "feature_cross_vs_per_segment_spearman": 0.0892318267553502,
+          "feature_median_abs_change": 0.6808972057171645
+        },
+        "GRResidual1p0MZ": {
+          "rows_compared": 5992,
+          "spearman_feature_vs_imaging_cross_segment": 0.010988469084163862,
+          "spearman_feature_vs_imaging_per_segment": 0.006891244707086445,
+          "feature_cross_vs_per_segment_spearman": 0.15095617973382622,
+          "feature_median_abs_change": 1.4388474520777788
+        },
+        "GRResidual3p0MZ": {
+          "rows_compared": 5992,
+          "spearman_feature_vs_imaging_cross_segment": -0.0178706845460443,
+          "spearman_feature_vs_imaging_per_segment": 0.00730323066933293,
+          "feature_cross_vs_per_segment_spearman": 0.13908469267812285,
+          "feature_median_abs_change": 1.0955444126020448
+        },
+        "GRResidual5p0MZ": {
+          "rows_compared": 5992,
+          "spearman_feature_vs_imaging_cross_segment": -0.022478867364748103,
+          "spearman_feature_vs_imaging_per_segment": 0.004888039108455909,
+          "feature_cross_vs_per_segment_spearman": 0.14342614384377855,
+          "feature_median_abs_change": 1.0226878266482284
+        },
+        "GRMAD1MZ": {
+          "rows_compared": 5992,
+          "spearman_feature_vs_imaging_cross_segment": -0.0005601853074759906,
+          "spearman_feature_vs_imaging_per_segment": 0.018596678137623404,
+          "feature_cross_vs_per_segment_spearman": 0.14396635696315788,
+          "feature_median_abs_change": 0.9491545223562374
+        },
+        "GRMAD3MZ": {
+          "rows_compared": 5992,
+          "spearman_feature_vs_imaging_cross_segment": -0.0010885194570049584,
+          "spearman_feature_vs_imaging_per_segment": -0.040651860990837854,
+          "feature_cross_vs_per_segment_spearman": 0.2149577720369126,
+          "feature_median_abs_change": 0.817441529248058
+        },
+        "GRMAD5MZ": {
+          "rows_compared": 5992,
+          "spearman_feature_vs_imaging_cross_segment": -0.027938809622954378,
+          "spearman_feature_vs_imaging_per_segment": -0.021489572919599943,
+          "feature_cross_vs_per_segment_spearman": 0.3183771272385214,
+          "feature_median_abs_change": 0.7275436929713746
+        },
+        "RDeepResidual0p5MZ": {
+          "rows_compared": 5992,
+          "spearman_feature_vs_imaging_cross_segment": -0.0011672095114398783,
+          "spearman_feature_vs_imaging_per_segment": -0.00018211797421203768,
+          "feature_cross_vs_per_segment_spearman": 0.045551609701483975,
+          "feature_median_abs_change": 0.09360957389999905
+        },
+        "RDeepResidual1p0MZ": {
+          "rows_compared": 5992,
+          "spearman_feature_vs_imaging_cross_segment": 0.0034975752475557053,
+          "spearman_feature_vs_imaging_per_segment": -0.0025851201762435933,
+          "feature_cross_vs_per_segment_spearman": 0.032995353925470164,
+          "feature_median_abs_change": 0.46502631490258006
+        },
+        "RDeepResidual3p0MZ": {
+          "rows_compared": 5992,
+          "spearman_feature_vs_imaging_cross_segment": 0.035046667069133876,
+          "spearman_feature_vs_imaging_per_segment": -0.015227192002310774,
+          "feature_cross_vs_per_segment_spearman": 0.09641484171731281,
+          "feature_median_abs_change": 0.9519129561378381
+        },
+        "RDeepMAD1MZ": {
+          "rows_compared": 5992,
+          "spearman_feature_vs_imaging_cross_segment": 0.02094325654671086,
+          "spearman_feature_vs_imaging_per_segment": -0.04736988426110073,
+          "feature_cross_vs_per_segment_spearman": -0.043062671447503496,
+          "feature_median_abs_change": 0.6744907594765952
+        },
+        "RDeepMAD3MZ": {
+          "rows_compared": 5992,
+          "spearman_feature_vs_imaging_cross_segment": 0.09750108495134117,
+          "spearman_feature_vs_imaging_per_segment": 0.05186249160358672,
+          "feature_cross_vs_per_segment_spearman": 0.25352864521228996,
+          "feature_median_abs_change": 0.6675853754069929
+        },
+        "GRGradientZ": {
+          "rows_compared": 5992,
+          "spearman_feature_vs_imaging_cross_segment": -0.050091477344114226,
+          "spearman_feature_vs_imaging_per_segment": 0.00685682089807716,
+          "feature_cross_vs_per_segment_spearman": 0.1595284826862866,
+          "feature_median_abs_change": 1.012277093906202
+        },
+        "RDeepGradientZ": {
+          "rows_compared": 5992,
+          "spearman_feature_vs_imaging_cross_segment": -0.08075483276496313,
+          "spearman_feature_vs_imaging_per_segment": -0.017981792243472655,
+          "feature_cross_vs_per_segment_spearman": 0.10593366221072753,
+          "feature_median_abs_change": 1.154907335017825
+        }
+      }
+    },
+    "埕北310": {
+      "rows": 7054,
+      "features": {
+        "GRResidual0p5MZ": {
+          "rows_compared": 6892,
+          "spearman_feature_vs_imaging_cross_segment": -0.0032904542030115966,
+          "spearman_feature_vs_imaging_per_segment": 0.00830565266986782,
+          "feature_cross_vs_per_segment_spearman": 0.30850764118585305,
+          "feature_median_abs_change": 0.5427179700380809
+        },
+        "GRResidual1p0MZ": {
+          "rows_compared": 6892,
+          "spearman_feature_vs_imaging_cross_segment": -0.012862348197494065,
+          "spearman_feature_vs_imaging_per_segment": 0.01135730192722317,
+          "feature_cross_vs_per_segment_spearman": 0.4086039960025976,
+          "feature_median_abs_change": 0.9620788521045269
+        },
+        "GRResidual3p0MZ": {
+          "rows_compared": 6892,
+          "spearman_feature_vs_imaging_cross_segment": -0.008283380389683173,
+          "spearman_feature_vs_imaging_per_segment": -0.014591799143919573,
+          "feature_cross_vs_per_segment_spearman": 0.4733197863477482,
+          "feature_median_abs_change": 0.628630012153415
+        },
+        "GRResidual5p0MZ": {
+          "rows_compared": 6892,
+          "spearman_feature_vs_imaging_cross_segment": 0.014483204363585115,
+          "spearman_feature_vs_imaging_per_segment": -0.000800671696417188,
+          "feature_cross_vs_per_segment_spearman": 0.4853581426189567,
+          "feature_median_abs_change": 0.5755414881265196
+        },
+        "GRMAD1MZ": {
+          "rows_compared": 7054,
+          "spearman_feature_vs_imaging_cross_segment": 0.0658181992844131,
+          "spearman_feature_vs_imaging_per_segment": 0.042743985400510394,
+          "feature_cross_vs_per_segment_spearman": 0.3090652827093377,
+          "feature_median_abs_change": 0.7504305366128703
+        },
+        "GRMAD3MZ": {
+          "rows_compared": 7054,
+          "spearman_feature_vs_imaging_cross_segment": 0.055890197686186846,
+          "spearman_feature_vs_imaging_per_segment": 0.1079151919346373,
+          "feature_cross_vs_per_segment_spearman": 0.44938125819126684,
+          "feature_median_abs_change": 0.6581462075082696
+        },
+        "GRMAD5MZ": {
+          "rows_compared": 7054,
+          "spearman_feature_vs_imaging_cross_segment": 0.08410155805481634,
+          "spearman_feature_vs_imaging_per_segment": 0.15615097460551172,
+          "feature_cross_vs_per_segment_spearman": 0.4977369570569603,
+          "feature_median_abs_change": 0.5911847714745826
+        },
+        "RDeepResidual0p5MZ": {
+          "rows_compared": 6892,
+          "spearman_feature_vs_imaging_cross_segment": 0.011452843892196462,
+          "spearman_feature_vs_imaging_per_segment": -0.0009199573525464423,
+          "feature_cross_vs_per_segment_spearman": 0.3124907891803051,
+          "feature_median_abs_change": 0.663921714768372
+        },
+        "RDeepResidual1p0MZ": {
+          "rows_compared": 6892,
+          "spearman_feature_vs_imaging_cross_segment": 0.025864757621742878,
+          "spearman_feature_vs_imaging_per_segment": 0.0033658297733069067,
+          "feature_cross_vs_per_segment_spearman": 0.45749140638405095,
+          "feature_median_abs_change": 1.0927319660645387
+        },
+        "RDeepResidual3p0MZ": {
+          "rows_compared": 6892,
+          "spearman_feature_vs_imaging_cross_segment": 0.053573895131764464,
+          "spearman_feature_vs_imaging_per_segment": 0.03498825751922056,
+          "feature_cross_vs_per_segment_spearman": 0.45388474541730345,
+          "feature_median_abs_change": 0.554759849663236
+        },
+        "RDeepMAD1MZ": {
+          "rows_compared": 7054,
+          "spearman_feature_vs_imaging_cross_segment": -0.05245852978662871,
+          "spearman_feature_vs_imaging_per_segment": -0.009416210166366595,
+          "feature_cross_vs_per_segment_spearman": 0.3438179401155806,
+          "feature_median_abs_change": 0.9123268251418758
+        },
+        "RDeepMAD3MZ": {
+          "rows_compared": 7054,
+          "spearman_feature_vs_imaging_cross_segment": -0.04486521843546185,
+          "spearman_feature_vs_imaging_per_segment": -0.02612405019808234,
+          "feature_cross_vs_per_segment_spearman": 0.2770593077940223,
+          "feature_median_abs_change": 0.7486272761575683
+        },
+        "GRGradientZ": {
+          "rows_compared": 6588,
+          "spearman_feature_vs_imaging_cross_segment": 0.09125408807505604,
+          "spearman_feature_vs_imaging_per_segment": -0.028074983273930144,
+          "feature_cross_vs_per_segment_spearman": 0.34272296770207195,
+          "feature_median_abs_change": 0.8810777328074179
+        },
+        "RDeepGradientZ": {
+          "rows_compared": 6588,
+          "spearman_feature_vs_imaging_cross_segment": -0.012003989931304814,
+          "spearman_feature_vs_imaging_per_segment": 0.015469099898511732,
+          "feature_cross_vs_per_segment_spearman": 0.3569751378546194,
+          "feature_median_abs_change": 0.5906910703058718
+        }
+      }
+    }
+  },
+  "feature_names": [
+    "GRResidual0p5MZ",
+    "GRResidual1p0MZ",
+    "GRResidual3p0MZ",
+    "GRResidual5p0MZ",
+    "GRMAD1MZ",
+    "GRMAD3MZ",
+    "GRMAD5MZ",
+    "RDeepResidual0p5MZ",
+    "RDeepResidual1p0MZ",
+    "RDeepResidual3p0MZ",
+    "RDeepMAD1MZ",
+    "RDeepMAD3MZ",
+    "GRGradientZ",
+    "RDeepGradientZ"
+  ]
+}

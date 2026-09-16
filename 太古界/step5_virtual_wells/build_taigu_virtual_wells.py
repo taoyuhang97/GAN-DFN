@@ -50,6 +50,16 @@ if str(COMMON_DIR / "attribute_sampling") not in sys.path:
 from attribute_sampling import MultiAttributeSampler  # noqa: E402
 from attribute_contract import score_attribute  # noqa: E402
 
+# P0-4：测井段坐标回接统一走公共模块（太古界/common/well_segment_join）
+TAIGU_ROOT = CURRENT_DIR.parent
+if str(TAIGU_ROOT) not in sys.path:
+    sys.path.insert(0, str(TAIGU_ROOT))
+from common.well_segment_join import (  # noqa: E402
+    attach_geometry_by_md,
+    cached_well_segment_pool,
+    summarize_join,
+)
+
 
 class _NoAmplitudeSampler:
     """Compatibility sampler for attribute-only mode; never reads OBN data."""
@@ -216,6 +226,22 @@ def confidence_for_well(row: pd.Series, config: dict[str, Any]) -> float:
     return float(np.clip(1.0 - distance / scale, minimum, 1.0))
 
 
+def content_sample_id(well: str, tvd: Any, md: Any = None) -> str:
+    """源样点内容键：井名 + 深度，不再依赖上游行号（P2-1 / P0-4 派生）。
+
+    旧口径 `井名::row{N}` 一旦上游行序变化就失效，并会连带影响下游所有以
+    SourceSampleID 为键的核对逻辑。改用井名 + TVD（缺 TVD 时回退 MD）。
+    """
+    for value in (tvd, md):
+        try:
+            numeric = float(value)
+        except (TypeError, ValueError):
+            continue
+        if np.isfinite(numeric):
+            return f"{well}::{numeric:.5f}"
+    return f"{well}::nodepth"
+
+
 def sample_context(
     sampler: ObnAmplitudeSampler,
     trace_idx: np.ndarray,
@@ -313,6 +339,16 @@ def main() -> int:
         )
     output_dir = (args.output_dir or Path(config["output_dir"])).resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
+    # P0-4：测井段坐标回接（公共模块）
+    samples_root = Path(config["step2_segments_root"])
+    join_config = dict(config.get("segment_join", {}))
+    tolerance_setting = join_config.get("tolerance_m", config.get("md_merge_tolerance"))
+    join_tolerance = (
+        None
+        if tolerance_setting is None or str(tolerance_setting).strip().lower() in {"", "auto"}
+        else float(tolerance_setting)
+    )
+    strong_join_audits: list[pd.DataFrame] = []
     unified_path = output_dir / "taigu_step5_unified_samples.csv"
     strong_path = output_dir / "taigu_step5_strong_supervision.csv"
     audit_path = output_dir / "taigu_step5_no_amplitude_audit.csv"
@@ -449,7 +485,7 @@ def main() -> int:
                     reason = "pending" if float(nearest_dist[pos]) <= max_sample_distance else "outside_obn_coverage"
                     track = f"{well}_VW_{di+2}_{dj+2}"
                     rec = {"SourceWellName": well, "TrackWellName": track, "VirtualWellName": track,
-                           "SourceSampleID": f"{well}::row{pos}",
+                           "SourceSampleID": content_sample_id(well, rows.iloc[pos]["TVD"], rows.iloc[pos].get("MD")),
                            "SourceRowIndex": int(pos), "TVD": rows.iloc[pos]["TVD"],
                            "OffsetDx": int(di), "OffsetDy": int(dj), "TrainingEligible": 0,
                            "ExcludeReason": reason}
@@ -481,7 +517,7 @@ def main() -> int:
                 all_records.append(
                     {
                         "SourceKind": "weak_real",
-                        "SourceSampleID": f"{well}::row{pos}",
+                        "SourceSampleID": content_sample_id(well, rows.iloc[pos]["TVD"], rows.iloc[pos].get("MD")),
                         "SourceWellName": well,
                         "TrackWellName": well,
                         "VirtualWellName": well,
@@ -731,7 +767,7 @@ def main() -> int:
                     all_records.append(
                         {
                             "SourceKind": "weak_virtual",
-                            "SourceSampleID": f"{well}::row{meta['row_pos']}",
+                            "SourceSampleID": content_sample_id(well, source_row["TVD"], source_row.get("MD")),
                             "SourceWellName": well,
                             "TrackWellName": track,
                             "VirtualWellName": track,
@@ -794,93 +830,107 @@ def main() -> int:
                 continue
             for group_file in group_files:
                 group = pd.read_csv(group_file, encoding="utf-8-sig")
-                for segment_path, sub in group.groupby("InputSegmentPath"):
-                    segment = pd.read_csv(segment_path, encoding="utf-8-sig")
-                    for column in ("MD", "TVD"):
-                        sub[column] = pd.to_numeric(sub[column], errors="coerce")
-                    for column in ("MD", "TVD", "X", "Y", "TIME"):
-                        segment[column] = pd.to_numeric(segment[column], errors="coerce")
-                    merged = pd.merge_asof(
-                        sub.sort_values("MD"),
-                        segment[["MD", "X", "Y", "TIME"]].sort_values("MD"),
-                        on="MD",
-                        direction="nearest",
-                        tolerance=float(config["md_merge_tolerance"]),
+                if group.empty or not {"WellName", "MD"}.issubset(group.columns):
+                    continue
+                group = group.copy()
+                group["MD"] = pd.to_numeric(group["MD"], errors="coerce")
+                merged_all, join_audit = attach_geometry_by_md(
+                    group,
+                    lambda item: cached_well_segment_pool(samples_root, item),
+                    tolerance_m=join_tolerance,
+                    preferred_column="InputSegmentPath" if "InputSegmentPath" in group.columns else None,
+                    geometry_source="step5_strong_supervision",
+                )
+                strong_join_audits.append(join_audit)
+                merged_all["Density"] = pd.to_numeric(merged_all.get("Density"), errors="coerce")
+                # 保持与改造前一致的行序：先按所属段（InputSegmentPath），段内按 MD。
+                # 顺序会影响 Step6A 的 GroupKFold 分折，进而影响模型与体，必须固定。
+                if {"InputSegmentPath", "MD"}.issubset(merged_all.columns):
+                    merged_all = merged_all.sort_values(
+                        ["InputSegmentPath", "MD"], kind="mergesort"
+                    ).reset_index(drop=True)
+                usable = merged_all["MDJoinStatus"].astype(str).isin(["matched", "existing_geometry"])
+                merged = merged_all.loc[usable].dropna(subset=["X", "Y", "TIME", "Density"]).copy()
+                unmatched = merged_all.loc[~usable]
+                if not unmatched.empty:
+                    unmatched.assign(ExcludeReason="segment_join_unmatched").to_csv(
+                        output_dir / "step5_strong_supervision_join_unmatched.csv",
+                        index=False, encoding="utf-8-sig",
                     )
-                    merged = merged.dropna(subset=["X", "Y", "TIME", "Density"]).copy()
-                    if merged.empty:
+                if merged.empty:
+                    continue
+                # P0-4: 段坐标回接已由公共模块一次性完成，下面统一在 merged 上采样
+                nearest_trace, nearest_dist = sampler.nearest_trace(
+                    merged["X"].to_numpy(dtype=np.float64), merged["Y"].to_numpy(dtype=np.float64)
+                )
+                ctx = sample_context(sampler, nearest_trace, merged["TIME"].to_numpy(dtype=np.float64), context_offsets)
+                imaging_attrs = attr_sampler.sample_at_xy(merged["X"].to_numpy(dtype=float), merged["Y"].to_numpy(dtype=float), merged["TIME"].to_numpy(dtype=float))
+                center = ctx[:, list(context_offsets).index(0.0)]
+                confidence = confidence_for_well(metadata_lookup.loc[well], config)
+                for pos in range(len(merged)):
+                    row = merged.iloc[pos]
+                    presence = int(row["HasFractureDensity"])
+                    amp = float(center[pos])
+                    if float(nearest_dist[pos]) > max_sample_distance or not np.isfinite(amp):
+                        audit_records.append(
+                            {
+                                "SourceWellName": well,
+                                "TrackWellName": well,
+                                "SourceKind": "imaging_supervision",
+                                "MD": row["MD"],
+                                "TVD": row["TVD"],
+                                "X": row["X"],
+                                "Y": row["Y"],
+                                "TIME": row["TIME"],
+                                "LayerGroup": row["StrataName"],
+                                "ExcludeReason": "outside_survey_no_amplitude"
+                                if float(nearest_dist[pos]) > max_sample_distance
+                                else "no_amplitude",
+                            }
+                        )
                         continue
-                    nearest_trace, nearest_dist = sampler.nearest_trace(
-                        merged["X"].to_numpy(dtype=np.float64), merged["Y"].to_numpy(dtype=np.float64)
-                    )
-                    ctx = sample_context(sampler, nearest_trace, merged["TIME"].to_numpy(dtype=np.float64), context_offsets)
-                    imaging_attrs = attr_sampler.sample_at_xy(merged["X"].to_numpy(dtype=float), merged["Y"].to_numpy(dtype=float), merged["TIME"].to_numpy(dtype=float))
-                    center = ctx[:, list(context_offsets).index(0.0)]
-                    confidence = confidence_for_well(metadata_lookup.loc[well], config)
-                    for pos in range(len(merged)):
-                        row = merged.iloc[pos]
-                        presence = int(row["HasFractureDensity"])
-                        amp = float(center[pos])
-                        if float(nearest_dist[pos]) > max_sample_distance or not np.isfinite(amp):
-                            audit_records.append(
-                                {
-                                    "SourceWellName": well,
-                                    "TrackWellName": well,
-                                    "SourceKind": "imaging_supervision",
-                                    "MD": row["MD"],
-                                    "TVD": row["TVD"],
-                                    "X": row["X"],
-                                    "Y": row["Y"],
-                                    "TIME": row["TIME"],
-                                    "LayerGroup": row["StrataName"],
-                                    "ExcludeReason": "outside_survey_no_amplitude"
-                                    if float(nearest_dist[pos]) > max_sample_distance
-                                    else "no_amplitude",
-                                }
-                            )
-                            continue
-                        record = {
-                            "SourceKind": "imaging_supervision",
-                            "SourceWellName": well,
-                            "TrackWellName": well,
-                            "X": float(row["X"]),
-                            "Y": float(row["Y"]),
-                            "TIME": float(row["TIME"]),
-                            "LayerGroup": str(row["StrataName"]),
-                            "WindowCode": "main",
-                            "PresenceLabel": presence,
-                            "DensityLabel": float(row["Density"]) if presence == 1 else np.nan,
-                            "HasFracture": presence,
-                            "PointConfidence": confidence,
-                            "SampleWeight": confidence,
-                            "SeisAmp": amp,
-                            "Coherence": float(imaging_attrs["Coherence"][pos]),
-                            "AntTrack": float(imaging_attrs["AntTrack"][pos]),
-                            "CurvatureMax": float(imaging_attrs["CurvatureMax"][pos]),
-                            "CoherenceValid": int(np.isfinite(imaging_attrs["Coherence"][pos])),
-                            "AntTrackValid": int(np.isfinite(imaging_attrs["AntTrack"][pos])),
-                            "CurvatureMaxValid": int(np.isfinite(imaging_attrs["CurvatureMax"][pos])),
-                            "AttributeValidCount": int(sum(np.isfinite(imaging_attrs[name][pos]) for name in ("Coherence", "AntTrack", "CurvatureMax"))),
-                            "SeisAmpM4": float(ctx[pos, 0]),
-                            "SeisAmpM2": float(ctx[pos, 1]),
-                            "SeisAmpP2": float(ctx[pos, 3]),
-                            "SeisAmpP4": float(ctx[pos, 4]),
-                            "AmpMad5": float(np.nanmedian(np.abs(ctx[pos] - amp))),
-                            "AttributeContinuity": 1.0,
-                            "ContinuityCoherence": np.nan,
-                            "ContinuityAntTrack": np.nan,
-                            "ContinuityCurvatureMax": np.nan,
-                            "ContinuitySeisAmp": np.nan,
-                            "PrimaryAmpSimilarity": 1.0,
-                            "LabelStatus": "imaging_supervision",
-                            "temporary_neighbor_time_depth": 1,
-                            "SourceWellType": "imaging",
-                            "TimeShiftMs": 0.0,
-                            "NearestTraceDistM": float(nearest_dist[pos]),
-                            "VirtualTraceIdx": int(nearest_trace[pos]),
-                        }
-                        all_records.append(record)
-                        strong_records.append(record)
+                    record = {
+                        "SourceKind": "imaging_supervision",
+                        "SourceWellName": well,
+                        "TrackWellName": well,
+                        "X": float(row["X"]),
+                        "Y": float(row["Y"]),
+                        "TIME": float(row["TIME"]),
+                        "LayerGroup": str(row["StrataName"]),
+                        "WindowCode": "main",
+                        "PresenceLabel": presence,
+                        "DensityLabel": float(row["Density"]) if presence == 1 else np.nan,
+                        "HasFracture": presence,
+                        "PointConfidence": confidence,
+                        "SampleWeight": confidence,
+                        "SeisAmp": amp,
+                        "Coherence": float(imaging_attrs["Coherence"][pos]),
+                        "AntTrack": float(imaging_attrs["AntTrack"][pos]),
+                        "CurvatureMax": float(imaging_attrs["CurvatureMax"][pos]),
+                        "CoherenceValid": int(np.isfinite(imaging_attrs["Coherence"][pos])),
+                        "AntTrackValid": int(np.isfinite(imaging_attrs["AntTrack"][pos])),
+                        "CurvatureMaxValid": int(np.isfinite(imaging_attrs["CurvatureMax"][pos])),
+                        "AttributeValidCount": int(sum(np.isfinite(imaging_attrs[name][pos]) for name in ("Coherence", "AntTrack", "CurvatureMax"))),
+                        "SeisAmpM4": float(ctx[pos, 0]),
+                        "SeisAmpM2": float(ctx[pos, 1]),
+                        "SeisAmpP2": float(ctx[pos, 3]),
+                        "SeisAmpP4": float(ctx[pos, 4]),
+                        "AmpMad5": float(np.nanmedian(np.abs(ctx[pos] - amp))),
+                        "AttributeContinuity": 1.0,
+                        "ContinuityCoherence": np.nan,
+                        "ContinuityAntTrack": np.nan,
+                        "ContinuityCurvatureMax": np.nan,
+                        "ContinuitySeisAmp": np.nan,
+                        "PrimaryAmpSimilarity": 1.0,
+                        "LabelStatus": "imaging_supervision",
+                        "temporary_neighbor_time_depth": 1,
+                        "SourceWellType": "imaging",
+                        "TimeShiftMs": 0.0,
+                        "NearestTraceDistM": float(nearest_dist[pos]),
+                        "VirtualTraceIdx": int(nearest_trace[pos]),
+                    }
+                    all_records.append(record)
+                    strong_records.append(record)
         strong_full = pd.DataFrame(strong_records, columns=SAMPLE_COLUMNS) if strong_records else pd.DataFrame(columns=SAMPLE_COLUMNS)
 
     unified = pd.DataFrame(all_records, columns=SAMPLE_COLUMNS)
@@ -899,6 +949,10 @@ def main() -> int:
     audit = pd.DataFrame(audit_records)
     if not audit.empty:
         audit.to_csv(audit_path, index=False, encoding="utf-8-sig")
+    if strong_join_audits:
+        pd.concat(strong_join_audits, ignore_index=True).to_csv(
+            output_dir / "step5_strong_supervision_join_audit.csv", index=False, encoding="utf-8-sig"
+        )
     index_df = pd.DataFrame(index_records)
     if not index_df.empty:
         # Finalize any candidate that reached all gates without an explicit
@@ -946,6 +1000,9 @@ def main() -> int:
         "status": status,
         "config_path": str(args.config.resolve()),
         "output_dir": str(output_dir),
+        "strong_supervision_segment_join_qc": summarize_join(
+            pd.concat(strong_join_audits, ignore_index=True) if strong_join_audits else pd.DataFrame()
+        ),
         "unified_sample_count": int(len(unified)),
         "unified_counts_by_kind": unified["SourceKind"].value_counts().to_dict(),
         "unified_counts_by_well": unified.groupby("SourceWellName")["SampleWeight"].count().to_dict(),

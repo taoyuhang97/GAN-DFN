@@ -38,6 +38,16 @@ from scipy.spatial import cKDTree
 from sklearn.cluster import KMeans
 from tqdm import tqdm
 
+# P0-4：测井段坐标回接统一走公共模块（太古界/common/well_segment_join）
+TAIGU_ROOT = Path(__file__).resolve().parents[1]
+if str(TAIGU_ROOT) not in sys.path:
+    sys.path.insert(0, str(TAIGU_ROOT))
+from common.well_segment_join import (  # noqa: E402
+    attach_geometry_by_md,
+    cached_well_segment_pool,
+    summarize_join,
+)
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Build small-scale fracture patches (太古界 Step7A v2).")
@@ -191,9 +201,19 @@ def axial_mean_std_deg(degrees: np.ndarray, weights: np.ndarray | None = None) -
     return mean, std
 
 
-def load_multiwell_orientation_points(groups_root: Path, allowed_wells: dict[str, list[str]]) -> pd.DataFrame:
-    """Load valid image-log orientations and attach their interpolated well XY."""
+def load_multiwell_orientation_points(
+    groups_root: Path,
+    allowed_wells: dict[str, list[str]],
+    samples_root: Path,
+    tolerance: float | None = None,
+) -> pd.DataFrame:
+    """Load valid image-log orientations and attach their interpolated well XY.
+
+    P0-4：回接改走公共 well_segment_join 模块，容差按各井 MD 半采样步长自动推导
+    （旧实现写死 0.05 m，且未命中的点会被静默丢弃）。
+    """
     parts: list[pd.DataFrame] = []
+    audits: list[pd.DataFrame] = []
     allowed = {layer: set(wells) for layer, wells in allowed_wells.items()}
     for group_file in sorted(Path(groups_root).glob("*.csv")):
         group = pd.read_csv(group_file, encoding="utf-8-sig")
@@ -212,20 +232,25 @@ def load_multiwell_orientation_points(groups_root: Path, allowed_wells: dict[str
         points = points.loc[keep].copy()
         if points.empty:
             continue
-        for segment_path, sub in points.groupby("InputSegmentPath"):
-            segment = pd.read_csv(segment_path, encoding="utf-8-sig", usecols=["MD", "X", "Y"])
-            for column in ("MD", "X", "Y"):
-                segment[column] = pd.to_numeric(segment[column], errors="coerce")
-            segment = segment.dropna().sort_values("MD")
-            if segment.empty:
-                continue
-            merged = pd.merge_asof(
-                sub.sort_values("MD"), segment, on="MD", direction="nearest", tolerance=0.05
-            )
-            parts.append(merged[["WellName", "StrataName", "FracAzimuth", "FracDip", "X", "Y"]])
+        matched, audit = attach_geometry_by_md(
+            points,
+            lambda well: cached_well_segment_pool(samples_root, well),
+            tolerance_m=tolerance,
+            preferred_column="InputSegmentPath",
+            geometry_source="step7a_orientation",
+        )
+        # 保持与改造前一致的行序（段 × MD）：方位族用 KMeans，顺序变化会改变分族结果。
+        if {"InputSegmentPath", "MD"}.issubset(matched.columns):
+            matched = matched.sort_values(["InputSegmentPath", "MD"], kind="mergesort").reset_index(drop=True)
+        parts.append(matched)
+        audits.append(audit)
     if not parts:
-        return pd.DataFrame(columns=["WellName", "StrataName", "FracAzimuth", "FracDip", "X", "Y"])
-    return pd.concat(parts, ignore_index=True).dropna()
+        return pd.DataFrame(columns=["WellName", "StrataName", "FracAzimuth", "FracDip", "X", "Y"]), summarize_join(pd.DataFrame())
+    merged_all = pd.concat(parts, ignore_index=True)
+    join_summary = summarize_join(pd.concat(audits, ignore_index=True) if audits else pd.DataFrame())
+    matched_mask = merged_all["MDJoinStatus"].astype(str).isin(["matched", "existing_geometry"])
+    keep_columns = ["WellName", "StrataName", "FracAzimuth", "FracDip", "X", "Y"]
+    return merged_all.loc[matched_mask, keep_columns].dropna().reset_index(drop=True), join_summary
 
 
 def build_orientation_families(points: pd.DataFrame, config: dict[str, Any]) -> dict[str, list[dict[str, Any]]]:
@@ -400,30 +425,45 @@ def local_gradient_ridge_orientation(
 
 
 def load_imaging_density_profile(config: dict[str, Any], well: str) -> pd.DataFrame:
-    """Imaging density vs TIME (borrowed) for QC, joining every segment path."""
+    """Imaging density vs TIME (borrowed) for QC, joining every segment path.
+
+    P0-4：回接改走公共 well_segment_join 模块；未命中的点不再静默丢弃。
+    """
     group_files = sorted(Path(config["step3_groups_root"]).glob(f"{well}_*.csv"))
     parts = []
+    audits = []
+    samples_root = Path(config["step2_segments_root"])
+    join_config = dict(config.get("segment_join", {}))
+    tolerance_setting = join_config.get("tolerance_m", config.get("md_merge_tolerance"))
+    tolerance = (
+        None
+        if tolerance_setting is None or str(tolerance_setting).strip().lower() in {"", "auto"}
+        else float(tolerance_setting)
+    )
     for group_file in group_files:
         group = pd.read_csv(group_file, encoding="utf-8-sig")
-        for segment_path, sub in group.groupby("InputSegmentPath"):
-            segment = pd.read_csv(segment_path, encoding="utf-8-sig")
-            for column in ("MD", "TVD"):
-                sub[column] = pd.to_numeric(sub[column], errors="coerce")
-            for column in ("MD", "TVD", "X", "Y", "TIME"):
-                segment[column] = pd.to_numeric(segment[column], errors="coerce")
-            merged = pd.merge_asof(
-                sub.sort_values("MD"),
-                segment[["MD", "X", "Y", "TIME"]].sort_values("MD"),
-                on="MD",
-                direction="nearest",
-                tolerance=float(config.get("md_merge_tolerance", 0.011)),
-            )
-            parts.append(merged[["X", "Y", "TIME", "StrataName", "Density"]])
+        if group.empty or not {"WellName", "MD"}.issubset(group.columns):
+            continue
+        group = group.copy()
+        group["MD"] = pd.to_numeric(group["MD"], errors="coerce")
+        matched, audit = attach_geometry_by_md(
+            group,
+            lambda item: cached_well_segment_pool(samples_root, item),
+            tolerance_m=tolerance,
+            preferred_column="InputSegmentPath" if "InputSegmentPath" in group.columns else None,
+            geometry_source="step7a_density_profile",
+        )
+        parts.append(matched)
+        audits.append(audit)
     if not parts:
         return pd.DataFrame()
     frame = pd.concat(parts, ignore_index=True)
+    config["_density_profile_join_qc"] = summarize_join(
+        pd.concat(audits, ignore_index=True) if audits else pd.DataFrame()
+    )
     for column in ("X", "Y", "TIME", "Density"):
-        frame[column] = pd.to_numeric(frame[column], errors="coerce")
+        if column in frame.columns:
+            frame[column] = pd.to_numeric(frame[column], errors="coerce")
     return frame.dropna(subset=["X", "Y", "TIME", "Density"]).copy()
 
 
@@ -681,9 +721,12 @@ def main() -> int:
         return 0 if sampling_qc["status"] == "pass" else 1
 
     # --- orientation: multi-well families + local gradient/ridge evidence ---
-    imaging_points = load_multiwell_orientation_points(
-        Path(config["step3_groups_root"]), orient_cfg["imaging_wells_by_layer"]
+    imaging_points, orientation_join_qc = load_multiwell_orientation_points(
+        Path(config["step3_groups_root"]),
+        orient_cfg["imaging_wells_by_layer"],
+        Path(config["step2_segments_root"]),
     )
+    config["_orientation_join_qc"] = dict(orientation_join_qc)
     orientation_families = build_orientation_families(imaging_points, orient_cfg)
     write_json(families_json_path, json_ready({
         "method": "balanced_multiwell_axial_kmeans",
@@ -989,6 +1032,10 @@ def main() -> int:
         "dip_min_constraint": bool((patches["DipDeg"] >= min_dip - 1.0e-6).all()),
         "geometry_finite": bool(np.isfinite(patches[["X", "Y", "TIME", "PatchAreaM2"]]).all().all()),
         "imaging_match_qc_exists": qc_csv.exists(),
+        "orientation_point_join_has_no_unmatched": int(
+            dict(config.get("_orientation_join_qc", {})).get("unmatched_count", 0)
+        )
+        == 0,
         "vtk_exists": vtk_path.exists(),
         "minimum_3d_spacing_respected": bool(
             min_center_distance_m <= 0.0
@@ -1000,6 +1047,10 @@ def main() -> int:
     summary = {
         "status": status,
         "config_path": str(args.config.resolve()),
+        "segment_join_qc": {
+            "orientation_points": dict(config.get("_orientation_join_qc", {})),
+            "imaging_density_profile": dict(config.get("_density_profile_join_qc", {})),
+        },
         "output_paths": {
             "patches_csv": str(patches_csv),
             "patches_vtk": str(vtk_path),
