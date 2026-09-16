@@ -39,8 +39,7 @@ TAIGU_ROOT = HERE.parent
 if str(TAIGU_ROOT) not in sys.path:
     sys.path.insert(0, str(TAIGU_ROOT))
 from common.well_segment_join import (  # noqa: E402
-    attach_geometry_by_md,
-    cached_well_segment_pool,
+    attach_geometry_per_segment,
     summarize_join,
 )
 
@@ -184,12 +183,13 @@ def load_imaging(config: dict[str, Any]) -> pd.DataFrame:
             frame = frame.dropna(subset=["FracAzimuth", "FracDip"])
         if frame.empty or not {"MD", "WellName"}.issubset(frame.columns):
             continue
-        matched, audit = attach_geometry_by_md(
+        # 逐段回接：每行自带 InputSegmentPath，只在该段内取坐标
+        matched, audit = attach_geometry_per_segment(
             frame,
-            lambda well: cached_well_segment_pool(samples_root, well),
+            preferred_column="InputSegmentPath",
             tolerance_m=tolerance,
-            preferred_column="InputSegmentPath" if "InputSegmentPath" in frame.columns else None,
             geometry_source="step9_imaging",
+            samples_root=samples_root,
         )
         parts.append(matched)
         audits.append(audit)
@@ -198,7 +198,7 @@ def load_imaging(config: dict[str, Any]) -> pd.DataFrame:
     merged_all = pd.concat(parts, ignore_index=True)
     audit_all = pd.concat(audits, ignore_index=True) if audits else pd.DataFrame()
     config["_imaging_join_qc"] = summarize_join(audit_all)
-    matched_mask = merged_all["MDJoinStatus"].astype(str).isin(["matched", "existing_geometry"])
+    matched_mask = merged_all["MDJoinStatus"].astype(str).eq("matched")
     join_failures = merged_all.loc[~matched_mask]
     if not join_failures.empty:
         output_dir = pth(config, "output_dir")

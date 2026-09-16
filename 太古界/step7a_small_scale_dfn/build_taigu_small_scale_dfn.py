@@ -43,8 +43,7 @@ TAIGU_ROOT = Path(__file__).resolve().parents[1]
 if str(TAIGU_ROOT) not in sys.path:
     sys.path.insert(0, str(TAIGU_ROOT))
 from common.well_segment_join import (  # noqa: E402
-    attach_geometry_by_md,
-    cached_well_segment_pool,
+    attach_geometry_per_segment,
     summarize_join,
 )
 
@@ -232,12 +231,13 @@ def load_multiwell_orientation_points(
         points = points.loc[keep].copy()
         if points.empty:
             continue
-        matched, audit = attach_geometry_by_md(
+        # 逐段回接：每行自带 InputSegmentPath，只在该段内取坐标
+        matched, audit = attach_geometry_per_segment(
             points,
-            lambda well: cached_well_segment_pool(samples_root, well),
-            tolerance_m=tolerance,
             preferred_column="InputSegmentPath",
+            tolerance_m=tolerance,
             geometry_source="step7a_orientation",
+            samples_root=samples_root,
         )
         # 保持与改造前一致的行序（段 × MD）：方位族用 KMeans，顺序变化会改变分族结果。
         if {"InputSegmentPath", "MD"}.issubset(matched.columns):
@@ -248,7 +248,7 @@ def load_multiwell_orientation_points(
         return pd.DataFrame(columns=["WellName", "StrataName", "FracAzimuth", "FracDip", "X", "Y"]), summarize_join(pd.DataFrame())
     merged_all = pd.concat(parts, ignore_index=True)
     join_summary = summarize_join(pd.concat(audits, ignore_index=True) if audits else pd.DataFrame())
-    matched_mask = merged_all["MDJoinStatus"].astype(str).isin(["matched", "existing_geometry"])
+    matched_mask = merged_all["MDJoinStatus"].astype(str).eq("matched")
     keep_columns = ["WellName", "StrataName", "FracAzimuth", "FracDip", "X", "Y"]
     return merged_all.loc[matched_mask, keep_columns].dropna().reset_index(drop=True), join_summary
 
@@ -446,12 +446,12 @@ def load_imaging_density_profile(config: dict[str, Any], well: str) -> pd.DataFr
             continue
         group = group.copy()
         group["MD"] = pd.to_numeric(group["MD"], errors="coerce")
-        matched, audit = attach_geometry_by_md(
+        matched, audit = attach_geometry_per_segment(
             group,
-            lambda item: cached_well_segment_pool(samples_root, item),
+            preferred_column="InputSegmentPath",
             tolerance_m=tolerance,
-            preferred_column="InputSegmentPath" if "InputSegmentPath" in group.columns else None,
             geometry_source="step7a_density_profile",
+            samples_root=samples_root,
         )
         parts.append(matched)
         audits.append(audit)

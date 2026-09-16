@@ -57,14 +57,16 @@ def numeric_diff(left: pd.DataFrame, right: pd.DataFrame, columns: list[str]) ->
 def main() -> int:
     parser = argparse.ArgumentParser(description="Compare P0-4 r2 outputs against the current formal chain.")
     parser.add_argument("--report", type=Path, default=TAIGU / "output_p04_r2_logs/p0_4_r2_report.json")
+    parser.add_argument("--new-suffix", default="_r2", help="新版本目录后缀，例如 _r2 / _r3")
     args = parser.parse_args()
+    SUF = args.new_suffix
 
     sections: dict[str, dict] = {}
     unexpected: list[str] = []
 
     # ---------- Step5 ----------
     s5_old_dir = TAIGU / "step5_virtual_wells/output/taigu_step5_attribute_v3_common_contract"
-    s5_new_dir = TAIGU / "step5_virtual_wells/output/taigu_step5_attribute_v3_common_contract_r2"
+    s5_new_dir = TAIGU / ("step5_virtual_wells/output/taigu_step5_attribute_v3_common_contract" + SUF)
     old_summary = read_json(s5_old_dir / "taigu_step5_acceptance_summary.json") or {}
     new_summary = read_json(s5_new_dir / "taigu_step5_acceptance_summary.json") or {}
     step5 = {
@@ -106,7 +108,7 @@ def main() -> int:
 
     # ---------- Step6A ----------
     a_old = read_json(TAIGU / "step6a_density_volume/output/taigu_step6a_attribute_v3/models/step6_two_stage_training_summary.json") or {}
-    a_new = read_json(TAIGU / "step6a_density_volume/output/taigu_step6a_attribute_v3_r2/models/step6_two_stage_training_summary.json") or {}
+    a_new = read_json(TAIGU / ("step6a_density_volume/output/taigu_step6a_attribute_v3" + SUF + "/models/step6_two_stage_training_summary.json")) or {}
     volume_compare = read_json(TAIGU / "output_p04_r2_logs/step6a_volume_compare.json") or {}
     sections["step6a"] = {
         "old_metrics": a_old.get("layer_metrics"),
@@ -119,7 +121,7 @@ def main() -> int:
 
     # ---------- Step7A ----------
     p_old = read_json(TAIGU / "step7a_small_scale_dfn/output/taigu_step7a_attribute_v3_regen_full/step7a_summary.json") or {}
-    p_new = read_json(TAIGU / "step7a_small_scale_dfn/output/taigu_step7a_attribute_v3_regen_full_r2/step7a_summary.json") or {}
+    p_new = read_json(TAIGU / ("step7a_small_scale_dfn/output/taigu_step7a_attribute_v3_regen_full" + SUF + "/step7a_summary.json")) or {}
     sections["step7a"] = {
         "old_patch_count": p_old.get("accepted_patch_count"),
         "new_patch_count": p_new.get("accepted_patch_count"),
@@ -130,7 +132,7 @@ def main() -> int:
 
     # ---------- Step7D ----------
     f_old = read_json(TAIGU / "step7d_multiscale_fused_dfn/output/taigu_step7d_fused_v1/fused_multiscale_summary.json") or {}
-    f_new = read_json(TAIGU / "step7d_multiscale_fused_dfn/output/taigu_step7d_fused_v1_r2/fused_multiscale_summary.json") or {}
+    f_new = read_json(TAIGU / ("step7d_multiscale_fused_dfn/output/taigu_step7d_fused_v1" + SUF + "/fused_multiscale_summary.json")) or {}
     sections["step7d"] = {
         "old_patch_count": f_old.get("patch_count"),
         "new_patch_count": f_new.get("patch_count"),
@@ -142,9 +144,9 @@ def main() -> int:
 
     # ---------- Step8 ----------
     w_old = read_json(TAIGU / "step8_well_correction/output/taigu_step8_attribute_multiscale_v1/well_corrected_dfn_summary.json") or {}
-    w_new = read_json(TAIGU / "step8_well_correction/output/taigu_step8_attribute_multiscale_v1_r2/well_corrected_dfn_summary.json") or {}
+    w_new = read_json(TAIGU / ("step8_well_correction/output/taigu_step8_attribute_multiscale_v1" + SUF + "/well_corrected_dfn_summary.json")) or {}
     old_patches = read_csv(TAIGU / "step8_well_correction/output/taigu_step8_attribute_multiscale_v1/well_corrected_dfn_fracture_patches.csv")
-    new_patches = read_csv(TAIGU / "step8_well_correction/output/taigu_step8_attribute_multiscale_v1_r2/well_corrected_dfn_fracture_patches.csv")
+    new_patches = read_csv(TAIGU / ("step8_well_correction/output/taigu_step8_attribute_multiscale_v1" + SUF + "/well_corrected_dfn_fracture_patches.csv"))
     step8: dict = {
         "old_control_count": (w_old.get("well_controls") or {}).get("control_point_count"),
         "new_control_count": (w_new.get("well_controls") or {}).get("control_point_count"),
@@ -191,7 +193,7 @@ def main() -> int:
     sections["step8"] = step8
 
     # ---------- Step9 ----------
-    s9_new = read_json(TAIGU / "step9_sections/output/taigu_step9_multibackground_v2_r2/section_summary.json") or {}
+    s9_new = read_json(TAIGU / ("step9_sections/output/taigu_step9_multibackground_v2" + SUF + "/section_summary.json")) or {}
     sections["step9"] = {
         "status": s9_new.get("status"),
         "counts": s9_new.get("counts"),

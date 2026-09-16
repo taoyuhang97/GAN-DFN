@@ -11,6 +11,41 @@
 > 的 `status=pass` 为放行条件）。下方正文是砂砾岩 `formal_rebuild` 的参考说明，
 > 不能直接用于太古界。
 
+## 太古界 v4（2026-09-16，第一步 + 第二步修正）
+
+新入口：`configs/taigu_step3_imaging_groups_v4.json` → 输出 `output/taigu_step3_imaging_v4`；
+v3 产物保留不动，供旧链条复现。
+
+本次修正五件事：
+
+1. **多密度源合并口径**：改为"按源声明深度范围（`depth_min_m`/`depth_max_m`）裁剪 + 同深度取最大值"。
+   旧写法 `concat → sort_values → drop_duplicates(keep="last")` 在深度区间完全重叠的两个源之间
+   会随机丢值（埕北313 实测丢掉一半，且换排序方式结果在 1246 / 620 / 0 之间跳）。
+2. **成像解释窗口显式登记**：每个密度源 = 一个解释窗口（`WindowID`，如 `埕北313_W01`），
+   窗口的深度范围来自配置声明；组 CSV 与组清单新增 `ImagingWindowID`，分组时按窗口断开。
+   登记表见 `imaging_window_registry.csv`。
+3. **填充区不再当作"密度 0"**：文件为写满深度轴而填的 0 一律裁掉，下游得到的是**无资料**
+   （`DensitySupportStatus=outside_imaging_window`）而不是"明确没有裂缝"的强负样本。
+   各源裁掉多少填充行见 `density_source_merge_audit.csv` 的 `PaddingRowsDropped`。
+4. **密度标定按窗口做**："每条缝 = 1 条"，`Density` 输出标定后的线密度（条/米），
+   原值保留在 `DensityRaw`，系数在 `DensityScaleFactor`（该行所属窗口的系数）。
+   按井的汇总结算保留在 `density_calibration_audit.csv` 做对照。
+5. **段外成像数据不再静默丢弃**：密度段外部分记入 `imaging_out_of_log_coverage.csv`，
+   未吸附的产状点明细记入 `unmapped_imaging_points.csv`（供 Step8 井控使用）；
+   `point_mapping_qc.csv` 增加 `DroppedOutsideLogCoverage` / `DroppedBeyondGridTolerance` 两列。
+
+新增审计产物：`density_source_merge_audit.csv`、`density_calibration_audit.csv`、
+`imaging_window_registry.csv`、`imaging_out_of_log_coverage.csv`、`unmapped_imaging_points.csv`。
+
+验收命令：
+
+```bash
+python3 太古界/step3_imaging_groups/build_taigu_imaging_groups.py \
+  --config 太古界/step3_imaging_groups/configs/taigu_step3_imaging_groups_v4.json --replace-output
+python3 太古界/step3_imaging_groups/validate_taigu_rebuild_delivery.py \
+  --config 太古界/step3_imaging_groups/configs/taigu_step3_imaging_groups_v4.json
+```
+
 本步骤的正式成果是 `formal_rebuild`，用于构造成像测井强监督训练样本。
 
 ## 正式口径

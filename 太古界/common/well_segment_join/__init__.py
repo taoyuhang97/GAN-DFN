@@ -1,52 +1,58 @@
-"""太古界公共测井段回接模块（P0-4）。
+"""太古界公共测井段回接模块（逐段口径）。
 
-太古界一口井有多个测井段（可能重叠、相邻或存在空档），而 Step3 成像组行与
-Step4 合并预测点都不带 X/Y/TIME，必须按 MD 回接到 Step2 的段文件取坐标。
-本模块把这段逻辑收成唯一实现，供 Step5 / Step7A / Step8 / Step9 共用。
+设计口径（2026-09-16 确认）：
+
+* 建模单元是**测井段**（同一批次观测），Step4 的输出以**井**为单位，
+  因此 Step4 的密度曲线与裂缝点直接携带井级 `X/Y/TIME`，下游不需要回接；
+* 仍需回接的是 **Step3 成像监督组行**（逐段行，带 `InputSegmentPath`，
+  但只有 MD/TVD），须在各自所属段内取坐标；
+* 回接一律**逐段进行**：不跨段匹配、不做段间平均，未命中只写审计、不静默丢弃。
 
 用法：
 
     from common.well_segment_join import (
-        attach_geometry_by_md, cached_well_segment_pool, summarize_join,
+        attach_geometry_per_segment, summarize_join,
     )
 
-    matched, audit = attach_geometry_by_md(
-        points,                                  # 需要含 WellName / MD
-        lambda well: cached_well_segment_pool(samples_root, well),
+    matched, audit = attach_geometry_per_segment(
+        points,                                  # 需含 WellName / MD / InputSegmentPath
         preferred_column="InputSegmentPath",
         geometry_source="step3_imaging_gt",
     )
+    summary_block = summarize_join(audit)
 """
 from __future__ import annotations
 
 from .attach import (
     MD_JOIN_AUDIT_COLUMNS,
-    attach_geometry_by_md,
+    attach_geometry_per_segment,
     summarize_join,
 )
 from .segment_pool import (
     DEFAULT_HALF_STEP_MULTIPLIER,
+    DEFAULT_TOLERANCE_CAP_M,
     DEFAULT_TOLERANCE_FLOOR_M,
     SEGMENT_GEOMETRY_COLUMNS,
     WellSegmentPool,
     cached_well_segment_pool,
     inferred_md_tolerance,
+    inferred_md_tolerance_from_md,
     list_segment_files,
     load_well_segment_pool,
     read_csv_flexible,
 )
-from .source_segment import Step4SourceSegmentLookup
 
 __all__ = [
     "MD_JOIN_AUDIT_COLUMNS",
     "DEFAULT_HALF_STEP_MULTIPLIER",
+    "DEFAULT_TOLERANCE_CAP_M",
     "DEFAULT_TOLERANCE_FLOOR_M",
     "SEGMENT_GEOMETRY_COLUMNS",
-    "Step4SourceSegmentLookup",
     "WellSegmentPool",
-    "attach_geometry_by_md",
+    "attach_geometry_per_segment",
     "cached_well_segment_pool",
     "inferred_md_tolerance",
+    "inferred_md_tolerance_from_md",
     "list_segment_files",
     "load_well_segment_pool",
     "read_csv_flexible",

@@ -55,8 +55,7 @@ TAIGU_ROOT = CURRENT_DIR.parent
 if str(TAIGU_ROOT) not in sys.path:
     sys.path.insert(0, str(TAIGU_ROOT))
 from common.well_segment_join import (  # noqa: E402
-    attach_geometry_by_md,
-    cached_well_segment_pool,
+    attach_geometry_per_segment,
     summarize_join,
 )
 
@@ -834,12 +833,13 @@ def main() -> int:
                     continue
                 group = group.copy()
                 group["MD"] = pd.to_numeric(group["MD"], errors="coerce")
-                merged_all, join_audit = attach_geometry_by_md(
+                # 逐段回接：行内自带 InputSegmentPath，只在该段内取坐标（不跨段、不平均）
+                merged_all, join_audit = attach_geometry_per_segment(
                     group,
-                    lambda item: cached_well_segment_pool(samples_root, item),
+                    preferred_column="InputSegmentPath",
                     tolerance_m=join_tolerance,
-                    preferred_column="InputSegmentPath" if "InputSegmentPath" in group.columns else None,
                     geometry_source="step5_strong_supervision",
+                    samples_root=samples_root,
                 )
                 strong_join_audits.append(join_audit)
                 merged_all["Density"] = pd.to_numeric(merged_all.get("Density"), errors="coerce")
@@ -849,7 +849,7 @@ def main() -> int:
                     merged_all = merged_all.sort_values(
                         ["InputSegmentPath", "MD"], kind="mergesort"
                     ).reset_index(drop=True)
-                usable = merged_all["MDJoinStatus"].astype(str).isin(["matched", "existing_geometry"])
+                usable = merged_all["MDJoinStatus"].astype(str).eq("matched")
                 merged = merged_all.loc[usable].dropna(subset=["X", "Y", "TIME", "Density"]).copy()
                 unmatched = merged_all.loc[~usable]
                 if not unmatched.empty:

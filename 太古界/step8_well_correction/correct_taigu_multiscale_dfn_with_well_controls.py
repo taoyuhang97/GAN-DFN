@@ -237,11 +237,9 @@ if str(TAIGU_ROOT) not in sys.path:
 
 from common.well_segment_join import (  # noqa: E402
     MD_JOIN_AUDIT_COLUMNS,
-    Step4SourceSegmentLookup,
     WellSegmentPool,
-    attach_geometry_by_md,
+    attach_geometry_per_segment,
     cached_well_segment_pool,
-    inferred_md_tolerance,
     list_segment_files as list_well_segment_files,
     summarize_join,
 )
@@ -286,13 +284,16 @@ def build_control_sample_ids(prefix: str, frame: pd.DataFrame) -> list[str]:
 
 def load_control_points(
     path: Path,
-    samples_root: Path,
     target_block: dict[str, Any],
-    tolerance: float,
-    source_lookup: Step4SourceSegmentLookup | None = None,
-    policy: str = "prefer_source_segment",
-    tolerance_options: dict[str, Any] | None = None,
+    merged_density_csv: Path | None = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """读取 Step4 的井级裂缝点（P0-4′）。
+
+    Step4 的输出以"井"为单位，其合并密度曲线与裂缝点都直接携带 `X/Y/TIME`，
+    因此这里**不需要任何按 MD 的段回接**：直接取坐标即可。
+    若点表仍是旧版（缺坐标），则用 Step4 的合并密度曲线按 `WellName+TVD`
+    做**精确主键连接**补齐（零容差、零歧义），并在审计里标明来源。
+    """
     df = read_csv_flexible(path, low_memory=False)
     required = ["WellName", "MD", "StrataName", "PredDensity"]
     missing = [column for column in required if column not in df.columns]
@@ -301,21 +302,45 @@ def load_control_points(
     df = df.copy()
     df["MD"] = safe_numeric(df["MD"])
     df["TVD"] = safe_numeric(df["TVD"]) if "TVD" in df.columns else np.nan
-    preferred_ids = pd.Series([""] * len(df), index=df.index, dtype=object)
-    if source_lookup is not None and source_lookup.available:
-        preferred_ids = pd.Series([
-            ";".join(source_lookup.preferred_segment_ids(str(well), float(tvd)))
-            for well, tvd in zip(df["WellName"].astype(str), df["TVD"])
-        ], index=df.index, dtype=object)
-    matched, audit_df = attach_geometry_by_md(
-        df,
-        lambda well: cached_well_segment_pool(samples_root, well),
-        tolerance_m=tolerance,
-        policy=policy,
-        preferred_ids_by_row=preferred_ids,
-        geometry_source="step4_predicted",
-        **(tolerance_options or {}),
+    has_geometry = all(column in df.columns for column in ("X", "Y", "TIME"))
+    if has_geometry:
+        geometry_source = "step4_merged_point_output"
+        df["X"] = safe_numeric(df["X"])
+        df["Y"] = safe_numeric(df["Y"])
+        df["TIME"] = safe_numeric(df["TIME"])
+    else:
+        if merged_density_csv is None or not Path(merged_density_csv).exists():
+            raise ValueError(
+                "Step4 fracture points carry no X/Y/TIME and no merged density curve is configured "
+                "for the exact-key fallback; rebuild Step4 with P0-4' applied"
+            )
+        geometry_source = "step4_merged_curve_exact_key_join"
+        curve = read_csv_flexible(Path(merged_density_csv), low_memory=False)
+        curve = curve[["WellName", "TVD", "X", "Y", "TIME"]].copy()
+        for column in ("TVD", "X", "Y", "TIME"):
+            curve[column] = safe_numeric(curve[column])
+        df = df.merge(curve, on=["WellName", "TVD"], how="left", validate="one_to_one")
+    audit_df = pd.DataFrame(
+        {
+            "WellName": df["WellName"].astype(str),
+            "MD": df["MD"],
+            "TVD": df["TVD"],
+            "StrataName": df["StrataName"],
+            "X": df["X"],
+            "Y": df["Y"],
+            "MDJoinStatus": np.where(
+                np.isfinite(safe_numeric(df["X"])) & np.isfinite(safe_numeric(df["Y"])) & np.isfinite(safe_numeric(df["TIME"])),
+                "matched",
+                "unmatched",
+            ),
+            "MDJoinReason": geometry_source,
+            "GeometrySource": geometry_source,
+            "SegmentSelectionPolicy": "not_applicable_well_level_output",
+            "MDNearestDifferenceM": np.nan,
+            "MDJoinDuplicateRow": 0,
+        }
     )
+    matched = df
     if not audit_df.empty:
         audit_df["InTargetBlock"] = _inside_target(audit_df, target_block).astype(int)
         audit_df["InAllowedLayer"] = audit_df["StrataName"].astype(str).isin(ALLOWED_LAYERS).astype(int)
@@ -332,9 +357,8 @@ def load_control_points(
     out["LayerGroup"] = out["StrataName"].astype(str)
     out["Density"] = safe_numeric(out["PredDensity"])
     out["DEPT"] = safe_numeric(out["MD"])
+    out = out.dropna(subset=["X", "Y", "TIME"])
     out = out[out["LayerGroup"].isin(ALLOWED_LAYERS) & _inside_target(out, target_block)].copy()
-    if "MDJoinDuplicateRow" in out.columns:
-        out = out[safe_numeric(out["MDJoinDuplicateRow"]).fillna(0).astype(int).eq(0)].copy()
     out["WellControlSampleID"] = build_control_sample_ids("step4", out)
     out = out.sort_values(["WellName", "LayerGroup", "TIME", "MD"]).reset_index(drop=True)
     out["ControlPointID"] = ["ctrl_%06d" % (idx + 1) for idx in range(len(out))]
@@ -349,9 +373,9 @@ def load_step3_imaging_controls(
     samples_root: Path,
     target_block: dict[str, Any],
     tolerance: float,
-    policy: str = "prefer_source_segment",
     tolerance_options: dict[str, Any] | None = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Step3 成像监督组（逐段行）在其所属测井段内回接坐标。"""
     parts: list[pd.DataFrame] = []
     for path in paths:
         df = read_csv_flexible(path, low_memory=False)
@@ -369,18 +393,12 @@ def load_step3_imaging_controls(
     if not parts:
         return pd.DataFrame(), pd.DataFrame()
     work = pd.concat(parts, ignore_index=True)
-    preferred = pd.Series(
-        [Path(str(value)).stem for value in work["InputSegmentPath"].astype(str)],
-        index=work.index,
-        dtype=object,
-    )
-    matched, audit_df = attach_geometry_by_md(
+    matched, audit_df = attach_geometry_per_segment(
         work,
-        lambda well: cached_well_segment_pool(samples_root, well),
+        preferred_column="InputSegmentPath",
         tolerance_m=tolerance,
-        policy=policy,
-        preferred_ids_by_row=preferred,
         geometry_source="step3_imaging_gt",
+        samples_root=samples_root,
         **(tolerance_options or {}),
     )
     if not audit_df.empty:
@@ -2034,15 +2052,17 @@ def build_summary(
             )
             * max(float(config.get("_md_join_qc", {}).get("step4_input_point_count", 0) + config.get("_md_join_qc", {}).get("step3_input_point_count", 0)), 1.0)
         ),
-        "md_join_tolerance_covers_step4_merge_offset": bool(
-            (
-                float(config.get("_md_join_qc", {}).get("step4_join_summary", {})
-                      .get("md_match_distance_stats", {}).get("max") or 0.0)
-                <= float(config.get("_md_join_qc", {}).get("step4_join_summary", {})
-                         .get("tolerance_stats", {}).get("max") or 0.0)
-            )
-            and float(config.get("_md_join_qc", {}).get("step4_join_summary", {})
-                      .get("tolerance_stats", {}).get("max") or 0.0) > 0.0
+        # P0-4′/P0-4″：Step4 的井级输出自带 X/Y/TIME，Step8 不再做 MD 回接；
+        # 这里改为检查"Step4 控制点坐标完整"与"Step3 成像组逐段回接无未命中"。
+        "step4_control_geometry_complete": bool(
+            int(config.get("_md_join_qc", {}).get("step4_input_point_count", 0)) > 0
+            and int(config.get("_md_join_qc", {}).get("step4_matched_count", 0))
+            == int(config.get("_md_join_qc", {}).get("step4_input_point_count", -1))
+        ),
+        "step3_imaging_join_has_no_unmatched": bool(
+            int(config.get("_md_join_qc", {}).get("step3_input_point_count", 0)) > 0
+            and int(config.get("_md_join_qc", {}).get("step3_matched_count", 0))
+            == int(config.get("_md_join_qc", {}).get("step3_input_point_count", -1))
         ),
         "layers_limited_to_taigu_target_layers": bool(set(corrected_df["LayerGroup"].dropna().astype(str)).issubset(set(ALLOWED_LAYERS))),
         "modified_centers_within_layer_windows": centers_within_layer_windows,
@@ -2240,8 +2260,8 @@ def main() -> int:
     config["_input_original_fault_fingerprint"] = geometry_fingerprint(input_original_fault_mesh)
 
     initial_df = load_initial_dfn(initial_csv)
-    log("[Step8 2/7] 回接 Step4 常规井预测点与 Step2 轨迹")
-    # 容差默认按各井 MD 半采样步长自动推导（P0-4）；只有显式配置才用固定值。
+    log("[Step8 2/7] 读取 Step4 井级常规井预测点（P0-4′：输出自带 X/Y/TIME）")
+    # 仅 Step3 成像组行需要逐段回接坐标；Step4 的井级输出直接带坐标。
     join_config = dict(config.get("segment_join", {}))
     tolerance_setting = join_config.get("tolerance_m", config.get("md_join_tolerance_m"))
     md_tolerance = (
@@ -2249,37 +2269,27 @@ def main() -> int:
         if tolerance_setting is None or str(tolerance_setting).strip().lower() in {"", "auto"}
         else float(tolerance_setting)
     )
-    selection_policy = str(
-        join_config.get("policy", config.get("segment_selection_policy", "prefer_source_segment"))
-    )
     tolerance_options = {
         "half_step_multiplier": float(join_config.get("half_step_multiplier", 0.5)),
         "tolerance_floor_m": float(join_config.get("tolerance_floor_m", 0.02)),
         "tolerance_cap_m": float(join_config.get("tolerance_cap_m", 0.5)),
     }
-    detail_csv_value = config.get("step4_source_detail_csv")
-    if detail_csv_value:
-        detail_csv = Path(str(detail_csv_value)).resolve()
-    else:
-        detail_csv = fracture_csv.parent / "all_wells_source_detail_predictions.csv"
-    source_lookup = Step4SourceSegmentLookup(
-        detail_csv if detail_csv.exists() else None,
-        tvd_tolerance_m=float(config.get("step4_source_detail_tvd_tolerance_m", 0.25)),
+    merged_density_value = config.get("step4_merged_density_csv")
+    merged_density_csv = (
+        Path(str(merged_density_value)).resolve()
+        if merged_density_value
+        else fracture_csv.parent / "all_wells_merged_density_prediction.csv"
     )
     step4_control_df, step4_join_audit = load_control_points(
         fracture_csv,
-        samples_root=samples_root,
         target_block=dict(config["target_block"]),
-        tolerance=md_tolerance,
-        source_lookup=source_lookup,
-        policy=selection_policy,
-        tolerance_options=tolerance_options,
+        merged_density_csv=merged_density_csv,
     )
     raw_step4_count = int(len(step4_control_df))
     step4_control_df = aggregate_step4_controls_to_events(step4_control_df, config=config)
     config["_raw_step4_control_count"] = raw_step4_count
     config["_aggregated_step4_control_count"] = int(len(step4_control_df))
-    log("[Step8 3/7] 回接 Step3 成像解释与 Step2 轨迹")
+    log("[Step8 3/7] 逐段回接 Step3 成像解释坐标")
     if config.get("step3_groups_root"):
         step3_group_paths = sorted(Path(config["step3_groups_root"]).resolve().glob("*.csv"))
     else:
@@ -2293,7 +2303,6 @@ def main() -> int:
             samples_root=samples_root,
             target_block=dict(config["target_block"]),
             tolerance=md_tolerance,
-            policy=selection_policy,
             tolerance_options=tolerance_options,
         )
         step3_windows = load_step3_imaging_time_windows(step3_control_df)
@@ -2325,15 +2334,14 @@ def main() -> int:
         segment_coverage.to_csv(paths["segment_coverage_csv"], index=False, encoding="utf-8-sig")
     config["_md_join_qc"] = {
         "tolerance_m": "auto_half_sampling_step" if md_tolerance is None else float(md_tolerance),
-        "segment_selection_policy": selection_policy,
-        "step4_source_detail_csv": str(detail_csv),
-        "step4_source_detail_available": bool(source_lookup.available),
-        "step4_source_detail_tvd_tolerance_m": float(source_lookup.tolerance),
+        "step4_geometry_policy": "step4_well_level_output_with_xy_time; no md re-attachment",
+        "step4_geometry_source": (
+            str(step4_join_audit["MDJoinReason"].iloc[0]) if not step4_join_audit.empty else ""
+        ),
         "step4_input_point_count": int(len(step4_join_audit)),
         "step4_matched_count": int(step4_join_audit["MDJoinStatus"].astype(str).eq("matched").sum()) if not step4_join_audit.empty else 0,
         "step4_used_count": int(safe_numeric(step4_join_audit.get("UsedForStep8", pd.Series(dtype=float))).fillna(0).sum()) if not step4_join_audit.empty else 0,
-        "step4_duplicate_md_count": int(safe_numeric(step4_join_audit.get("MDJoinDuplicateRow", pd.Series(dtype=float))).fillna(0).sum()) if not step4_join_audit.empty else 0,
-        "step4_preferred_segment_matched_count": int(safe_numeric(step4_join_audit.get("Step4SourceSegmentMatched", pd.Series(dtype=float))).fillna(0).sum()) if not step4_join_audit.empty else 0,
+        "step3_segment_selection_policy": "per_segment_exact_within_batch",
         "step3_input_point_count": int(len(step3_join_audit)),
         "step3_matched_count": int(step3_join_audit["MDJoinStatus"].astype(str).eq("matched").sum()) if not step3_join_audit.empty else 0,
         "step3_used_count": int(safe_numeric(step3_join_audit.get("UsedForStep8", pd.Series(dtype=float))).fillna(0).sum()) if not step3_join_audit.empty else 0,

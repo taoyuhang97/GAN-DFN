@@ -115,51 +115,143 @@ def depth_gradient(values: pd.Series, depth: pd.Series) -> pd.Series:
     return pd.Series(gradient, index=values.index)
 
 
-def engineer_features(frame: pd.DataFrame) -> pd.DataFrame:
+def engineer_batch_window_features(segment: pd.DataFrame) -> pd.DataFrame:
+    """在**单个测井批次（测井段）内部**计算窗口类特征。
+
+    设计口径：同一批次是一次连续观测，段内规律一致；跨批次的邻居不能进入同一个
+    滑动窗口，否则局部残差/MAD 度量的是"两次测井之间的差异"而不是地质变化。
+    只依赖本段样本，输出的窗口特征为未标准化原值（标准化在井×地层内统一进行）。
+    """
+    out = segment.sort_values("TVD").copy()
+    depth = out["TVD"]
+    deep_signed = signed_log1p(numeric(out["RD"]))
+    reference_signed = signed_log1p(numeric(out["RS"]))
+    transformed = {
+        "GR": numeric(out["GR"]),
+        "RDeep": deep_signed,
+        "RReference": reference_signed,
+    }
+    for prefix, values in transformed.items():
+        out[f"{prefix}Gradient"] = depth_gradient(values, depth)
+        for window_m in (0.5, 1.0, 3.0, 5.0):
+            suffix = str(window_m).replace(".", "p")
+            out[f"{prefix}Residual{suffix}M"] = rolling_residual(values, depth, window_m)
+        for window_m in (1.0, 3.0, 5.0):
+            out[f"{prefix}MAD{int(window_m)}M"] = rolling_mad(values, depth, window_m)
+    contrast = deep_signed - reference_signed
+    for window_m in (1.0, 3.0, 5.0):
+        out[f"ContrastResidual{int(window_m)}M"] = rolling_residual(contrast, depth, window_m)
+    return out
+
+
+def cross_segment_window_columns(max_window_m: float) -> list[str]:
+    """列出"允许跨段补齐"的窗口特征名（窗口长度 ≤ max_window_m）。
+
+    深度梯度只用相邻行，等价于最小窗口，因此一并纳入。
+    """
+    columns: list[str] = []
+    for prefix in ("GR", "RDeep", "RReference"):
+        columns.append(f"{prefix}Gradient")
+        for window_m in (0.5, 1.0, 3.0, 5.0):
+            if window_m <= max_window_m + 1.0e-9:
+                columns.append(f"{prefix}Residual{str(window_m).replace('.', 'p')}M")
+        for window_m in (1.0, 3.0, 5.0):
+            if window_m <= max_window_m + 1.0e-9:
+                columns.append(f"{prefix}MAD{int(window_m)}M")
+    for window_m in (1.0, 3.0, 5.0):
+        if window_m <= max_window_m + 1.0e-9:
+            columns.append(f"ContrastResidual{int(window_m)}M")
+    return columns
+
+
+def add_scaled_features(out: pd.DataFrame) -> pd.DataFrame:
+    """在给定分组内计算逐行派生特征与标准化特征（稳健 Z / 分位秩）。"""
+    out = out.copy()
+    out["RDeep"] = numeric(out["RD"])
+    out["RReference"] = numeric(out["RS"])
+    out["RDeepSignedLog"] = signed_log1p(out["RDeep"])
+    out["RReferenceSignedLog"] = signed_log1p(out["RReference"])
+    out["LogRDeepPositive"] = positive_log10(out["RDeep"])
+    out["LogRReferencePositive"] = positive_log10(out["RReference"])
+    out["GRRobustZ"] = robust_z(numeric(out["GR"]))
+    out["RDeepRobustZ"] = robust_z(out["RDeepSignedLog"])
+    out["RReferenceRobustZ"] = robust_z(out["RReferenceSignedLog"])
+    out["GRRank"] = numeric(out["GR"]).rank(method="average", pct=True)
+    out["RDeepRank"] = numeric(out["RDeep"]).rank(method="average", pct=True)
+    out["RReferenceRank"] = numeric(out["RReference"]).rank(method="average", pct=True)
+
+    for prefix in ("GR", "RDeep", "RReference"):
+        out[f"{prefix}GradientZ"] = robust_z(out[f"{prefix}Gradient"])
+        for window_m in (0.5, 1.0, 3.0, 5.0):
+            suffix = str(window_m).replace(".", "p")
+            out[f"{prefix}Residual{suffix}MZ"] = robust_z(out[f"{prefix}Residual{suffix}M"])
+        for window_m in (1.0, 3.0, 5.0):
+            out[f"{prefix}MAD{int(window_m)}MZ"] = robust_z(out[f"{prefix}MAD{int(window_m)}M"])
+
+    out["Contrast"] = out["RDeepSignedLog"] - out["RReferenceSignedLog"]
+    out["ContrastRobustZ"] = robust_z(out["Contrast"])
+    denominator = numeric(out["RDeep"]).abs() + numeric(out["RReference"]).abs()
+    out["NormalizedContrast"] = (numeric(out["RDeep"]) - numeric(out["RReference"])) / denominator.where(denominator.gt(1.0e-12))
+    for window_m in (1.0, 3.0, 5.0):
+        out[f"ContrastResidual{int(window_m)}MZ"] = robust_z(out[f"ContrastResidual{int(window_m)}M"])
+    out["GRxDeepResidual"] = out["GRRobustZ"] * out["RDeepResidual1p0MZ"]
+    out["GRxReferenceResidual"] = out["GRRobustZ"] * out["RReferenceResidual1p0MZ"]
+    out["GRxNormalizedContrast"] = out["GRRobustZ"] * out["NormalizedContrast"]
+    out["DeepNonPositiveFlag"] = numeric(out["RDeep"]).le(0.0).astype(int)
+    out["ReferenceNonPositiveFlag"] = numeric(out["RReference"]).le(0.0).astype(int)
+    out["ModelInputEligible"] = out[["GR", "RDeep", "RReference"]].notna().all(axis=1)
+    return out
+
+
+def engineer_features(frame: pd.DataFrame, window_policy: dict[str, Any] | None = None) -> pd.DataFrame:
+    """逐行特征 + 窗口特征 + 井×地层内标准化。
+
+    窗口特征的作用范围由 `window_policy` 控制：
+
+    * `scope="segment"`（默认）：**窗口只在单次测井内部计算**，不跨批次；
+    * `scope="well"`：窗口整条井一起算（改造前的旧口径）；
+    * `cross_segment_max_window_m`：在 `scope="segment"` 下，窗口长度 ≤ 该值的特征
+      允许跨段补齐（例如 0.5 m 这种只有几个采样点的小窗口），更大的窗口仍严格段内计算。
+      这样既避免"大窗口跨批次"，又保留段边界处小窗口的连续性。
+
+    标准化（稳健 Z / 分位秩）与逐行派生特征的作用范围由
+    `normalization_scope` 控制：`"well_strata"`（默认）按井×地层；
+    `"segment"` 按测井段——与窗口口径一致，代价是短段的统计量不稳定。
+    """
     if frame.empty:
         return frame.copy()
+    policy = dict(window_policy or {})
+    scope = str(policy.get("scope", "segment")).strip().lower()
+    cross_max = float(policy.get("cross_segment_max_window_m", 0.0) or 0.0)
+    norm_scope = str(policy.get("normalization_scope", "well_strata")).strip().lower()
     parts = []
     for (well_name, strata_name), group in frame.groupby(["WellName", "StrataName"], dropna=False):
-        out = group.sort_values("TVD").copy()
-        out["RDeep"] = numeric(out["RD"])
-        out["RReference"] = numeric(out["RS"])
-        out["RDeepSignedLog"] = signed_log1p(out["RDeep"])
-        out["RReferenceSignedLog"] = signed_log1p(out["RReference"])
-        out["LogRDeepPositive"] = positive_log10(out["RDeep"])
-        out["LogRReferencePositive"] = positive_log10(out["RReference"])
-        out["GRRobustZ"] = robust_z(numeric(out["GR"]))
-        out["RDeepRobustZ"] = robust_z(out["RDeepSignedLog"])
-        out["RReferenceRobustZ"] = robust_z(out["RReferenceSignedLog"])
-        out["GRRank"] = numeric(out["GR"]).rank(method="average", pct=True)
-        out["RDeepRank"] = numeric(out["RDeep"]).rank(method="average", pct=True)
-        out["RReferenceRank"] = numeric(out["RReference"]).rank(method="average", pct=True)
+        ordered = group.sort_values("TVD").copy()
+        ordered["_rowkey"] = np.arange(len(ordered))
+        # --- 1) 窗口特征 ---
+        if scope == "well" or "SegmentID" not in ordered.columns or not ordered["SegmentID"].notna().any():
+            out = engineer_batch_window_features(ordered).sort_values("_rowkey")
+        else:
+            batch_parts = [
+                engineer_batch_window_features(segment)
+                for _, segment in ordered.groupby("SegmentID", dropna=False)
+            ]
+            out = pd.concat(batch_parts).sort_values("_rowkey")
+            if cross_max > 0.0:
+                wide = engineer_batch_window_features(ordered).set_index("_rowkey")
+                out = out.set_index("_rowkey")
+                for column in cross_segment_window_columns(cross_max):
+                    out[column] = wide[column]
+                out = out.reset_index()
+        out = out.sort_values("_rowkey")
 
-        transformed = {
-            "GR": numeric(out["GR"]),
-            "RDeep": out["RDeepSignedLog"],
-            "RReference": out["RReferenceSignedLog"],
-        }
-        for prefix, values in transformed.items():
-            out[f"{prefix}GradientZ"] = robust_z(depth_gradient(values, out["TVD"]))
-            for window_m in (0.5, 1.0, 3.0, 5.0):
-                suffix = str(window_m).replace(".", "p")
-                out[f"{prefix}Residual{suffix}MZ"] = robust_z(rolling_residual(values, out["TVD"], window_m))
-            for window_m in (1.0, 3.0, 5.0):
-                out[f"{prefix}MAD{int(window_m)}MZ"] = robust_z(rolling_mad(values, out["TVD"], window_m))
-
-        out["Contrast"] = out["RDeepSignedLog"] - out["RReferenceSignedLog"]
-        out["ContrastRobustZ"] = robust_z(out["Contrast"])
-        denominator = numeric(out["RDeep"]).abs() + numeric(out["RReference"]).abs()
-        out["NormalizedContrast"] = (numeric(out["RDeep"]) - numeric(out["RReference"])) / denominator.where(denominator.gt(1.0e-12))
-        for window_m in (1.0, 3.0, 5.0):
-            out[f"ContrastResidual{int(window_m)}MZ"] = robust_z(rolling_residual(out["Contrast"], out["TVD"], window_m))
-        out["GRxDeepResidual"] = out["GRRobustZ"] * out["RDeepResidual1p0MZ"]
-        out["GRxReferenceResidual"] = out["GRRobustZ"] * out["RReferenceResidual1p0MZ"]
-        out["GRxNormalizedContrast"] = out["GRRobustZ"] * out["NormalizedContrast"]
-        out["DeepNonPositiveFlag"] = numeric(out["RDeep"]).le(0.0).astype(int)
-        out["ReferenceNonPositiveFlag"] = numeric(out["RReference"]).le(0.0).astype(int)
-        out["ModelInputEligible"] = out[["GR", "RDeep", "RReference"]].notna().all(axis=1)
-        parts.append(out)
+        # --- 2) 逐行派生特征与标准化 ---
+        if norm_scope == "segment" and "SegmentID" in out.columns and out["SegmentID"].notna().any():
+            scaled = pd.concat([add_scaled_features(segment) for _, segment in out.groupby("SegmentID", dropna=False)])
+        else:
+            scaled = add_scaled_features(out)
+        scaled = scaled.sort_values("_rowkey").drop(columns="_rowkey").reset_index(drop=True)
+        parts.append(scaled)
     return pd.concat(parts, ignore_index=True)
 
 
@@ -301,7 +393,7 @@ def train_validation_for_strata(training: pd.DataFrame, config: dict[str, Any], 
     """Return (expert dict, validation frame) for one strata."""
     base = training.copy()
     strata_name = str(base.StrataName.iloc[0])
-    featured = engineer_features(base)
+    featured = engineer_features(base, window_policy=config.get("feature_windows"))
     featured = featured[featured.ModelInputEligible].copy()
     stage1 = featured[featured.PresenceLabel.notna()].copy()
     stage2 = featured[featured.Density.gt(0.0)].copy()
@@ -417,8 +509,12 @@ def train_validation_for_strata(training: pd.DataFrame, config: dict[str, Any], 
     return expert, validation
 
 
-def build_prediction_rows_for_well(well_rows: pd.DataFrame, experts: dict[str, dict[str, Any]]) -> pd.DataFrame:
-    featured = engineer_features(well_rows)
+def build_prediction_rows_for_well(
+    well_rows: pd.DataFrame,
+    experts: dict[str, dict[str, Any]],
+    window_policy: dict[str, Any] | None = None,
+) -> pd.DataFrame:
+    featured = engineer_features(well_rows, window_policy=window_policy)
     featured = featured[featured.ModelInputEligible].copy()
     parts = []
     for strata_name in TARGET_STRATA:
@@ -441,9 +537,70 @@ def build_prediction_rows_for_well(well_rows: pd.DataFrame, experts: dict[str, d
     return pd.concat(parts, ignore_index=True)
 
 
+def _select_within_clusters(rows: pd.DataFrame, gap_break_m: float,
+                            priority: list[str]) -> pd.DataFrame:
+    """在每个深度邻域簇内，按优先级挑一整行（不平均），并补支持段与审计字段。"""
+    work = rows.copy()
+    if "LogDate" in work.columns:
+        work["_LogDate"] = work["LogDate"].astype(str)
+    else:
+        work["_LogDate"] = ""
+    segment_rows = work.groupby("SegmentID")["TVD"].size().rename("_SegmentRowCount")
+    work = work.merge(segment_rows, left_on="SegmentID", right_index=True, how="left")
+
+    sort_keys: list[str] = ["ClusterID"]
+    ascending: list[bool] = [True]
+    for item in priority:
+        key = str(item).strip().lower()
+        if key == "segment_rows_desc":
+            sort_keys.append("_SegmentRowCount"); ascending.append(False)
+        elif key == "log_date_desc":
+            sort_keys.append("_LogDate"); ascending.append(False)
+        elif key == "segment_id_asc":
+            sort_keys.append("SegmentID"); ascending.append(True)
+        else:
+            raise ValueError(f"unknown select_priority item: {item}")
+    ordered = work.sort_values(sort_keys, ascending=ascending, kind="mergesort")
+    selected = ordered.groupby("ClusterID", as_index=False).first()
+    audit = rows.groupby("ClusterID").agg(
+        SourceCount=("SegmentID", "nunique"),
+        SourceSegmentIDs=("SegmentID", lambda s: ";".join(sorted(set(s)))),
+    ).reset_index()
+    selected = selected.merge(audit, on="ClusterID", how="left")
+    selected["SelectedSegmentID"] = selected["SegmentID"].astype(str)
+    selected["PredHasFracture"] = (
+        numeric(selected["PredFractureProb"]) >= numeric(selected["Stage1Threshold"])
+    ).astype(int)
+    selected["MergeRule"] = "select_by_segment_priority"
+    selected = selected.drop(columns=["_SegmentRowCount", "_LogDate"], errors="ignore")
+    selected = selected.sort_values(["WellName", "TVD"]).reset_index(drop=True)
+    new_seg = selected.StrataName.ne(selected.StrataName.shift()) | selected.TVD.diff().gt(gap_break_m)
+    selected["SupportSegmentID"] = new_seg.cumsum()
+    bounds = selected.groupby("SupportSegmentID")["TVD"].agg(["min", "max"])
+    selected["SegmentStartTVD"] = selected["SupportSegmentID"].map(bounds["min"])
+    selected["SegmentEndTVD"] = selected["SupportSegmentID"].map(bounds["max"])
+    columns = [
+        "WellName", "TVD", "MD", "X", "Y", "TIME", "StrataName",
+        "PredFractureProb", "PredConditionalDensity", "PredDensity", "GR", "RD", "RS",
+        "SourceCount", "SourceSegmentIDs", "SelectedSegmentID",
+        "PredictionValid", "Stage1Threshold", "ExpertID", "PredHasFracture",
+        "SupportSegmentID", "SegmentStartTVD", "SegmentEndTVD", "MergeRule",
+    ]
+    return selected[[column for column in columns if column in selected.columns]]
+
+
 def merge_well_predictions(rows: pd.DataFrame, tolerance_m: float, gap_break_m: float,
-                           weight_scheme: str) -> pd.DataFrame:
-    """Merge per-source rows into WellName+TVD unique rows; cross-source only."""
+                           weight_scheme: str, rule: str = "mean",
+                           select_priority: list[str] | None = None) -> pd.DataFrame:
+    """把逐段预测合并成"井 + 垂直深度"唯一的井级曲线（只在不同测次之间合并）。
+
+    `rule` 支持两种口径：
+
+    * `"mean"`（旧口径）：对同一深度邻域内的各测次取平均（坐标、曲线、预测值都平均）；
+    * `"select"`（择一口径）：**不平均**，按测次优先级在邻域内**挑一条**整行保留。
+      优先级由 `select_priority` 给出，默认：段内行数多者优先 → 测井日期新者优先 → 段名字典序。
+      理由与砂砾岩"不同曲线对不平均、按优先级择一"一致：不同批次的数据不可简单平均。
+    """
     rows = rows.sort_values("TVD").reset_index(drop=True)
     n = len(rows)
     if n == 0:
@@ -481,6 +638,10 @@ def merge_well_predictions(rows: pd.DataFrame, tolerance_m: float, gap_break_m: 
     rows["ClusterID"] = [find(i) for i in range(n)]
     weights = np.ones(n, dtype=float)
     rows["MergeWeight"] = weights
+    if str(rule).strip().lower() == "select":
+        return _select_within_clusters(rows, gap_break_m, select_priority or [
+            "segment_rows_desc", "log_date_desc", "segment_id_asc",
+        ])
     agg = rows.groupby("ClusterID").agg(
         WellName=("WellName", "first"),
         TVD=("TVD", "mean"),
@@ -546,9 +707,14 @@ def refine_points(merged: pd.DataFrame, scales: dict[str, float]) -> pd.DataFram
                 source = segment.iloc[int(local_index)]
                 rows.append({
                     "WellName": source.WellName, "TVD": float(source.TVD), "MD": float(source.MD),
+                    # P0-4′: 裂缝点属于"井级合并曲线"，必须携带该井的 X/Y/TIME，
+                    # 供 Step8 直接使用；下游不允许再用 MD 回到 Step2 段文件"猜"坐标。
+                    "X": float(source.X), "Y": float(source.Y), "TIME": float(source.TIME),
                     "StrataName": source.StrataName, "PredDensity": float(source.PredDensity),
                     "PredFractureProb": float(source.PredFractureProb),
                     "SupportSegmentID": int(support_id[1]), "PointOrdinalInSegment": ordinal,
+                    "SourceCount": int(source.SourceCount),
+                    "SourceSegmentIDs": str(source.SourceSegmentIDs),
                 })
     return pd.DataFrame(rows)
 
@@ -574,7 +740,7 @@ def predict_all_wells(config: dict[str, Any], experts: dict[str, dict[str, Any]]
             frames.append(df)
         well_rows = pd.concat(frames, ignore_index=True)
         well_rows = well_rows[well_rows.StrataName.isin(TARGET_STRATA)].copy()
-        detail = build_prediction_rows_for_well(well_rows, experts)
+        detail = build_prediction_rows_for_well(well_rows, experts, window_policy=config.get("feature_windows"))
         if detail.empty:
             coverage_rows.append({"WellName": well, "Status": "no_prediction_rows", "Rows": int(len(well_rows))})
             continue
@@ -582,6 +748,8 @@ def predict_all_wells(config: dict[str, Any], experts: dict[str, dict[str, Any]]
         merged = merge_well_predictions(
             detail, float(config["merge"]["tolerance_m"]),
             float(config["merge"]["gap_break_m"]), str(config["merge"]["weight_scheme"]),
+            rule=str(config["merge"].get("rule", "mean")),
+            select_priority=config["merge"].get("select_priority"),
         )
         if not merged.empty:
             merged_parts.append(merged)

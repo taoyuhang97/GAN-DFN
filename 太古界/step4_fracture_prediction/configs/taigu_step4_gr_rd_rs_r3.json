@@ -51,9 +51,9 @@
     "reg_alpha": 0.1,
     "reg_lambda": 2.0
   },
-  "output_dir": "太古界/step4_fracture_prediction/output/taigu_step4_gr_rd_rs_v1",
+  "output_dir": "太古界/step4_fracture_prediction/output/taigu_step4_gr_rd_rs_r3",
   "feature_windows": {
-    "scope": "well",
+    "scope": "segment",
     "cross_segment_max_window_m": 0.0
   }
 }

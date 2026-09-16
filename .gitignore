@@ -26,6 +26,14 @@ reference/
 # 太古界 P0-4 r2 / 诊断运行日志。
 太古界/output_p04_r2_logs/
 
+# 太古界 r3 / Step3 v4 运行日志。
+太古界/output_r3_logs/
+太古界/output_step3_v4_logs/
+
+# 太古界中间产物目录（断层预处理成品、matplotlib 缓存）。
+太古界/common/fault_preprocessing_300m/
+太古界/common/coverage_qc/.mplconfig/
+
 # 运行日志与工具内部目录。
 优化阶段二/正式主线/logs/
 .agents/

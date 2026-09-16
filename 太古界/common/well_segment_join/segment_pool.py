@@ -154,7 +154,28 @@ def inferred_md_tolerance(
     """
     if pool is None:
         return float(floor_m)
-    step = pool.md_step_median()
-    if not np.isfinite(step) or step <= 0:
+    return inferred_md_tolerance_from_md(
+        pool.md,
+        half_step_multiplier=half_step_multiplier,
+        floor_m=floor_m,
+        cap_m=cap_m,
+    )
+
+
+def inferred_md_tolerance_from_md(
+    md_values: np.ndarray,
+    half_step_multiplier: float = DEFAULT_HALF_STEP_MULTIPLIER,
+    floor_m: float = DEFAULT_TOLERANCE_FLOOR_M,
+    cap_m: float = DEFAULT_TOLERANCE_CAP_M,
+) -> float:
+    """由一段（或一口井）的 MD 采样轴推导回接容差。"""
+    values = np.asarray(md_values, dtype=float)
+    values = values[np.isfinite(values)]
+    if values.size < 2:
         return float(floor_m)
+    steps = np.diff(np.unique(values))
+    steps = steps[np.isfinite(steps) & (steps > 0)]
+    if steps.size == 0:
+        return float(floor_m)
+    step = float(np.median(steps))
     return float(min(max(half_step_multiplier * step, floor_m), cap_m))

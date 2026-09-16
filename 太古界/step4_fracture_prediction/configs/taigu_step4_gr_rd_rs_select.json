@@ -18,9 +18,14 @@
   "max_support_gap_m": 0.5,
   "merge": {
     "tolerance_m": 0.25,
-    "weight_scheme": "equal",
     "gap_break_m": 0.5,
-    "rule": "mean"
+    "weight_scheme": "equal",
+    "rule": "select",
+    "select_priority": [
+      "segment_rows_desc",
+      "log_date_desc",
+      "segment_id_asc"
+    ]
   },
   "label": {
     "clear_positive_density_quantile": 0.5,
@@ -51,9 +56,9 @@
     "reg_alpha": 0.1,
     "reg_lambda": 2.0
   },
-  "output_dir": "太古界/step4_fracture_prediction/output/taigu_step4_gr_rd_rs_v1",
+  "output_dir": "太古界/step4_fracture_prediction/output/taigu_step4_gr_rd_rs_select",
   "feature_windows": {
-    "scope": "well",
+    "scope": "segment",
     "cross_segment_max_window_m": 0.0
   }
 }
