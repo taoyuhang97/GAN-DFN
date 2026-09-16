@@ -22,6 +22,10 @@ v4 changes (2026-09-16):
 - 落在常规测井覆盖之外的成像数据不再静默丢弃：密度段外部分记入
   `imaging_out_of_log_coverage.csv`，产状点明细记入 `unmapped_imaging_points.csv`
   （供 Step8 井控使用）。
+- 产状点吸附放宽：只要落在常规测井覆盖内就吸附到最近采样点，不再因"离网格超过容差"丢弃；
+  吸附残差（中位/P95/最大）与超过半个采样步长的行数记入 `point_mapping_qc.csv`。
+- 监督层级 `SupervisionTier`（strong / presence_only / audit_only）写入组 CSV，
+  供 Step4 做监督门控；层级由 `supervision_status` 映射，可按井覆盖。
 """
 
 from __future__ import annotations
@@ -42,8 +46,14 @@ LABEL_COLUMNS = [
     "Density", "DensityRaw", "DensityScaleFactor", "ImagingWindowID",
     "HasFractureDensity", "GT_POINT_FLAG", "RawPointCount", "FracAzimuth", "FracDip",
     "DensityKind", "FractureScope", "DensitySourcePaths", "PointSourcePaths",
-    "DensitySupportStatus", "SupervisionStatus",
+    "DensitySupportStatus", "SupervisionStatus", "SupervisionTier",
 ]
+
+DEFAULT_SUPERVISION_TIERS = {
+    "supervision_ready": "strong",
+    "candidate_scope_pending": "presence_only",
+    "density_only_scope_pending": "audit_only",
+}
 
 
 def lookup_window_id(tvd_values: np.ndarray, windows: list[tuple[str, float, float]]) -> np.ndarray:
@@ -263,12 +273,12 @@ def attach_points(
     labels: pd.DataFrame,
     points: pd.DataFrame,
     coverage: list[tuple[float, float]] | None = None,
-) -> tuple[pd.DataFrame, pd.DataFrame]:
+) -> tuple[pd.DataFrame, pd.DataFrame, dict[str, float]]:
     """Attach points once at well level by TVD.
 
-    Returns `(labels, unmapped)`; `unmapped` lists every point that could not be attached,
-    with the reason (`outside_log_coverage` = 成像测到了、常规测井没有覆盖；`beyond_grid_tolerance`
-    = 落在覆盖内但离最近网格点超过容差），供审计与 Step8 井控使用，不再静默丢弃。
+    Returns `(labels, unmapped, residual_stats)`。**覆盖判定取代容差判定**：只要点落在常规
+    测井覆盖内，就吸附到最近的采样点（不再因为离网格超过容差而丢弃），残差只记录不拦截；
+    只有落在覆盖之外的点才进 `unmapped`（成像测到了、常规测井没有覆盖），供审计与 Step8 井控使用。
     """
     out = labels.copy()
     out["GT_POINT_FLAG"] = 0
@@ -279,40 +289,58 @@ def attach_points(
         "PointRowIndex", "TVD", "FracAzimuth", "FracDip", "PointSourcePath", "Reason",
         "NearestGridTVD", "DistanceToGridM",
     ]
+    empty_stats = {
+        "GridStepM": np.nan,
+        "AttachResidualMedianM": np.nan,
+        "AttachResidualP95M": np.nan,
+        "AttachResidualMaxM": np.nan,
+        "AttachedRows": 0.0,
+        "AttachedBeyondHalfStepRows": 0.0,
+    }
     if out.empty or points.empty:
-        return out, pd.DataFrame(columns=unmapped_columns)
+        return out, pd.DataFrame(columns=unmapped_columns), empty_stats
     tvd = out["TVD"].to_numpy(float)
     step = float(np.median(np.diff(tvd))) if len(tvd) > 1 else 0.1
-    tolerance = min(max(step * 0.51, 0.05), 0.25)
     ranges = merge_ranges(coverage) if coverage else [(float(tvd.min()), float(tvd.max()))]
 
     def inside_coverage(value: float) -> bool:
         return any(lo - 1.0e-6 <= value <= hi + 1.0e-6 for lo, hi in ranges)
 
     unmapped_rows: list[dict[str, object]] = []
+    residuals: list[float] = []
     for point in points.itertuples(index=False):
         pos = int(np.searchsorted(tvd, point.TVD))
         candidates = [idx for idx in (pos - 1, pos) if 0 <= idx < len(tvd)]
         idx = min(candidates, key=lambda value: abs(tvd[value] - point.TVD)) if candidates else None
         distance = abs(tvd[idx] - point.TVD) if idx is not None else np.inf
-        if idx is None or distance > tolerance:
+        if idx is None or not inside_coverage(float(point.TVD)):
             unmapped_rows.append({
                 "PointRowIndex": int(getattr(point, "PointRowIndex", -1)),
                 "TVD": float(point.TVD),
                 "FracAzimuth": float(point.FracAzimuth) if pd.notna(point.FracAzimuth) else np.nan,
                 "FracDip": float(point.FracDip) if pd.notna(point.FracDip) else np.nan,
                 "PointSourcePath": str(getattr(point, "PointSourcePath", "")),
-                "Reason": "beyond_grid_tolerance" if inside_coverage(float(point.TVD)) else "outside_log_coverage",
+                "Reason": "outside_log_coverage",
                 "NearestGridTVD": float(tvd[idx]) if idx is not None else np.nan,
                 "DistanceToGridM": float(distance) if np.isfinite(distance) else np.nan,
             })
             continue
+        residuals.append(float(distance))
         out.loc[idx, "GT_POINT_FLAG"] = 1
         out.loc[idx, "RawPointCount"] += 1
         if pd.isna(out.loc[idx, "FracAzimuth"]):
             out.loc[idx, "FracAzimuth"] = point.FracAzimuth
             out.loc[idx, "FracDip"] = point.FracDip
-    return out, pd.DataFrame(unmapped_rows, columns=unmapped_columns)
+    residual_array = np.asarray(residuals, dtype=float)
+    stats = {
+        "GridStepM": float(step),
+        "AttachResidualMedianM": float(np.median(residual_array)) if residual_array.size else np.nan,
+        "AttachResidualP95M": float(np.quantile(residual_array, 0.95)) if residual_array.size else np.nan,
+        "AttachResidualMaxM": float(residual_array.max()) if residual_array.size else np.nan,
+        "AttachedRows": float(residual_array.size),
+        "AttachedBeyondHalfStepRows": float((residual_array > step * 0.5).sum()) if residual_array.size else 0.0,
+    }
+    return out, pd.DataFrame(unmapped_rows, columns=unmapped_columns), stats
 
 
 def split_groups(labels: pd.DataFrame) -> list[pd.DataFrame]:
@@ -421,7 +449,11 @@ def main() -> int:
             "outside_imaging_window",
             np.where(labels["Density"].notna(), "supported", "missing_density_within_window"),
         )
-        labels, unmapped = attach_points(labels, points, coverage)
+        labels, unmapped, attach_stats = attach_points(labels, points, coverage)
+        supervision_tier = str(
+            well_cfg.get("supervision_tier")
+            or DEFAULT_SUPERVISION_TIERS.get(str(well_cfg["supervision_status"]), "audit_only")
+        )
 
         # ---- 成像解释窗口登记 + 按窗口标定（"每条缝 = 1 条"）----
         # 每个文件是一次独立解释作业，刻度按文件（窗口）算；同时保留按井汇总结算做对照。
@@ -532,6 +564,7 @@ def main() -> int:
             group["DensitySourcePaths"] = density_paths
             group["PointSourcePaths"] = point_paths
             group["SupervisionStatus"] = well_cfg["supervision_status"]
+            group["SupervisionTier"] = supervision_tier
             group_window_id = str(group.ImagingWindowID.iloc[0])
             group_scale = float(window_scale.get(group_window_id, density_scale))
             group = group[LABEL_COLUMNS]
@@ -552,6 +585,7 @@ def main() -> int:
                 "CoLocatedPointCount": int(max(0, int(group.RawPointCount.sum()) - int(group.GT_POINT_FLAG.sum()))),
                 "GroupPath": str(group_path), "DensityKind": well_cfg["density_kind"], "FractureScope": well_cfg["fracture_scope"],
                 "SupervisionStatus": well_cfg["supervision_status"],
+                "SupervisionTier": supervision_tier,
                 "ImagingWindowID": group_window_id,
                 "DensityScaleFactor": group_scale,
             })
@@ -567,7 +601,13 @@ def main() -> int:
             "MappedPointsOutsideDensitySupport": mapped_outside,
             "DroppedPointRows": int(len(unmapped)),
             "DroppedOutsideLogCoverage": int((unmapped.Reason == "outside_log_coverage").sum()) if len(unmapped) else 0,
-            "DroppedBeyondGridTolerance": int((unmapped.Reason == "beyond_grid_tolerance").sum()) if len(unmapped) else 0,
+            "DroppedBeyondGridTolerance": 0,
+            "GridStepM": round(float(attach_stats["GridStepM"]), 5) if attach_stats["GridStepM"] == attach_stats["GridStepM"] else None,
+            "AttachResidualMedianM": round(float(attach_stats["AttachResidualMedianM"]), 4) if attach_stats["AttachResidualMedianM"] == attach_stats["AttachResidualMedianM"] else None,
+            "AttachResidualP95M": round(float(attach_stats["AttachResidualP95M"]), 4) if attach_stats["AttachResidualP95M"] == attach_stats["AttachResidualP95M"] else None,
+            "AttachResidualMaxM": round(float(attach_stats["AttachResidualMaxM"]), 4) if attach_stats["AttachResidualMaxM"] == attach_stats["AttachResidualMaxM"] else None,
+            "AttachedBeyondHalfStepRows": int(attach_stats["AttachedBeyondHalfStepRows"]),
+            "SupervisionTier": supervision_tier,
         })
 
     group_df = pd.DataFrame(group_rows)
@@ -647,6 +687,8 @@ def main() -> int:
         "coverage_gaps": coverage_gaps,
         "density_merge_rule": "clip_each_source_to_its_imaging_window_then_max_per_tvd",
         "density_calibration_rule": "per_window: scale = points_in_window_in_log_coverage / density_integral_in_window_in_log_coverage; well-level pooled value reported for comparison",
+        "point_attach_rule": "accept every point inside log coverage, snap to nearest sample, record residual (no tolerance rejection)",
+        "supervision_tiers": {well: str(well_cfg.get("supervision_tier") or DEFAULT_SUPERVISION_TIERS.get(str(well_cfg["supervision_status"]), "audit_only")) for well_cfg in cfg["wells"]},
         "density_calibration": calibration_rows,
         "imaging_windows": window_rows,
         "out_of_log_coverage": out_of_coverage_rows,

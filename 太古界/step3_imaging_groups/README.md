@@ -11,6 +11,14 @@
 > 的 `status=pass` 为放行条件）。下方正文是砂砾岩 `formal_rebuild` 的参考说明，
 > 不能直接用于太古界。
 
+本次同时落地第三步（监督门控 + 产状点吸附放宽）：
+
+- **产状点吸附放宽**：只要落在常规测井覆盖内就吸附到最近采样点，不再因"离网格超容差"丢弃；
+  `point_mapping_qc.csv` 增加 `GridStepM/AttachResidualMedianM/AttachResidualP95M/AttachResidualMaxM/AttachedBeyondHalfStepRows`；
+- **监督层级**：组 CSV 与清单新增 `SupervisionTier`（`strong` / `presence_only` / `audit_only`），
+  由 `supervision_status` 映射、可按井覆盖（配置键 `supervision_tier`），供 Step4 做监督门控。
+
+
 ## 太古界 v4（2026-09-16，第一步 + 第二步修正）
 
 新入口：`configs/taigu_step3_imaging_groups_v4.json` → 输出 `output/taigu_step3_imaging_v4`；

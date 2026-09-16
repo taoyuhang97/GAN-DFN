@@ -298,6 +298,76 @@ def assign_presence_labels(training: pd.DataFrame, config: dict[str, Any]) -> pd
     return pd.concat(parts, ignore_index=True)
 
 
+def supervision_tier(frame: pd.DataFrame) -> pd.Series:
+    """监督层级：优先用 Step3 的 `SupervisionTier` 列，缺失时按 `SupervisionStatus` 回退。"""
+    if "SupervisionTier" in frame.columns:
+        tier = frame["SupervisionTier"].astype(str)
+    elif "SupervisionStatus" in frame.columns:
+        tier = frame["SupervisionStatus"].astype(str).map(
+            {"supervision_ready": "strong", "candidate_scope_pending": "presence_only",
+             "density_only_scope_pending": "audit_only"}
+        )
+    else:
+        tier = pd.Series("strong", index=frame.index)
+    return tier.fillna("strong")
+
+
+def supervision_gate(config: dict[str, Any]) -> dict[str, list[str]]:
+    gate = dict(config.get("supervision_gate") or {})
+    regression_tiers = [str(v) for v in gate.get("density_regression_tiers", ["strong"])]
+    return {
+        "positive_tiers": [str(v) for v in gate.get("positive_tiers", ["strong", "presence_only"])],
+        "negative_tiers": [str(v) for v in gate.get("negative_tiers", ["strong"])],
+        "density_regression_tiers": regression_tiers,
+        # 总量守恒标定用哪些井：默认与回归一致；可单独收紧到只信得过的强监督井。
+        "calibration_tiers": [str(v) for v in (gate.get("calibration_tiers") or regression_tiers)],
+    }
+
+
+def apply_supervision_gate(training: pd.DataFrame, config: dict[str, Any]) -> pd.DataFrame:
+    """把"哪一级监督能提供哪种标签"接进流程。
+
+    - 正样本（有密度或有解释点）：`positive_tiers` 的井都可以提供；
+    - 负样本（明确没有裂缝）：只有 `negative_tiers` 的井可以提供——口径未核验的井不能教模型
+      "这里没有裂缝"；
+    - 条件密度回归：只有 `density_regression_tiers` 的井参与（数值刻度最可信的那一批）。
+    """
+    gate = supervision_gate(config)
+    out = training.copy()
+    tier = supervision_tier(out)
+    out["SupervisionTier"] = tier
+    kind = out.get("PresenceLabelKind", pd.Series("", index=out.index)).astype(str)
+    gated = (
+        (kind.eq("clear_fracture") & ~tier.isin(gate["positive_tiers"]))
+        | (kind.eq("clear_background") & ~tier.isin(gate["negative_tiers"]))
+    )
+    out.loc[gated, "PresenceLabel"] = np.nan
+    out.loc[gated, "PresenceLabelKind"] = "gated_out"
+    out["DensityRegressionEligible"] = (
+        numeric(out["Density"]).fillna(0.0).gt(0.0) & tier.isin(gate["density_regression_tiers"])
+    )
+    return out
+
+
+def depth_integral(frame: pd.DataFrame, column: str, gap_break_m: float = 0.5) -> float:
+    """按井做深度积分（跨测次重叠按深度去重，缺口不跨接），用于总量守恒标定。"""
+    if frame.empty or column not in frame.columns:
+        return 0.0
+    total = 0.0
+    for _, well in frame.groupby("WellName", sort=False):
+        ordered = well.sort_values("TVD").drop_duplicates("TVD", keep="first")
+        depth = numeric(ordered["TVD"]).to_numpy(dtype=float)
+        values = numeric(ordered[column]).fillna(0.0).clip(lower=0.0).to_numpy(dtype=float)
+        if len(depth) < 2:
+            continue
+        step = float(np.median(np.diff(depth)))
+        breaks = np.flatnonzero(np.diff(depth) > max(3.0 * step, gap_break_m))
+        for run in np.split(np.arange(len(depth)), breaks + 1):
+            if len(run) >= 2:
+                total += float(np.trapezoid(values[run], depth[run]))
+    return total
+
+
 def equalized_depth_weights(frame: pd.DataFrame) -> np.ndarray:
     frame = frame.reset_index(drop=True)
     weights = np.zeros(len(frame), dtype=float)
@@ -396,7 +466,7 @@ def train_validation_for_strata(training: pd.DataFrame, config: dict[str, Any], 
     featured = engineer_features(base, window_policy=config.get("feature_windows"))
     featured = featured[featured.ModelInputEligible].copy()
     stage1 = featured[featured.PresenceLabel.notna()].copy()
-    stage2 = featured[featured.Density.gt(0.0)].copy()
+    stage2 = featured[featured.DensityRegressionEligible].copy()
     wells = sorted(featured.WellName.unique())
     oof_rows = []
     for held_out in wells:
@@ -407,7 +477,9 @@ def train_validation_for_strata(training: pd.DataFrame, config: dict[str, Any], 
         reg = xgb_regressor(config, random_state)
         fit1 = stage1[train_mask.loc[stage1.index]]
         fit2 = stage2[train_mask.loc[stage2.index]]
-        if fit1.empty or fit2.empty:
+        # 门控后可能出现"某一折的训练集只剩单一类别"（例如风化壳强监督只有 313，
+        # 扣掉它以后剩下的井只有正样本）——这种折无法训练分类器，直接跳过。
+        if fit1.empty or fit2.empty or fit1.PresenceLabel.nunique() < 2:
             continue
         w1 = equalized_depth_weights(fit1)
         w2 = equalized_depth_weights(fit2)
@@ -451,24 +523,37 @@ def train_validation_for_strata(training: pd.DataFrame, config: dict[str, Any], 
                     threshold,
                 ),
             })
-    # density scale: align positive-density mean
-    scale = 1.0
+    # OOF 口径的标定系数（只作诊断，不再用于部署输出）
+    oof_scale = 1.0
     if not oof.empty:
         pos = oof[oof.Density.gt(0.0)]
         if len(pos):
             mean_true = float(pos.Density.mean())
             mean_pred = float(pos.OOFDensity.mean())
-            if mean_pred > 1e-12:
-                scale = float(np.clip(mean_true / mean_pred, 0.1, 10.0))
+            if mean_pred > 1.0e-12:
+                oof_scale = float(mean_true / mean_pred)
     # final deployment model on all wells
     clf = xgb_classifier(config, random_state)
     reg = xgb_regressor(config, random_state)
     clf.fit(stage1[FEATURE_COLUMNS], stage1.PresenceLabel, sample_weight=equalized_depth_weights(stage1))
     reg.fit(stage2[FEATURE_COLUMNS], stage2.Density, sample_weight=equalized_depth_weights(stage2))
+    # 部署标定：**总量守恒**，并且用部署模型自己的样本内预测来标定。
+    # 口径是"条数"——比较的是深度积分 ∫ρdz，不是正样本均值。
+    eligible = featured[featured.SupervisionTier.astype(str).isin(supervision_gate(config)["calibration_tiers"])]
+    if eligible.empty:
+        eligible = featured
+    in_sample_pred = clf.predict_proba(eligible[FEATURE_COLUMNS])[:, 1] * reg.predict(eligible[FEATURE_COLUMNS])
+    actual_total = depth_integral(eligible, "Density")
+    predicted_total = depth_integral(eligible.assign(_PredDensity=in_sample_pred), "_PredDensity")
+    scale = float(actual_total / predicted_total) if predicted_total > 1.0e-12 else 1.0
     expert = {
         "stage1": clf, "stage2": reg,
         "threshold": float(thresholds.get("threshold", 0.5)),
         "density_scale": float(scale),
+        "density_scale_oof_diagnostic": float(oof_scale),
+        "calibration_actual_total": float(actual_total),
+        "calibration_predicted_total": float(predicted_total),
+        "calibration_wells": sorted(eligible.WellName.astype(str).unique()),
         "training_rows": int(len(featured)),
         "stage1_rows": int(len(stage1)),
         "stage2_rows": int(len(stage2)),
@@ -673,6 +758,11 @@ def merge_well_predictions(rows: pd.DataFrame, tolerance_m: float, gap_break_m: 
 
 
 def point_count_scales(training: pd.DataFrame, point_wells: list[str]) -> dict[str, float]:
+    """【审计量，已退出点数计算】每地层"解释缝条数 ÷ 密度积分"。
+
+    这个比值以前被当作细化乘子（点数 = ∫ρdz × 该常数），等于把各家产品的数值刻度差
+    当成物理规律。现在只输出到审计表，`refine_points` 不再使用它。
+    """
     scales = {}
     labeled = training[training.WellName.isin(point_wells)].copy()
     for strata_name, strata in labeled.groupby("StrataName"):
@@ -688,35 +778,259 @@ def point_count_scales(training: pd.DataFrame, point_wells: list[str]) -> dict[s
     return scales
 
 
-def refine_points(merged: pd.DataFrame, scales: dict[str, float]) -> pd.DataFrame:
-    rows = []
-    for support_id, support in merged.groupby(["WellName", "SupportSegmentID"]):
-        support = support.sort_values("TVD").reset_index(drop=True)
-        positive = support.PredHasFracture.gt(0).to_numpy()
-        starts = np.flatnonzero(positive & np.concatenate(([True], ~positive[:-1])))
-        for start in starts:
-            end = start
-            while end + 1 < len(support) and positive[end + 1]:
-                end += 1
-            segment = support.iloc[start : end + 1]
-            depth = segment.TVD.to_numpy(dtype=float)
-            density = segment.PredDensity.to_numpy(dtype=float)
-            area = float(np.trapezoid(density, depth)) if len(depth) >= 2 else float(density[0]) * 0.125
-            count = min(len(segment), max(1, int(round(area * float(scales.get(str(segment.StrataName.iloc[0]), 1.0))))))
-            for ordinal, local_index in enumerate(sorted(np.argsort(-density)[:count].tolist()), start=1):
-                source = segment.iloc[int(local_index)]
-                rows.append({
-                    "WellName": source.WellName, "TVD": float(source.TVD), "MD": float(source.MD),
-                    # P0-4′: 裂缝点属于"井级合并曲线"，必须携带该井的 X/Y/TIME，
-                    # 供 Step8 直接使用；下游不允许再用 MD 回到 Step2 段文件"猜"坐标。
-                    "X": float(source.X), "Y": float(source.Y), "TIME": float(source.TIME),
-                    "StrataName": source.StrataName, "PredDensity": float(source.PredDensity),
-                    "PredFractureProb": float(source.PredFractureProb),
-                    "SupportSegmentID": int(support_id[1]), "PointOrdinalInSegment": ordinal,
-                    "SourceCount": int(source.SourceCount),
-                    "SourceSegmentIDs": str(source.SourceSegmentIDs),
-                })
-    return pd.DataFrame(rows)
+REFINE_DEFAULTS = {
+    "gap_break_m": 0.5,
+    "min_interval_thickness_m": 1.0,
+    "coverage_targets": {"上部复合层": 0.33, "太古界风化壳": 0.68},
+    "density_bins": [0.5, 2.0],
+    "thickness_bins": [3.0, 10.0],
+}
+
+
+def refine_config(config: dict[str, Any]) -> dict[str, Any]:
+    merged = dict(REFINE_DEFAULTS)
+    merged.update(dict(config.get("refine") or {}))
+    merged["coverage_targets"] = dict(merged.get("coverage_targets") or {})
+    return merged
+
+
+def _interval_bounds(depth: np.ndarray, above: np.ndarray, gap_break_m: float,
+                     min_thickness_m: float) -> list[tuple[int, int]]:
+    """在"值 ≥ 地板"的布尔序列上切连续区间：缺口 ≤ gap 合并，厚度 < 下限丢弃。"""
+    bounds: list[tuple[int, int]] = []
+    n = len(depth)
+    i = 0
+    while i < n:
+        if not above[i]:
+            i += 1
+            continue
+        j = i
+        while True:
+            k = j
+            while k + 1 < n and above[k + 1] and (depth[k + 1] - depth[k]) <= gap_break_m:
+                k += 1
+            nxt = None
+            for t in range(k + 1, n):
+                if depth[t] - depth[k] > gap_break_m:
+                    break
+                if above[t]:
+                    nxt = t
+                    break
+            if nxt is None:
+                j = k
+                break
+            j = nxt
+        if depth[j] - depth[i] >= min_thickness_m:
+            bounds.append((i, j))
+        i = j + 1
+    return bounds
+
+
+def _coverage_for_floor(frame: pd.DataFrame, floor: float, gap_break_m: float,
+                        min_thickness_m: float) -> float:
+    covered = 0.0
+    total = 0.0
+    for _, well in frame.groupby("WellName", sort=False):
+        ordered = well.sort_values("TVD")
+        depth = numeric(ordered["TVD"]).to_numpy(dtype=float)
+        values = numeric(ordered["PredDensity"]).fillna(0.0).clip(lower=0.0).to_numpy(dtype=float)
+        if len(depth) < 2:
+            continue
+        total += float(depth[-1] - depth[0])
+        for i, j in _interval_bounds(depth, values >= floor, gap_break_m, min_thickness_m):
+            covered += float(depth[j] - depth[i])
+    return covered / total if total > 0 else 0.0
+
+
+def select_density_floors(merged: pd.DataFrame, config: dict[str, Any]) -> dict[str, dict[str, float]]:
+    """按"区间覆盖率对齐成像井"确定地层级密度地板（每个地层一个数，不逐井调）。"""
+    refine = refine_config(config)
+    floors: dict[str, dict[str, float]] = {}
+    for strata_name, target in refine["coverage_targets"].items():
+        subset = merged[merged.StrataName.eq(strata_name)]
+        if subset.empty:
+            floors[strata_name] = {"floor": 0.0, "coverage": 0.0, "target": float(target), "status": "no_rows"}
+            continue
+        candidates = np.unique(np.quantile(subset.PredDensity.clip(lower=0.0).to_numpy(dtype=float),
+                                          np.linspace(0.02, 0.98, 193)))
+        best = None
+        for floor in candidates:
+            coverage = _coverage_for_floor(subset, float(floor), refine["gap_break_m"],
+                                           refine["min_interval_thickness_m"])
+            if best is None or abs(coverage - float(target)) < abs(best["coverage"] - float(target)):
+                best = {"floor": float(floor), "coverage": float(coverage)}
+        floors[strata_name] = {**best, "target": float(target), "status": "ok"}
+    return floors
+
+
+def _bin_label(value: float, edges: list[float], names: list[str]) -> str:
+    for edge, name in zip(edges, names):
+        if value < edge:
+            return name
+    return names[-1]
+
+
+def build_intervals(merged: pd.DataFrame, floors: dict[str, dict[str, float]],
+                    config: dict[str, Any]) -> pd.DataFrame:
+    """在预测密度曲线上切"裂缝发育区间"（替代原来的阈值连通段）。"""
+    refine = refine_config(config)
+    density_edges = [float(v) for v in refine["density_bins"]]
+    thickness_edges = [float(v) for v in refine["thickness_bins"]]
+    rows: list[dict[str, object]] = []
+    for (well, strata_name), group in merged.groupby(["WellName", "StrataName"], sort=False):
+        ordered = group.sort_values("TVD").reset_index(drop=True)
+        depth = numeric(ordered["TVD"]).to_numpy(dtype=float)
+        density = numeric(ordered["PredDensity"]).fillna(0.0).clip(lower=0.0).to_numpy(dtype=float)
+        floor = float(floors.get(strata_name, {}).get("floor", 0.0))
+        for i, j in _interval_bounds(depth, density >= floor, refine["gap_break_m"],
+                                     refine["min_interval_thickness_m"]):
+            local = density[i : j + 1]
+            local_depth = depth[i : j + 1]
+            integral = float(np.trapezoid(local, local_depth)) if len(local) >= 2 else float(local[0]) * 0.125
+            thickness = float(local_depth[-1] - local_depth[0])
+            mean_density = integral / thickness if thickness > 0 else 0.0
+            rows.append({
+                "WellName": well, "StrataName": strata_name,
+                "TVDStart": float(local_depth[0]), "TVDEnd": float(local_depth[-1]),
+                "ThicknessM": round(thickness, 3), "MeanDensity": round(mean_density, 4),
+                "DensityIntegral": round(integral, 3),
+                "ExpectedCount": int(max(1, round(integral))),
+                "DensityFloor": round(floor, 4),
+                "DensityBin": _bin_label(mean_density, density_edges, [f"低<{density_edges[0]}", f"中{density_edges[0]}-{density_edges[1]}", f"高≥{density_edges[1]}"]),
+                "ThicknessBin": _bin_label(thickness, thickness_edges, [f"薄<{thickness_edges[0]}m", f"中{thickness_edges[0]}-{thickness_edges[1]}m", f"厚≥{thickness_edges[1]}m"]),
+            })
+    intervals = pd.DataFrame(rows)
+    if not intervals.empty:
+        intervals.insert(0, "IntervalID", [f"INT{index:05d}" for index in range(1, len(intervals) + 1)])
+    return intervals
+
+
+def place_points_in_intervals(merged: pd.DataFrame, intervals: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """区间内落点：按密度累积曲线等分（点数 = ∫ρdz），不再挑密度最大的采样点。"""
+    rows: list[dict[str, object]] = []
+    audit: list[dict[str, object]] = []
+    for _, interval in intervals.iterrows():
+        subset = merged[(merged.WellName.eq(interval.WellName)) & (merged.StrataName.eq(interval.StrataName))
+                        & (merged.TVD >= interval.TVDStart - 1.0e-9) & (merged.TVD <= interval.TVDEnd + 1.0e-9)]
+        subset = subset.sort_values("TVD").reset_index(drop=True)
+        depth = subset.TVD.to_numpy(dtype=float)
+        density = numeric(subset.PredDensity).fillna(0.0).clip(lower=0.0).to_numpy(dtype=float)
+        count = int(interval.ExpectedCount)
+        placed = 0
+        if len(depth) >= 2 and count > 0:
+            cumulative = np.concatenate(([0.0], np.cumsum((density[1:] + density[:-1]) * 0.5 * np.diff(depth))))
+            total = cumulative[-1]
+            used: set[int] = set()
+            if total > 0:
+                targets = (np.arange(count) + 0.5) / count * total
+                for ordinal, target in enumerate(targets, start=1):
+                    index = int(np.clip(np.searchsorted(cumulative, target), 0, len(cumulative) - 1))
+                    if index in used:
+                        continue
+                    used.add(index)
+                    source = subset.iloc[index]
+                    rows.append({
+                        "WellName": source.WellName, "TVD": float(source.TVD), "MD": float(source.MD),
+                        "X": float(source.X), "Y": float(source.Y), "TIME": float(source.TIME),
+                        "StrataName": source.StrataName, "PredDensity": float(source.PredDensity),
+                        "PredFractureProb": float(source.PredFractureProb),
+                        "SupportSegmentID": int(source.SupportSegmentID),
+                        "PointOrdinalInSegment": ordinal,
+                        "IntervalID": str(interval.IntervalID),
+                        "DensityBin": str(interval.DensityBin),
+                        "ThicknessBin": str(interval.ThicknessBin),
+                        "IntervalStartTVD": float(interval.TVDStart),
+                        "IntervalEndTVD": float(interval.TVDEnd),
+                        "RuleSource": "density_cumulative",
+                        "SourceCount": int(source.SourceCount),
+                        "SourceSegmentIDs": str(source.SourceSegmentIDs),
+                    })
+                    placed += 1
+        audit.append({
+            "WellName": interval.WellName, "StrataName": interval.StrataName, "IntervalID": interval.IntervalID,
+            "DensityBin": interval.DensityBin, "ThicknessBin": interval.ThicknessBin,
+            "ThicknessM": interval.ThicknessM, "MeanDensity": interval.MeanDensity,
+            "DensityIntegral": interval.DensityIntegral,
+            "ExpectedCount": int(interval.ExpectedCount), "PlacedCount": int(placed),
+            "Shortfall": int(interval.ExpectedCount) - int(placed),
+        })
+    return pd.DataFrame(rows), pd.DataFrame(audit)
+
+
+def build_refine_rule_library(training: pd.DataFrame, config: dict[str, Any]) -> list[dict[str, object]]:
+    """从成像井（有真实密度与真实解释点）统计"不同密度档、不同厚度档的点数与间距"。"""
+    refine = refine_config(config)
+    density_edges = [float(v) for v in refine["density_bins"]]
+    thickness_edges = [float(v) for v in refine["thickness_bins"]]
+    library: list[dict[str, object]] = []
+    for strata_name, group in training.groupby("StrataName", sort=False):
+        for (bin_name, thickness_name), cell in _imaging_interval_cells(group, refine, density_edges, thickness_edges):
+            library.append({
+                "StrataName": strata_name, "DensityBin": bin_name, "ThicknessBin": thickness_name,
+                "IntervalCount": int(cell["interval_count"]),
+                "WellCount": int(cell["well_count"]),
+                "MeanThicknessM": round(float(cell["mean_thickness"]), 3),
+                "MeanDensity": round(float(cell["mean_density"]), 4),
+                "ExpectedCountFromIntegral": round(float(cell["integral"]), 2),
+                "ObservedPointCount": int(cell["points"]),
+                "ObservedOverIntegral": round(float(cell["points"] / cell["integral"]), 3) if cell["integral"] > 0 else None,
+                "MedianSpacingM": round(float(cell["median_spacing"]), 3) if cell["median_spacing"] else None,
+                "P90SpacingM": round(float(cell["p90_spacing"]), 3) if cell["p90_spacing"] else None,
+                "Support": "ok" if cell["interval_count"] >= 3 else "thin_support",
+            })
+    return library
+
+
+def _imaging_interval_cells(frame: pd.DataFrame, refine: dict[str, Any], density_edges: list[float],
+                            thickness_edges: list[float]):
+    cells: dict[tuple[str, str], dict[str, object]] = {}
+    for (well, strata_name), group in frame.groupby(["WellName", "StrataName"], sort=False):
+        ordered = group.sort_values("TVD").reset_index(drop=True)
+        depth = numeric(ordered["TVD"]).to_numpy(dtype=float)
+        density = numeric(ordered["Density"]).fillna(0.0).clip(lower=0.0).to_numpy(dtype=float)
+        for i, j in _interval_bounds(depth, density > 0.0, refine["gap_break_m"], refine["min_interval_thickness_m"]):
+            local_depth = depth[i : j + 1]
+            integral = float(np.trapezoid(density[i : j + 1], local_depth))
+            thickness = float(local_depth[-1] - local_depth[0])
+            mean_density = integral / thickness if thickness > 0 else 0.0
+            bin_name = _bin_label(mean_density, density_edges, ["低", "中", "高"])
+            thickness_name = _bin_label(thickness, thickness_edges, ["薄", "中", "厚"])
+            point_depths = np.sort(np.concatenate([
+                numeric(group.loc[(group.TVD >= local_depth[0]) & (group.TVD <= local_depth[-1]) & group.GT_POINT_FLAG.gt(0), "TVD"]).to_numpy(dtype=float)
+            ])) if "GT_POINT_FLAG" in group.columns else np.array([])
+            spacings = np.diff(point_depths)
+            spacings = spacings[spacings > 0]
+            key = (bin_name, thickness_name)
+            cell = cells.setdefault(key, {"interval_count": 0, "wells": set(), "thickness": [], "density": [],
+                                          "integral": 0.0, "points": 0, "spacings": []})
+            cell["interval_count"] += 1
+            cell["wells"].add(well)
+            cell["thickness"].append(thickness)
+            cell["density"].append(mean_density)
+            cell["integral"] += integral
+            cell["points"] += int(len(point_depths))
+            cell["spacings"].extend(spacings.tolist())
+    for key, cell in cells.items():
+        spacings = np.asarray(cell["spacings"], dtype=float)
+        cell["mean_thickness"] = float(np.mean(cell["thickness"])) if cell["thickness"] else 0.0
+        cell["mean_density"] = float(np.mean(cell["density"])) if cell["density"] else 0.0
+        cell["well_count"] = len(cell["wells"])
+        cell["median_spacing"] = float(np.median(spacings)) if spacings.size else None
+        cell["p90_spacing"] = float(np.quantile(spacings, 0.9)) if spacings.size else None
+        yield key, cell
+
+
+def refine_points(merged: pd.DataFrame, config: dict[str, Any],
+                  training: pd.DataFrame) -> dict[str, Any]:
+    """细化：定地板 → 切区间 → 按密度累积落点。点数 = ∫ρdz，不再乘地层常数。"""
+    floors = select_density_floors(merged, config)
+    intervals = build_intervals(merged, floors, config)
+    points, interval_audit = place_points_in_intervals(merged, intervals)
+    library = build_refine_rule_library(training, config)
+    return {
+        "points": points, "intervals": intervals, "interval_audit": interval_audit,
+        "floors": floors, "library": library,
+    }
 
 
 def predict_all_wells(config: dict[str, Any], experts: dict[str, dict[str, Any]], prediction_root: Path) -> tuple[pd.DataFrame, pd.DataFrame, list[dict[str, object]], pd.DataFrame]:
@@ -843,6 +1157,7 @@ def main() -> int:
     random_state = int(cfg["random_state"])
     training = load_training_table(cfg)
     training = assign_presence_labels(training, cfg["label"])
+    training = apply_supervision_gate(training, cfg)
     experts: dict[str, dict[str, Any]] = {}
     validation_parts = []
     registry = []
@@ -858,6 +1173,10 @@ def main() -> int:
             "Stage1Rows": expert["stage1_rows"], "Stage2Rows": expert["stage2_rows"],
             "TrainingRows": expert["training_rows"], "Wells": ";".join(expert["wells"]),
             "DeploymentThreshold": expert["threshold"], "DensityScale": expert["density_scale"],
+            "DensityScaleOOFDiagnostic": expert["density_scale_oof_diagnostic"],
+            "CalibrationActualTotal": expert["calibration_actual_total"],
+            "CalibrationPredictedTotal": expert["calibration_predicted_total"],
+            "CalibrationWells": ";".join(expert["calibration_wells"]),
         })
         joblib.dump(expert["stage1"], model_dir / f"{strata_name}_RD_RS_stage1_xgb.joblib")
         joblib.dump(expert["stage2"], model_dir / f"{strata_name}_RD_RS_stage2_xgb.joblib")
@@ -883,8 +1202,30 @@ def main() -> int:
     unsupported.to_csv(qc_dir / "unsupported_intervals.csv", index=False, encoding="utf-8-sig")
 
     scales = point_count_scales(training, [str(w) for w in cfg["point_wells"]])
-    points = refine_points(merged_all, scales)
+    refine = refine_points(merged_all, cfg, training)
+    points = refine["points"]
     points.to_csv(prediction_dir / "all_wells_merged_fracture_points.csv", index=False, encoding="utf-8-sig")
+    refine["intervals"].to_csv(prediction_dir / "all_wells_refine_intervals.csv", index=False, encoding="utf-8-sig")
+    refine["interval_audit"].to_csv(qc_dir / "refine_interval_audit.csv", index=False, encoding="utf-8-sig")
+    (model_dir / "refine_rule_library.json").write_text(
+        json.dumps({"version": "taigu_step4_refine_rule_v1",
+                    "unit": {"density": "count/m", "thickness": "m", "spacing": "m"},
+                    "floors": refine["floors"], "rules": refine["library"]},
+                   ensure_ascii=False, indent=2), encoding="utf-8")
+    if not points.empty:
+        point_audit = (
+            points.groupby(["WellName", "StrataName"]).size().rename("PlacedPoints").reset_index()
+            .merge(refine["intervals"].groupby(["WellName", "StrataName"]).agg(
+                IntervalCount=("IntervalID", "size"), ExpectedPoints=("ExpectedCount", "sum"),
+                IntervalThicknessM=("ThicknessM", "sum"), ExpectedIntegral=("DensityIntegral", "sum")).reset_index(),
+                on=["WellName", "StrataName"], how="left")
+        )
+        point_audit["PlacedOverExpected"] = (
+            point_audit.PlacedPoints / point_audit.ExpectedPoints.replace(0, np.nan)
+        ).round(3)
+        point_audit.to_csv(qc_dir / "refine_point_count_audit.csv", index=False, encoding="utf-8-sig")
+    else:
+        pd.DataFrame().to_csv(qc_dir / "refine_point_count_audit.csv", index=False, encoding="utf-8-sig")
 
     # acceptance
     errors = []
@@ -909,6 +1250,13 @@ def main() -> int:
         "coverage_wells": int(len(coverage)),
         "overlap_pairs": int(len(overlap)),
         "density_scales": scales,
+        "supervision_gate": supervision_gate(cfg),
+        "supervision_tier_rows": {str(k): int(v) for k, v in training.SupervisionTier.value_counts().items()},
+        "supervision_tier_wells": {str(well): str(tier) for well, tier in
+                                   training.groupby("WellName").SupervisionTier.first().items()},
+        "refine_floors": refine["floors"],
+        "refine_interval_count": int(len(refine["intervals"])),
+        "refine_rule_count": int(len(refine["library"])),
         "errors": errors,
     }
     (out_dir / "taigu_step4_acceptance_summary.json").write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -917,6 +1265,10 @@ def main() -> int:
         "all_wells_merged_prediction_table": str(prediction_dir / "all_wells_merged_density_prediction.csv"),
         "all_wells_source_detail_table": str(prediction_dir / "all_wells_source_detail_predictions.csv"),
         "all_wells_fracture_points_table": str(prediction_dir / "all_wells_merged_fracture_points.csv"),
+        "all_wells_refine_intervals_table": str(prediction_dir / "all_wells_refine_intervals.csv"),
+        "refine_rule_library": str(model_dir / "refine_rule_library.json"),
+        "refine_interval_audit": str(qc_dir / "refine_interval_audit.csv"),
+        "refine_point_count_audit": str(qc_dir / "refine_point_count_audit.csv"),
         "per_well_predictions_root": str(prediction_dir / "real_well_predictions"),
         "registry": str(model_dir / "taigu_two_expert_registry.csv"),
         "oof_predictions": str(validation_dir / "oof_predictions.csv"),
