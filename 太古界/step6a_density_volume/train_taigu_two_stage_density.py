@@ -98,6 +98,94 @@ def finite_stats(values: np.ndarray) -> dict[str, float | int | None]:
 
 
 def imaging_density_reference(groups_root: Path, strong_wells: list[str]) -> dict[str, Any]:
+    """每井每层的成像密度分位（仅作参照，不混用跨井口径）。"""
+    return _imaging_density_reference(groups_root, strong_wells)
+
+
+def imaging_truth_positive_rate(groups_root: Path) -> dict[str, dict[str, float | int | None]]:
+    """从 Step3 成像 group 统计每层的"成像真值判缝率"（= 有缝行 ÷ 全部行，按井汇总）。"""
+    totals: dict[str, dict[str, int]] = {}
+    for group_file in sorted(groups_root.glob("*.csv")):
+        frame = pd.read_csv(group_file, encoding="utf-8-sig", usecols=["StrataName", "HasFractureDensity"])
+        frame["HasFractureDensity"] = pd.to_numeric(frame["HasFractureDensity"], errors="coerce").fillna(0)
+        for strata, sub in frame.groupby("StrataName"):
+            bucket = totals.setdefault(str(strata), {"rows": 0, "positive_rows": 0})
+            bucket["rows"] += int(len(sub))
+            bucket["positive_rows"] += int((sub["HasFractureDensity"].astype(int) == 1).sum())
+    return {
+        layer: {
+            "rows": value["rows"],
+            "positive_rows": value["positive_rows"],
+            "positive_rate": (value["positive_rows"] / value["rows"]) if value["rows"] else None,
+        }
+        for layer, value in totals.items()
+    }
+
+
+def validate_sample_construction(
+    input_csv: Path,
+    groups_root: Path,
+    config: dict[str, Any],
+) -> dict[str, Any]:
+    """样本构成硬校验（训练前）。
+
+    规则（2026-09-16 需求方确认）：
+
+    * 某一层**没有负样本**（全部是"有裂缝"）→ 样本与事实不符，分类器无法训练，
+      **直接失败中止**，不允许静默产出一个"处处有缝"的三维体；
+    * 某层的样本判缝率与成像真值偏差超过 `sample_positive_rate_tolerance`
+      （默认 0.25）→ **报警但不中止**，留人工判断（样本集包含低裂缝井，天然会与成像井口径有差）。
+    """
+    tolerance = float(config.get("sample_positive_rate_tolerance", 0.25))
+    frame = pd.read_csv(
+        input_csv, encoding="utf-8-sig", usecols=["LayerGroup", "PresenceLabel", "SourceKind"], low_memory=False,
+    )
+    frame["PresenceLabel"] = pd.to_numeric(frame["PresenceLabel"], errors="coerce")
+    frame = frame[frame["PresenceLabel"].isin([0.0, 1.0])]
+    truth = imaging_truth_positive_rate(groups_root)
+    report: dict[str, Any] = {
+        "tolerance": tolerance,
+        "rule": "negative_samples_zero_is_failure; positive_rate_gap_is_warning",
+        "layers": {},
+        "failures": [],
+        "warnings": [],
+    }
+    for layer in ("上部复合层", "太古界风化壳"):
+        sub = frame[frame["LayerGroup"].astype(str).eq(layer)]
+        positive = int((sub["PresenceLabel"] == 1).sum())
+        negative = int((sub["PresenceLabel"] == 0).sum())
+        row_count = int(len(sub))
+        sample_rate = (positive / row_count) if row_count else None
+        truth_rate = truth.get(layer, {}).get("positive_rate")
+        gap = abs(sample_rate - truth_rate) if (sample_rate is not None and truth_rate is not None) else None
+        entry = {
+            "rows": row_count,
+            "positive_rows": positive,
+            "negative_rows": negative,
+            "sample_positive_rate": sample_rate,
+            "imaging_positive_rate": truth_rate,
+            "gap": gap,
+            "status": "pass",
+        }
+        if row_count == 0:
+            entry["status"] = "fail"
+            report["failures"].append(f"{layer}: 样本为空")
+        elif negative == 0:
+            entry["status"] = "fail"
+            report["failures"].append(
+                f"{layer}: 负样本为 0（{positive} 行全是'有裂缝'）——样本构造与成像事实不符，无法训练分类器"
+            )
+        elif gap is not None and gap > tolerance:
+            entry["status"] = "warning"
+            report["warnings"].append(
+                f"{layer}: 样本判缝率 {sample_rate:.3f} 与成像真值 {truth_rate:.3f} 偏差 {gap:.3f} > {tolerance}"
+            )
+        report["layers"][layer] = entry
+    report["status"] = "fail" if report["failures"] else ("warning" if report["warnings"] else "pass")
+    return report
+
+
+def _imaging_density_reference(groups_root: Path, strong_wells: list[str]) -> dict[str, Any]:
     """Per-well, per-strata imaging density quantiles (reference only, no mixing)."""
     out: dict[str, Any] = {}
     for well in strong_wells:
@@ -431,6 +519,25 @@ def main() -> int:
     for code in ("top", "mid", "base"):
         lookups[code] = cKDTree(np.column_stack([payload[f"{code}_x"], payload[f"{code}_y"]]))
     feature_columns = list(config["feature_columns"])
+
+    # ---- 训练前样本构成硬校验（2026-09-16）----
+    # 某层全是"有裂缝"的样本 = 样本构造错误，训练出来的密度体是伪造结果，必须中止而不是静默产出。
+    sample_validation = validate_sample_construction(
+        input_csv=Path(config["unified_samples_csv"]),
+        groups_root=Path(config["step3_groups_root"]),
+        config=config,
+    )
+    print(json.dumps({"sample_construction_validation": sample_validation}, ensure_ascii=False, indent=2), flush=True)
+    if sample_validation["status"] == "fail":
+        for message in sample_validation["failures"]:
+            print(f"[step6a-train] SAMPLE-VALIDATION FAILED: {message}", flush=True)
+        raise RuntimeError(
+            "sample construction invalid: " + "; ".join(sample_validation["failures"])
+            + f" (unified_samples_csv={config['unified_samples_csv']})"
+        )
+    for message in sample_validation["warnings"]:
+        print(f"[step6a-train] SAMPLE-VALIDATION WARNING: {message}", flush=True)
+
     data, group_codes, normalization_audit = collect_training_data(
         input_csv=Path(config["unified_samples_csv"]),
         lookups=lookups,
@@ -531,6 +638,7 @@ def main() -> int:
         "config_path": str(args.config.resolve()),
         "training_input": str(Path(config["unified_samples_csv"]).resolve()),
         "output_dir": str(output_dir),
+        "sample_construction_validation": sample_validation,
         "output_paths": {
             "model_joblib": str(artifact_path),
             "training_summary_json": str(summary_path),

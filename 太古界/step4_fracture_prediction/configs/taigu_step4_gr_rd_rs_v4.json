@@ -33,14 +33,18 @@
       "presence_only"
     ],
     "negative_tiers": [
-      "strong"
+      "strong",
+      "presence_only"
     ],
     "density_regression_tiers": [
       "strong",
       "presence_only"
     ],
-    "calibration_tiers": [
-      "strong"
+    "calibration_wells": [
+      "埕北313",
+      "埕北古斜405",
+      "桩斜169",
+      "埕北816"
     ]
   },
   "refine": {

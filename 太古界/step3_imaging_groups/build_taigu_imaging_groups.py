@@ -52,7 +52,9 @@ LABEL_COLUMNS = [
 DEFAULT_SUPERVISION_TIERS = {
     "supervision_ready": "strong",
     "candidate_scope_pending": "presence_only",
-    "density_only_scope_pending": "audit_only",
+    # 无产状点、刻度未锚定的井（桩海102）同样参与"存在性"监督（正/负样本都要），
+    # 只是它的密度数值不参与绝对水平标定——见 Step4 的 supervision_gate。
+    "density_only_scope_pending": "presence_only",
 }
 
 

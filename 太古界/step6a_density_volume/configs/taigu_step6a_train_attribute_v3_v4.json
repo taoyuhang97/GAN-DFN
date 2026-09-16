@@ -45,6 +45,7 @@
     "l2_regularization": 1.0
   },
   "density_cap": 15.0,
+  "sample_positive_rate_tolerance": 0.25,
   "random_state": 42,
   "training_chunksize": 250000,
   "max_horizon_match_distance_m": 10.0

@@ -319,9 +319,20 @@ def supervision_gate(config: dict[str, Any]) -> dict[str, list[str]]:
         "positive_tiers": [str(v) for v in gate.get("positive_tiers", ["strong", "presence_only"])],
         "negative_tiers": [str(v) for v in gate.get("negative_tiers", ["strong"])],
         "density_regression_tiers": regression_tiers,
-        # 总量守恒标定用哪些井：默认与回归一致；可单独收紧到只信得过的强监督井。
+        # 总量守恒标定用哪些井：优先用显式井清单（可解释、可审计），否则回退到层级。
+        "calibration_wells": [str(v) for v in (gate.get("calibration_wells") or [])],
         "calibration_tiers": [str(v) for v in (gate.get("calibration_tiers") or regression_tiers)],
     }
+
+
+def calibration_rows(featured: pd.DataFrame, config: dict[str, Any]) -> pd.DataFrame:
+    """选出参与"绝对水平标定"的样本行：显式井清单优先，其次按层级。"""
+    gate = supervision_gate(config)
+    if gate["calibration_wells"]:
+        selected = featured[featured.WellName.astype(str).isin(gate["calibration_wells"])]
+        if not selected.empty:
+            return selected
+    return featured[featured.SupervisionTier.astype(str).isin(gate["calibration_tiers"])]
 
 
 def apply_supervision_gate(training: pd.DataFrame, config: dict[str, Any]) -> pd.DataFrame:
@@ -539,7 +550,7 @@ def train_validation_for_strata(training: pd.DataFrame, config: dict[str, Any], 
     reg.fit(stage2[FEATURE_COLUMNS], stage2.Density, sample_weight=equalized_depth_weights(stage2))
     # 部署标定：**总量守恒**，并且用部署模型自己的样本内预测来标定。
     # 口径是"条数"——比较的是深度积分 ∫ρdz，不是正样本均值。
-    eligible = featured[featured.SupervisionTier.astype(str).isin(supervision_gate(config)["calibration_tiers"])]
+    eligible = calibration_rows(featured, config)
     if eligible.empty:
         eligible = featured
     in_sample_pred = clf.predict_proba(eligible[FEATURE_COLUMNS])[:, 1] * reg.predict(eligible[FEATURE_COLUMNS])
