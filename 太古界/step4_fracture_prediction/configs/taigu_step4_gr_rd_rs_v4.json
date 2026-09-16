@@ -36,6 +36,10 @@
       "strong"
     ],
     "density_regression_tiers": [
+      "strong",
+      "presence_only"
+    ],
+    "calibration_tiers": [
       "strong"
     ]
   },

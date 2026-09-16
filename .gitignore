@@ -30,6 +30,7 @@ reference/
 太古界/output_r3_logs/
 太古界/output_step3_v4_logs/
 太古界/output_step4_v4_logs/
+太古界/output_v4_logs/
 
 # 太古界中间产物目录（断层预处理成品、matplotlib 缓存）。
 太古界/common/fault_preprocessing_300m/
