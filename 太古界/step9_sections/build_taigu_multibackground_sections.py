@@ -45,10 +45,20 @@ from common.well_segment_join import (  # noqa: E402
 
 ATTRIBUTES = ("AntTrack", "Coherence", "CurvatureMax")
 HORIZONS = (
-    ("TopTimeMs", "上部复合层T-a-1", "#00bcd4"),
-    ("MidTimeMs", "太古界顶Art_1", "#43a047"),
-    ("BaseTimeMs", "风化壳底Art_d1-1", "#ff9800"),
+    ("TopTimeMs", "上部复合层顶(T-a-1)", "#00bcd4"),
+    ("MidTimeMs", "太古界顶(Art_1)", "#43a047"),
+    ("BaseTimeMs", "风化壳底(Art_d1-1)", "#ff9800"),
 )
+# 图例方案对齐砂砾岩（优化阶段二/正式主线/step9_section_visualize）：
+#   DFN 裂缝片按层段着色（橙/蓝）、尺度用灰阶三档线宽、成像解释带 Step3 前缀、
+#   图例整体移到数据区外侧（不打在剖面上）。
+DFN_LAYER_COLORS = {"上部复合层": "#ff7a00", "太古界风化壳": "#00a6ff"}
+SCALE_LEGEND_STYLES = {
+    "small": ("#9ca3af", 2.0, "小尺度裂缝"),
+    "medium": ("#6b7280", 2.6, "中尺度裂缝"),
+    "large": ("#374151", 2.6, "大尺度裂缝"),
+}
+IMAGING_POINT_COLOR = "#ff2bd6"
 SCOPE_LABELS = {"overview": "5 km Demo区", "local_200m": "井周200 m"}
 CHINESE_FONT_CANDIDATES = (
     "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
@@ -339,7 +349,7 @@ def patch_segments(patches: pd.DataFrame, track: pd.DataFrame, projection: str,
     well_perp = interp_track(track, centers_t, perpendicular)
     selected = patches[np.abs(center_perp - well_perp) <= half_width]
     segments, colors, widths = [], [], []
-    color = {"上部复合层": "#ef6c00", "太古界风化壳": "#1976d2"}
+    color = dict(DFN_LAYER_COLORS)
     width = {"small": .55, "medium": 1.0, "large": 1.7}
     for row in selected.itertuples(index=False):
         cx = float(row.CenterX if projection == "XZ" else row.CenterY)
@@ -368,21 +378,22 @@ def draw_overlays(ax, projection: str, coords: np.ndarray, times: np.ndarray, tr
         ax.plot(coords, curves[field], color=color, lw=1.3, label=label, zorder=8)
     real_track = (times >= float(track["TIME"].min())) & (times <= float(track["TIME"].max()))
     ax.plot(well_h[real_track], times[real_track], color="black", lw=1.8,
-            label="埕北古斜405真实轨迹段", zorder=10)
+            label="埕北古斜405井轨迹（成像段）", zorder=10)
     segments, colors, widths = patch_segments(patches, track, projection, half_width)
     if segments:
         ax.add_collection(LineCollection(segments, colors=colors, linewidths=widths, alpha=.82, zorder=7))
-        ax.plot([], [], color="#ef6c00", lw=1.2, label="DFN：上部复合层")
-        ax.plot([], [], color="#1976d2", lw=1.2, label="DFN：太古界风化壳")
-        ax.plot([], [], color="#616161", lw=.55, label="小尺度")
-        ax.plot([], [], color="#616161", lw=1.0, label="中尺度")
-        ax.plot([], [], color="#616161", lw=1.7, label="大尺度")
+        for layer, layer_color in DFN_LAYER_COLORS.items():
+            ax.plot([], [], color=layer_color, lw=2.0, label=f"DFN裂缝片：{layer}")
+        for scale_key in ("small", "medium", "large"):
+            scale_color, scale_width, scale_label = SCALE_LEGEND_STYLES[scale_key]
+            ax.plot([], [], color=scale_color, lw=scale_width, label=scale_label)
     if len(imaging):
         perp = "Y" if projection == "XZ" else "X"
         mask = np.abs(imaging[perp].to_numpy() - interp_track(track, imaging["TIME"].to_numpy(), perp)) <= half_width
         shown = imaging[mask]
         hcol = "X" if projection == "XZ" else "Y"
-        ax.scatter(shown[hcol], shown["TIME"], marker="^", c="#d500f9", s=12, label="成像测井裂缝", zorder=11)
+        ax.scatter(shown[hcol], shown["TIME"], marker="^", c=IMAGING_POINT_COLOR, s=12,
+                   label="Step3成像测井裂缝点", zorder=11)
     else:
         shown = imaging
     return {"dfn_segment_count": len(segments), "imaging_point_count": int(len(shown))}
@@ -433,8 +444,15 @@ def plot_image(path: Path, name: str, renderer: str, projection: str, scope: str
     title = {"AntTrack":"蚂蚁体", "Coherence":"相干体", "CurvatureMax":"曲率绝对值", "SeisAmp":"OBN地震"}[name]
     mode = "波形+变面积" if renderer == "wiggle" else ("变密度" if renderer == "density" else "属性")
     ax.set_title(f"埕北古斜405 {SCOPE_LABELS[scope]} {projection} | {title}{mode}")
-    ax.legend(loc="upper right", fontsize=7, framealpha=.9)
-    ax.grid(False); fig.tight_layout(); path.parent.mkdir(parents=True, exist_ok=True)
+    ax.grid(False)
+    fig.tight_layout()
+    # 图例放在数据区外侧（对齐砂砾岩方案：不遮挡剖面主体）。
+    legend_handles, legend_labels = ax.get_legend_handles_labels()
+    if legend_handles:
+        fig.legend(legend_handles, legend_labels, loc="upper left",
+                   bbox_to_anchor=(1.005, 1.0), fontsize=8.4, framealpha=0.92,
+                   borderaxespad=0.0)
+    path.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(path, dpi=int(config.get("dpi", 180)), bbox_inches="tight"); plt.close(fig)
     return overlay
 
