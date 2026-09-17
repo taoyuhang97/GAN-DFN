@@ -4,6 +4,8 @@
 #        + demo 区域移到 405 居中（taigu_attribute_demo_grid_v2_405center）
 #   用法: tmux new-session -d -s taigu_v4 "cd <repo> && bash 太古界/run_v4_chain.sh 2>&1 | tee 太古界/output_v4_logs/chain.log"
 # 说明：Step3 监督层级与 Step4 输出都变了 → 3/4/5/6A/6B/6C/7A/7B/7C/7D/8/9 必须整链重跑。
+# 注意：Step7A 的小尺度口径已被 v5 取代（分域采样，见问题记录 0.25）。
+#       重跑当前正式口径请用 太古界/run_v5_from_7a.sh；本脚本保留用于复现 v4 历史结果。
 set -uo pipefail
 # 约定：每步 stdout/stderr 双写（tmux 面板 + 日志文件），见 太古界/AGENTS.md
 

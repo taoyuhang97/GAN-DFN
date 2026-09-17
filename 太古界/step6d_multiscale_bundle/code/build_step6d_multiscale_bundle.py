@@ -360,7 +360,14 @@ def run_compact_context(
 def main() -> int:
     args = parse_args()
     config = read_json(args.config.resolve())
-    output_dir = args.output_dir.resolve()
+    # 目录口径：命令行显式给出优先；否则回落到配置里的 step6a_dir/step6b_dir/
+    # step6c_dir/output_dir（太古界 v4 配置自带这些键，便于链条脚本自洽）。
+    if args.output_dir != DEFAULT_OUTPUT_DIR:
+        output_dir = args.output_dir.resolve()
+    elif config.get("output_dir"):
+        output_dir = Path(config["output_dir"]).resolve()
+    else:
+        output_dir = args.output_dir.resolve()
     ensure_dir(output_dir)
     root = args.rebalance_root.resolve()
     input_density_sgy = Path(config["input_density_sgy"]).resolve()
@@ -370,9 +377,18 @@ def main() -> int:
         return run_compact_context(args, config, output_dir, root, mapping)
     _, samples, density_load = load_trace_matrix(input_density_sgy, None, None, "Density")
 
-    step6a_dir = resolve_step_dir(args.step6a_dir, root, "step6a_small")
-    step6b_dir = resolve_step_dir(args.step6b_dir, root, "step6b_medium")
-    step6c_dir = resolve_step_dir(args.step6c_dir, root, "step6c_large")
+    def configured_dir(cli_value: Path | None, config_key: str, fallback_name: str) -> Path:
+        if cli_value is not None:
+            candidate = cli_value
+        elif config.get(config_key):
+            candidate = Path(config[config_key])
+        else:
+            candidate = None
+        return resolve_step_dir(candidate, root, fallback_name)
+
+    step6a_dir = configured_dir(args.step6a_dir, "step6a_dir", "step6a_small")
+    step6b_dir = configured_dir(args.step6b_dir, "step6b_dir", "step6b_medium")
+    step6c_dir = configured_dir(args.step6c_dir, "step6c_dir", "step6c_large")
     step6a = load_npz_dict(step6a_dir / "small_background_prior.npz")
     step6b = load_npz_dict(step6b_dir / "medium_corridor_components.npz")
     step6c = load_npz_dict(step6c_dir / "large_fault_prior_components.npz")
@@ -549,8 +565,16 @@ def main() -> int:
     summary: dict[str, Any] = {
         "status": "pass",
         "model_contract_version": str(config.get("model_contract_version", "taigu_step6a_attribute_v3_v4")),
-        # 供 Step7A 的输入契约校验使用：声明小尺度密度体的最终来源（多尺度矫正后的结果）。
-        "output_paths": {"density_sgy": str(output_dir / "final_small_density.sgy")},
+        # 供 Step7A 的输入契约校验使用：分别声明"背景小尺度"与"构造派生小尺度"
+        # 两个密度体的来源。Step7A v5 起按砂砾岩口径分域采样：
+        # 背景域读 background_density_sgy，断层派生域读 damage_density_sgy。
+        "output_paths": {
+            "density_sgy": str(output_dir / "final_small_density.sgy"),
+            "background_density_sgy": str(output_dir / "background_small_density.sgy"),
+            "damage_density_sgy": str(output_dir / "large_damage_small_density.sgy"),
+            "medium_damage_density_sgy": str(output_dir / "medium_damage_small_density.sgy"),
+            "scale_label_sgy": str(output_dir / "scale_label.sgy"),
+        },
         "input_density_sgy": str(input_density_sgy),
         "trace_mapping_npz": str(trace_mapping_npz),
         "step6a_dir": str(step6a_dir),

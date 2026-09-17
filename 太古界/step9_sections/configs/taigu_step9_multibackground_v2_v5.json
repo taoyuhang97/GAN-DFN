@@ -1,0 +1,47 @@
+{
+ "version": "taigu_step9_multibackground_v2_v5",
+ "output_dir": "/home/tyh/projects/petroleum/code/GAN-DFN/太古界/step9_sections/output/taigu_step9_multibackground_v2_v5",
+ "profile_well": "埕北古斜405",
+ "target_block": {
+  "name": "taigu_attribute_demo_5km_405center",
+  "x_min": 662925.0,
+  "x_max": 667925.0,
+  "y_min": 4240113.0,
+  "y_max": 4245113.0
+ },
+ "expected_demo_trace_count": 160801,
+ "attribute_trace_header_csv": "/home/tyh/projects/petroleum/code/GAN-DFN/太古界/common/attribute_trace_contract/output/taigu_attribute_trace_header_v1/attribute_trace_header.csv",
+ "attribute_demo_grid_csv": "/home/tyh/projects/petroleum/code/GAN-DFN/太古界/common/attribute_demo_grid/output/taigu_attribute_demo_grid_v2_405center/attribute_demo_grid.csv",
+ "horizon_contract_csv": "/home/tyh/projects/petroleum/code/GAN-DFN/太古界/common/horizon_contract/output/taigu_attribute_full_horizon_contract_v1/demo_horizon_contract.csv",
+ "volume_paths": {
+  "Coherence": "/data/shared/project-oil/wx数据/埕岛太古界/体数据/Chengdao-Taigujie-Eigenstructure Coherence.sgy",
+  "AntTrack": "/data/shared/project-oil/wx数据/埕岛太古界/体数据/Chengdao-Taigujie-AntTracking.sgy",
+  "CurvatureMax": "/data/shared/project-oil/wx数据/埕岛太古界/体数据/Chengdao-Taigujie-Most Positive Curvature.sgy"
+ },
+ "attribute_time_offsets_ms": {
+  "Coherence": 1800.0,
+  "AntTrack": 0.0,
+  "CurvatureMax": 1800.0
+ },
+ "obn_segy": "/data/shared/project-oil/wx数据/埕岛太古界/cd2023_obn_pstm_cub_all_grid125_1206_haorui.segy",
+ "obn_trace_header_csv": "/home/tyh/projects/petroleum/code/GAN-DFN/太古界/common/trace_contract/output/obn_trace_header_v1/obn_trace_header_xy.csv",
+ "step8_patches_csv": "/home/tyh/projects/petroleum/code/GAN-DFN/太古界/step8_well_correction/output/taigu_step8_attribute_multiscale_v1_v5/well_corrected_dfn_fracture_patches.csv",
+ "step2_segments_root": "/home/tyh/projects/petroleum/code/GAN-DFN/太古界/step2_well_log_segments/output/taigu_step2_regular_v3",
+ "step3_groups_root": "/home/tyh/projects/petroleum/code/GAN-DFN/太古界/step3_imaging_groups/output/taigu_step3_imaging_v4/groups",
+ "section_sample_interval_ms": 2.0,
+ "time_padding_ms": 20.0,
+ "local_axis_radius_m": 200.0,
+ "dfn_projection_half_width_m": 50.0,
+ "local_dfn_projection_half_width_m": 200.0,
+ "attribute_max_nearest_distance_m": 20.0,
+ "obn_max_nearest_distance_m": 25.0,
+ "wiggle_trace_count": 80,
+ "progress_interval": 100,
+ "dpi": 180,
+ "segment_join": {
+  "tolerance_m": "auto",
+  "half_step_multiplier": 0.5,
+  "tolerance_floor_m": 0.02,
+  "tolerance_cap_m": 0.5
+ }
+}

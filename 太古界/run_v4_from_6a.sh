@@ -2,6 +2,8 @@
 # v4 局部重跑：Step6A 特征只保留 3 个属性分数（位置/几何特征剔除）后的下游重跑
 #   用法: tmux new-session -d -s taigu_v4_6a "cd <repo> && bash 太古界/run_v4_from_6a.sh 2>&1 | tee 太古界/output_v4_logs/chain_from_6a.log"
 # 说明：Step6A 模型与密度体都会变 → 6B/6C/7A/7B/7C/7D/8/9 必须一起重跑；Step3/4/5 不动。
+# 注意：Step7A 的小尺度口径已被 v5 取代（分域采样，见问题记录 0.25）。
+#       重跑当前正式口径请用 太古界/run_v5_from_7a.sh；本脚本保留用于复现 v4 历史结果。
 set -uo pipefail
 # 约定：每步 stdout/stderr 双写（tmux 面板 + 日志文件），见 太古界/AGENTS.md
 

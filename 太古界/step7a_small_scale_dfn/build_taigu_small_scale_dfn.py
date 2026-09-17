@@ -18,11 +18,19 @@ Outputs (config.output_dir):
   orientation_families.json / orientation_families.csv
   step7a_imaging_match_qc.csv
   step7a_summary.json    status=pass
+
+Changes vs v4（2026-09-17，对齐砂砾岩"背景 + 受限构造派生"口径）:
+  * 分域采样：背景域（Step6D background_small_density）为主体；断层派生域
+    （Step6D large_damage_small_density）单独抽样，总量按
+    `damage_domain.max_selected_fraction_of_background` 限制（砂砾岩同名参数 0.75）；
+  * 每片带 SmallDomain / SmallDomainCode / StructuralRelation，便于对外解释
+    "哪些小尺度片来自背景、哪些来自断层旁派生"。
 """
 
 from __future__ import annotations
 
 import argparse
+import contextlib
 import gc
 import json
 import sys
@@ -530,8 +538,31 @@ def main() -> int:
     prediction_summary = read_json(prediction_summary_path)
     if prediction_summary.get("status") != "pass":
         raise RuntimeError("Step6A prediction summary is not pass")
-    if Path(prediction_summary["output_paths"]["density_sgy"]).resolve() != density_sgy:
-        raise RuntimeError("Step7A density_sgy does not match the declared Step6A prediction summary")
+    # 背景域密度体：v5 起指向 Step6D 的 background_small_density.sgy
+    # （= 0.06 + 0.85×Step6A 小尺度背景分数），不再直接用最大值合成体。
+    declared_outputs = dict(prediction_summary.get("output_paths", {}))
+    density_contract_key = str(config.get("density_contract_output_key", "density_sgy"))
+    if Path(declared_outputs.get(density_contract_key, "")).resolve() != density_sgy:
+        raise RuntimeError(
+            f"Step7A density_sgy does not match the declared Step6A/6D contract key '{density_contract_key}'"
+        )
+    damage_cfg = dict(config.get("damage_domain", {}))
+    damage_enabled = bool(damage_cfg.get("enabled", False))
+    damage_domain_name = str(damage_cfg.get("name", "large_fault_damage"))
+    damage_domain_code = int(damage_cfg.get("domain_code", 2))
+    damage_structural_relation = str(
+        damage_cfg.get("structural_relation", "small_derivative_near_large_fault")
+    )
+    damage_density_sgy: Path | None = None
+    if damage_enabled:
+        if not config.get("damage_density_sgy"):
+            raise RuntimeError("damage_domain.enabled requires config['damage_density_sgy']")
+        damage_density_sgy = Path(config["damage_density_sgy"]).resolve()
+        damage_contract_key = str(config.get("damage_contract_output_key", "damage_density_sgy"))
+        if Path(declared_outputs.get(damage_contract_key, "")).resolve() != damage_density_sgy:
+            raise RuntimeError(
+                f"Step7A damage_density_sgy does not match the declared contract key '{damage_contract_key}'"
+            )
     expected_step6a_contract = config.get("expected_step6a_model_contract_version")
     if expected_step6a_contract and prediction_summary.get("model_contract_version") != expected_step6a_contract:
         raise RuntimeError(
@@ -543,6 +574,14 @@ def main() -> int:
             raise RuntimeError("Step6A density trace count does not match Step7A demo grid")
         if len(density_handle.samples) != len(sample_axis) or not np.allclose(density_handle.samples, sample_axis):
             raise RuntimeError("Step6A density sample axis does not match window_code sample axis")
+    if damage_density_sgy is not None:
+        with segyio.open(str(damage_density_sgy), "r", ignore_geometry=True) as damage_handle:
+            if damage_handle.tracecount != len(grid):
+                raise RuntimeError("Step7A damage density trace count does not match demo grid")
+            if len(damage_handle.samples) != len(sample_axis) or not np.allclose(
+                damage_handle.samples, sample_axis
+            ):
+                raise RuntimeError("Step7A damage density sample axis does not match window_code sample axis")
     if window_codes.shape != (len(grid), len(sample_axis)):
         raise RuntimeError("window_code shape does not match Step7A grid/sample axis")
     block_x_lines = max(int(config.get("block_x_line_count", 20)), 1)
@@ -585,18 +624,32 @@ def main() -> int:
         "上部复合层": [],
         "太古界风化壳": [],
     }
+    damage_parts: dict[str, list[tuple[np.ndarray, np.ndarray, np.ndarray]]] = {
+        "上部复合层": [],
+        "太古界风化壳": [],
+    }
     valid_mask = grid["SurfaceValid"].fillna(0).astype(bool).to_numpy()
     top = grid["TopTimeMs"].to_numpy(dtype=np.float64)
     mid = grid["MidTimeMs"].to_numpy(dtype=np.float64)
     base = grid["BaseTimeMs"].to_numpy(dtype=np.float64)
 
-    with segyio.open(str(density_sgy), "r", ignore_geometry=True) as handle:
+    with contextlib.ExitStack() as stack:
+        handle = stack.enter_context(segyio.open(str(density_sgy), "r", ignore_geometry=True))
         handle.mmap()
+        damage_handle = None
+        if damage_density_sgy is not None:
+            damage_handle = stack.enter_context(segyio.open(str(damage_density_sgy), "r", ignore_geometry=True))
+            damage_handle.mmap()
         for ix_start in tqdm(range(0, x_line_count, block_x_lines), desc="Step7A density blocks", unit="block"):
             ix_stop = min(ix_start + block_x_lines, x_line_count)
             block = grid[grid["IX"].between(ix_start, ix_stop - 1)].sort_values("OutputTraceIndex")
             output_indices = block["OutputTraceIndex"].to_numpy(dtype=np.int64)
             matrix = np.stack([np.asarray(handle.trace[int(r)], dtype=np.float32) for r in output_indices])
+            damage_matrix = (
+                np.stack([np.asarray(damage_handle.trace[int(r)], dtype=np.float32) for r in output_indices])
+                if damage_handle is not None
+                else None
+            )
             codes = window_codes[output_indices]
             valid_block = block["SurfaceValid"].fillna(0).astype(bool).to_numpy()
             times_2d = sample_axis[None, :]
@@ -616,6 +669,21 @@ def main() -> int:
                         matrix[mask].astype(np.float32),
                     )
                 )
+            if damage_matrix is not None:
+                block_rows = block["Row"].to_numpy(dtype=np.int64)
+                damage_upper = upper_mask & np.isfinite(damage_matrix) & (damage_matrix > 0.0)
+                damage_crust = crust_mask & np.isfinite(damage_matrix) & (damage_matrix > 0.0)
+                for name, mask in (("上部复合层", damage_upper), ("太古界风化壳", damage_crust)):
+                    if not mask.any():
+                        continue
+                    rows_m, samples_m = np.where(mask)
+                    damage_parts[name].append(
+                        (
+                            block_rows[rows_m],
+                            samples_m.astype(np.int32),
+                            damage_matrix[mask].astype(np.float32),
+                        )
+                    )
             print(f"[step7a] block ix={ix_start}:{ix_stop} rss_mb={rss_mb():.0f}", flush=True)
             if args.max_blocks > 0 and ix_start // block_x_lines + 1 >= args.max_blocks:
                 break
@@ -629,6 +697,7 @@ def main() -> int:
     sampled_density: list[np.ndarray] = []
     sampled_priority: list[np.ndarray] = []
     sampled_layer: list[str] = []
+    sampled_domain: list[str] = []
     layer_sampling_audit: dict[str, dict[str, Any]] = {}
     for name in ("上部复合层", "太古界风化壳"):
         if not candidate_parts[name]:
@@ -655,10 +724,13 @@ def main() -> int:
         sampled_rows.append(rows[keep])
         sampled_samples.append(samples[keep])
         sampled_density.append(density[keep])
-        sampled_priority.append((density[keep] / reference).astype(np.float32))
+        # 优先级用"相对本域候选阈值的倍数"，保证背景域与构造派生域在
+        # 同一个三维最小间距去重里可比（否则阈值口径不同会系统性剔除某一域）。
+        sampled_priority.append((density[keep] / candidate_ref).astype(np.float32))
         if not (len(rows[keep]) == len(samples[keep]) == len(density[keep])):
             raise RuntimeError(f"sampled candidate length mismatch for layer {name}")
         sampled_layer.extend([name] * int(keep.sum()))
+        sampled_domain.extend(["background"] * int(keep.sum()))
         layer_sampling_audit[name] = {
             "positive_voxel_count": positive_count,
             "candidate_quantile": candidate_quantile,
@@ -670,14 +742,74 @@ def main() -> int:
             "density_power": density_power,
             "expected_before_spacing": expected,
             "sampled_before_spacing": int(keep.sum()),
+            "domain": "background",
+            "structural_relation": "small_background",
         }
         print(f"[step7a] layer={name} candidate_q={candidate_quantile:.2f} threshold={candidate_ref:.3f} ref={reference:.3f} candidates={len(rows)} sampled={int(keep.sum())}", flush=True)
+
+    # --- 断层派生小尺度域（second domain，砂砾岩口径的 damage domain） ---
+    damage_sampling_audit: dict[str, dict[str, Any]] = {}
+    damage_selected_count = 0
+    if damage_enabled:
+        damage_rng = np.random.default_rng(
+            int(damage_cfg.get("random_seed", int(sampling_cfg["random_seed"]) + 101))
+        )
+        damage_quantile_cfg = damage_cfg.get("candidate_quantile", 0.5)
+        damage_rate_cfg = damage_cfg.get("occurrence_rate", 0.005)
+        damage_ref_quantile = float(damage_cfg.get("reference_quantile", 0.95))
+        damage_power = float(damage_cfg.get("density_power", 1.0))
+        for name in ("上部复合层", "太古界风化壳"):
+            if not damage_parts[name]:
+                continue
+            rows = np.concatenate([p[0] for p in damage_parts[name]])
+            samples = np.concatenate([p[1] for p in damage_parts[name]])
+            density = np.concatenate([p[2] for p in damage_parts[name]])
+            positive_count = int(len(density))
+            damage_quantile = layer_parameter(damage_quantile_cfg, name)
+            damage_rate = layer_parameter(damage_rate_cfg, name)
+            damage_ref = max(float(np.quantile(density, damage_ref_quantile)), 1.0e-9)
+            candidate_thr = max(float(np.quantile(density, damage_quantile)), 1.0e-9)
+            candidate_mask = density >= candidate_thr
+            rows, samples, density = rows[candidate_mask], samples[candidate_mask], density[candidate_mask]
+            probability = np.clip(
+                damage_rate * np.power(np.clip(density / damage_ref, 0.0, 2.0), damage_power), 0.0, 1.0
+            )
+            expected = float(probability.sum())
+            keep = damage_rng.random(len(rows)) < probability
+            keep = keep.astype(bool)
+            sampled_rows.append(rows[keep])
+            sampled_samples.append(samples[keep])
+            sampled_density.append(density[keep])
+            sampled_priority.append((density[keep] / candidate_thr).astype(np.float32))
+            sampled_layer.extend([name] * int(keep.sum()))
+            sampled_domain.extend([damage_domain_name] * int(keep.sum()))
+            damage_selected_count += int(keep.sum())
+            damage_sampling_audit[name] = {
+                "positive_voxel_count": positive_count,
+                "candidate_quantile": damage_quantile,
+                "candidate_threshold": candidate_thr,
+                "candidate_count": int(len(rows)),
+                "reference_quantile": damage_ref_quantile,
+                "reference_density": damage_ref,
+                "occurrence_rate": damage_rate,
+                "density_power": damage_power,
+                "expected_before_spacing": expected,
+                "sampled_before_spacing": int(keep.sum()),
+                "domain": damage_domain_name,
+                "structural_relation": damage_structural_relation,
+            }
+            print(
+                f"[step7a] damage layer={name} q={damage_quantile:.2f} threshold={candidate_thr:.3f} "
+                f"ref={damage_ref:.3f} candidates={len(rows)} sampled={int(keep.sum())}",
+                flush=True,
+            )
 
     accepted_rows = np.concatenate(sampled_rows) if sampled_rows else np.empty(0, dtype=np.int64)
     accepted_samples = np.concatenate(sampled_samples) if sampled_samples else np.empty(0, dtype=np.int64)
     accepted_density = np.concatenate(sampled_density) if sampled_density else np.empty(0, dtype=np.float32)
     accepted_priority = np.concatenate(sampled_priority) if sampled_priority else np.empty(0, dtype=np.float32)
     accepted_layer = np.asarray(sampled_layer)
+    accepted_domain = np.asarray(sampled_domain)
     if len(accepted_rows) == 0:
         raise RuntimeError("layered weighted probability sampling produced zero patches")
     pre_spacing_count = int(len(accepted_rows))
@@ -695,14 +827,65 @@ def main() -> int:
     accepted_density = accepted_density[retained]
     accepted_priority = accepted_priority[retained]
     accepted_layer = accepted_layer[retained]
+    accepted_domain = accepted_domain[retained]
+    # --- 构造派生域总量上限（对齐砂砾岩 max_damage_selected_fraction_of_background）---
+    damage_cap_audit: dict[str, Any] = {"enabled": bool(damage_enabled)}
+    if damage_enabled:
+        background_index = np.where(accepted_domain == "background")[0]
+        damage_index = np.where(accepted_domain == damage_domain_name)[0]
+        fraction_limit = float(damage_cfg.get("max_selected_fraction_of_background", 0.75))
+        fraction_cap = int(np.floor(len(background_index) * fraction_limit))
+        absolute_cap = damage_cfg.get("max_selected_count")
+        cap = min(fraction_cap, int(absolute_cap)) if absolute_cap is not None else fraction_cap
+        keep_index = np.arange(len(accepted_rows), dtype=np.int64)
+        if len(damage_index) > cap:
+            cap_rng = np.random.default_rng(
+                int(damage_cfg.get("cap_random_seed", int(damage_cfg.get("random_seed", 20260823)) + 7))
+            )
+            dropped = cap_rng.choice(damage_index, size=len(damage_index) - cap, replace=False)
+            keep_index = np.setdiff1d(keep_index, dropped, assume_unique=False)
+        accepted_rows = accepted_rows[keep_index]
+        accepted_samples = accepted_samples[keep_index]
+        accepted_density = accepted_density[keep_index]
+        accepted_priority = accepted_priority[keep_index]
+        accepted_layer = accepted_layer[keep_index]
+        accepted_domain = accepted_domain[keep_index]
+        damage_cap_audit.update(
+            {
+                "max_selected_fraction_of_background": fraction_limit,
+                "max_selected_count": None if absolute_cap is None else int(absolute_cap),
+                "cap_applied": cap,
+                "background_after_spacing": int(len(background_index)),
+                "damage_before_cap": int(len(damage_index)),
+                "damage_after_cap": int((accepted_domain == damage_domain_name).sum()),
+            }
+        )
     post_counts = pd.Series(accepted_layer).value_counts().to_dict()
     for layer, audit in layer_sampling_audit.items():
         audit["retained_after_spacing"] = int(post_counts.get(layer, 0))
+    damage_layer_counts = pd.Series(accepted_layer[accepted_domain == damage_domain_name]).value_counts().to_dict()
+    for layer, audit in damage_sampling_audit.items():
+        audit["retained_after_spacing"] = int(damage_layer_counts.get(layer, 0))
+    domain_counts = {
+        str(name): int(count)
+        for name, count in zip(*np.unique(accepted_domain, return_counts=True))
+    } if len(accepted_domain) else {}
     sampling_qc = {
         "status": "pass" if len(accepted_rows) > 0 else "fail",
         "config_path": str(args.config.resolve()),
         "mode": sampling_cfg["mode"],
         "layer_audit": layer_sampling_audit,
+        "damage_domain": {
+            "enabled": bool(damage_enabled),
+            "name": damage_domain_name,
+            "domain_code": damage_domain_code,
+            "structural_relation": damage_structural_relation,
+            "density_sgy": None if damage_density_sgy is None else str(damage_density_sgy),
+            "layer_audit": damage_sampling_audit,
+            "cap_audit": damage_cap_audit,
+            "patch_count_before_cap": int(damage_selected_count),
+        },
+        "domain_patch_counts": domain_counts,
         "pre_spacing_patch_count": pre_spacing_count,
         "post_spacing_patch_count": int(len(accepted_rows)),
         "spacing_removed_count": int(pre_spacing_count - len(accepted_rows)),
@@ -898,6 +1081,14 @@ def main() -> int:
             "PatchHeightMs": heights,
             "PatchAreaM2": areas,
             "FractureScale": "small",
+            "SmallDomain": accepted_domain,
+            "SmallDomainCode": np.where(
+                accepted_domain == "background", 1, damage_domain_code
+            ).astype(np.int32),
+            "StructuralRelation": np.where(
+                accepted_domain == "background", "small_background", damage_structural_relation
+            ),
+            "SamplingPriority": accepted_priority,
             "WindowCode": 1,
         }
     )
@@ -946,6 +1137,7 @@ def main() -> int:
         "LocalGradientStrength": patches["LocalGradientStrength"].to_numpy(dtype=np.float64),
         "LocalAnisotropy": patches["LocalAnisotropy"].to_numpy(dtype=np.float64),
         "LocalRidgeStrength": patches["LocalRidgeStrength"].to_numpy(dtype=np.float64),
+        "SmallDomainCode": patches["SmallDomainCode"].to_numpy(dtype=np.int32),
     }
     write_legacy_vtk(vtk_path, np.stack(points) if points else np.empty((0, 3)), np.stack(quads) if quads else np.empty((0, 4), dtype=np.int64), cell_data)
 
@@ -1027,6 +1219,17 @@ def main() -> int:
         "patch_count_positive": len(patches) > 0,
         "patch_count_within_cap": safety_max_patches is None or len(patches) <= safety_max_patches,
         "both_layers_represented": upper_fraction > 0.05 and float(layer_counts.get("太古界风化壳", 0)) > 0,
+        "damage_domain_within_configured_cap": bool(
+            (not damage_enabled)
+            or int((patches["SmallDomain"] == damage_domain_name).sum())
+            <= int(np.floor(int((patches["SmallDomain"] == "background").sum())
+                            * float(damage_cfg.get("max_selected_fraction_of_background", 0.75))))
+        ),
+        "background_domain_is_majority": bool(
+            (not damage_enabled)
+            or int((patches["SmallDomain"] == "background").sum())
+            > int((patches["SmallDomain"] == damage_domain_name).sum())
+        ),
         "all_patches_main_window": bool((patches["WindowCode"] == 1).all()),
         "orientation_ranges_valid": bool(patches["DipDeg"].between(0, 90).all() and patches["AzimuthDeg"].between(0, 180).all()),
         "dip_min_constraint": bool((patches["DipDeg"] >= min_dip - 1.0e-6).all()),
@@ -1062,6 +1265,8 @@ def main() -> int:
         },
         "step6a_input": {
             "prediction_summary_json": str(prediction_summary_path),
+            "background_density_sgy": str(density_sgy),
+            "damage_density_sgy": None if damage_density_sgy is None else str(damage_density_sgy),
             "model_contract_version": prediction_summary.get("model_contract_version"),
             "attribute_normalization_contract_version": prediction_summary.get("attribute_normalization_contract_version"),
         },
@@ -1069,6 +1274,17 @@ def main() -> int:
             "mode": sampling_cfg["mode"],
             "reference_quantiles": layer_refs,
             "layer_audit": layer_sampling_audit,
+            "damage_domain": {
+                "enabled": bool(damage_enabled),
+                "name": damage_domain_name,
+                "domain_code": damage_domain_code,
+                "structural_relation": damage_structural_relation,
+                "layer_audit": damage_sampling_audit,
+                "cap_audit": damage_cap_audit,
+            },
+            "domain_patch_counts": {
+                str(name): int(count) for name, count in patches["SmallDomain"].value_counts().items()
+            },
             "layer_patch_counts": layer_counts,
             "upper_layer_fraction": upper_fraction,
             "pre_spacing_patch_count": pre_spacing_count,
