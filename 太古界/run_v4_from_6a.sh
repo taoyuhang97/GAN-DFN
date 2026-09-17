@@ -1,9 +1,7 @@
 #!/usr/bin/env bash
-# v4 全链：Step3 标签口径修正（窗口/填充/每条缝=1 标定/监督分层/点吸附放宽）
-#        + Step4 标定·区间·细化改造（负样本不按井一刀切 + 样本硬校验）
-#        + demo 区域移到 405 居中（taigu_attribute_demo_grid_v2_405center）
-#   用法: tmux new-session -d -s taigu_v4 "cd <repo> && bash 太古界/run_v4_chain.sh 2>&1 | tee 太古界/output_v4_logs/chain.log"
-# 说明：Step3 监督层级与 Step4 输出都变了 → 3/4/5/6A/6B/6C/7A/7B/7C/7D/8/9 必须整链重跑。
+# v4 局部重跑：Step6A 特征只保留 3 个属性分数（位置/几何特征剔除）后的下游重跑
+#   用法: tmux new-session -d -s taigu_v4_6a "cd <repo> && bash 太古界/run_v4_from_6a.sh 2>&1 | tee 太古界/output_v4_logs/chain_from_6a.log"
+# 说明：Step6A 模型与密度体都会变 → 6B/6C/7A/7B/7C/7D/8/9 必须一起重跑；Step3/4/5 不动。
 set -uo pipefail
 # 约定：每步 stdout/stderr 双写（tmux 面板 + 日志文件），见 太古界/AGENTS.md
 
@@ -16,43 +14,12 @@ PY=python3
 step() { echo; echo "[$(date '+%F %T')] ===== $1 ====="; }
 fail() { echo "[$(date '+%F %T')] FAILED: $1"; exit 1; }
 
-step "Step3 成像标签重建（v4：窗口/填充/标定/监督分层/点吸附放宽）"
-$PY $ROOT/step3_imaging_groups/build_taigu_imaging_groups.py \
-  --config $ROOT/step3_imaging_groups/configs/taigu_step3_imaging_groups_v4.json \
-  --replace-output 2>&1 | tee "$LOG/step3_v4.log" || fail "step3"
-
-step "Step3 交付校验"
-$PY $ROOT/step3_imaging_groups/validate_taigu_rebuild_delivery.py \
-  --config $ROOT/step3_imaging_groups/configs/taigu_step3_imaging_groups_v4.json \
-  2>&1 | tee "$LOG/step3_validate_v4.log" || fail "step3 validate"
-
-step "Step4 分段预测 + 同井合并（v4）"
-$PY $ROOT/step4_fracture_prediction/train_and_predict_taigu_gr_rd_rs.py \
-  --config $ROOT/step4_fracture_prediction/configs/taigu_step4_gr_rd_rs_v4.json \
-  --replace-existing-output 2>&1 | tee "$LOG/step4_v4.log" || fail "step4"
-
-step "Step4 裂缝点坐标自检"
-$PY $ROOT/tools/check_step4_point_geometry.py \
-  --points $ROOT/step4_fracture_prediction/output/taigu_step4_gr_rd_rs_v4/predictions/all_wells_merged_fracture_points.csv \
-  2>&1 | tee "$LOG/step4_point_geometry.log" || fail "step4 point geometry"
-
-step "Step5 虚拟井 + 统一训练样本（v4）"
-$PY $ROOT/step5_virtual_wells/build_taigu_virtual_wells.py \
-  --config $ROOT/step5_virtual_wells/configs/taigu_step5_attribute_v3_v4.json \
-  --replace-output 2>&1 | tee "$LOG/step5_v4.log" || fail "step5"
-
-step "Step5B 统一训练样本交付（v4）"
-$PY $ROOT/step5_virtual_wells/build_taigu_step5b_unified_samples.py \
-  --input-csv $ROOT/step5_virtual_wells/output/taigu_step5_attribute_v3_common_contract_v4/taigu_step5_unified_samples.csv \
-  --output-dir $ROOT/step5_virtual_wells/output/taigu_step5_attribute_v3_common_contract_v4/step5b \
-  --replace-output 2>&1 | tee "$LOG/step5b_v4.log" || fail "step5b"
-
-step "Step6A 训练（v4，含训练前样本构成硬校验）"
+step "Step6A 训练（v4：特征=3 属性分数，含样本构成硬校验）"
 OMP_NUM_THREADS=16 $PY $ROOT/step6a_density_volume/train_taigu_two_stage_density.py \
   --config $ROOT/step6a_density_volume/configs/taigu_step6a_train_attribute_v3_v4.json \
   --replace-output 2>&1 | tee "$LOG/step6a_train_v4.log" || fail "step6a train"
 
-step "Step6A 预测（v4，demo 区域已移到 405 居中）"
+step "Step6A 预测（v4：demo 区 5km，含层内纵向分布 QC）"
 $PY $ROOT/step6a_density_volume/predict_taigu_density_volume.py \
   --config $ROOT/step6a_density_volume/configs/taigu_step6a_predict_attribute_v3_v4.json \
   --replace-output 2>&1 | tee "$LOG/step6a_predict_v4.log" || fail "step6a predict"
@@ -98,4 +65,4 @@ $PY $ROOT/step9_sections/build_taigu_multibackground_sections.py \
   --replace-output \
   2>&1 | tee "$LOG/step9_v4.log" || fail "step9"
 
-echo "[$(date '+%F %T')] ALL DONE"
+echo "[$(date '+%F %T')] ALL DONE (from 6A)"

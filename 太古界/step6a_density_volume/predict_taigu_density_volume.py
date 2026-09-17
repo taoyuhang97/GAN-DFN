@@ -167,6 +167,41 @@ class RunningStats:
             "std": float(variance**0.5),
         }
 
+def _accumulate_relative_position(stats: dict[str, np.ndarray], sample_axis: np.ndarray,
+                                  row_idx: np.ndarray, time_idx: np.ndarray,
+                                  layer_top: np.ndarray, layer_base: np.ndarray,
+                                  values: np.ndarray) -> None:
+    """按"层内相对位置"分四档累计密度，用于验收"层内纵向分布"（2026-09-17 新增）。
+
+    位置/几何特征已从模型输入中剔除，因此预测结果不应再呈现"裂缝集中在层顶"的形态；
+    这里输出层内四等分的密度均值，作为验收指标直接暴露该类偏斜。
+    """
+    top = layer_top[row_idx]
+    thickness = layer_base[row_idx] - top
+    ok = thickness > 0
+    if not ok.any():
+        return
+    rel = (sample_axis[time_idx][ok] - top[ok]) / thickness[ok]
+    bins = np.clip(np.floor(rel * 4.0).astype(int), 0, 3)
+    vals = values[ok]
+    for b in range(4):
+        mask = bins == b
+        stats["count"][b] += int(mask.sum())
+        stats["sum"][b] += float(np.nansum(vals[mask]))
+
+
+def select_model_features(features: np.ndarray, model: dict[str, Any]) -> np.ndarray:
+    """按模型工件记录的 `feature_columns`，从固定 9 列特征矩阵里取子集。
+
+    2026-09-17 起正式模型只用 3 个属性分数（位置/几何特征已剔除），
+    因此预测时必须按模型自己的列清单取子集，不能直接把 9 列喂进去。
+    """
+    columns = list(model.get("feature_columns") or FEATURE_COLUMNS)
+    index = [FEATURE_COLUMNS.index(name) for name in columns]
+    if index == list(range(len(FEATURE_COLUMNS))):
+        return features
+    return features[:, index]
+
 
 def build_layer_features(
     attributes: dict[str, np.ndarray],
@@ -178,6 +213,11 @@ def build_layer_features(
     layer_name: str,
     normalization_contract: dict[str, Any],
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """按地层窗口构造特征矩阵（固定 9 列顺序，见 FEATURE_COLUMNS）。
+
+    实际喂给模型的列由模型工件里的 `feature_columns` 决定，用 `select_model_features`
+    取子集；2026-09-17 起正式模型只用 3 个属性分数（位置/几何特征已剔除）。
+    """
     times = samples[None, :]
     scores = {
         name: layer_score(values, name, normalization_contract, layer_name)
@@ -270,8 +310,14 @@ def main() -> int:
 
     model_path = Path(config["model_joblib"]).resolve()
     artifact = joblib.load(model_path)
-    if tuple(artifact["feature_columns"]) != tuple(FEATURE_COLUMNS):
-        raise ValueError(f"model feature contract mismatch: {artifact['feature_columns']}")
+    # 模型特征必须是固定 9 列超集的子集（2026-09-17 起正式模型只用 3 个属性分数，
+    # 位置/几何特征已剔除；这里放宽为"子集"约束，预测时用 select_model_features 取列）。
+    model_feature_columns = list(artifact["feature_columns"])
+    unknown = [name for name in model_feature_columns if name not in FEATURE_COLUMNS]
+    if unknown or not model_feature_columns:
+        raise ValueError(
+            f"model feature contract mismatch: {model_feature_columns} (unknown={unknown})"
+        )
     normalization_contract_path = Path(config["attribute_normalization_contract_json"]).resolve()
     normalization_contract = read_json(normalization_contract_path)
     model_contract = artifact.get("attribute_normalization_contract", {})
@@ -349,6 +395,10 @@ def main() -> int:
     stats_main = RunningStats()
     stats_ext = RunningStats()
     layer_total = {"上部复合层": 0, "太古界风化壳": 0}
+    layer_rel_stats: dict[str, dict[str, np.ndarray]] = {
+        layer: {"count": np.zeros(4, dtype=np.int64), "sum": np.zeros(4, dtype=np.float64)}
+        for layer in ("上部复合层", "太古界风化壳")
+    }
     anttrack_minus_one_count = 0
     anttrack_finite_count = 0
     started = time.time()
@@ -404,22 +454,34 @@ def main() -> int:
                     block_valid, 1.0, "上部复合层", normalization_contract
                 )
                 if len(row_idx):
-                    prob = model_upper["classifier"].predict_proba(features)[:, 1]
-                    cond = model_upper["conditional_density_regressor"].predict(features)
+                    model_matrix = select_model_features(features, model_upper)
+                    prob = model_upper["classifier"].predict_proba(model_matrix)[:, 1]
+                    cond = model_upper["conditional_density_regressor"].predict(model_matrix)
                     predicted[row_idx, time_idx] = np.clip(prob * np.clip(cond, 0.0, cap), 0.0, cap)
                     codes[row_idx, time_idx] = 1
                     layer_total["上部复合层"] += int(len(row_idx))
+                    _accumulate_relative_position(
+                        layer_rel_stats["上部复合层"], sample_axis, row_idx, time_idx,
+                        block["TopTimeMs"].to_numpy(), block["MidTimeMs"].to_numpy(),
+                        predicted[row_idx, time_idx],
+                    )
 
                 features, row_idx, time_idx = build_layer_features(
                     attr_arrays, sample_axis, block["MidTimeMs"].to_numpy(), block["BaseTimeMs"].to_numpy(),
                     block_valid, 2.0, "太古界风化壳", normalization_contract
                 )
                 if len(row_idx):
-                    prob = model_crust["classifier"].predict_proba(features)[:, 1]
-                    cond = model_crust["conditional_density_regressor"].predict(features)
+                    model_matrix = select_model_features(features, model_crust)
+                    prob = model_crust["classifier"].predict_proba(model_matrix)[:, 1]
+                    cond = model_crust["conditional_density_regressor"].predict(model_matrix)
                     predicted[row_idx, time_idx] = np.clip(prob * np.clip(cond, 0.0, cap), 0.0, cap)
                     codes[row_idx, time_idx] = 1
                     layer_total["太古界风化壳"] += int(len(row_idx))
+                    _accumulate_relative_position(
+                        layer_rel_stats["太古界风化壳"], sample_axis, row_idx, time_idx,
+                        block["MidTimeMs"].to_numpy(), block["BaseTimeMs"].to_numpy(),
+                        predicted[row_idx, time_idx],
+                    )
 
                 features, row_idx, time_idx = build_layer_features(
                     attr_arrays,
@@ -432,8 +494,9 @@ def main() -> int:
                     normalization_contract,
                 )
                 if len(row_idx):
-                    prob = model_crust["classifier"].predict_proba(features)[:, 1]
-                    cond = model_crust["conditional_density_regressor"].predict(features)
+                    model_matrix = select_model_features(features, model_crust)
+                    prob = model_crust["classifier"].predict_proba(model_matrix)[:, 1]
+                    cond = model_crust["conditional_density_regressor"].predict(model_matrix)
                     predicted[row_idx, time_idx] = np.clip(prob * np.clip(cond, 0.0, cap), 0.0, cap)
                     codes[row_idx, time_idx] = 2
 
@@ -587,6 +650,17 @@ def main() -> int:
             "all": stats_all.summary(),
             "main_window": stats_main.summary(),
             "ext50_window": stats_ext.summary(),
+        },
+        "density_stats_by_relative_position": {
+            layer: {
+                f"{index * 25}-{index * 25 + 25}%": {
+                    "count": int(value["count"][index]),
+                    "mean": (float(value["sum"][index] / value["count"][index])
+                             if value["count"][index] > 0 else None),
+                }
+                for index in range(4)
+            }
+            for layer, value in layer_rel_stats.items()
         },
         "checks": checks,
         "elapsed_seconds": float(time.time() - started),

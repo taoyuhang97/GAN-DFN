@@ -22,13 +22,7 @@
   "feature_columns": [
     "CoherenceScore",
     "AntTrackScore",
-    "CurvatureMaxScore",
-    "LayerCode",
-    "RelativeTimeInLayer",
-    "TimeSinceTop",
-    "TimeToBase",
-    "LayerThickness",
-    "TimeMs"
+    "CurvatureMaxScore"
   ],
   "classifier": {
     "max_iter": 150,
