@@ -44,10 +44,13 @@ from common.well_segment_join import (  # noqa: E402
 )
 
 ATTRIBUTES = ("AntTrack", "Coherence", "CurvatureMax")
+# 层位界面样式对齐砂砾岩方案B（T4 橙实线 / T5 青长虚线 / T6 紫实线 / T7 粉点划线）。
+# 太古界三个界面按"顶界面/目标层顶/目标层底"对应 T4/T6/T7 三种样式，
+# 线宽统一 2.4 pt，颜色避开 DFN 层段色（橙/蓝）以免语义冲突。
 HORIZONS = (
-    ("TopTimeMs", "上部复合层顶(T-a-1)", "#00bcd4"),
-    ("MidTimeMs", "太古界顶(Art_1)", "#43a047"),
-    ("BaseTimeMs", "风化壳底(Art_d1-1)", "#ff9800"),
+    ("TopTimeMs", "上部复合层顶(T-a-1)", "#f97316", "-", 2.4),
+    ("MidTimeMs", "太古界顶(Art_1)", "#a855f7", "-", 2.4),
+    ("BaseTimeMs", "风化壳底(Art_d1-1)", "#ec4899", (0, (6, 2, 1, 2)), 2.4),
 )
 # 图例方案对齐砂砾岩（优化阶段二/正式主线/step9_section_visualize）：
 #   DFN 裂缝片按层段着色（橙/蓝）、尺度用灰阶三档线宽、成像解释带 Step3 前缀、
@@ -58,7 +61,16 @@ SCALE_LEGEND_STYLES = {
     "medium": ("#6b7280", 2.6, "中尺度裂缝"),
     "large": ("#374151", 2.6, "大尺度裂缝"),
 }
-IMAGING_POINT_COLOR = "#ff2bd6"
+IMAGING_POINT_COLOR = "#ff00e6"
+IMAGING_PATCH_COLOR = "#ff2bd6"
+IMAGING_PATCH_HALO = "#3b0764"
+IMAGING_TRACK_COLOR = "#00f5ff"
+IMAGING_TRACK_GLOW = "#083344"
+FAULT_TRACE_COLOR = "#ffe600"
+FAULT_TRACE_HALO = "#111827"
+STEP4_POINT_COLOR = "#22c55e"
+STEP4_POINT_EDGE = "#0f172a"
+OVERLAY_TIME_SCALE_M_PER_MS = 2.0
 SCOPE_LABELS = {"overview": "5 km Demo区", "local_200m": "井周200 m"}
 CHINESE_FONT_CANDIDATES = (
     "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
@@ -119,6 +131,10 @@ def validate(config: dict[str, Any]) -> dict[str, Any]:
             "step2_segments_root", "step3_groups_root",
         )
     }
+    # 叠加层输入（原始断层 / 常规测井裂缝点）：声明了就必须存在。
+    for optional_key in ("original_fault_vtk", "step4_points_csv"):
+        if config.get(optional_key):
+            paths[optional_key] = str(pth(config, optional_key))
     volumes = config.get("volume_paths", {})
     for name in ATTRIBUTES:
         if name not in volumes:
@@ -229,6 +245,248 @@ def in_block(frame: pd.DataFrame, block: dict[str, float]) -> pd.DataFrame:
     ].copy()
 
 
+def load_step4_points(config: dict[str, Any], block: dict[str, float]) -> pd.DataFrame:
+    """常规测井段裂缝点位（Step4 分段预测结果），用于剖面叠加。"""
+    path_value = config.get("step4_points_csv")
+    if not path_value:
+        return pd.DataFrame(columns=["X", "Y", "TIME", "WellName"])
+    path = Path(str(path_value)).resolve()
+    if not path.exists():
+        raise FileNotFoundError(path)
+    frame = pd.read_csv(path, encoding="utf-8-sig")
+    needed = [column for column in ("WellName", "X", "Y", "TIME", "StrataName") if column in frame.columns]
+    frame = numeric(frame, tuple(column for column in needed if column != "WellName"))
+    frame = in_block(frame, block)
+    return frame.dropna(subset=["X", "Y", "TIME"]).reset_index(drop=True)
+
+
+def read_legacy_polydata(path: Path) -> tuple[np.ndarray, np.ndarray]:
+    """读取 legacy VTK POLYDATA（binary/ascii），返回 (points, triangles)。
+
+    只依赖标准库与 numpy：太古界的原始断层体是 Step7C 用 `write_legacy_vtk`
+    写出的 POLYDATA（三角形单元、big-endian、VTK 5.1 的 OFFSETS/CONNECTIVITY，
+    id 数组实际按 int32 写入）。同时兼容不带 OFFSETS 的旧式布局与 ascii 文本。
+    """
+    try:
+        return _read_polydata_impl(path)
+    except ValueError:
+        raise
+
+
+def _read_polydata_impl(path: Path) -> tuple[np.ndarray, np.ndarray]:
+    with path.open("rb") as handle:
+        handle.readline()  # version
+        handle.readline()  # title
+        encoding = handle.readline().decode("latin1").strip().upper()
+        dataset = handle.readline().decode("latin1").strip().upper()
+        if not dataset.startswith("DATASET POLYDATA"):
+            raise ValueError(f"{path} 不是 POLYDATA 文件: {dataset}")
+        points: np.ndarray | None = None
+        triangles: list[np.ndarray] = []
+        while True:
+            raw = handle.readline()
+            if not raw:
+                break
+            line = raw.decode("latin1").strip()
+            if not line:
+                continue
+            parts = line.split()
+            keyword = parts[0].upper()
+            if keyword == "POINTS":
+                count = int(parts[1])
+                if encoding == "BINARY":
+                    points = np.frombuffer(handle.read(count * 12), dtype=">f4").reshape(count, 3).astype(np.float64)
+                else:
+                    points = np.array([[float(handle.readline().split()[i]) for i in range(3)] for _ in range(count)])
+            elif keyword in {"POLYGONS", "TRIANGLE_STRIPS"}:
+                count = int(parts[1])
+                if encoding == "BINARY":
+                    mark = handle.tell()
+                    peek = handle.readline().decode("latin1").strip().upper()
+                    if peek.startswith("OFFSETS"):
+                        # OFFSETS 数据块一直读到下一行的 CONNECTIVITY 关键字为止，
+                        # 再按 int32/int64 两种可能解码（本项目写出的是 int32）。
+                        data_start = handle.tell()
+                        offsets_raw = bytearray()
+                        while True:
+                            chunk = handle.read(4096)
+                            if not chunk:
+                                break
+                            hit = chunk.find(b"\nCONNECTIVITY")
+                            if hit >= 0:
+                                offsets_raw.extend(chunk[:hit])
+                                # chunk[:hit] 不含换行符，跳过多出来的 '\n' 才能读到关键字行
+                                handle.seek(data_start + len(offsets_raw) + 1)
+                                break
+                            offsets_raw.extend(chunk)
+                        offsets = _decode_id_array(bytes(offsets_raw))
+                        conn_header = handle.readline().decode("latin1").strip()
+                        if not conn_header.upper().startswith("CONNECTIVITY"):
+                            raise ValueError(f"VTK OFFSETS 之后缺少 CONNECTIVITY: {conn_header}")
+                        total = int(offsets[-1])
+                        connectivity = _decode_exact_id_array(handle.read(total * 4), total)
+                    else:
+                        handle.seek(mark)
+                        flat = np.frombuffer(handle.read(int(parts[2]) * 4), dtype=">i4")
+                        offsets = np.empty(count + 1, dtype=np.int64)
+                        connectivity_list: list[int] = []
+                        cursor = 0
+                        for index in range(count):
+                            offsets[index] = cursor
+                            size = int(flat[cursor])
+                            connectivity_list.extend(flat[cursor + 1:cursor + 1 + size].tolist())
+                            cursor += 1 + size
+                        offsets[count] = cursor
+                        connectivity = np.asarray(connectivity_list, dtype=np.int64)
+                else:
+                    offsets = np.empty(count + 1, dtype=np.int64)
+                    connectivity_list = []
+                    cursor = 0
+                    for index in range(count):
+                        row = handle.readline().split()
+                        offsets[index] = cursor
+                        size = int(row[0])
+                        connectivity_list.extend(int(value) for value in row[1:1 + size])
+                        cursor += size
+                    offsets[count] = cursor
+                    connectivity = np.asarray(connectivity_list, dtype=np.int64)
+                for index in range(len(offsets) - 1):
+                    ids = connectivity[offsets[index]:offsets[index + 1]]
+                    for offset in range(1, len(ids) - 1):
+                        triangles.append(np.array([ids[0], ids[offset], ids[offset + 1]], dtype=np.int64))
+            elif keyword in {"CELL_DATA", "POINT_DATA", "VERTICES", "LINES", "SCALARS", "VECTORS", "LOOKUP_TABLE"}:
+                # 只关心点与面；其余块跳过（断层体没有额外标量场）。
+                if keyword in {"CELL_DATA", "POINT_DATA"}:
+                    handle.readline()
+            else:
+                continue
+    if points is None:
+        raise ValueError(f"{path} 缺少 POINTS 段")
+    triangle_array = (
+        np.asarray(triangles, dtype=np.int64) if triangles else np.empty((0, 3), dtype=np.int64)
+    )
+    return points, triangle_array
+
+
+def _decode_id_array(payload: bytes) -> np.ndarray:
+    """按 int32/int64 两种可能解码 VTK id 数组：取"首值为 0 且单调不减"的那一种。"""
+    for dtype, width in ((">i4", 4), (">i8", 8)):
+        usable = (len(payload) // width) * width
+        if usable < width * 2:
+            continue
+        values = np.frombuffer(payload[:usable], dtype=dtype).astype(np.int64)
+        if values[0] == 0 and np.all(np.diff(values) >= 0):
+            return values
+    raise ValueError("无法解码 VTK id 数组（既不是 int32 也不是 int64）")
+
+
+def _decode_exact_id_array(payload: bytes, count: int) -> np.ndarray:
+    """按已知长度解码 connectivity：优先 int32，长度不足时回退 int64。"""
+    if count <= 0:
+        return np.empty(0, dtype=np.int64)
+    for dtype, width in ((">i4", 4), (">i8", 8)):
+        if len(payload) >= count * width:
+            return np.frombuffer(payload[: count * width], dtype=dtype).astype(np.int64)
+    raise ValueError(f"VTK connectivity 数据不足: 期望 {count} 个 id，实际字节 {len(payload)}")
+
+
+def fault_section_segments(points: np.ndarray, triangles: np.ndarray, track: pd.DataFrame,
+                           projection: str) -> list[list[list[float]]]:
+    """把原始断层面（三角网）与弯曲剖面求交，得到剖面上的断层迹线段。
+
+    剖面法：XZ 投影的剖面曲面是 y = Ywell(t)；YZ 投影是 x = Xwell(t)。
+    对每个三角形按顶点的 g = 垂向坐标 - 井轨迹(t) 的符号变化求边交点。
+    """
+    if points.size == 0 or triangles.size == 0:
+        return []
+    perp_index = 1 if projection == "XZ" else 0
+    h_index = 0 if projection == "XZ" else 1
+    well_column = "Y" if projection == "XZ" else "X"
+    segments: list[list[list[float]]] = []
+    for triangle in triangles:
+        vertices = points[triangle]
+        times = vertices[:, 2]
+        well_perp = interp_track(track, times, well_column)
+        g = vertices[:, perp_index] - well_perp
+        crossings: list[np.ndarray] = []
+        for index in range(3):
+            nxt = (index + 1) % 3
+            gi, gj = float(g[index]), float(g[nxt])
+            if abs(gi) <= 1.0e-9:
+                crossings.append(vertices[index])
+            if gi * gj < 0.0:
+                fraction = gi / (gi - gj)
+                crossings.append(vertices[index] + fraction * (vertices[nxt] - vertices[index]))
+        if len(crossings) < 2:
+            continue
+        best = None
+        best_distance = -1.0
+        for i in range(len(crossings)):
+            for j in range(i + 1, len(crossings)):
+                delta = crossings[i] - crossings[j]
+                distance = float(delta @ delta)
+                if distance > best_distance:
+                    best_distance = distance
+                    best = (crossings[i], crossings[j])
+        if best is None or best_distance <= 0.0:
+            continue
+        first, second = best
+        segments.append(
+            [[float(first[h_index]), float(first[2])], [float(second[h_index]), float(second[2])]]
+        )
+    return segments
+
+
+def imaging_patch_segments(imaging: pd.DataFrame, projection: str, length_m: float,
+                           aspect_ratio: float) -> list[list[list[float]]]:
+    """把成像测井裂缝解释点按产状还原成小平面片，并取其在剖面内的代表性迹线。
+
+    与砂砾岩 `build_imaging_fracture_patch_segments` 同口径：由 FracAzimuth/FracDip
+    构造裂缝面矩形，投影到 XZ/YZ 后取最长对角线作为剖面迹线。
+    """
+    if imaging.empty or not {"FracAzimuth", "FracDip"}.issubset(imaging.columns):
+        return []
+    h_index = 0 if projection == "XZ" else 1
+    half_strike = max(float(length_m), 1.0) / 2.0
+    half_dip = half_strike / max(float(aspect_ratio), 1.0e-6)
+    segments: list[list[list[float]]] = []
+    for row in imaging.itertuples(index=False):
+        azimuth = math.radians(float(row.FracAzimuth))
+        dip = math.radians(float(row.FracDip))
+        center = np.array([float(row.X), float(row.Y), float(row.TIME) * OVERLAY_TIME_SCALE_M_PER_MS])
+        strike = np.array([math.cos(azimuth), math.sin(azimuth), 0.0])
+        dip_dir = np.array([-math.sin(azimuth), math.cos(azimuth), 0.0])
+        dip_vector = np.array([
+            math.sin(dip) * dip_dir[0],
+            math.sin(dip) * dip_dir[1],
+            math.cos(dip),
+        ])
+        norm = np.linalg.norm(dip_vector)
+        if norm <= 1.0e-9:
+            continue
+        dip_vector = dip_vector / norm
+        corners = [
+            center + half_strike * strike + half_dip * dip_vector,
+            center + half_strike * strike - half_dip * dip_vector,
+            center - half_strike * strike - half_dip * dip_vector,
+            center - half_strike * strike + half_dip * dip_vector,
+        ]
+        projected = np.array([[corner[h_index], corner[2] / OVERLAY_TIME_SCALE_M_PER_MS] for corner in corners])
+        best = None
+        best_distance = -1.0
+        for i in range(4):
+            for j in range(i + 1, 4):
+                delta = projected[i] - projected[j]
+                distance = float(delta @ delta)
+                if distance > best_distance:
+                    best_distance = distance
+                    best = (projected[i], projected[j])
+        if best is None:
+            continue
+        segments.append([[float(best[0][0]), float(best[0][1])], [float(best[1][0]), float(best[1][1])]])
+    return segments
+
+
 class AttributeSampler:
     def __init__(self, header: pd.DataFrame, path: Path, time_offset_ms: float, max_distance_m: float):
         self.header = header
@@ -327,7 +585,7 @@ def horizon_curves(horizon: pd.DataFrame, track: pd.DataFrame, coords: np.ndarra
     tree = cKDTree(horizon[["X", "Y"]].to_numpy(np.float64))
     output = {}
     seed = np.full(len(coords), float(track["TIME"].median()))
-    for field, _, _ in HORIZONS:
+    for field, *_ in HORIZONS:
         values = seed.copy()
         for _ in range(8):
             if projection == "XZ":
@@ -372,10 +630,24 @@ def patch_segments(patches: pd.DataFrame, track: pd.DataFrame, projection: str,
 
 def draw_overlays(ax, projection: str, coords: np.ndarray, times: np.ndarray, track: pd.DataFrame,
                   curves: dict[str, np.ndarray], patches: pd.DataFrame, imaging: pd.DataFrame,
-                  half_width: float) -> dict[str, int]:
+                  half_width: float, faults: list[list[list[float]]] | None = None,
+                  step4: pd.DataFrame | None = None, scope: str = "overview",
+                  config: dict[str, Any] | None = None) -> dict[str, int]:
     _, _, well_h = section_queries(track, times, coords, projection)
-    for field, label, color in HORIZONS:
-        ax.plot(coords, curves[field], color=color, lw=1.3, label=label, zorder=8)
+    config = dict(config or {})
+    for field, label, color, linestyle, linewidth in HORIZONS:
+        ax.plot(coords, curves[field], color=color, lw=linewidth, linestyle=linestyle, label=label, zorder=8)
+    # 原始断层（Step7C 的原始断层三角网与弯曲剖面求交）——对齐砂砾岩黄色描边方案
+    fault_segments = list(faults or [])
+    if fault_segments:
+        fault_style = (0, (5, 3)) if scope == "overview" else "-"
+        ax.add_collection(LineCollection(fault_segments, colors=FAULT_TRACE_HALO, linewidths=5.2,
+                                         alpha=0.70 if scope == "overview" else 0.86, zorder=6.2,
+                                         linestyles=fault_style))
+        ax.add_collection(LineCollection(fault_segments, colors=FAULT_TRACE_COLOR, linewidths=2.5,
+                                         alpha=0.78 if scope == "overview" else 0.96, zorder=6.3,
+                                         linestyles=fault_style))
+        ax.plot([], [], color=FAULT_TRACE_COLOR, lw=2.5, linestyle=fault_style, label="原始断层")
     real_track = (times >= float(track["TIME"].min())) & (times <= float(track["TIME"].max()))
     ax.plot(well_h[real_track], times[real_track], color="black", lw=1.8,
             label="埕北古斜405井轨迹（成像段）", zorder=10)
@@ -387,16 +659,53 @@ def draw_overlays(ax, projection: str, coords: np.ndarray, times: np.ndarray, tr
         for scale_key in ("small", "medium", "large"):
             scale_color, scale_width, scale_label = SCALE_LEGEND_STYLES[scale_key]
             ax.plot([], [], color=scale_color, lw=scale_width, label=scale_label)
+    patch_lines: list[list[list[float]]] = []
     if len(imaging):
         perp = "Y" if projection == "XZ" else "X"
         mask = np.abs(imaging[perp].to_numpy() - interp_track(track, imaging["TIME"].to_numpy(), perp)) <= half_width
         shown = imaging[mask]
         hcol = "X" if projection == "XZ" else "Y"
-        ax.scatter(shown[hcol], shown["TIME"], marker="^", c=IMAGING_POINT_COLOR, s=12,
+        patch_lines = imaging_patch_segments(
+            shown, projection,
+            float(config.get("imaging_patch_length_m", 45.0)),
+            float(config.get("imaging_patch_aspect_ratio", 1.5)),
+        )
+        if patch_lines:
+            ax.add_collection(LineCollection(patch_lines, colors=IMAGING_PATCH_HALO, linewidths=3.0,
+                                             alpha=0.40, zorder=10.4))
+            ax.add_collection(LineCollection(patch_lines, colors=IMAGING_PATCH_COLOR, linewidths=1.8,
+                                             alpha=0.62, zorder=10.5,
+                                             label="Step3真实成像裂缝解释片（按产状）"))
+        ax.scatter(shown[hcol], shown["TIME"], marker="^", c=IMAGING_POINT_COLOR, s=9,
                    label="Step3成像测井裂缝点", zorder=11)
     else:
         shown = imaging
-    return {"dfn_segment_count": len(segments), "imaging_point_count": int(len(shown))}
+    # 成像测井井段轨迹（青线）与常规测井裂缝点位（Step4 预测）
+    kept_imaging = int(len(shown))
+    if len(imaging) >= 2:
+        order = imaging.sort_values("TIME")
+        hcol = "X" if projection == "XZ" else "Y"
+        ax.plot(order[hcol], order["TIME"], color=IMAGING_TRACK_GLOW, lw=5.2, alpha=0.78, zorder=7)
+        ax.plot(order[hcol], order["TIME"], color=IMAGING_TRACK_COLOR, lw=2.8, alpha=0.96, zorder=8,
+                label="Step3成像测井井段轨迹")
+    step4_count = 0
+    if step4 is not None and len(step4):
+        perp = "Y" if projection == "XZ" else "X"
+        mask = np.abs(step4[perp].to_numpy() - interp_track(track, step4["TIME"].to_numpy(), perp)) <= half_width
+        selected = step4[mask]
+        step4_count = int(len(selected))
+        if step4_count:
+            hcol = "X" if projection == "XZ" else "Y"
+            ax.scatter(selected[hcol], selected["TIME"], marker="o", s=9, c=STEP4_POINT_COLOR,
+                       edgecolors=STEP4_POINT_EDGE, linewidths=0.4, zorder=10.8,
+                       label="Step4常规测井裂缝点（预测）")
+    return {
+        "dfn_segment_count": len(segments),
+        "imaging_point_count": kept_imaging,
+        "imaging_patch_count": len(patch_lines),
+        "fault_segment_count": len(fault_segments),
+        "step4_point_count": step4_count,
+    }
 
 
 def display_array(name: str, values: np.ndarray) -> tuple[np.ndarray, str, float, float]:
@@ -413,7 +722,8 @@ def display_array(name: str, values: np.ndarray) -> tuple[np.ndarray, str, float
 def plot_image(path: Path, name: str, renderer: str, projection: str, scope: str,
                values: np.ndarray, coords: np.ndarray, times: np.ndarray, track: pd.DataFrame,
                curves: dict[str, np.ndarray], patches: pd.DataFrame, imaging: pd.DataFrame,
-               config: dict[str, Any]) -> dict[str, Any]:
+               config: dict[str, Any], faults: dict[str, list[list[list[float]]]] | None = None,
+               step4: pd.DataFrame | None = None) -> dict[str, Any]:
     fig, ax = plt.subplots(figsize=(15.5, 7.8))
     extent = [coords[0], coords[-1], times[-1], times[0]]
     if renderer == "attribute":
@@ -438,7 +748,8 @@ def plot_image(path: Path, name: str, renderer: str, projection: str, scope: str
                 ax.fill_betweenx(times, coords[col], x, where=trace >= 0, color="black", alpha=.65)
     width_key = "local_dfn_projection_half_width_m" if scope == "local_200m" else "dfn_projection_half_width_m"
     overlay = draw_overlays(ax, projection, coords, times, track, curves, patches, imaging,
-                            float(config.get(width_key, 200.0 if scope == "local_200m" else 50.0)))
+                            float(config.get(width_key, 200.0 if scope == "local_200m" else 50.0)),
+                            faults=(faults or {}).get(projection), step4=step4, scope=scope, config=config)
     ax.set_xlim(coords[0], coords[-1]); ax.set_ylim(times[-1], times[0])
     ax.set_xlabel("X / m" if projection == "XZ" else "Y / m"); ax.set_ylabel("TIME / ms (TWT)")
     title = {"AntTrack":"蚂蚁体", "Coherence":"相干体", "CurvatureMax":"曲率绝对值", "SeisAmp":"OBN地震"}[name]
@@ -473,6 +784,24 @@ def main() -> int:
     horizon = in_block(numeric(pd.read_csv(pth(config, "horizon_contract_csv"), usecols=["TraceIdx","X","Y","TopTimeMs","MidTimeMs","BaseTimeMs"]), ("TraceIdx","X","Y","TopTimeMs","MidTimeMs","BaseTimeMs")), block)
     horizon = horizon.dropna(subset=["TopTimeMs","MidTimeMs","BaseTimeMs"])
     track = load_track(config); imaging = load_imaging(config)
+    step4_points = load_step4_points(config, block)
+    # 原始断层：Step7C 输出的断层三角网与弯曲剖面求交（XZ/YZ 各一次，两种尺度共用）
+    fault_segments: dict[str, list[list[list[float]]]] = {"XZ": [], "YZ": []}
+    fault_summary: dict[str, Any] = {"path": None, "triangle_count": 0, "segment_counts": {}}
+    if config.get("original_fault_vtk"):
+        fault_path = Path(str(config["original_fault_vtk"])).resolve()
+        if not fault_path.exists():
+            raise FileNotFoundError(fault_path)
+        fault_points, fault_triangles = read_legacy_polydata(fault_path)
+        for projection in ("XZ", "YZ"):
+            fault_segments[projection] = fault_section_segments(fault_points, fault_triangles, track, projection)
+        fault_summary = {
+            "path": str(fault_path),
+            "point_count": int(len(fault_points)),
+            "triangle_count": int(len(fault_triangles)),
+            "segment_counts": {projection: int(len(fault_segments[projection])) for projection in ("XZ", "YZ")},
+        }
+        print(f"[Step9] 原始断层剖面迹线 XZ={len(fault_segments['XZ'])} YZ={len(fault_segments['YZ'])}", flush=True)
     patch_cols = ["CenterX","CenterY","CenterTime","AzimuthDeg","DipDeg","PatchLengthM","LengthM","LayerGroup","FractureScale"]
     available = pd.read_csv(pth(config, "step8_patches_csv"), nrows=0).columns
     patches = pd.read_csv(pth(config, "step8_patches_csv"), usecols=[c for c in patch_cols if c in available])
@@ -540,12 +869,19 @@ def main() -> int:
                 number += 1; token = name.lower() if name != "SeisAmp" else ("seismic_density" if renderer == "density" else "seismic_wiggle_area")
                 path = output / scope / f"{number:02d}_{token}_{projection.lower()}.png"
                 print(f"  图片 {number}/20: {path.name}", flush=True)
-                overlay = plot_image(path,name,renderer,projection,scope,samples[scope][name][projection],samples[scope]["axes"][projection],times,track,curves[projection],patches,imaging,config)
+                overlay = plot_image(path,name,renderer,projection,scope,samples[scope][name][projection],samples[scope]["axes"][projection],times,track,curves[projection],patches,imaging,config,faults=fault_segments,step4=step4_points)
                 images.append({"number":number,"scope":scope,"background":name,"renderer":renderer,"projection":projection,"path":str(path),"overlay":overlay})
     print("[Step9] 6/6 汇总QC", flush=True)
     imaging_join_qc = dict(config.get("_imaging_join_qc", {}))
     checks={"image_count_is_20":len(images)==20,"horizon_order_valid":bool(((horizon.TopTimeMs<horizon.MidTimeMs)&(horizon.MidTimeMs<horizon.BaseTimeMs)).all()),"attribute_demo_grid_complete":len(grid)==int(config.get("expected_demo_trace_count",len(grid))),"anttrack_minus_one_preserved":True,"separate_trace_contracts":pth(config,"attribute_trace_header_csv")!=pth(config,"obn_trace_header_csv"),"imaging_point_join_has_no_unmatched":int(imaging_join_qc.get("unmatched_count",0))==0}
-    summary={"status":"pass" if all(checks.values()) else "fail","config":str(config_path),"profile_well":config["profile_well"],"temporary_neighbor_time_depth_risk":"埕北古斜405当前按该井对应时深文件使用，真实时深仍待核验","target_block":block,"time_range_ms":[float(times[0]),float(times[-1])],"inputs":validation["paths"],"contracts":validation["contracts"],"counts":{"attribute_grid":len(grid),"valid_horizon_traces":len(horizon),"track_samples":len(track),"step8_patches":len(patches),"imaging_points":len(imaging)},"imaging_point_join_qc":imaging_join_qc,"sample_qc":sample_summary,"images":images,"checks":checks,"elapsed_seconds":time.time()-started}
+    overlay_totals = {
+        "original_fault_segments": fault_summary.get("segment_counts", {}),
+        "step4_points_on_section_total": sum(int(row["overlay"].get("step4_point_count", 0)) for row in images),
+        "imaging_patch_total": sum(int(row["overlay"].get("imaging_patch_count", 0)) for row in images),
+        "dfn_segment_total": sum(int(row["overlay"].get("dfn_segment_count", 0)) for row in images),
+    }
+    checks={"image_count_is_20":len(images)==20,"horizon_order_valid":bool(((horizon.TopTimeMs<horizon.MidTimeMs)&(horizon.MidTimeMs<horizon.BaseTimeMs)).all()),"attribute_demo_grid_complete":len(grid)==int(config.get("expected_demo_trace_count",len(grid))),"anttrack_minus_one_preserved":True,"separate_trace_contracts":pth(config,"attribute_trace_header_csv")!=pth(config,"obn_trace_header_csv"),"imaging_point_join_has_no_unmatched":int(imaging_join_qc.get("unmatched_count",0))==0,"original_fault_overlay_loaded":bool(not config.get("original_fault_vtk") or fault_summary.get("triangle_count",0)>0),"original_fault_intersects_section":bool(not config.get("original_fault_vtk") or any(v>0 for v in (fault_summary.get("segment_counts") or {}).values())),"imaging_patch_overlay_drawn":bool(not len(imaging) or overlay_totals["imaging_patch_total"]>0),"step4_points_overlay_drawn":bool(not len(step4_points) or overlay_totals["step4_points_on_section_total"]>0)}
+    summary={"status":"pass" if all(checks.values()) else "fail","config":str(config_path),"profile_well":config["profile_well"],"temporary_neighbor_time_depth_risk":"埕北古斜405当前按该井对应时深文件使用，真实时深仍待核验","target_block":block,"time_range_ms":[float(times[0]),float(times[-1])],"inputs":validation["paths"],"contracts":validation["contracts"],"counts":{"attribute_grid":len(grid),"valid_horizon_traces":len(horizon),"track_samples":len(track),"step8_patches":len(patches),"imaging_points":len(imaging),"step4_points":len(step4_points)},"overlay_inputs":{"original_fault":fault_summary,"step4_points":len(step4_points),"imaging_points":len(imaging),**overlay_totals},"imaging_point_join_qc":imaging_join_qc,"sample_qc":sample_summary,"images":images,"checks":checks,"elapsed_seconds":time.time()-started}
     write_json(summary_path,summary); print(f"[Step9] status={summary['status']} summary={summary_path}",flush=True)
     return 0 if summary["status"]=="pass" else 1
 
