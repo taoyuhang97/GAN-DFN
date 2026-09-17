@@ -1,0 +1,21 @@
+{
+  "version": "taigu_step6a_small_background_v4",
+  "model_contract_version": "taigu_step6a_attribute_v3_v4",
+  "density_sgy": "/home/tyh/projects/petroleum/code/GAN-DFN/太古界/step6a_density_volume/output/taigu_step6a_attribute_v3_full_v4/volume/predicted_fracture_density.sgy",
+  "trace_mapping_npz": "/home/tyh/projects/petroleum/code/GAN-DFN/太古界/step6a_density_volume/output/taigu_step6a_attribute_v3_full_v4/volume/trace_mapping.npz",
+  "horizon_contract_table": "/home/tyh/projects/petroleum/code/GAN-DFN/太古界/common/horizon_contract/output/taigu_attribute_full_horizon_contract_v1/demo_horizon_contract.npy",
+  "curvature_volume_path": "/data/shared/project-oil/wx数据/埕岛太古界/体数据/Chengdao-Taigujie-Most Positive Curvature.sgy",
+  "curvature_time_origin_ms": 1800.0,
+  "output_dir": "/home/tyh/projects/petroleum/code/GAN-DFN/太古界/step6a_density_volume/output/taigu_step6a_small_background_v4",
+  "small_evidence": {
+    "density_weight": 0.4,
+    "curvature_weight": 0.6,
+    "curvature_transform": "absolute",
+    "density_clip_low_q": 0.02,
+    "density_clip_high_q": 0.98,
+    "curvature_clip_low_q": 0.50,
+    "curvature_clip_high_q": 0.995,
+    "candidate_quantile": 0.88,
+    "core_quantile": 0.95
+  }
+}

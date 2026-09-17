@@ -387,6 +387,29 @@ def main() -> int:
     large_mask = step6c["large_mask"].astype(bool)
     large_component_id = step6c["inferred_component_id"].astype(np.int32)
 
+    # 6B/6C 的采样步长（10 ms）与 6A 小尺度分数（2 ms）不同，先按各体的时间轴
+    # 线性重采样到小尺度轴上，再做多尺度融合（2026-09-17 新增）。
+    def _resample_to_small(values: np.ndarray, source_axis: Any, label: str) -> np.ndarray:
+        source = np.asarray(source_axis, dtype=np.float64)
+        target = np.asarray(samples, dtype=np.float64)
+        if values.shape[1] == len(target) and np.allclose(source, target, atol=1.0e-6):
+            return values
+        out = np.empty((values.shape[0], len(target)), dtype=np.float32)
+        for row in range(values.shape[0]):
+            out[row] = np.interp(target, source, values[row].astype(np.float64),
+                                 left=0.0, right=0.0).astype(np.float32)
+        print(f"[step6d] resampled {label} {values.shape[1]} -> {len(target)} samples", flush=True)
+        return out
+
+    medium_prior = _resample_to_small(medium_prior, step6b.get("samples"), "medium_prior")
+    large_prior = _resample_to_small(large_prior, step6c.get("samples"), "large_prior")
+    if medium_mask.shape[1] != len(samples):
+        medium_mask = _resample_to_small(medium_mask.astype(np.float32), step6b.get("samples"),
+                                         "medium_mask") > 0.5
+    if large_mask.shape[1] != len(samples):
+        large_mask = _resample_to_small(large_mask.astype(np.float32), step6c.get("samples"),
+                                        "large_mask") > 0.5
+
     shapes = {
         "small_density": small_density.shape,
         "small_score": small_score.shape,
@@ -525,6 +548,9 @@ def main() -> int:
     label_fractions = {key: float(value / total_voxels) for key, value in label_counts.items()}
     summary: dict[str, Any] = {
         "status": "pass",
+        "model_contract_version": str(config.get("model_contract_version", "taigu_step6a_attribute_v3_v4")),
+        # 供 Step7A 的输入契约校验使用：声明小尺度密度体的最终来源（多尺度矫正后的结果）。
+        "output_paths": {"density_sgy": str(output_dir / "final_small_density.sgy")},
         "input_density_sgy": str(input_density_sgy),
         "trace_mapping_npz": str(trace_mapping_npz),
         "step6a_dir": str(step6a_dir),

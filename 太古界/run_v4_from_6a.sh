@@ -24,27 +24,37 @@ $PY $ROOT/step6a_density_volume/predict_taigu_density_volume.py \
   --config $ROOT/step6a_density_volume/configs/taigu_step6a_predict_attribute_v3_v4.json \
   --replace-output 2>&1 | tee "$LOG/step6a_predict_v4.log" || fail "step6a predict"
 
+step "Step6A 小尺度背景分数（v4：体数据再矫正，密度 0.4 / 曲率 0.6）"
+$PY $ROOT/step6a_density_volume/build_taigu_small_background.py \
+  --config $ROOT/step6a_density_volume/configs/taigu_step6a_small_background_v4.json \
+  --replace-output 2>&1 | tee "$LOG/step6a_small_background_v4.log" || fail "step6a small background"
+
 step "Step6B 中尺度裂缝带（v4）"
 $PY $ROOT/step6b_medium_corridor/code/build_step6b_medium_corridor_prior.py \
   --config $ROOT/step6b_medium_corridor/configs/taigu_step6b_medium_v7_anttrack_led_v4.json \
   2>&1 | tee "$LOG/step6b_v4.log" || fail "step6b"
-
-step "Step7B 中尺度 DFN（v4）"
-$PY $ROOT/step7b_multiscale_initial_dfn/build_medium_scale_dfn_v4.py \
-  --config $ROOT/step7b_multiscale_initial_dfn/configs/taigu_step7b_medium_v7_anttrack_led_v4.json \
-  2>&1 | tee "$LOG/step7b_v4.log" || fail "step7b"
 
 step "Step6C 大尺度断层先验（v4）"
 $PY $ROOT/step6c_large_fault/code/build_step6c_large_fault_prior.py \
   --config $ROOT/step6c_large_fault/configs/taigu_step6c_large_v3_attribute_v3_v4.json \
   2>&1 | tee "$LOG/step6c_v4.log" || fail "step6c"
 
+step "Step6D 多尺度打包（v4：6A 小尺度背景 + 6B 中尺度 + 6C 大尺度）"
+$PY $ROOT/step6d_multiscale_bundle/code/build_step6d_multiscale_bundle.py \
+  --config $ROOT/step6d_multiscale_bundle/configs/taigu_step6d_multiscale_v4.json \
+  2>&1 | tee "$LOG/step6d_v4.log" || fail "step6d"
+
+step "Step7B 中尺度 DFN（v4）"
+$PY $ROOT/step7b_multiscale_initial_dfn/build_medium_scale_dfn_v4.py \
+  --config $ROOT/step7b_multiscale_initial_dfn/configs/taigu_step7b_medium_v7_anttrack_led_v4.json \
+  2>&1 | tee "$LOG/step7b_v4.log" || fail "step7b"
+
 step "Step7C 大尺度 DFN（v4）"
 $PY $ROOT/step7c_large_fault_dfn/build_large_fault_dfn.py \
   --config $ROOT/step7c_large_fault_dfn/configs/taigu_step7c_large_v3_attribute_v3_v4.json \
   2>&1 | tee "$LOG/step7c_v4.log" || fail "step7c"
 
-step "Step7A 小尺度 DFN（v4）"
+step "Step7A 小尺度 DFN（v4：输入源 = Step6D final_small_density）"
 $PY $ROOT/step7a_small_scale_dfn/build_taigu_small_scale_dfn.py \
   --config $ROOT/step7a_small_scale_dfn/configs/taigu_step7a_attribute_v3_regen_v4.json \
   --replace-output 2>&1 | tee "$LOG/step7a_v4.log" || fail "step7a"

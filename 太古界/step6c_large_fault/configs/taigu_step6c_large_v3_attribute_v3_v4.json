@@ -15,8 +15,8 @@
   },
   "output_dir": "/home/tyh/projects/petroleum/code/GAN-DFN/太古界/step6c_large_fault/output/taigu_step6c_large_v3_attribute_v3_v4",
   "large_evidence": {
-    "sample_start_ms": 2248.0,
-    "sample_stop_ms": 3446.0,
+    "sample_start_ms": 2624.0,
+    "sample_stop_ms": 4048.0,
     "sample_interval_ms": 10.0
   },
   "small_density_sgy_name": "taigu_small_density.sgy",

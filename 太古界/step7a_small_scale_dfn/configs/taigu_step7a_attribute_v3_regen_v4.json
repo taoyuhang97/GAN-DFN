@@ -1,9 +1,9 @@
 {
   "version": "taigu_step7a_attribute_v3_regen",
   "output_dir": "/home/tyh/projects/petroleum/code/GAN-DFN/太古界/step7a_small_scale_dfn/output/taigu_step7a_attribute_v3_regen_full_v4",
-  "density_sgy": "/home/tyh/projects/petroleum/code/GAN-DFN/太古界/step6a_density_volume/output/taigu_step6a_attribute_v3_full_v4/volume/predicted_fracture_density.sgy",
+  "density_sgy": "/home/tyh/projects/petroleum/code/GAN-DFN/太古界/step6d_multiscale_bundle/output/taigu_step6d_multiscale_v4/final_small_density.sgy",
   "window_code_npz": "/home/tyh/projects/petroleum/code/GAN-DFN/太古界/step6a_density_volume/output/taigu_step6a_attribute_v3_full_v4/volume/window_code.npz",
-  "step6a_prediction_summary_json": "/home/tyh/projects/petroleum/code/GAN-DFN/太古界/step6a_density_volume/output/taigu_step6a_attribute_v3_full_v4/volume/prediction_summary.json",
+  "step6a_prediction_summary_json": "/home/tyh/projects/petroleum/code/GAN-DFN/太古界/step6d_multiscale_bundle/output/taigu_step6d_multiscale_v4/multiscale_bundle_summary.json",
   "expected_step6a_model_contract_version": "taigu_step6a_attribute_v3_v4",
   "trace_mapping_npz": "/home/tyh/projects/petroleum/code/GAN-DFN/太古界/step6a_density_volume/output/taigu_step6a_attribute_v3_full_v4/volume/trace_mapping.npz",
   "demo_grid_csv": "/home/tyh/projects/petroleum/code/GAN-DFN/太古界/common/attribute_demo_grid/output/taigu_attribute_demo_grid_v2_405center/attribute_demo_grid.csv",
