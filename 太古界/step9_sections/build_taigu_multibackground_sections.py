@@ -56,10 +56,14 @@ HORIZONS = (
 #   DFN 裂缝片按层段着色（橙/蓝）、尺度用灰阶三档线宽、成像解释带 Step3 前缀、
 #   图例整体移到数据区外侧（不打在剖面上）。
 DFN_LAYER_COLORS = {"上部复合层": "#ff7a00", "太古界风化壳": "#00a6ff"}
+# 尺度靠线宽区分：小/中/大差距拉开到 4 倍（0.9 / 2.2 / 4.2 pt），
+# 大尺度另外加深色描边，避免"一条缝看不出属于哪个尺度"。
+DFN_SCALE_WIDTH = {"small": 0.9, "medium": 2.2, "large": 4.2}
+LARGE_SCALE_HALO_COLOR = "#111827"
 SCALE_LEGEND_STYLES = {
-    "small": ("#9ca3af", 2.0, "小尺度裂缝"),
-    "medium": ("#6b7280", 2.6, "中尺度裂缝"),
-    "large": ("#374151", 2.6, "大尺度裂缝"),
+    "small": ("#9ca3af", 1.4, "小尺度裂缝（细线）"),
+    "medium": ("#6b7280", 3.0, "中尺度裂缝（中线）"),
+    "large": ("#374151", 5.4, "大尺度裂缝（粗线+描边）"),
 }
 IMAGING_POINT_COLOR = "#ff00e6"
 IMAGING_PATCH_COLOR = "#ff2bd6"
@@ -68,9 +72,15 @@ IMAGING_TRACK_COLOR = "#00f5ff"
 IMAGING_TRACK_GLOW = "#083344"
 FAULT_TRACE_COLOR = "#ffe600"
 FAULT_TRACE_HALO = "#111827"
-STEP4_POINT_COLOR = "#22c55e"
+CONVENTIONAL_LOG_COLOR = "#16a34a"
+STEP4_POINT_COLOR = "#a3e635"
 STEP4_POINT_EDGE = "#0f172a"
 OVERLAY_TIME_SCALE_M_PER_MS = 2.0
+WELL_TRACK_COLOR = "#111827"
+WELL_TRACK_HALO = "#f8fafc"
+ORIENTATION_TICK_COLOR = "#ff00e6"
+ORIENTATION_TICK_MIN_M = 22.0
+ORIENTATION_TICK_MAX_M = 55.0
 SCOPE_LABELS = {"overview": "5 km Demo区", "local_200m": "井周200 m"}
 CHINESE_FONT_CANDIDATES = (
     "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
@@ -368,6 +378,48 @@ def _read_polydata_impl(path: Path) -> tuple[np.ndarray, np.ndarray]:
     return points, triangle_array
 
 
+def imaging_orientation_ticks(imaging: pd.DataFrame, projection: str,
+                              min_length_m: float = ORIENTATION_TICK_MIN_M,
+                              max_length_m: float = ORIENTATION_TICK_MAX_M) -> list[list[list[float]]]:
+    """成像测井裂缝产状符号：沿"视倾角方向"画短线，线长随倾角增大。
+
+    构造裂缝面的倾向矢量（倾角 δ、方位 α），投影到当前剖面平面内
+    （XZ 去掉 Y 分量、YZ 去掉 X 分量），得到该裂缝在剖面上的视倾角方向；
+    线长按 δ 从 min_length_m 线性增长到 max_length_m（度量空间，1 ms = 2 m）。
+    这样"倾向"体现为短线朝哪一侧倾斜，"倾角"体现为短线的陡缓与长短。
+    """
+    if imaging.empty or not {"FracAzimuth", "FracDip"}.issubset(imaging.columns):
+        return []
+    h_index = 0 if projection == "XZ" else 1
+    view_index = 1 if projection == "XZ" else 0
+    ticks: list[list[list[float]]] = []
+    for row in imaging.itertuples(index=False):
+        azimuth = math.radians(float(row.FracAzimuth))
+        dip = math.radians(float(row.FracDip))
+        dip_direction = np.array([-math.sin(azimuth), math.cos(azimuth), 0.0])
+        # 度量空间取 (X, Y, -TIME*2)，"上"为正，因此倾向矢量的垂向分量为 -cos(dip)
+        vector = np.array([
+            math.sin(dip) * dip_direction[0],
+            math.sin(dip) * dip_direction[1],
+            -math.cos(dip),
+        ])
+        vector[view_index] = 0.0  # 投影到剖面平面
+        norm = float(np.linalg.norm(vector))
+        if norm <= 1.0e-9:
+            continue
+        vector = vector / norm
+        length = min_length_m + (max_length_m - min_length_m) * (dip / (math.pi / 2.0))
+        half = length / 2.0
+        center_h = float(row.X) if projection == "XZ" else float(row.Y)
+        center_t = float(row.TIME)
+        delta_h = half * vector[h_index]
+        delta_t = -half * vector[2] / OVERLAY_TIME_SCALE_M_PER_MS
+        ticks.append(
+            [[center_h - delta_h, center_t - delta_t], [center_h + delta_h, center_t + delta_t]]
+        )
+    return ticks
+
+
 def _decode_id_array(payload: bytes) -> np.ndarray:
     """按 int32/int64 两种可能解码 VTK id 数组：取"首值为 0 且单调不减"的那一种。"""
     for dtype, width in ((">i4", 4), (">i8", 8)):
@@ -600,15 +652,14 @@ def horizon_curves(horizon: pd.DataFrame, track: pd.DataFrame, coords: np.ndarra
 
 
 def patch_segments(patches: pd.DataFrame, track: pd.DataFrame, projection: str,
-                   half_width: float) -> tuple[list[list[list[float]]], list[str], list[float]]:
+                   half_width: float) -> tuple[list[list[list[float]]], list[str], list[float], list[str]]:
     centers_t = patches["CenterTime"].to_numpy(np.float64)
     perpendicular = "Y" if projection == "XZ" else "X"
     center_perp = patches[f"Center{perpendicular}"].to_numpy(np.float64)
     well_perp = interp_track(track, centers_t, perpendicular)
     selected = patches[np.abs(center_perp - well_perp) <= half_width]
-    segments, colors, widths = [], [], []
+    segments, colors, widths, scales = [], [], [], []
     color = dict(DFN_LAYER_COLORS)
-    width = {"small": .55, "medium": 1.0, "large": 1.7}
     for row in selected.itertuples(index=False):
         cx = float(row.CenterX if projection == "XZ" else row.CenterY)
         ct = float(row.CenterTime)
@@ -624,8 +675,10 @@ def patch_segments(patches: pd.DataFrame, track: pd.DataFrame, projection: str,
         half = min(length, 500.0) / 2
         segments.append([[cx - half * lateral, ct - half * vertical], [cx + half * lateral, ct + half * vertical]])
         colors.append(color.get(str(row.LayerGroup), "#7b1fa2"))
-        widths.append(width.get(str(row.FractureScale), .8))
-    return segments, colors, widths
+        scale_key = str(row.FractureScale)
+        scales.append(scale_key)
+        widths.append(DFN_SCALE_WIDTH.get(scale_key, 0.9))
+    return segments, colors, widths, scales
 
 
 def draw_overlays(ax, projection: str, coords: np.ndarray, times: np.ndarray, track: pd.DataFrame,
@@ -649,10 +702,23 @@ def draw_overlays(ax, projection: str, coords: np.ndarray, times: np.ndarray, tr
                                          linestyles=fault_style))
         ax.plot([], [], color=FAULT_TRACE_COLOR, lw=2.5, linestyle=fault_style, label="原始断层")
     real_track = (times >= float(track["TIME"].min())) & (times <= float(track["TIME"].max()))
-    ax.plot(well_h[real_track], times[real_track], color="black", lw=1.8,
-            label="埕北古斜405井轨迹（成像段）", zorder=10)
-    segments, colors, widths = patch_segments(patches, track, projection, half_width)
+    # 常规测井段（Step2 的 405 常规测井采样区间）：绿色加粗虚线，独立于成像井段
+    conventional_label = "埕北古斜405常规测井段"
+    ax.plot(well_h[real_track], times[real_track], color=CONVENTIONAL_LOG_COLOR, lw=7.5,
+            linestyle=(0, (7, 3)), alpha=0.9, zorder=10.05, label=conventional_label)
+    # 井轨迹：浅色描边 + 深色实线，画在叠加层最上面，保证在密集裂缝片之上仍可辨认
+    ax.plot(well_h[real_track], times[real_track], color=WELL_TRACK_HALO, lw=3.6, alpha=0.9, zorder=12.4)
+    ax.plot(well_h[real_track], times[real_track], color=WELL_TRACK_COLOR, lw=2.0,
+            label="埕北古斜405井轨迹", zorder=12.45)
+    segments, colors, widths, scales = patch_segments(patches, track, projection, half_width)
     if segments:
+        large_index = [index for index, scale in enumerate(scales) if scale == "large"]
+        if large_index:
+            ax.add_collection(LineCollection(
+                [segments[index] for index in large_index],
+                colors=LARGE_SCALE_HALO_COLOR,
+                linewidths=[widths[index] + 2.6 for index in large_index],
+                alpha=.55, zorder=6.9))
         ax.add_collection(LineCollection(segments, colors=colors, linewidths=widths, alpha=.82, zorder=7))
         for layer, layer_color in DFN_LAYER_COLORS.items():
             ax.plot([], [], color=layer_color, lw=2.0, label=f"DFN裂缝片：{layer}")
@@ -670,24 +736,52 @@ def draw_overlays(ax, projection: str, coords: np.ndarray, times: np.ndarray, tr
             float(config.get("imaging_patch_length_m", 45.0)),
             float(config.get("imaging_patch_aspect_ratio", 1.5)),
         )
+        orientation_ticks = imaging_orientation_ticks(
+            shown, projection,
+            float(config.get("orientation_tick_min_m", ORIENTATION_TICK_MIN_M)),
+            float(config.get("orientation_tick_max_m", ORIENTATION_TICK_MAX_M)),
+        )
         if patch_lines:
             ax.add_collection(LineCollection(patch_lines, colors=IMAGING_PATCH_HALO, linewidths=3.0,
                                              alpha=0.40, zorder=10.4))
             ax.add_collection(LineCollection(patch_lines, colors=IMAGING_PATCH_COLOR, linewidths=1.8,
                                              alpha=0.62, zorder=10.5,
                                              label="Step3真实成像裂缝解释片（按产状）"))
+        if orientation_ticks:
+            ax.add_collection(LineCollection(orientation_ticks, colors="#111827", linewidths=3.4,
+                                             alpha=0.55, zorder=11.1))
+            ax.add_collection(LineCollection(orientation_ticks, colors=ORIENTATION_TICK_COLOR, linewidths=1.5,
+                                             alpha=0.95, zorder=11.2,
+                                             label="Step3成像裂缝产状（视倾角方向，长度∝倾角）"))
         ax.scatter(shown[hcol], shown["TIME"], marker="^", c=IMAGING_POINT_COLOR, s=9,
                    label="Step3成像测井裂缝点", zorder=11)
     else:
         shown = imaging
-    # 成像测井井段轨迹（青线）与常规测井裂缝点位（Step4 预测）
+        orientation_ticks = []
+    # 段区间标注：常规测井段（绿）/ 成像测井段（青）。405 两者几乎完全重叠，
+    # 直接画在井轨迹上会互相遮盖，因此统一用剖面左缘的区间标尺表示；
+    # 常规测井裂缝点位（Step4 预测）仍直接画在井上。
     kept_imaging = int(len(shown))
-    if len(imaging) >= 2:
-        order = imaging.sort_values("TIME")
-        hcol = "X" if projection == "XZ" else "Y"
-        ax.plot(order[hcol], order["TIME"], color=IMAGING_TRACK_GLOW, lw=5.2, alpha=0.78, zorder=7)
-        ax.plot(order[hcol], order["TIME"], color=IMAGING_TRACK_COLOR, lw=2.8, alpha=0.96, zorder=8,
-                label="Step3成像测井井段轨迹")
+    span = float(coords[-1] - coords[0])
+    bracket_intervals = [
+        ("埕北古斜405常规测井段", float(track["TIME"].min()), float(track["TIME"].max()),
+         CONVENTIONAL_LOG_COLOR, 0.0),
+    ]
+    if len(imaging):
+        bracket_intervals.append(
+            ("Step3成像测井段", float(imaging["TIME"].min()), float(imaging["TIME"].max()),
+             IMAGING_TRACK_COLOR, 1.0)
+        )
+    for label, time_min, time_max, color, slot in bracket_intervals:
+        x_at = float(coords[0]) + (0.012 + 0.020 * slot) * span
+        cap = 0.008 * span
+        ax.plot([x_at, x_at], [time_min, time_max], color="#f8fafc", lw=5.2, alpha=0.9, zorder=12.0)
+        ax.plot([x_at, x_at], [time_min, time_max], color=color, lw=3.0, zorder=12.1)
+        for endpoint in (time_min, time_max):
+            ax.plot([x_at - cap, x_at + cap], [endpoint, endpoint], color=color, lw=3.0, zorder=12.1)
+        ax.text(x_at + cap * 1.6, 0.5 * (time_min + time_max),
+                f"{label} {time_min:.0f}–{time_max:.0f} ms", color=color, fontsize=7.4,
+                rotation=90, ha="center", va="center", zorder=12.2)
     step4_count = 0
     if step4 is not None and len(step4):
         perp = "Y" if projection == "XZ" else "X"
@@ -696,13 +790,23 @@ def draw_overlays(ax, projection: str, coords: np.ndarray, times: np.ndarray, tr
         step4_count = int(len(selected))
         if step4_count:
             hcol = "X" if projection == "XZ" else "Y"
-            ax.scatter(selected[hcol], selected["TIME"], marker="o", s=9, c=STEP4_POINT_COLOR,
-                       edgecolors=STEP4_POINT_EDGE, linewidths=0.4, zorder=10.8,
+            # 常规测井裂缝点画在井轨迹之上：它与井轨迹完全重合，
+            # 若压在轨迹下面会被描边吃掉，只能看到零星几个点。
+            ax.scatter(selected[hcol], selected["TIME"], marker="o", s=42, c=STEP4_POINT_COLOR,
+                       edgecolors=STEP4_POINT_EDGE, linewidths=0.8, zorder=12.6,
                        label="Step4常规测井裂缝点（预测）")
     return {
         "dfn_segment_count": len(segments),
         "imaging_point_count": kept_imaging,
         "imaging_patch_count": len(patch_lines),
+        "imaging_orientation_tick_count": len(orientation_ticks),
+        "conventional_log_interval_ms": [
+            float(track["TIME"].min()),
+            float(track["TIME"].max()),
+        ],
+        "dfn_scale_segment_counts": {
+            scale: int(scales.count(scale)) for scale in ("small", "medium", "large")
+        },
         "fault_segment_count": len(fault_segments),
         "step4_point_count": step4_count,
     }
