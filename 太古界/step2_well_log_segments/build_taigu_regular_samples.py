@@ -38,7 +38,28 @@ STRATA_UPPER = "上部复合层"
 STRATA_LOWER = "太古界风化壳"
 OUT_OF_TARGET = "OUT_OF_TARGET"
 
-SEGMENT_COLUMNS = ["MD", "TVD", "X", "Y", "TIME", "StrataName", "GR", "RD", "RS"]
+# v5：井段列增加"层位时间 + 取样窗口标记"，把"成像段管标签、层位段管预测"固化到数据里。
+WINDOW_COLUMNS = [
+    "TopTime", "MiddleTime", "BottomTime",
+    "InImagingInterval", "InHorizonLayer", "UseCase",
+    "LayerGroupByHorizon", "LayerGroupByImaging", "ImagingTVDMin", "ImagingTVDMax",
+]
+SEGMENT_COLUMNS = ["MD", "TVD", "X", "Y", "TIME", "StrataName", "GR", "RD", "RS"] + WINDOW_COLUMNS
+
+
+def fill_window_defaults(log: pd.DataFrame) -> pd.DataFrame:
+    """常规井没有成像标记：层内行统一记 layer_only，层位层属=StrataName。"""
+    out = log.copy()
+    defaults: dict[str, object] = {
+        "TopTime": np.nan, "MiddleTime": np.nan, "BottomTime": np.nan,
+        "InImagingInterval": 0, "InHorizonLayer": 1, "UseCase": "layer_only",
+        "LayerGroupByHorizon": out["StrataName"], "LayerGroupByImaging": "",
+        "ImagingTVDMin": np.nan, "ImagingTVDMax": np.nan,
+    }
+    for column, default in defaults.items():
+        if column not in out.columns:
+            out[column] = default
+    return out
 
 
 def parse_args() -> argparse.Namespace:
@@ -191,20 +212,95 @@ def read_las_dev_azim(path: Path) -> np.ndarray | None:
     return np.array(rows) if rows else None
 
 
+def read_prn_dev_azim(path: Path) -> np.ndarray | None:
+    """读取"补充井位曲线"PRN 的 DEPTH/DEV/AZIM（按表头名取列）。
+
+    各井 PRN 的列集与列序都不一致（有的 AZIM 在前、有的没有 DEV/AZIM），
+    因此必须按表头取列，不能按列号。甲方建模用的就是这份曲线。
+    """
+    header: list[str] | None = None
+    rows: list[list[float]] = []
+    for raw in Path(path).read_text(encoding="utf-8", errors="ignore").splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        if line.startswith("#"):
+            columns = [column.upper() for column in line.lstrip("#").split()]
+            if {"DEPTH", "DEV", "AZIM"}.issubset(set(columns)):
+                header = columns
+            continue
+        if header is None:
+            continue
+        values = line.split()
+        if len(values) < len(header):
+            continue
+        try:
+            rows.append([
+                float(values[header.index("DEPTH")]),
+                float(values[header.index("DEV")]),
+                float(values[header.index("AZIM")]),
+            ])
+        except (ValueError, IndexError):
+            continue
+    if not rows:
+        return None
+    return np.asarray(rows, dtype=float)
+
+
+def integrate_dev_azim(md: np.ndarray, dev_deg: np.ndarray, azim_deg: np.ndarray,
+                       wellhead_xy: tuple[float, float]) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """由测斜曲线积分出 TVD/X/Y。
+
+    方位角约定（2026-09-18 修正）：测斜方位角自正北起顺时针，X=东、Y=北，
+        dX = sin(DEV) * sin(AZIM) * dMD
+        dY = sin(DEV) * cos(AZIM) * dMD
+    旧实现误用 (cos, sin)，会把水平位移镜像到错误的方位（实测最大偏 847 m）。
+    积分起点取测斜曲线最浅的一点，X/Y 用井口坐标锚定。
+    """
+    md = np.asarray(md, dtype=float)
+    dev = np.radians(np.asarray(dev_deg, dtype=float))
+    azim = np.radians(np.asarray(azim_deg, dtype=float))
+    step = np.diff(md)
+    x0, y0 = float(wellhead_xy[0]), float(wellhead_xy[1])
+    tvd = np.concatenate([[md[0]], md[0] + np.cumsum(np.cos(dev[1:]) * step)])
+    x = np.concatenate([[x0], x0 + np.cumsum(np.sin(dev[1:]) * np.sin(azim[1:]) * step)])
+    y = np.concatenate([[y0], y0 + np.cumsum(np.sin(dev[1:]) * np.cos(azim[1:]) * step)])
+    return tvd, x, y
+
+
+def index_prn_files(roots: list[Path]) -> dict[str, Path]:
+    """按井代码索引"补充井位曲线-*"目录下的 PRN 文件。"""
+    index: dict[str, Path] = {}
+    for root in roots:
+        if not root.exists():
+            continue
+        for path in sorted(root.glob("*.prn")):
+            index.setdefault(path.stem.upper(), path)
+    return index
+
+
 def build_trajectory(well: str, well_code: str, las_files: list[Path], deviation_dir: Path,
-                     wellhead_xy: tuple[float, float], bottom_xy: tuple[float, float] | None = None) -> dict[str, Any]:
-    """Return MD->(TVD,X,Y) mapping with provenance; vertical fallback is exact for vertical wells."""
+                     wellhead_xy: tuple[float, float], bottom_xy: tuple[float, float] | None = None,
+                     prn_path: Path | None = None) -> dict[str, Any]:
+    """Return MD->(TVD,X,Y) mapping with provenance.
+
+    来源优先级（2026-09-18 冻结）：甲方声明直井 > 官方井斜文件 > 补充井位曲线 PRN > 直井假设。
+    LAS 内 DEV/AZIM 拼接积分已停用（多年份拼接 + 方位角约定错误，见问题记录 0.28/0.29）。
+    """
+    x0, y0 = float(wellhead_xy[0]), float(wellhead_xy[1])
     if bottom_xy is not None:
         lateral = np.hypot(bottom_xy[0] - wellhead_xy[0], bottom_xy[1] - wellhead_xy[1])
         if lateral <= 5.0:
             return {
                 "source": "vertical_assumption",
+                "path": "",
                 "md": np.array([], dtype=float),
                 "tvd": np.array([], dtype=float),
                 "x": np.array([], dtype=float),
                 "y": np.array([], dtype=float),
                 "start_md": np.nan,
                 "inc_median_deg": 0.0,
+                "validation": "ok",
                 "note": f"wellhead_bottom_lateral_offset_{lateral:.2f}m_le_5m",
             }
     if well_code:
@@ -213,52 +309,58 @@ def build_trajectory(well: str, well_code: str, las_files: list[Path], deviation
             track = read_deviation_file(dev_file)
             if len(track) >= 2:
                 inc = np.degrees(np.arccos(np.clip(np.diff(track.TVD.to_numpy()) / np.maximum(np.diff(track.MD.to_numpy()), 1e-9), -1, 1)))
+                anchor = float(np.hypot(track.X.iloc[0] - x0, track.Y.iloc[0] - y0))
                 return {
                     "source": "deviation_file",
+                    "path": str(dev_file),
                     "md": track.MD.to_numpy(float),
                     "tvd": track.TVD.to_numpy(float),
                     "x": track.X.to_numpy(float),
                     "y": track.Y.to_numpy(float),
                     "start_md": float(track.MD.min()),
                     "inc_median_deg": float(np.median(inc)) if len(inc) else np.nan,
+                    "anchor_delta_m": anchor,
+                    "validation": "ok" if anchor <= 5.0 else f"anchor_delta_{anchor:.1f}m",
+                    "note": "第一点应与井口坐标一致",
                 }
-    frames = []
-    for f in las_files:
-        a = read_las_dev_azim(f)
-        if a is None:
-            continue
-        ok = np.isfinite(a[:, 1]) & np.isfinite(a[:, 2]) & (a[:, 1] >= 0) & (a[:, 1] < 90)
-        if ok.sum() < 50:
-            continue
-        frames.append(a[ok])
-    if frames:
-        a = np.concatenate(frames)
-        a = a[np.argsort(a[:, 0], kind="stable")]
-        _, first = np.unique(a[:, 0], return_index=True)
-        a = a[first]
-        dep, dev, az = a[:, 0], np.radians(a[:, 1]), np.radians(a[:, 2])
-        d = np.diff(dep)
-        tvd = np.concatenate([[dep[0]], dep[0] + np.cumsum(np.cos(dev[1:]) * d)])
-        x0, y0 = wellhead_xy
-        x = np.concatenate([[x0], x0 + np.cumsum(np.sin(dev[1:]) * np.cos(az[1:]) * d)])
-        y = np.concatenate([[y0], y0 + np.cumsum(np.sin(dev[1:]) * np.sin(az[1:]) * d)])
-        return {
-            "source": "las_dev_integration",
-            "md": dep,
-            "tvd": tvd,
-            "x": x,
-            "y": y,
-            "start_md": float(dep[0]),
-            "inc_median_deg": float(np.degrees(np.median(dev[1:]))),
-        }
+    if prn_path is not None and Path(prn_path).exists():
+        raw = read_prn_dev_azim(Path(prn_path))
+        if raw is not None:
+            ok = (
+                np.isfinite(raw[:, 1]) & np.isfinite(raw[:, 2])
+                & (raw[:, 1] >= 0.0) & (raw[:, 1] < 90.0)
+                & (raw[:, 2] >= 0.0) & (raw[:, 2] <= 360.0)
+            )
+            raw = raw[ok]
+            raw = raw[np.argsort(raw[:, 0], kind="stable")]
+            _, first = np.unique(raw[:, 0], return_index=True)
+            raw = raw[first]
+            if len(raw) >= 50:
+                tvd, x, y = integrate_dev_azim(raw[:, 0], raw[:, 1], raw[:, 2], wellhead_xy)
+                return {
+                    "source": "prn_dev_azim",
+                    "path": str(prn_path),
+                    "md": raw[:, 0],
+                    "tvd": tvd,
+                    "x": x,
+                    "y": y,
+                    "start_md": float(raw[0, 0]),
+                    "inc_median_deg": float(np.median(raw[:, 1])),
+                    "anchor_delta_m": 0.0,
+                    "validation": "ok",
+                    "note": "起点(最浅测斜点)按井口坐标锚定，方位角自北起顺时针",
+                }
     return {
         "source": "vertical_assumption",
+        "path": "",
         "md": np.array([], dtype=float),
         "tvd": np.array([], dtype=float),
         "x": np.array([], dtype=float),
         "y": np.array([], dtype=float),
         "start_md": np.nan,
         "inc_median_deg": np.nan,
+        "validation": "ok",
+        "note": "no_deviation_file_no_prn",
     }
 
 
@@ -300,6 +402,62 @@ def imaging_strata_mask(df: pd.DataFrame, contract_row: pd.Series) -> pd.Series:
         inside |= df["TVD"].ge(float(lo)) & df["TVD"].le(float(hi))
     result.loc[~inside] = OUT_OF_TARGET
     return result
+
+
+def classify_imaging_window(log: pd.DataFrame, contract_row: pd.Series,
+                            surfaces: dict[str, Any]) -> pd.DataFrame:
+    """成像井取样窗口（v5）：甲方成像解释区间 ∪ 层位合同区间。
+
+    旧口径把甲方成像 TVD 区间直接当取样窗口，导致"层内但成像段之外"的常规测井
+    （405 是 MD 4557.9–4812.6）被丢弃、也无法在成像段之外预测。v5 改成并集，
+    并逐行打标记，由下游按用途取用：
+
+    * ``InImagingInterval``：TVD 落在甲方成像解释区间内（有监督标签的候选行）；
+    * ``InHorizonLayer``  ：TIME 落在沿线层位 [Top, Base] 内（可进 DFN 的行）；
+    * ``UseCase``         ：``both`` / ``imaging_only`` / ``layer_only``；
+    * ``StrataName``      ：成像区间内用甲方层属，否则用层位层属（保持监督口径不变）。
+    """
+    out = log.copy()
+    intervals = json.loads(contract_row.InterpretedTVDIntervals or "[]")
+    tvd = pd.to_numeric(out["TVD"], errors="coerce")
+    in_imaging = pd.Series(False, index=out.index)
+    for lo, hi in intervals:
+        in_imaging |= tvd.between(float(lo), float(hi))
+    out["InImagingInterval"] = in_imaging.astype(int)
+    out["ImagingTVDMin"] = float(contract_row.InterpretedTVDMin) if pd.notna(contract_row.InterpretedTVDMin) else np.nan
+    out["ImagingTVDMax"] = float(contract_row.InterpretedTVDMax) if pd.notna(contract_row.InterpretedTVDMax) else np.nan
+    out["LayerGroupByImaging"] = imaging_strata_mask(out, contract_row)
+
+    top = np.full(len(out), np.nan)
+    middle = np.full(len(out), np.nan)
+    bottom = np.full(len(out), np.nan)
+    pos = out["TIME"].notna() & out["X"].notna() & out["Y"].notna()
+    if pos.any():
+        query = out.loc[pos, ["X", "Y"]].to_numpy(float)
+        top[pos.to_numpy()] = query_surface(surfaces["top"], query)["SurfaceTime"].to_numpy(float)
+        middle[pos.to_numpy()] = query_surface(surfaces["middle"], query)["SurfaceTime"].to_numpy(float)
+        bottom[pos.to_numpy()] = query_surface(surfaces["bottom"], query)["SurfaceTime"].to_numpy(float)
+    out["TopTime"] = top
+    out["MiddleTime"] = middle
+    out["BottomTime"] = bottom
+    time_values = pd.to_numeric(out["TIME"], errors="coerce").to_numpy(float)
+    in_horizon = np.isfinite(time_values) & (time_values >= top) & (time_values <= bottom)
+    out["InHorizonLayer"] = in_horizon.astype(int)
+    horizon_group = pd.Series(OUT_OF_TARGET, index=out.index, dtype="object")
+    horizon_group.loc[in_horizon & (time_values < middle)] = STRATA_UPPER
+    horizon_group.loc[in_horizon & (time_values >= middle)] = STRATA_LOWER
+    out["LayerGroupByHorizon"] = horizon_group
+
+    keep = out["InImagingInterval"].eq(1) | out["InHorizonLayer"].eq(1)
+    out = out[keep].copy()
+    imaging_label = out["LayerGroupByImaging"].astype(str)
+    use_imaging = out["InImagingInterval"].eq(1) & ~imaging_label.isin({OUT_OF_TARGET, "", "nan", "None"})
+    out["StrataName"] = np.where(use_imaging, imaging_label, out["LayerGroupByHorizon"].astype(str))
+    out["UseCase"] = np.where(
+        out["InImagingInterval"].eq(1) & out["InHorizonLayer"].eq(1), "both",
+        np.where(out["InImagingInterval"].eq(1), "imaging_only", "layer_only"),
+    )
+    return out
 
 
 def source_intervals(frame: pd.DataFrame, gap_factor: float) -> list[tuple[float, float]]:
@@ -366,7 +524,9 @@ def make_segment(well: str, source_kind: str, seg_seq: int, source_path: Path, l
     seg_id = f"{well}_seg_{seg_seq:03d}"
     out_path = well_dir / f"{seg_id}.csv"
     well_dir.mkdir(parents=True, exist_ok=True)
-    log[SEGMENT_COLUMNS].to_csv(out_path, index=False, encoding="utf-8-sig")
+    fill_window_defaults(log)[SEGMENT_COLUMNS].to_csv(out_path, index=False, encoding="utf-8-sig")
+    strata_counts = log["StrataName"].value_counts().to_dict()
+    use_case_counts = log["UseCase"].value_counts().to_dict() if "UseCase" in log.columns else {}
     strata_names = "|".join(sorted(log.StrataName.drop_duplicates().astype(str)))
     complete_rows = int(len(log))
     row = {
@@ -392,6 +552,8 @@ def make_segment(well: str, source_kind: str, seg_seq: int, source_path: Path, l
         "TIMEValidRows": int(log.TIME.notna().sum()),
         "XYValidRows": int((log.X.notna() & log.Y.notna()).sum()),
         "StrataNames": strata_names,
+        "UseCaseCounts": json.dumps({str(k): int(v) for k, v in use_case_counts.items()}, ensure_ascii=False),
+        "LayerRowCounts": json.dumps({str(k): int(v) for k, v in strata_counts.items()}, ensure_ascii=False),
         "InTarget": True,
         "TimeDepthSource": td_source,
         "BorrowedFrom": borrowed_from,
@@ -401,6 +563,46 @@ def make_segment(well: str, source_kind: str, seg_seq: int, source_path: Path, l
         "OutputFilePath": str(out_path),
     }
     return row, seg_id
+
+
+def imaging_window_audit(well: str, well_dir: Path) -> dict[str, Any]:
+    """统计成像井四块取样窗口（both / imaging_only / layer_only）的边界与行数。
+
+    v5 口径：取样窗口 = 甲方成像区间 ∪ 层位区间；本表用于核对"成像段管标签、
+    层位段管预测"是否按预期切分（405 的验收依据）。
+    """
+    frames = []
+    for path in sorted(well_dir.glob(f"{well}_seg_*.csv")):
+        try:
+            frames.append(pd.read_csv(path, encoding="utf-8-sig"))
+        except Exception:
+            continue
+    out: dict[str, Any] = {}
+    if not frames:
+        for case in ("both", "imaging_only", "layer_only"):
+            out[f"{case}Rows"] = 0
+            out[f"{case}MD"] = ""
+            out[f"{case}TVD"] = ""
+            out[f"{case}TIME"] = ""
+        out["TotalRows"] = 0
+        return out
+    data = pd.concat(frames, ignore_index=True)
+    use_case = data["UseCase"].astype(str) if "UseCase" in data.columns else pd.Series("", index=data.index)
+    for case in ("both", "imaging_only", "layer_only"):
+        sub = data[use_case.eq(case)]
+        out[f"{case}Rows"] = int(len(sub))
+        if sub.empty:
+            out[f"{case}MD"] = ""
+            out[f"{case}TVD"] = ""
+            out[f"{case}TIME"] = ""
+            continue
+        out[f"{case}MD"] = "%.1f–%.1f" % (sub.MD.min(), sub.MD.max())
+        out[f"{case}TVD"] = "%.1f–%.1f" % (sub.TVD.min(), sub.TVD.max())
+        out[f"{case}TIME"] = "%.1f–%.1f" % (sub.TIME.min(), sub.TIME.max())
+    out["TotalRows"] = int(len(data))
+    out["ImagingIntervalRows"] = int(data["InImagingInterval"].sum()) if "InImagingInterval" in data.columns else 0
+    out["HorizonLayerRows"] = int(data["InHorizonLayer"].sum()) if "InHorizonLayer" in data.columns else 0
+    return out
 
 
 def process_well_segments(well: str, source_kind: str, candidates: list[tuple[Path, pd.DataFrame, dict[str, str | None], int]],
@@ -456,6 +658,9 @@ def main() -> int:
     imaging_coords = {str(k): (float(v[0]), float(v[1])) for k, v in cfg.get("imaging_well_coords", {}).items()}
     borrow = {str(k): str(v) for k, v in cfg.get("imaging_time_depth_borrow", {}).items()}
     deviation_dir = Path(cfg["deviation_dir"])
+    prn_index = index_prn_files([Path(x) for x in cfg.get("supplement_prn_roots", [])])
+    imaging_well_codes = {str(k): str(v) for k, v in cfg.get("imaging_well_codes", {}).items()}
+    print(f"[step2] PRN 索引 {len(prn_index)} 个文件；轨迹优先级=甲方直井>井斜文件>PRN>直井", flush=True)
 
     eligible_regular = {w: r for w, r in regular_by_well.items() if r.ContractStatus == "eligible"}
     regular_files = index_las_files([Path(x) for x in cfg["regular_las_roots"]], set(eligible_regular))
@@ -465,6 +670,7 @@ def main() -> int:
     windows = {str(k): [[float(a), float(b)] for a, b in v] for k, v in cfg.get("well_tvd_windows", {}).items()}
 
     segment_rows: list[dict[str, object]] = []
+    imaging_audit_rows: list[dict[str, object]] = []
     well_rows: list[dict[str, object]] = []
     rejected_rows: list[dict[str, object]] = []
     borrow_audit: dict[str, object] = {}
@@ -480,7 +686,10 @@ def main() -> int:
     for well, c in sorted(eligible_regular.items()):
         wellhead_xy = (float(c.WellX), float(c.WellY))
         bottom_xy = (float(c.BottomX), float(c.BottomY)) if pd.notna(c.BottomX) and pd.notna(c.BottomY) else None
-        traj = build_trajectory(well, str(c.WellCode), regular_files.get(well, []), deviation_dir, wellhead_xy, bottom_xy)
+        traj = build_trajectory(
+            well, str(c.WellCode), regular_files.get(well, []), deviation_dir, wellhead_xy, bottom_xy,
+            prn_path=prn_index.get(str(c.WellCode).upper()),
+        )
         trajectory_audit[well] = {"Source": traj["source"], "StartMD": traj["start_md"], "InclinationMedianDeg": traj["inc_median_deg"]}
         matched = regular_files.get(well, [])
         parsed, complete, candidates = 0, 0, []
@@ -511,6 +720,7 @@ def main() -> int:
             log["StrataName"] = classify_time(log, log.TopTime.to_numpy(), log.MiddleTime.to_numpy(), log.BottomTime.to_numpy())
             log = log[log.StrataName.ne(OUT_OF_TARGET)].copy()
             log = apply_tvd_windows(log, windows.get(well, []))
+            log = fill_window_defaults(log)
             if not log.empty:
                 candidates.append((path, log, meta, raw_rows))
         well_dir = out_dir / well
@@ -542,6 +752,9 @@ def main() -> int:
             "BoundaryTVD": np.nan, "StrataNames": "", "StrataEvidence": "", "HasExplicitMdBounds": "",
             "TrajectorySource": traj["source"], "TrajectoryStartMD": traj["start_md"],
             "InclinationMedianDeg": traj["inc_median_deg"],
+            "TrajectoryPath": traj.get("path", ""),
+            "TrajectoryValidation": traj.get("validation", ""),
+            "TrajectoryAnchorDeltaM": traj.get("anchor_delta_m", np.nan),
             "Step2Status": "eligible" if segs else "rejected",
             "RejectReason": reason, "SegmentCount": seg_count, "TotalRows": total_rows,
         })
@@ -584,7 +797,11 @@ def main() -> int:
 
         neighbor_row = regular_by_well.get(neighbor_name)
         dist = float(np.hypot(neighbor_row.WellX - coords[0], neighbor_row.WellY - coords[1])) if neighbor_row is not None else np.nan
-        traj = build_trajectory(well, "", imaging_files.get(well, []), deviation_dir, coords)
+        imaging_code = imaging_well_codes.get(well, "")
+        traj = build_trajectory(
+            well, imaging_code, imaging_files.get(well, []), deviation_dir, coords,
+            prn_path=prn_index.get(imaging_code.upper()) if imaging_code else None,
+        )
         trajectory_audit[well] = {"Source": traj["source"], "StartMD": traj["start_md"], "InclinationMedianDeg": traj["inc_median_deg"]}
 
         matched = imaging_files.get(well, [])
@@ -601,9 +818,10 @@ def main() -> int:
             log = apply_trajectory(log, traj, coords)
             log["TIME"] = interpolate_time_depth(neighbor_td, log["MD"].to_numpy(float))
             log = log[log.TVD.notna()].copy()
-            log["StrataName"] = imaging_strata_mask(log, ic)
-            log = log[log.StrataName.ne(OUT_OF_TARGET)].copy()
+            # v5：取样窗口 = 甲方成像区间 ∪ 层位区间（并集），并逐行打标记
+            log = classify_imaging_window(log, ic, surfaces)
             log = apply_tvd_windows(log, windows.get(well, []))
+            log = log[log.StrataName.isin({STRATA_UPPER, STRATA_LOWER})].copy()
             if not log.empty:
                 candidates.append((path, log, meta, raw_rows))
 
@@ -620,6 +838,8 @@ def main() -> int:
             borrow_code or "", dist, coverage, traj["source"], out_dir, well_dir
         )
         segment_rows.extend(segs)
+        window_audit = imaging_window_audit(well, well_dir)
+        imaging_audit_rows.append({"WellName": well, **window_audit})
         reason = ""
         if not segs:
             if not matched:
@@ -646,6 +866,10 @@ def main() -> int:
             "StrataNames": ic.StrataNames, "StrataEvidence": ic.StrataEvidence,
             "HasExplicitMdBounds": ic.HasExplicitMdBounds, "TrajectorySource": traj["source"],
             "TrajectoryStartMD": traj["start_md"], "InclinationMedianDeg": traj["inc_median_deg"],
+            "TrajectoryPath": traj.get("path", ""),
+            "TrajectoryValidation": traj.get("validation", ""),
+            "TrajectoryAnchorDeltaM": traj.get("anchor_delta_m", np.nan),
+            "ImagingWindow": json.dumps(window_audit, ensure_ascii=False),
             "Step2Status": "eligible" if segs else "rejected",
             "RejectReason": reason, "SegmentCount": seg_count, "TotalRows": total_rows,
         })
@@ -676,6 +900,9 @@ def main() -> int:
     manifest_df.to_csv(out_dir / "taigu_step2_segment_manifest.csv", index=False, encoding="utf-8-sig")
     well_df.to_csv(out_dir / "taigu_step2_well_metadata.csv", index=False, encoding="utf-8-sig")
     rejected_df.to_csv(out_dir / "taigu_step2_rejected_wells.csv", index=False, encoding="utf-8-sig")
+    pd.DataFrame(imaging_audit_rows).to_csv(
+        out_dir / "taigu_step2_imaging_window_audit.csv", index=False, encoding="utf-8-sig"
+    )
 
     rejected_counts = {str(k): int(v) for k, v in rejected_df.Reason.value_counts().items()} if not rejected_df.empty else {}
     summary = {
