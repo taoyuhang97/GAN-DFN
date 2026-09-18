@@ -362,6 +362,14 @@ def main() -> int:
     started = time.time()
     step4 = pd.read_csv(config["step4_merged_predictions_csv"], encoding="utf-8-sig")
     step4 = step4[step4["PredictionValid"].astype(int) == 1].copy()
+    # v5：下游（虚拟井/样本/DFN）只使用目标地层内的预测行；成像段超出层顶的部分
+    # （UseCase=imaging_only）只用于 Step4 的"预测 vs 成像真值"验证，不进 Step5/6。
+    if "InHorizonLayer" in step4.columns:
+        before = int(len(step4))
+        step4 = step4[
+            pd.to_numeric(step4["InHorizonLayer"], errors="coerce").fillna(0).astype(int).eq(1)
+        ].copy()
+        print(f"[step5] InHorizonLayer=1 过滤预测行：{before} → {len(step4)}", flush=True)
     for column in ("X", "Y", "TIME", "TVD", "PredDensity", "PredConditionalDensity", "PredHasFracture"):
         step4[column] = pd.to_numeric(step4[column], errors="coerce")
     step4 = step4.dropna(subset=["WellName", "TVD", "X", "Y", "TIME", "PredHasFracture"]).copy()
