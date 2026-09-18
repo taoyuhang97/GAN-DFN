@@ -47,7 +47,73 @@ LABEL_COLUMNS = [
     "HasFractureDensity", "GT_POINT_FLAG", "RawPointCount", "FracAzimuth", "FracDip",
     "DensityKind", "FractureScope", "DensitySourcePaths", "PointSourcePaths",
     "DensitySupportStatus", "SupervisionStatus", "SupervisionTier",
+    # v5：Step2 的取样窗口标记（成像段管标签、层位段管预测）
+    "InImagingInterval", "InHorizonLayer", "UseCase",
+    "LayerGroupByHorizon", "LayerGroupByImaging", "ImagingTVDMin", "ImagingTVDMax",
 ]
+
+WINDOW_COLUMNS = [
+    "InImagingInterval", "InHorizonLayer", "UseCase",
+    "LayerGroupByHorizon", "LayerGroupByImaging", "ImagingTVDMin", "ImagingTVDMax",
+]
+
+
+def ensure_window_columns(frame: pd.DataFrame) -> pd.DataFrame:
+    """兼容旧 Step2 产物：缺列时按"常规井"默认值补齐。"""
+    out = frame.copy()
+    defaults: dict[str, object] = {
+        "InImagingInterval": 0, "InHorizonLayer": 1, "UseCase": "layer_only",
+        "LayerGroupByHorizon": out.get("StrataName", ""), "LayerGroupByImaging": "",
+        "ImagingTVDMin": np.nan, "ImagingTVDMax": np.nan,
+    }
+    for column, default in defaults.items():
+        if column not in out.columns:
+            out[column] = default
+    return out
+
+
+def select_overlapping_passes(frames: list[pd.DataFrame], dates: list[str],
+                              policy: str = "prefer_newest_log_date") -> tuple[pd.DataFrame, dict[str, Any]]:
+    """同一口井多测次在深度上重叠时择一（v5 新增）。
+
+    Step2 按"一个 LAS 文件 = 一段"输出，405 的两份 2016 年测井在
+    TVD 3729–3998 完全重叠且深度网格错开 0.02 m，直接拼接会让同一深度
+    出现两条不同批次的样本（采样密度 8 行/m → 16 行/m）。这里按测井日期
+    优先保留最新一次，旧测次只保留未被覆盖的深度段。
+    """
+    if not frames:
+        return pd.DataFrame(), {"policy": policy, "inputRows": 0, "keptRows": 0, "droppedRows": 0}
+    if not policy or policy == "keep_all" or len(frames) == 1:
+        merged = pd.concat(frames, ignore_index=True).sort_values("TVD").reset_index(drop=True)
+        return merged, {"policy": "keep_all", "inputRows": int(len(merged)), "keptRows": int(len(merged)),
+                        "droppedRows": 0, "contributions": []}
+    order = sorted(range(len(frames)), key=lambda index: str(dates[index]), reverse=True)
+    covered: list[tuple[float, float]] = []
+    kept_parts: list[pd.DataFrame] = []
+    contributions: list[dict[str, Any]] = []
+    input_rows = int(sum(len(frame) for frame in frames))
+    for index in order:
+        frame = frames[index]
+        depth = pd.to_numeric(frame["TVD"], errors="coerce").to_numpy(dtype=float)
+        keep = np.isfinite(depth)
+        for lo, hi in covered:
+            keep &= ~((depth >= lo) & (depth <= hi))
+        part = frame.loc[keep].copy()
+        if part.empty:
+            contributions.append({"logDate": str(dates[index]), "rows": 0, "TVD": ""})
+            continue
+        kept_parts.append(part)
+        lo, hi = float(part["TVD"].min()), float(part["TVD"].max())
+        covered = merge_ranges(covered + [(lo, hi)])
+        contributions.append({"logDate": str(dates[index]), "rows": int(len(part)), "TVD": "%.1f–%.1f" % (lo, hi)})
+    merged = pd.concat(kept_parts, ignore_index=True).sort_values("TVD").reset_index(drop=True) if kept_parts else pd.DataFrame()
+    return merged, {
+        "policy": policy,
+        "inputRows": input_rows,
+        "keptRows": int(len(merged)),
+        "droppedRows": int(input_rows - len(merged)),
+        "contributions": contributions,
+    }
 
 DEFAULT_SUPERVISION_TIERS = {
     "supervision_ready": "strong",
@@ -429,11 +495,17 @@ def main() -> int:
             continue
 
         frames = []
+        frame_dates = []
         for seg in segments.itertuples(index=False):
-            seg_df = pd.read_csv(seg.OutputFilePath, encoding="utf-8-sig")
+            seg_df = ensure_window_columns(pd.read_csv(seg.OutputFilePath, encoding="utf-8-sig"))
             seg_df["InputSegmentPath"] = str(seg.OutputFilePath)
             frames.append(seg_df)
-        base = pd.concat(frames, ignore_index=True).sort_values("TVD").reset_index(drop=True)
+            frame_dates.append(str(getattr(seg, "LogDate", "")))
+        base, dedupe_audit = select_overlapping_passes(
+            frames, frame_dates, str(cfg.get("overlapping_passes_policy", "prefer_newest_log_date"))
+        )
+        if base.empty:
+            continue
         coverage = merge_ranges([(float(frame.TVD.min()), float(frame.TVD.max())) for frame in frames])
         coverage_m = float(sum(hi - lo for lo, hi in coverage))
         density_depth = density.TVD.to_numpy(dtype=float)
@@ -441,10 +513,13 @@ def main() -> int:
         inside_mask = np.zeros(len(density), dtype=bool)
         for lo, hi in coverage:
             inside_mask |= (density_depth >= lo) & (density_depth <= hi)
-        labels = base[["MD", "TVD", "StrataName", "InputSegmentPath"]].copy()
+        labels = base[["MD", "TVD", "StrataName", "InputSegmentPath"] + WINDOW_COLUMNS].copy()
         labels["WellName"] = well
         labels["ImagingWindowID"] = lookup_window_id(labels.TVD.to_numpy(dtype=float), windows)
         labels["Density"] = interpolate_density(density, labels["TVD"], float(well_cfg["max_density_interpolation_gap_m"]))
+        # v5：只有落在甲方成像解释区间内的行才可能带标签；层内但成像段外的行标签为 NaN
+        imaging_mask = pd.to_numeric(labels["InImagingInterval"], errors="coerce").fillna(0).astype(int).eq(1)
+        labels.loc[~imaging_mask, "Density"] = np.nan
         in_window = labels["ImagingWindowID"].astype(str).ne("").to_numpy()
         labels["DensitySupportStatus"] = np.where(
             ~in_window,
@@ -610,6 +685,14 @@ def main() -> int:
             "AttachResidualMaxM": round(float(attach_stats["AttachResidualMaxM"]), 4) if attach_stats["AttachResidualMaxM"] == attach_stats["AttachResidualMaxM"] else None,
             "AttachedBeyondHalfStepRows": int(attach_stats["AttachedBeyondHalfStepRows"]),
             "SupervisionTier": supervision_tier,
+            # v5：多测次重叠择一审计
+            "OverlappingPassPolicy": dedupe_audit.get("policy"),
+            "RowsBeforeDedupe": int(dedupe_audit.get("inputRows", 0)),
+            "RowsDroppedByDedupe": int(dedupe_audit.get("droppedRows", 0)),
+            "DedupeContributions": json.dumps(dedupe_audit.get("contributions", []), ensure_ascii=False),
+            "ImagingIntervalRows": int(labels["InImagingInterval"].sum()),
+            "HorizonLayerRows": int(labels["InHorizonLayer"].sum()),
+            "UseCaseCounts": json.dumps(labels["UseCase"].value_counts().to_dict(), ensure_ascii=False),
         })
 
     group_df = pd.DataFrame(group_rows)

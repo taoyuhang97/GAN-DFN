@@ -466,6 +466,10 @@ def load_training_table(config: dict[str, Any]) -> pd.DataFrame:
         on=["WellName", "TVD", "SegmentID"], how="left", validate="one_to_one",
     )
     training = training[training.StrataName.isin(TARGET_STRATA)].copy()
+    # v5：训练样本显式限定"有成像标签的窗口"（both / imaging_only）。
+    # 层内但成像段外的行（UseCase=layer_only）标签为 NaN，只参与预测、不参与训练。
+    if "UseCase" in training.columns:
+        training = training[training["UseCase"].astype(str).isin({"both", "imaging_only"})].copy()
     return training
 
 
@@ -681,6 +685,8 @@ def _select_within_clusters(rows: pd.DataFrame, gap_break_m: float,
         "SourceCount", "SourceSegmentIDs", "SelectedSegmentID",
         "PredictionValid", "Stage1Threshold", "ExpertID", "PredHasFracture",
         "SupportSegmentID", "SegmentStartTVD", "SegmentEndTVD", "MergeRule",
+        # v5：取样窗口标记（供 Step5 只取 InHorizonLayer=1 的目标地层段）
+        "InImagingInterval", "InHorizonLayer", "UseCase",
     ]
     return selected[[column for column in columns if column in selected.columns]]
 
@@ -755,7 +761,15 @@ def merge_well_predictions(rows: pd.DataFrame, tolerance_m: float, gap_break_m: 
         PredictionValid=("PredictionValid", "first"),
         Stage1Threshold=("Stage1Threshold", "first"),
         ExpertID=("ExpertID", "first"),
+        # v5：把取样窗口标记透传到井级预测表，供 Step5 只取目标地层内（InHorizonLayer=1）
+        InImagingInterval=("InImagingInterval", "max"),
+        InHorizonLayer=("InHorizonLayer", "max"),
     ).reset_index(drop=True)
+    if {"InImagingInterval", "InHorizonLayer"}.issubset(agg.columns):
+        agg["UseCase"] = np.where(
+            agg["InImagingInterval"].eq(1) & agg["InHorizonLayer"].eq(1), "both",
+            np.where(agg["InImagingInterval"].eq(1), "imaging_only", "layer_only"),
+        )
     agg["PredHasFracture"] = (agg.PredFractureProb >= agg.Stage1Threshold).astype(int)
     agg = agg.sort_values(["WellName", "TVD"]).reset_index(drop=True)
     # support segments
