@@ -1,0 +1,121 @@
+{
+  "version": "taigu_step7a_attribute_v3_regen_v5",
+  "output_dir": "/home/tyh/projects/petroleum/code/GAN-DFN/太古界/step7a_small_scale_dfn/output/taigu_step7a_attribute_v3_regen_full_v6",
+  "density_sgy": "/home/tyh/projects/petroleum/code/GAN-DFN/太古界/step6d_multiscale_bundle/output/taigu_step6d_multiscale_v5/background_small_density.sgy",
+  "window_code_npz": "/home/tyh/projects/petroleum/code/GAN-DFN/太古界/step6a_density_volume/output/taigu_step6a_attribute_v3_full_v5/volume/window_code.npz",
+  "step6a_prediction_summary_json": "/home/tyh/projects/petroleum/code/GAN-DFN/太古界/step6d_multiscale_bundle/output/taigu_step6d_multiscale_v5/multiscale_bundle_summary.json",
+  "expected_step6a_model_contract_version": "taigu_step6a_attribute_v3_v4",
+  "trace_mapping_npz": "/home/tyh/projects/petroleum/code/GAN-DFN/太古界/step6a_density_volume/output/taigu_step6a_attribute_v3_full_v5/volume/trace_mapping.npz",
+  "demo_grid_csv": "/home/tyh/projects/petroleum/code/GAN-DFN/太古界/common/attribute_demo_grid/output/taigu_attribute_demo_grid_v2_405center/attribute_demo_grid.csv",
+  "horizon_contract_csv": "/home/tyh/projects/petroleum/code/GAN-DFN/太古界/common/horizon_contract/output/taigu_attribute_full_horizon_contract_v1/demo_horizon_contract.csv",
+  "step3_groups_root": "/home/tyh/projects/petroleum/code/GAN-DFN/太古界/step3_imaging_groups/output/taigu_step3_imaging_v5/groups",
+  "step2_segments_root": "/home/tyh/projects/petroleum/code/GAN-DFN/太古界/step2_well_log_segments/output/taigu_step2_regular_v5",
+  "profile_well": "埕北古斜405",
+  "sampling": {
+    "mode": "layered_weighted_probability_with_3d_spacing",
+    "reference_quantile": 0.95,
+    "candidate_quantile": {
+      "上部复合层": 0.9,
+      "太古界风化壳": 0.9
+    },
+    "occurrence_rate": {
+      "上部复合层": 0.015,
+      "太古界风化壳": 0.01
+    },
+    "density_power": 1.5,
+    "min_center_distance_m": 20.0,
+    "spacing_time_scale_m_per_ms": 2.0,
+    "min_density": 1e-06,
+    "random_seed": 20260822
+  },
+  "orientation": {
+    "window_xy_radius": 2,
+    "time_half_span_ms": 12.0,
+    "density_fraction": 0.5,
+    "min_dip_deg": 25.0,
+    "max_dip_deg": 89.0,
+    "azimuth_jitter_std_deg": 10.0,
+    "dip_jitter_std_deg": 6.0,
+    "random_seed": 20260822,
+    "imaging_wells_by_layer": {
+      "上部复合层": [
+        "埕北310",
+        "埕北313",
+        "桩斜169",
+        "埕北古斜405"
+      ],
+      "太古界风化壳": [
+        "埕北313",
+        "埕北816"
+      ]
+    },
+    "family_count_by_layer": {
+      "上部复合层": 3,
+      "太古界风化壳": 2
+    },
+    "family_random_seed": 20260822,
+    "family_distance_scale_m": 10000.0,
+    "family_dip_feature_weight": 0.7,
+    "gradient_quantile": 0.7,
+    "gradient_smoothing_sigma": 0.8,
+    "gradient_time_scale_m_per_ms": 2.0,
+    "local_high_quality": 0.65,
+    "local_medium_quality": 0.35,
+    "medium_local_weight_min": 0.35,
+    "medium_local_weight_max": 0.7,
+    "fallback_family": {
+      "上部复合层": {
+        "azimuth_deg": 80.0,
+        "dip_deg": 55.0
+      },
+      "太古界风化壳": {
+        "azimuth_deg": 120.0,
+        "dip_deg": 65.0
+      }
+    }
+  },
+  "patch_length_m": [
+    25.0,
+    80.0
+  ],
+  "patch_height_ms": [
+    5.0,
+    15.0
+  ],
+  "display_z_scale_m_per_ms": 1.0,
+  "vtk_z_scale_m_per_ms": 1.0,
+  "imaging_match": {
+    "corridor_half_width_m": 500.0,
+    "time_bin_ms": 20.0
+  },
+  "block_x_line_count": 20,
+  "segment_join": {
+    "tolerance_m": "auto",
+    "half_step_multiplier": 0.5,
+    "tolerance_floor_m": 0.02,
+    "tolerance_cap_m": 0.5
+  },
+  "density_contract_output_key": "background_density_sgy",
+  "damage_density_sgy": "/home/tyh/projects/petroleum/code/GAN-DFN/太古界/step6d_multiscale_bundle/output/taigu_step6d_multiscale_v5/large_damage_small_density.sgy",
+  "damage_contract_output_key": "damage_density_sgy",
+  "damage_domain": {
+    "enabled": true,
+    "name": "large_fault_damage",
+    "domain_code": 2,
+    "structural_relation": "small_derivative_near_large_fault",
+    "candidate_quantile": {
+      "上部复合层": 0.5,
+      "太古界风化壳": 0.5
+    },
+    "reference_quantile": 0.95,
+    "occurrence_rate": {
+      "上部复合层": 0.005,
+      "太古界风化壳": 0.005
+    },
+    "density_power": 1.0,
+    "max_selected_fraction_of_background": 0.75,
+    "random_seed": 20260823,
+    "note": "断层派生小尺度裂缝：只做‘背景为主 + 断层旁附带’，总量上限 0.75×背景片数（对齐砂砾岩）"
+  },
+  "notes": "6A 模型已用 v5 样本重训；contract_version 字符串仍沿用 v4（待下次重训时统一升版），下游契约校验按实际声明值执行。"
+}

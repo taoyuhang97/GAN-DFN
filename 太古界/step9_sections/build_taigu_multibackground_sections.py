@@ -25,6 +25,7 @@ import numpy as np
 import pandas as pd
 import segyio
 from matplotlib.collections import LineCollection
+from matplotlib.lines import Line2D
 from matplotlib import font_manager
 from scipy.spatial import cKDTree
 
@@ -63,7 +64,7 @@ LARGE_SCALE_HALO_COLOR = "#111827"
 SCALE_LEGEND_STYLES = {
     "small": ("#9ca3af", 1.4, "小尺度裂缝（细线）"),
     "medium": ("#6b7280", 3.0, "中尺度裂缝（中线）"),
-    "large": ("#374151", 5.4, "大尺度裂缝（粗线+描边）"),
+    "large": ("#374151", 5.4, "预测大尺度裂缝（深灰粗线+描边）"),
 }
 IMAGING_POINT_COLOR = "#ff00e6"
 IMAGING_PATCH_COLOR = "#ff2bd6"
@@ -73,6 +74,7 @@ IMAGING_TRACK_GLOW = "#083344"
 FAULT_TRACE_COLOR = "#ffe600"
 FAULT_TRACE_HALO = "#111827"
 CONVENTIONAL_LOG_COLOR = "#16a34a"
+WINDOW_LAYER_COLOR = "#f59e0b"
 STEP4_POINT_COLOR = "#a3e635"
 STEP4_POINT_EDGE = "#0f172a"
 OVERLAY_TIME_SCALE_M_PER_MS = 2.0
@@ -82,6 +84,46 @@ ORIENTATION_TICK_COLOR = "#ff00e6"
 ORIENTATION_TICK_MIN_M = 22.0
 ORIENTATION_TICK_MAX_M = 55.0
 SCOPE_LABELS = {"overview": "5 km Demo区", "local_200m": "井周200 m"}
+
+# v7：图例按用途分组（12–15 项平铺很难读）
+LEGEND_GROUPS = [
+    ("地层界面", ("上部复合层顶", "太古界顶", "风化壳底")),
+    ("井与测井段", ("常规测井段", "成像测井段", "目标地层内", "井轨迹")),
+    ("DFN 裂缝", ("DFN裂缝片", "小尺度裂缝", "中尺度裂缝", "大尺度裂缝")),
+    ("测井证据", ("Step3", "Step4")),
+    ("构造", ("原始断层",)),
+]
+
+
+def grouped_legend(fig, ax, fontsize: float = 8.4) -> None:
+    """按用途分组排列叠加层图例，组前插入组标题（占位 handle）。"""
+    handles, labels = ax.get_legend_handles_labels()
+    pairs = list(zip(handles, labels))
+    used: set[int] = set()
+    ordered_handles: list[Any] = []
+    ordered_labels: list[str] = []
+    for group_name, keys in LEGEND_GROUPS:
+        matched = [
+            (index, handle, label)
+            for index, (handle, label) in enumerate(pairs)
+            if index not in used and any(key in str(label) for key in keys)
+        ]
+        if not matched:
+            continue
+        ordered_handles.append(Line2D([], [], color="none"))
+        ordered_labels.append(f"— {group_name} —")
+        for index, handle, label in matched:
+            used.add(index)
+            ordered_handles.append(handle)
+            ordered_labels.append(label)
+    for index, (handle, label) in enumerate(pairs):
+        if index not in used:
+            ordered_handles.append(handle)
+            ordered_labels.append(label)
+    if ordered_labels:
+        fig.legend(ordered_handles, ordered_labels, loc="upper left",
+                   bbox_to_anchor=(1.005, 1.0), fontsize=fontsize, framealpha=0.92,
+                   borderaxespad=0.0)
 CHINESE_FONT_CANDIDATES = (
     "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
     "/usr/share/fonts/opentype/noto/NotoSansCJK-Medium.ttc",
@@ -188,7 +230,12 @@ def load_track(config: dict[str, Any]) -> pd.DataFrame:
     for path in sorted(root.glob("*.csv")):
         frame = numeric(pd.read_csv(path, encoding="utf-8-sig"), ("MD", "X", "Y", "TIME"))
         if {"MD", "X", "Y", "TIME"}.issubset(frame.columns):
-            frames.append(frame[["MD", "X", "Y", "TIME"]])
+            keep = ["MD", "X", "Y", "TIME"] + [
+                column
+                for column in ("TVD", "InImagingInterval", "InHorizonLayer", "UseCase")
+                if column in frame.columns
+            ]
+            frames.append(frame[keep])
     track = pd.concat(frames, ignore_index=True).dropna(subset=["X", "Y", "TIME"])
     return track.sort_values("TIME").drop_duplicates("TIME").reset_index(drop=True)
 
@@ -700,7 +747,8 @@ def draw_overlays(ax, projection: str, coords: np.ndarray, times: np.ndarray, tr
         ax.add_collection(LineCollection(fault_segments, colors=FAULT_TRACE_COLOR, linewidths=2.5,
                                          alpha=0.78 if scope == "overview" else 0.96, zorder=6.3,
                                          linestyles=fault_style))
-        ax.plot([], [], color=FAULT_TRACE_COLOR, lw=2.5, linestyle=fault_style, label="原始断层")
+        ax.plot([], [], color=FAULT_TRACE_COLOR, lw=2.5, linestyle=fault_style,
+                label="原始断层（黄色，非预测）")
     real_track = (times >= float(track["TIME"].min())) & (times <= float(track["TIME"].max()))
     # 常规测井段（Step2 的 405 常规测井采样区间）：绿色加粗虚线，独立于成像井段
     conventional_label = "埕北古斜405常规测井段"
@@ -758,30 +806,23 @@ def draw_overlays(ax, projection: str, coords: np.ndarray, times: np.ndarray, tr
     else:
         shown = imaging
         orientation_ticks = []
-    # 段区间标注：常规测井段（绿）/ 成像测井段（青）。405 两者几乎完全重叠，
-    # 直接画在井轨迹上会互相遮盖，因此统一用剖面左缘的区间标尺表示；
-    # 常规测井裂缝点位（Step4 预测）仍直接画在井上。
+    # v7：去掉剖面左缘的"成像测井段 / 常规测井段 / 目标地层内"标注（三项旋转文字互相遮挡、
+    # 且不属于图例信息）；405 的三段区间数值仍写入 section_summary.json 与文档。
     kept_imaging = int(len(shown))
     span = float(coords[-1] - coords[0])
-    bracket_intervals = [
-        ("埕北古斜405常规测井段", float(track["TIME"].min()), float(track["TIME"].max()),
-         CONVENTIONAL_LOG_COLOR, 0.0),
-    ]
-    if len(imaging):
-        bracket_intervals.append(
-            ("Step3成像测井段", float(imaging["TIME"].min()), float(imaging["TIME"].max()),
-             IMAGING_TRACK_COLOR, 1.0)
-        )
-    for label, time_min, time_max, color, slot in bracket_intervals:
-        x_at = float(coords[0]) + (0.012 + 0.020 * slot) * span
-        cap = 0.008 * span
-        ax.plot([x_at, x_at], [time_min, time_max], color="#f8fafc", lw=5.2, alpha=0.9, zorder=12.0)
-        ax.plot([x_at, x_at], [time_min, time_max], color=color, lw=3.0, zorder=12.1)
-        for endpoint in (time_min, time_max):
-            ax.plot([x_at - cap, x_at + cap], [endpoint, endpoint], color=color, lw=3.0, zorder=12.1)
-        ax.text(x_at + cap * 1.6, 0.5 * (time_min + time_max),
-                f"{label} {time_min:.0f}–{time_max:.0f} ms", color=color, fontsize=7.4,
-                rotation=90, ha="center", va="center", zorder=12.2)
+    window_audit: dict[str, Any] = {}
+    if {"InImagingInterval", "InHorizonLayer"}.issubset(track.columns):
+        imaging_rows = track[pd.to_numeric(track["InImagingInterval"], errors="coerce").fillna(0).eq(1)]
+        horizon_rows = track[pd.to_numeric(track["InHorizonLayer"], errors="coerce").fillna(0).eq(1)]
+        window_audit = {
+            "conventional_log_time_ms": [float(track["TIME"].min()), float(track["TIME"].max())],
+            "imaging_interval_time_ms": (
+                [float(imaging_rows["TIME"].min()), float(imaging_rows["TIME"].max())] if len(imaging_rows) else None
+            ),
+            "horizon_layer_time_ms": (
+                [float(horizon_rows["TIME"].min()), float(horizon_rows["TIME"].max())] if len(horizon_rows) else None
+            ),
+        }
     step4_count = 0
     if step4 is not None and len(step4):
         perp = "Y" if projection == "XZ" else "X"
@@ -809,6 +850,8 @@ def draw_overlays(ax, projection: str, coords: np.ndarray, times: np.ndarray, tr
         },
         "fault_segment_count": len(fault_segments),
         "step4_point_count": step4_count,
+        # 405 三段区间（左缘标注已在 v7 移除，数值改为只在 summary 里保留）
+        "window_audit": window_audit,
     }
 
 
@@ -861,12 +904,8 @@ def plot_image(path: Path, name: str, renderer: str, projection: str, scope: str
     ax.set_title(f"埕北古斜405 {SCOPE_LABELS[scope]} {projection} | {title}{mode}")
     ax.grid(False)
     fig.tight_layout()
-    # 图例放在数据区外侧（对齐砂砾岩方案：不遮挡剖面主体）。
-    legend_handles, legend_labels = ax.get_legend_handles_labels()
-    if legend_handles:
-        fig.legend(legend_handles, legend_labels, loc="upper left",
-                   bbox_to_anchor=(1.005, 1.0), fontsize=8.4, framealpha=0.92,
-                   borderaxespad=0.0)
+    # 图例放在数据区外侧（对齐砂砾岩方案：不遮挡剖面主体），并按用途分组（v7）。
+    grouped_legend(fig, ax, fontsize=8.4)
     path.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(path, dpi=int(config.get("dpi", 180)), bbox_inches="tight"); plt.close(fig)
     return overlay
