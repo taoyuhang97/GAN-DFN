@@ -1,5 +1,12 @@
 # 原型与第一轮优化数据清理计划（不含优化阶段二）
 
+> **执行状态（2026-09-21 更新）**：本文件是 2026-07-08 的方案快照，"建议保留"只代表当时的判断，
+> 不代表现状。实际执行情况见文末《执行记录》。
+>
+> 特别提示：`/data/shared/project-oil/GAN-step3-result-20260511` **整个目录已于 2026-09-21 手动删除**
+> （约 15 GB），下面"建议保留：第一轮最终/展示产物"一节中该目录的 7 条保留项**已全部失效**。
+> 其余"必须保留/建议保留/删除候选"各行与列表保持一致（删除候选均已于 2026-07-08 执行）。
+
 ## 第二轮正式主线明确依赖，必须保留
 /data/shared/project-oil/wx数据/砂砾岩/研究内容一/成像测井/测井-地震时窗
 /data/shared/project-oil/wx数据/砂砾岩/研究内容一/成像测井/裂缝标注
@@ -100,3 +107,57 @@
 /data/shared/project-oil/GAN-step3-result-20260511/full113_conf_up_traininfer_20260506_142956/analysis/postprocess_progress_smoke
 /data/shared/project-oil/GAN-step3-result-20260511/full113_conf_up_traininfer_20260506_142956/analysis/postprocess_quality
 /data/shared/project-oil/GAN-step3-result-20260511/full113_conf_up_traininfer_20260506_142956/analysis/zero_layer_filled_v2
+
+---
+
+## 执行记录
+
+按时间倒序，只记"实际动了什么、依据是什么"。核对方式：`awk '/^\/data\/shared/{print}' 本文件`
+后逐条 `test -e`，可与下面的状态对照。
+
+### 2026-09-21：删除 `/data/shared/project-oil/GAN-step3-result-20260511`（整目录，约 15 GB，手动执行）
+
+**对象**：第一轮（优化阶段一）· 研究内容三 · G_DFN 监督基线的砂砾岩全区结果包
+`full113_conf_up_traininfer_20260506_142956`。原路径为
+`/data/tyh/project-oil/砂砾岩/优化阶段一/研究内容三/G_DFN监督基线/后台执行/full113_conf_up_traininfer_20260506_142956`
+（内部 summary 的 `run_dir` 字段可证），后拷贝为 `GAN-step3-result-20260511`。
+
+链路与规模：8 层段训练（`train_layerwise`，计划 `layerwise_training_plan_demo_v1.py`，2026-05-06）
+→ 全区推理（`production/full_infer`，2026-05-11）→ 区域断层后融合（`fault_postfusion`，2026-05-11）
+→ 边界再平衡 v4（`analysis/final_dfn_boundary_rebalance_v4_full_iter05`，5185 单元 / 2,388,801 片，
+2026-05-15）。删除前占用：analysis 11 G、production 2.4 G、fault_postfusion 2.3 G、train_layerwise 80 M。
+
+**删除前的核查结论（据此作废了本文件对该目录的"保留"建议）**：
+
+1. 仓库全量检索（代码/配置/文档）中，该路径只出现在本计划与 `cleanup_proto_round1_delete.sh` 里，
+   没有任何脚本或配置读取它；
+2. `优化阶段二/正式主线` 所有 config 的外部数据都在 `/data/shared/project-oil/wx数据/砂砾岩/...` 下，
+   没有一条指向 `/data/shared/project-oil/` 下非 `wx数据` 的路径；断层/DFN 输入均来自
+   `优化阶段二/正式主线/output/...` 与仓库内 `小范围DFN生成/...`；
+3. 太古界只依赖 `/data/shared/project-oil/wx数据/埕岛太古界/...`，与该目录无关；
+4. 无符号链接指向它；`优化阶段二/提交材料/` 的结项材料梳理也未引用该路径。
+
+结论：它是第一轮 GAN 链路的历史产物，已被第二轮（优化阶段二）正式主线整体替代。
+
+**残留说明**：结项材料梳理（`优化阶段二/提交材料/结项材料内容梳理与完善分析_20260916.md`）
+把"研究内容三"标为口径风险项（监督基线已训练但效果很差，验证集 center precision ≈0.024、
+recall ≈0.0043）。本次删除后，"研究内容三"只剩仓库内的代码与文档描述可供举证，**原始产物不再可取**。
+
+**执行后状态**：`/data/shared/project-oil/` 下只剩 `wx数据/`、`GAN-DFN-git/`、
+`GAN-DFN-upload-first-round-improvement-20260420/`；`/data` 可用空间约 102 GB（该盘 2.2 T 已用 96%）。
+
+### 2026-07-08：第一轮清理（按本计划执行）
+
+`cleanup_proto_round1_delete.sh` 的删除候选全部执行完毕，2026-09-21 复核结果：
+
+* **已删**（脚本候选）：`wx数据/砂砾岩` 下研究内容一/二/三与优化阶段一的前述 33 条过程产物，
+  以及 `GAN-step3-result-20260511` 内的 `visualization`、`eval`、`logs`、`merge`、`postprocess`
+  与 `analysis` 的 25 个中间版本子目录；
+* **仍在**（本计划"必须保留/建议保留"各节）：`研究内容一/成像测井/测井-地震时窗`、
+  `优化阶段一/研究内容一/两阶段裂缝预测流程结果/deploy_runs`（127 M）与
+  `现有常规测井裂缝预测`（1.7 G）、`G_DFN监督基线/训练结果/baseline_v1_*`、
+  `G_DFN监督基线/生产推理/*`、`研究内容三/单元DFN批量生成/区域断层后融合结果`（58 M）等，
+  合计约 2 GB。
+
+即：第一轮只清理了过程产物，最终/展示产物一直保留到 2026-09-21；其中体积最大的
+`GAN-step3-result-20260511`（15 GB）已在 9-21 删除，其余保留项未动。

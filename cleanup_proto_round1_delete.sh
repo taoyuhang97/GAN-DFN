@@ -1,6 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# 记录（2026-09-21）：本脚本的删除候选已于 2026-07-08 执行完毕；
+# 其中 /data/shared/project-oil/GAN-step3-result-20260511 整个目录
+# 已于 2026-09-21 手动删除（约 15 GB），脚本里该目录下的条目现均为 no-op。
+# 执行详情与核查依据见 cleanup_proto_round1_plan.txt 文末《执行记录》。
+
 if [[ "${1:-}" != "--execute" ]]; then
   echo "Dry run only. Use --execute to delete listed paths."
   DRY_RUN=1
