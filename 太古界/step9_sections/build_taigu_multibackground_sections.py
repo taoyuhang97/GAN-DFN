@@ -701,6 +701,19 @@ def horizon_curves(horizon: pd.DataFrame, track: pd.DataFrame, coords: np.ndarra
 
 def patch_segments(patches: pd.DataFrame, track: pd.DataFrame, projection: str,
                    half_width: float) -> tuple[list[list[list[float]]], list[str], list[float], list[str]]:
+    """DFN 裂缝片在剖面内的迹线：与成像层同口径，取"裂缝面 ∩ 剖面面"交线。
+
+    注意两套方位约定的差别：
+
+    * Step7/Step8 合同的 `AzimuthDeg` 是**走向**（0–180，axial），VTK 几何也按走向建面，
+      所以这里先 `+90°` 转成"倾向方位"再交给 `apparent_dip_trace`；
+    * Step3 成像的 `FracAzimuth` 本身就是**真倾向方位**（甲方 LAS 参数块写明
+      `TLFamily_Azimuth = True Dip Azimuth`），直接使用。
+
+    旧实现把水平分量取成"倾向方位的水平分量"、并给 `|lateral|` 加 0.08 下限，
+    结果是：绝大多数片子被画成真倾角，而走向≈垂直剖面时（`lateral→0`）直接翻成
+    竖直——本该接近水平的高角度缝反而画成竖线，和成像标签完全对不上。
+    """
     centers_t = patches["CenterTime"].to_numpy(np.float64)
     perpendicular = "Y" if projection == "XZ" else "X"
     center_perp = patches[f"Center{perpendicular}"].to_numpy(np.float64)
@@ -711,17 +724,16 @@ def patch_segments(patches: pd.DataFrame, track: pd.DataFrame, projection: str,
     for row in selected.itertuples(index=False):
         cx = float(row.CenterX if projection == "XZ" else row.CenterY)
         ct = float(row.CenterTime)
-        az = math.radians(float(row.AzimuthDeg))
-        dip = math.radians(float(row.DipDeg))
-        lateral = math.cos(az) if projection == "XZ" else math.sin(az)
-        vertical = math.tan(dip) * max(abs(lateral), .08)
-        norm = math.hypot(lateral, vertical)
-        lateral, vertical = lateral / norm, vertical / norm
+        dip_azimuth = (float(row.AzimuthDeg) + 90.0) % 360.0
+        trace = apparent_dip_trace(dip_azimuth, float(row.DipDeg), projection)
+        if trace is None:
+            continue
+        dh, dt = trace
         length = float(getattr(row, "PatchLengthM", np.nan))
         if not np.isfinite(length):
             length = float(getattr(row, "LengthM", 30.0))
         half = min(length, 500.0) / 2
-        segments.append([[cx - half * lateral, ct - half * vertical], [cx + half * lateral, ct + half * vertical]])
+        segments.append([[cx - half * dh, ct - half * dt], [cx + half * dh, ct + half * dt]])
         colors.append(color.get(str(row.LayerGroup), "#7b1fa2"))
         scale_key = str(row.FractureScale)
         scales.append(scale_key)
