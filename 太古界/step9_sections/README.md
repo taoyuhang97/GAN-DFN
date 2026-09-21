@@ -55,6 +55,34 @@ v9 修正了 DFN 片迹线：旧实现 `vertical = tan(dip)·max(|lateral|,0.08)
 真倾角、且走向接近垂直剖面时被直接拉成竖直（本该接近水平的片子画成竖线）。
 改为统一走 `apparent_dip_trace` 后，局部 200 m 剖面里屏角 >60° 的 DFN 段从 7 条降到 0 条。
 
+## 纵向范围口径（2026-09-21，v7 = 方案 B）
+
+v6 及以前：`overview` 与 `local_200m` **共用**一套纵向刻度，取全工区层位合同的
+`min(TopTimeMs)` ~ `max(BaseTimeMs)` ± `time_padding_ms`（=20 ms），实测 2604–4018 ms。
+后果是局部剖面上 3/4 的纵向是无关区域（层位带只占图高 24–26%），纵向被压 6.9 倍。
+
+v7 起改为**逐剖面自适应**（对齐砂砾岩 `well_curved_section_common.py` 的做法）：
+
+* 用**该剖面自己画出来的三条层位曲线**（`TopTimeMs` / `MidTimeMs` / `BaseTimeMs`）的
+  min/max ± `scope_time_padding_ms` 作为纵向范围；
+* `overview` 与 `local_200m` **各自算**，不再共用；
+* 方案 B 取 `scope_time_padding_ms = 100.0`（层位上下各留 100 ms 上下文）；
+* `local_200m` 仍取 `overview` 采样网格的子集（两者都对齐 `section_sample_interval_ms`），
+  所以属性/OBN 只采样一次，局部只是行列裁剪，NPZ 缓存与 `section_summary.json` 里
+  `time_range_ms_by_scope` 记录各自的范围。
+
+实测（埕北古斜405）：
+
+| | v6（全局共用 2604–4018） | v7（逐剖面自适应 ±100 ms） |
+| --- | --- | --- |
+| `overview` 纵向范围 | 2604–4018 ms（1414 ms） | 2606–3990 ms（1384 ms） |
+| `local_200m` 纵向范围 | 2604–4018 ms（1414 ms） | **2750–3322 ms（572 ms）** |
+| 局部图层位带占图高 | 26% / 24%（XZ/YZ） | **65% / 58%** |
+| 局部图纵向压缩 | **6.86 倍** | **约 2.7 倍** |
+| 全局图纵向压缩 | 0.98 倍 | **约 1.0 倍（近似等比例）** |
+
+对应配置：`configs/taigu_step9_multibackground_v2_v7.json`（v6 配置与产物保留不覆盖）。
+
 运行前接口检查：
 
 ```bash

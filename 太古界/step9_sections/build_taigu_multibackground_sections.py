@@ -962,14 +962,41 @@ def main() -> int:
     available = pd.read_csv(pth(config, "step8_patches_csv"), nrows=0).columns
     patches = pd.read_csv(pth(config, "step8_patches_csv"), usecols=[c for c in patch_cols if c in available])
     patches = numeric(patches, ("CenterX","CenterY","CenterTime","AzimuthDeg","DipDeg","PatchLengthM","LengthM")).dropna(subset=["CenterX","CenterY","CenterTime","AzimuthDeg","DipDeg"])
-    top = float(horizon["TopTimeMs"].min()) - float(config.get("time_padding_ms", 20)); bottom = float(horizon["BaseTimeMs"].max()) + float(config.get("time_padding_ms", 20))
-    dt = float(config.get("section_sample_interval_ms", 2)); times = np.arange(math.floor(top/dt)*dt, math.ceil(bottom/dt)*dt + .1*dt, dt)
+    # 纵向范围改为"逐剖面自适应"（对齐砂砾岩 Step9 口径：用该剖面自己画出来的层位曲线
+    # 的 min/max ± padding），不再让 overview 与 local_200m 共用"全工区层位合同的全局 min/max"。
+    # 方案 B：scope_time_padding_ms = 100 ms，层位上下各留 100 ms 上下文。
+    dt = float(config.get("section_sample_interval_ms", 2))
+    scope_padding = float(config.get("scope_time_padding_ms", config.get("time_padding_ms", 20.0)))
     samples: dict[str, Any] = {}; sample_summary: dict[str, Any] = {}
     overview_x, overview_y = axes_for_scope(grid, track, "overview", float(config.get("local_axis_radius_m", 200)))
     local_x, local_y = axes_for_scope(grid, track, "local_200m", float(config.get("local_axis_radius_m", 200)))
     samples["overview"] = {"axes": {"XZ": overview_x, "YZ": overview_y}}
     samples["local_200m"] = {"axes": {"XZ": local_x, "YZ": local_y}}
     sample_summary["overview"] = {}; sample_summary["local_200m"] = {}
+    scope_curves = {
+        scope: {p: horizon_curves(horizon, track, samples[scope]["axes"][p], p) for p in ("XZ", "YZ")}
+        for scope in ("overview", "local_200m")
+    }
+
+    def scope_window(curves_by_projection: dict[str, dict[str, np.ndarray]]) -> tuple[float, float]:
+        values = [v[np.isfinite(v)] for curves in curves_by_projection.values() for v in curves.values() if np.isfinite(v).any()]
+        stacked = np.concatenate(values)
+        return float(stacked.min()) - scope_padding, float(stacked.max()) + scope_padding
+
+    overview_top, overview_bottom = scope_window(scope_curves["overview"])
+    times = np.arange(math.floor(overview_top / dt) * dt, math.ceil(overview_bottom / dt) * dt + .1 * dt, dt)
+    # local 直接取 overview 采样网格的子集（两者都对齐到 dt 网格，且 local 层位带必含于 overview），
+    # 这样属性/OBN 采样只做一次，local 只是行列裁剪。
+    local_top, local_bottom = scope_window(scope_curves["local_200m"])
+    local_start = int(np.searchsorted(times, math.floor(local_top / dt) * dt - 1.0e-9))
+    local_stop = int(np.searchsorted(times, math.ceil(local_bottom / dt) * dt + 1.0e-9))
+    if local_stop - local_start < 2:
+        local_start, local_stop = 0, len(times)
+    times_by_scope = {"overview": times, "local_200m": times[local_start:local_stop]}
+    print(f"[Step9] 纵向范围(逐剖面自适应, padding={scope_padding:.0f}ms): "
+          f"overview {times[0]:.0f}-{times[-1]:.0f} ms({len(times)}样点) / "
+          f"local_200m {times_by_scope['local_200m'][0]:.0f}-{times_by_scope['local_200m'][-1]:.0f} ms"
+          f"({len(times_by_scope['local_200m'])}样点)", flush=True)
     print("[Step9] 2/6 采样三属性剖面（属性TraceIdx合同）", flush=True)
     offsets = config.get("attribute_time_offsets_ms", {}); progress = int(config.get("progress_interval", 100))
     for name in ATTRIBUTES:
@@ -985,11 +1012,12 @@ def main() -> int:
         for projection, local_axis in (("XZ", local_x), ("YZ", local_y)):
             full_axis = samples["overview"]["axes"][projection]
             positions = np.searchsorted(full_axis, local_axis)
-            local_values = samples["overview"][name][projection][:, positions]
+            local_values = samples["overview"][name][projection][local_start:local_stop, positions]
             samples["local_200m"][name][projection] = local_values
             finite = local_values[np.isfinite(local_values)]
             sample_summary["local_200m"][name][projection] = {
                 "source": "overview_axis_subset", "shape": list(local_values.shape),
+                "time_window_ms": [float(times_by_scope["local_200m"][0]), float(times_by_scope["local_200m"][-1])],
                 "finite_fraction": float(np.isfinite(local_values).mean()),
                 "raw_percentiles": np.percentile(finite, [0, 1, 50, 99, 100]).tolist() if len(finite) else [],
             }
@@ -1002,11 +1030,12 @@ def main() -> int:
     samples["local_200m"]["SeisAmp"] = {}; sample_summary["local_200m"]["SeisAmp"] = {}
     for projection, local_axis in (("XZ", local_x), ("YZ", local_y)):
         positions = np.searchsorted(samples["overview"]["axes"][projection], local_axis)
-        local_values = samples["overview"]["SeisAmp"][projection][:, positions]
+        local_values = samples["overview"]["SeisAmp"][projection][local_start:local_stop, positions]
         samples["local_200m"]["SeisAmp"][projection] = local_values
         finite = local_values[np.isfinite(local_values)]
         sample_summary["local_200m"]["SeisAmp"][projection] = {
             "source": "overview_axis_subset", "shape": list(local_values.shape),
+            "time_window_ms": [float(times_by_scope["local_200m"][0]), float(times_by_scope["local_200m"][-1])],
             "finite_fraction": float(np.isfinite(local_values).mean()),
             "raw_percentiles": np.percentile(finite, [0, 1, 50, 99, 100]).tolist() if len(finite) else [],
         }
@@ -1014,18 +1043,18 @@ def main() -> int:
     for scope in samples:
         cache = output / "section_samples" / scope; cache.mkdir(parents=True, exist_ok=True)
         for name in (*ATTRIBUTES, "SeisAmp"):
-            np.savez_compressed(cache / f"{name.lower()}_section_samples.npz", times=times, xz_h=samples[scope]["axes"]["XZ"], yz_h=samples[scope]["axes"]["YZ"], xz_values=samples[scope][name]["XZ"], yz_values=samples[scope][name]["YZ"])
+            np.savez_compressed(cache / f"{name.lower()}_section_samples.npz", times=times_by_scope[scope], xz_h=samples[scope]["axes"]["XZ"], yz_h=samples[scope]["axes"]["YZ"], xz_values=samples[scope][name]["XZ"], yz_values=samples[scope][name]["YZ"])
     print("[Step9] 5/6 生成20张正式剖面", flush=True)
     images=[]; number=0
     for scope in ("overview", "local_200m"):
-        curves = {p: horizon_curves(horizon, track, samples[scope]["axes"][p], p) for p in ("XZ","YZ")}
+        curves = scope_curves[scope]; scope_times = times_by_scope[scope]
         plan=[("AntTrack","attribute"),("Coherence","attribute"),("CurvatureMax","attribute"),("SeisAmp","density"),("SeisAmp","wiggle")]
         for name, renderer in plan:
             for projection in ("XZ","YZ"):
                 number += 1; token = name.lower() if name != "SeisAmp" else ("seismic_density" if renderer == "density" else "seismic_wiggle_area")
                 path = output / scope / f"{number:02d}_{token}_{projection.lower()}.png"
                 print(f"  图片 {number}/20: {path.name}", flush=True)
-                overlay = plot_image(path,name,renderer,projection,scope,samples[scope][name][projection],samples[scope]["axes"][projection],times,track,curves[projection],patches,imaging,config,faults=fault_segments,step4=step4_points)
+                overlay = plot_image(path,name,renderer,projection,scope,samples[scope][name][projection],samples[scope]["axes"][projection],scope_times,track,curves[projection],patches,imaging,config,faults=fault_segments,step4=step4_points)
                 images.append({"number":number,"scope":scope,"background":name,"renderer":renderer,"projection":projection,"path":str(path),"overlay":overlay})
     print("[Step9] 6/6 汇总QC", flush=True)
     imaging_join_qc = dict(config.get("_imaging_join_qc", {}))
@@ -1037,7 +1066,7 @@ def main() -> int:
         "dfn_segment_total": sum(int(row["overlay"].get("dfn_segment_count", 0)) for row in images),
     }
     checks={"image_count_is_20":len(images)==20,"horizon_order_valid":bool(((horizon.TopTimeMs<horizon.MidTimeMs)&(horizon.MidTimeMs<horizon.BaseTimeMs)).all()),"attribute_demo_grid_complete":len(grid)==int(config.get("expected_demo_trace_count",len(grid))),"anttrack_minus_one_preserved":True,"separate_trace_contracts":pth(config,"attribute_trace_header_csv")!=pth(config,"obn_trace_header_csv"),"imaging_point_join_has_no_unmatched":int(imaging_join_qc.get("unmatched_count",0))==0,"original_fault_overlay_loaded":bool(not config.get("original_fault_vtk") or fault_summary.get("triangle_count",0)>0),"original_fault_intersects_section":bool(not config.get("original_fault_vtk") or any(v>0 for v in (fault_summary.get("segment_counts") or {}).values())),"imaging_patch_overlay_drawn":bool(not len(imaging) or overlay_totals["imaging_patch_total"]>0),"step4_points_overlay_drawn":bool(not len(step4_points) or overlay_totals["step4_points_on_section_total"]>0)}
-    summary={"status":"pass" if all(checks.values()) else "fail","config":str(config_path),"profile_well":config["profile_well"],"temporary_neighbor_time_depth_risk":"埕北古斜405当前按该井对应时深文件使用，真实时深仍待核验","target_block":block,"time_range_ms":[float(times[0]),float(times[-1])],"inputs":validation["paths"],"contracts":validation["contracts"],"counts":{"attribute_grid":len(grid),"valid_horizon_traces":len(horizon),"track_samples":len(track),"step8_patches":len(patches),"imaging_points":len(imaging),"step4_points":len(step4_points)},"overlay_inputs":{"original_fault":fault_summary,"step4_points":len(step4_points),"imaging_points":len(imaging),**overlay_totals},"imaging_point_join_qc":imaging_join_qc,"sample_qc":sample_summary,"images":images,"checks":checks,"elapsed_seconds":time.time()-started}
+    summary={"status":"pass" if all(checks.values()) else "fail","config":str(config_path),"profile_well":config["profile_well"],"temporary_neighbor_time_depth_risk":"埕北古斜405当前按该井对应时深文件使用，真实时深仍待核验","target_block":block,"time_range_ms":[float(times[0]),float(times[-1])],"time_range_ms_by_scope":{s:[float(times_by_scope[s][0]),float(times_by_scope[s][-1])] for s in ("overview","local_200m")},"time_window_policy":{"mode":"per_scope_adaptive","scope_time_padding_ms":scope_padding,"basis":"该剖面上三条层位曲线(Top/Mid/Base)的 min/max ± padding"},"inputs":validation["paths"],"contracts":validation["contracts"],"counts":{"attribute_grid":len(grid),"valid_horizon_traces":len(horizon),"track_samples":len(track),"step8_patches":len(patches),"imaging_points":len(imaging),"step4_points":len(step4_points)},"overlay_inputs":{"original_fault":fault_summary,"step4_points":len(step4_points),"imaging_points":len(imaging),**overlay_totals},"imaging_point_join_qc":imaging_join_qc,"sample_qc":sample_summary,"images":images,"checks":checks,"elapsed_seconds":time.time()-started}
     write_json(summary_path,summary); print(f"[Step9] status={summary['status']} summary={summary_path}",flush=True)
     return 0 if summary["status"]=="pass" else 1
 
