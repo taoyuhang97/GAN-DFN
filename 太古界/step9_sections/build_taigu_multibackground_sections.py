@@ -700,7 +700,7 @@ def horizon_curves(horizon: pd.DataFrame, track: pd.DataFrame, coords: np.ndarra
 
 
 def patch_segments(patches: pd.DataFrame, track: pd.DataFrame, projection: str,
-                   half_width: float) -> tuple[list[list[list[float]]], list[str], list[float], list[str]]:
+                   half_width: float) -> tuple[list[list[list[float]]], list[str], list[float], list[str], list[bool]]:
     """DFN 裂缝片在剖面内的迹线：与成像层同口径，取"裂缝面 ∩ 剖面面"交线。
 
     注意两套方位约定的差别：
@@ -719,7 +719,7 @@ def patch_segments(patches: pd.DataFrame, track: pd.DataFrame, projection: str,
     center_perp = patches[f"Center{perpendicular}"].to_numpy(np.float64)
     well_perp = interp_track(track, centers_t, perpendicular)
     selected = patches[np.abs(center_perp - well_perp) <= half_width]
-    segments, colors, widths, scales = [], [], [], []
+    segments, colors, widths, scales, crossed = [], [], [], [], []
     color = dict(DFN_LAYER_COLORS)
     for row in selected.itertuples(index=False):
         cx = float(row.CenterX if projection == "XZ" else row.CenterY)
@@ -738,7 +738,22 @@ def patch_segments(patches: pd.DataFrame, track: pd.DataFrame, projection: str,
         scale_key = str(row.FractureScale)
         scales.append(scale_key)
         widths.append(DFN_SCALE_WIDTH.get(scale_key, 0.9))
-    return segments, colors, widths, scales
+        # 判断"剖面是否真的穿过这个片"：片的走向/倾角决定它在剖面法向（XZ→Y，YZ→X）
+        # 上占多宽，若片中心在该方向上的距离小于片自身半宽，就是这个剖面真实切到的片。
+        # 真实交线画在最上层（对齐砂砾岩 13.0/13.2），其余只作井周投影（半透明、12.7）。
+        theta = math.radians(float(row.AzimuthDeg))
+        height_time = float(getattr(row, "HeightTimeMs", np.nan))
+        half_dip_m = (
+            (0.5 * height_time * 2.0) / max(math.tan(math.radians(min(max(float(row.DipDeg), 1.0), 89.9))), 1.0e-6)
+            if np.isfinite(height_time) else 0.0
+        )
+        dx_half = half * abs(math.sin(theta)) + half_dip_m * abs(math.cos(theta))
+        dy_half = half * abs(math.cos(theta)) + half_dip_m * abs(math.sin(theta))
+        half_extent = dy_half if projection == "XZ" else dx_half
+        row_perp = float(row.CenterY) if projection == "XZ" else float(row.CenterX)
+        well_perp_center = float(interp_track(track, np.array([ct]), perpendicular)[0])
+        crossed.append(bool(abs(row_perp - well_perp_center) <= half_extent))
+    return segments, colors, widths, scales, crossed
 
 
 def draw_overlays(ax, projection: str, coords: np.ndarray, times: np.ndarray, track: pd.DataFrame,
@@ -771,18 +786,43 @@ def draw_overlays(ax, projection: str, coords: np.ndarray, times: np.ndarray, tr
     ax.plot(well_h[real_track], times[real_track], color=WELL_TRACK_HALO, lw=3.6, alpha=0.9, zorder=12.4)
     ax.plot(well_h[real_track], times[real_track], color=WELL_TRACK_COLOR, lw=2.0,
             label="埕北古斜405井轨迹", zorder=12.45)
-    segments, colors, widths, scales = patch_segments(patches, track, projection, half_width)
+    # 成像测井井段轨迹（青色，压在井轨迹之上）——对齐砂砾岩 Step9 的"Step3成像测井井段轨迹"
+    if "InImagingInterval" in track.columns:
+        imaging_rows = track[pd.to_numeric(track["InImagingInterval"], errors="coerce").fillna(0).eq(1)].sort_values("TIME")
+        if len(imaging_rows) >= 2:
+            imaging_h = imaging_rows["X" if projection == "XZ" else "Y"].to_numpy(np.float64)
+            imaging_t = imaging_rows["TIME"].to_numpy(np.float64)
+            ax.plot(imaging_h, imaging_t, color=IMAGING_TRACK_GLOW, lw=5.2, alpha=.78, zorder=12.5)
+            ax.plot(imaging_h, imaging_t, color=IMAGING_TRACK_COLOR, lw=2.8, alpha=.96, zorder=12.55,
+                    label=f"{config.get('profile_well', '')}成像测井段轨迹")
+    segments, colors, widths, scales, crossed = patch_segments(patches, track, projection, half_width)
     if segments:
-        large_index = [index for index, scale in enumerate(scales) if scale == "large"]
-        if large_index:
+        projected_index = [index for index, flag in enumerate(crossed) if not flag]
+        crossed_index = [index for index, flag in enumerate(crossed) if flag]
+        # 井周投影片：剖面并没有真正穿过它，只作背景参考（半透明、略细）
+        if projected_index:
             ax.add_collection(LineCollection(
-                [segments[index] for index in large_index],
-                colors=LARGE_SCALE_HALO_COLOR,
-                linewidths=[widths[index] + 2.6 for index in large_index],
-                alpha=.55, zorder=6.9))
-        ax.add_collection(LineCollection(segments, colors=colors, linewidths=widths, alpha=.82, zorder=7))
+                [segments[index] for index in projected_index],
+                colors=[colors[index] for index in projected_index],
+                linewidths=[max(widths[index] * 0.85, 0.7) for index in projected_index],
+                alpha=.42, zorder=12.7))
+        # 真实交线：剖面确实切到的片子，画在最上层，压在井轨迹与成像裂缝之上
+        if crossed_index:
+            large_index = [index for index in crossed_index if scales[index] == "large"]
+            if large_index:
+                ax.add_collection(LineCollection(
+                    [segments[index] for index in large_index],
+                    colors=LARGE_SCALE_HALO_COLOR,
+                    linewidths=[widths[index] + 4.4 for index in large_index],
+                    alpha=.78, zorder=12.9))
+            ax.add_collection(LineCollection(
+                [segments[index] for index in crossed_index],
+                colors=[colors[index] for index in crossed_index],
+                linewidths=[widths[index] for index in crossed_index],
+                alpha=.95, zorder=13.1))
         for layer, layer_color in DFN_LAYER_COLORS.items():
             ax.plot([], [], color=layer_color, lw=2.0, label=f"DFN裂缝片：{layer}")
+        ax.plot([], [], color="#9ca3af", lw=1.2, alpha=.42, label="DFN裂缝片：井周投影（半透明）")
         for scale_key in ("small", "medium", "large"):
             scale_color, scale_width, scale_label = SCALE_LEGEND_STYLES[scale_key]
             ax.plot([], [], color=scale_color, lw=scale_width, label=scale_label)
@@ -861,6 +901,8 @@ def draw_overlays(ax, projection: str, coords: np.ndarray, times: np.ndarray, tr
         "dfn_scale_segment_counts": {
             scale: int(scales.count(scale)) for scale in ("small", "medium", "large")
         },
+        "dfn_crossed_count": int(sum(1 for flag in crossed if flag)),
+        "dfn_projected_count": int(sum(1 for flag in crossed if not flag)),
         "fault_segment_count": len(fault_segments),
         "step4_point_count": step4_count,
         # 405 三段区间（左缘标注已在 v7 移除，数值改为只在 summary 里保留）
