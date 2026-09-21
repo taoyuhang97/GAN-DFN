@@ -430,39 +430,25 @@ def imaging_orientation_ticks(imaging: pd.DataFrame, projection: str,
                               max_length_m: float = ORIENTATION_TICK_MAX_M) -> list[list[list[float]]]:
     """成像测井裂缝产状符号：沿"视倾角方向"画短线，线长随倾角增大。
 
-    构造裂缝面的倾向矢量（倾角 δ、方位 α），投影到当前剖面平面内
-    （XZ 去掉 Y 分量、YZ 去掉 X 分量），得到该裂缝在剖面上的视倾角方向；
-    线长按 δ 从 min_length_m 线性增长到 max_length_m（度量空间，1 ms = 2 m）。
+    方向取"裂缝面与剖面面的交线"（见 `apparent_dip_trace`），即真实视倾角方向；
+    线长按倾角 δ 从 min_length_m 线性增长到 max_length_m（度量空间，1 ms = 2 m）。
     这样"倾向"体现为短线朝哪一侧倾斜，"倾角"体现为短线的陡缓与长短。
     """
     if imaging.empty or not {"FracAzimuth", "FracDip"}.issubset(imaging.columns):
         return []
-    h_index = 0 if projection == "XZ" else 1
-    view_index = 1 if projection == "XZ" else 0
     ticks: list[list[list[float]]] = []
     for row in imaging.itertuples(index=False):
-        azimuth = math.radians(float(row.FracAzimuth))
         dip = math.radians(float(row.FracDip))
-        dip_direction = np.array([-math.sin(azimuth), math.cos(azimuth), 0.0])
-        # 度量空间取 (X, Y, -TIME*2)，"上"为正，因此倾向矢量的垂向分量为 -cos(dip)
-        vector = np.array([
-            math.sin(dip) * dip_direction[0],
-            math.sin(dip) * dip_direction[1],
-            -math.cos(dip),
-        ])
-        vector[view_index] = 0.0  # 投影到剖面平面
-        norm = float(np.linalg.norm(vector))
-        if norm <= 1.0e-9:
+        trace = apparent_dip_trace(float(row.FracAzimuth), float(row.FracDip), projection)
+        if trace is None:
             continue
-        vector = vector / norm
+        dh, dt = trace
         length = min_length_m + (max_length_m - min_length_m) * (dip / (math.pi / 2.0))
         half = length / 2.0
         center_h = float(row.X) if projection == "XZ" else float(row.Y)
         center_t = float(row.TIME)
-        delta_h = half * vector[h_index]
-        delta_t = -half * vector[2] / OVERLAY_TIME_SCALE_M_PER_MS
         ticks.append(
-            [[center_h - delta_h, center_t - delta_t], [center_h + delta_h, center_t + delta_t]]
+            [[center_h - half * dh, center_t - half * dt], [center_h + half * dh, center_t + half * dt]]
         )
     return ticks
 
@@ -536,53 +522,68 @@ def fault_section_segments(points: np.ndarray, triangles: np.ndarray, track: pd.
     return segments
 
 
+def apparent_dip_trace(azimuth_deg: float, dip_deg: float, projection: str) -> tuple[float, float] | None:
+    """求"裂缝面 与 剖面面"的交线方向，返回 (水平分量, TIME 分量) 的单位方向。
+
+    约定：``FracAzimuth`` 是**倾向方位**（自北起顺时针），度量空间取 x=东、y=北、z=上，
+    1 ms = ``OVERLAY_TIME_SCALE_M_PER_MS`` 米。
+
+    * 裂缝面法向 n = (sinα·sinδ, cosα·sinδ, cosδ)；
+    * 剖面法向：XZ 剖面法向为 ŷ（剖面含 X 轴），YZ 剖面法向为 x̂；
+    * 交线方向 t = n × 剖面法向（注意：不能拿"倾向矢量去掉视线分量"代替，
+      投影后的矢量一般不在裂缝面内，视倾角会算错）。
+
+    返回的 ``dt_ms`` 已换算到 TIME（向下为正），即沿该方向 TIME 增大（下倾方向）。
+    旧实现直接把"倾向矢量在横轴上的投影"当作水平分量，对高角度缝会把视倾角压成水平线
+    （405 实测：正确中位 68–82°，旧实现只画出 8–10°）。
+    """
+    azimuth = math.radians(float(azimuth_deg))
+    dip = math.radians(float(dip_deg))
+    # 度量空间（x=东, y=北, z=上）里的裂缝面单位法向
+    normal = np.array([
+        math.sin(azimuth) * math.sin(dip),
+        math.cos(azimuth) * math.sin(dip),
+        math.cos(dip),
+    ])
+    view = np.array([0.0, 1.0, 0.0]) if projection == "XZ" else np.array([1.0, 0.0, 0.0])
+    trace = np.cross(normal, view)
+    norm = float(np.linalg.norm(trace))
+    if norm <= 1.0e-9:
+        return None
+    trace = trace / norm
+    if trace[2] > 0.0:  # 统一朝下（度量空间 z 向下为负）
+        trace = -trace
+    h_index = 0 if projection == "XZ" else 1
+    dh_m = float(trace[h_index])
+    dt_ms = -float(trace[2]) / OVERLAY_TIME_SCALE_M_PER_MS
+    if abs(dh_m) <= 1.0e-9 and abs(dt_ms) <= 1.0e-9:
+        return None
+    return dh_m, dt_ms
+
+
 def imaging_patch_segments(imaging: pd.DataFrame, projection: str, length_m: float,
                            aspect_ratio: float) -> list[list[list[float]]]:
-    """把成像测井裂缝解释点按产状还原成小平面片，并取其在剖面内的代表性迹线。
+    """成像解释片：沿"裂缝面与剖面面的交线"画线段（即真实视倾角方向）。
 
-    与砂砾岩 `build_imaging_fracture_patch_segments` 同口径：由 FracAzimuth/FracDip
-    构造裂缝面矩形，投影到 XZ/YZ 后取最长对角线作为剖面迹线。
+    早期实现取"解释点小平面投影后的最长对角线"，对高角度缝会退化成近水平短线；
+    现改为直接使用交线方向（见 `apparent_dip_trace`），长度取配置的解释片长度。
     """
     if imaging.empty or not {"FracAzimuth", "FracDip"}.issubset(imaging.columns):
         return []
     h_index = 0 if projection == "XZ" else 1
-    half_strike = max(float(length_m), 1.0) / 2.0
-    half_dip = half_strike / max(float(aspect_ratio), 1.0e-6)
+    half = max(float(length_m), 1.0) / 2.0
     segments: list[list[list[float]]] = []
     for row in imaging.itertuples(index=False):
-        azimuth = math.radians(float(row.FracAzimuth))
-        dip = math.radians(float(row.FracDip))
-        center = np.array([float(row.X), float(row.Y), float(row.TIME) * OVERLAY_TIME_SCALE_M_PER_MS])
-        strike = np.array([math.cos(azimuth), math.sin(azimuth), 0.0])
-        dip_dir = np.array([-math.sin(azimuth), math.cos(azimuth), 0.0])
-        dip_vector = np.array([
-            math.sin(dip) * dip_dir[0],
-            math.sin(dip) * dip_dir[1],
-            math.cos(dip),
+        trace = apparent_dip_trace(float(row.FracAzimuth), float(row.FracDip), projection)
+        if trace is None:
+            continue
+        dh, dt = trace
+        center_h = float(row.X) if projection == "XZ" else float(row.Y)
+        center_t = float(row.TIME)
+        segments.append([
+            [center_h - half * dh, center_t - half * dt],
+            [center_h + half * dh, center_t + half * dt],
         ])
-        norm = np.linalg.norm(dip_vector)
-        if norm <= 1.0e-9:
-            continue
-        dip_vector = dip_vector / norm
-        corners = [
-            center + half_strike * strike + half_dip * dip_vector,
-            center + half_strike * strike - half_dip * dip_vector,
-            center - half_strike * strike - half_dip * dip_vector,
-            center - half_strike * strike + half_dip * dip_vector,
-        ]
-        projected = np.array([[corner[h_index], corner[2] / OVERLAY_TIME_SCALE_M_PER_MS] for corner in corners])
-        best = None
-        best_distance = -1.0
-        for i in range(4):
-            for j in range(i + 1, 4):
-                delta = projected[i] - projected[j]
-                distance = float(delta @ delta)
-                if distance > best_distance:
-                    best_distance = distance
-                    best = (projected[i], projected[j])
-        if best is None:
-            continue
-        segments.append([[float(best[0][0]), float(best[0][1])], [float(best[1][0]), float(best[1][1])]])
     return segments
 
 
