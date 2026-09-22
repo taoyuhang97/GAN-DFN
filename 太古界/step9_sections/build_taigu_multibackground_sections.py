@@ -43,6 +43,7 @@ from common.well_segment_join import (  # noqa: E402
     attach_geometry_per_segment,
     summarize_join,
 )
+from common.orientation_frame import convention as convention  # noqa: E402
 
 ATTRIBUTES = ("AntTrack", "Coherence", "CurvatureMax")
 # 层位界面样式对齐砂砾岩方案B（T4 橙实线 / T5 青长虚线 / T6 紫实线 / T7 粉点划线）。
@@ -129,9 +130,56 @@ CHINESE_FONT_CANDIDATES = (
     "/usr/share/fonts/opentype/noto/NotoSansCJK-Medium.ttc",
     "/usr/share/fonts/truetype/droid/DroidSansFallbackFull.ttf",
 )
+# 简化字（SC）字面优先：Noto Sans CJK 的 .ttc 里 face0=JP、face1=KR、face2=SC、face3=TC、face4=HK，
+# 而 matplotlib 的 addfont() 只注册 ttc 的第一个字面（JP）——用 JP 字面会把"复/壳"等简化字
+# 画成日文字形（结构不同）。这里显式抽 SC 字面成单独 .otf 再注册。
+SC_FONT_FACE_HINTS = ("CJK SC", "CJK SC Regular", "SC")
+FONT_CACHE_DIR = Path.home() / ".cache" / "taigu_step9_fonts"
+
+
+def register_simplified_chinese_font() -> str | None:
+    """注册简体中文（SC）字面，返回字体名；失败返回 None。"""
+    try:
+        from fontTools.ttLib import TTCollection
+    except Exception:
+        return None
+    for candidate in CHINESE_FONT_CANDIDATES[:2]:
+        path = Path(candidate)
+        if not path.exists() or path.suffix.lower() != ".ttc":
+            continue
+        try:
+            collection = TTCollection(str(path))
+        except Exception:
+            continue
+        for index, face in enumerate(collection.fonts):
+            try:
+                family = str(face["name"].getDebugName(1) or "")
+            except Exception:
+                continue
+            if "SC" not in family:
+                continue
+            target = FONT_CACHE_DIR / f"{path.stem}-face{index}.otf"
+            try:
+                if not target.exists() or target.stat().st_mtime < path.stat().st_mtime:
+                    FONT_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+                    face.save(str(target))
+                font_manager.fontManager.addfont(str(target))
+                name = font_manager.FontProperties(fname=str(target)).get_name()
+                if name:
+                    return name
+            except Exception:
+                continue
+    return None
 
 
 def configure_fonts() -> str:
+    sc_name = register_simplified_chinese_font()
+    if sc_name:
+        plt.rcParams["font.family"] = "sans-serif"
+        plt.rcParams["font.sans-serif"] = [sc_name, "DejaVu Sans"]
+        plt.rcParams["axes.unicode_minus"] = False
+        print(f"[Step9] 中文字体：{sc_name}（简体字面，来自 Noto CJK ttc 的 SC face）", flush=True)
+        return sc_name
     for candidate in CHINESE_FONT_CANDIDATES:
         path = Path(candidate)
         if path.exists():
@@ -140,6 +188,7 @@ def configure_fonts() -> str:
             plt.rcParams["font.family"] = "sans-serif"
             plt.rcParams["font.sans-serif"] = [name, "DejaVu Sans"]
             plt.rcParams["axes.unicode_minus"] = False
+            print(f"[Step9] 中文字体：{name}（未取到 SC 字面，可能为日文字形）", flush=True)
             return name
     plt.rcParams["axes.unicode_minus"] = False
     return "unavailable"
@@ -213,6 +262,14 @@ def validate(config: dict[str, Any]) -> dict[str, Any]:
             "horizons": [x[0] for x in HORIZONS],
             "anttrack_minus_one_is_valid": True,
             "seismic_role": "仅Step9展示，不参与裂缝预测或属性融合",
+            # 中文字体（简体 SC 字面）：图例里"复/壳"等字必须用 SC face，否则会渲染成日文字形
+            "matplotlib_chinese_font": CHINESE_FONT,
+            "conventional_log_policy": "目标地层（InHorizonLayer==1）内的井轨迹；层外不计入，层内不跨缺口插值",
+            "dfn_azimuth_semantics": "dip_azimuth",
+            "dfn_azimuth_rule": (
+                "DipAzimuthDeg=真倾向方位(0–360，2026-09-22 统一口径) → 直接送入 apparent_dip_trace；"
+                "AzimuthDeg 仅为派生走向(=(D-90)%180)的兼容字段"
+            ),
         },
     }
 
@@ -699,21 +756,184 @@ def horizon_curves(horizon: pd.DataFrame, track: pd.DataFrame, coords: np.ndarra
     return output
 
 
+SECTION_INTERSECTION_EPS_M = 1.0e-6
+
+
+def representative_line_2d(coords_2d: np.ndarray):
+    """用 PCA 主轴把二维点集压成一条代表线（对齐砂砾岩 Step9 的实现）。"""
+    if len(coords_2d) < 2 or not np.all(np.isfinite(coords_2d)):
+        return None
+    center = coords_2d.mean(axis=0)
+    centered = coords_2d - center
+    if float(np.linalg.norm(centered)) <= 1e-8:
+        return None
+    try:
+        _, _, vh = np.linalg.svd(centered, full_matrices=False)
+    except np.linalg.LinAlgError:
+        return None
+    direction = vh[0]
+    norm = float(np.linalg.norm(direction))
+    if norm <= 1e-8:
+        return None
+    direction = direction / norm
+    projections = centered @ direction
+    lo, hi = float(np.nanmin(projections)), float(np.nanmax(projections))
+    if hi - lo <= 1e-8:
+        return None
+    p1 = center + lo * direction
+    p2 = center + hi * direction
+    return (float(p1[0]), float(p1[1])), (float(p2[0]), float(p2[1]))
+
+
+def plane_polygon_intersection_line(vertices: np.ndarray, axis: int, value: float):
+    """凸多边形与平面（X=value 或 Y=value）的交线，返回剖面坐标 ((h1,z1),(h2,z2))。"""
+    points: list[np.ndarray] = []
+    count = len(vertices)
+    if count < 3:
+        return None
+    for index in range(count):
+        p1 = vertices[index]
+        p2 = vertices[(index + 1) % count]
+        d1 = float(p1[axis] - value)
+        d2 = float(p2[axis] - value)
+        if abs(d1) <= SECTION_INTERSECTION_EPS_M:
+            points.append(p1.copy())
+        if d1 * d2 < 0.0:
+            ratio = abs(d1) / (abs(d1) + abs(d2))
+            points.append(p1 + ratio * (p2 - p1))
+        elif abs(d2) <= SECTION_INTERSECTION_EPS_M:
+            points.append(p2.copy())
+    if len(points) < 2:
+        return None
+    unique: list[np.ndarray] = []
+    for point in points:
+        if not any(float(np.linalg.norm(point - other)) <= 1.0e-5 for other in unique):
+            unique.append(point)
+    if len(unique) < 2:
+        return None
+    arr = np.asarray(unique, dtype=float)
+    coords = arr[:, [0, 2]] if axis == 1 else arr[:, [1, 2]]
+    if len(coords) == 2:
+        p1, p2 = coords[0], coords[1]
+        if float(np.linalg.norm(p2 - p1)) <= 1.0e-8:
+            return None
+        return (float(p1[0]), float(p1[1])), (float(p2[0]), float(p2[1]))
+    return representative_line_2d(coords)
+
+
+def projected_polygon_line(vertices: np.ndarray, projection: str):
+    coords = vertices[:, [0, 2]] if projection == "XZ" else vertices[:, [1, 2]]
+    return representative_line_2d(coords)
+
+
+_PATCH_POLYGON_CACHE: dict[str, list[np.ndarray]] = {}
+
+
+def load_patch_polygons(config: dict[str, Any]) -> list[np.ndarray]:
+    """读取 Step8 统一 VTK 里的**预测裂缝片**多边形（ASCII legacy POLYDATA）。
+
+    行序与 Step8 的 `well_corrected_dfn_fracture_patches.csv` 一一对应
+    （预测片在前、原始断层三角形在后）。
+    """
+    path = str(config.get("step8_vtk") or "")
+    if not path:
+        return []
+    if path in _PATCH_POLYGON_CACHE:
+        return _PATCH_POLYGON_CACHE[path]
+    with Path(path).open("r", encoding="utf-8", errors="ignore") as handle:
+        lines = handle.read().splitlines()
+    point_index = next(i for i, line in enumerate(lines) if line.startswith("POINTS"))
+    polygon_index = next(i for i, line in enumerate(lines) if line.startswith("POLYGONS"))
+    point_count = int(lines[point_index].split()[1])
+    polygon_count = int(lines[polygon_index].split()[1])
+    points = np.array([[float(v) for v in lines[point_index + 1 + i].split()] for i in range(point_count)])
+    polygons: list[np.ndarray] = []
+    for i in range(polygon_index + 1, min(polygon_index + 1 + polygon_count, len(lines))):
+        parts = lines[i].split()
+        if len(parts) < 4:
+            continue
+        if not parts[0].isdigit():
+            break
+        count = int(parts[0])
+        if count < 3:
+            continue
+        ids = np.asarray([int(value) for value in parts[1:1 + count]], dtype=np.int64)
+        if ids.size and int(ids.max()) < point_count:
+            polygons.append(points[ids])
+    _PATCH_POLYGON_CACHE[path] = polygons
+    return polygons
+
+
+def patch_segments_from_geometry(polygons: list[np.ndarray], patches: pd.DataFrame, track: pd.DataFrame,
+                                 projection: str, half_width: float,
+                                 projection_half_width: float
+                                 ) -> tuple[list[list[list[float]]], list[str], list[float], list[str], list[bool]]:
+    """按**真实几何**画 DFN 片（对齐砂砾岩 Step9）：求交优先，其次小尺度投影。
+
+    * 片中心到剖面法向（XZ→Y、YZ→X）的距离 <= ``half_width`` → 与剖面平面求交，
+      得到真实交线（``crossed=True``）；
+    * 求交失败或未落在半宽内的小尺度片，若距离 <= ``projection_half_width`` →
+      画该多边形在剖面内的投影线（``crossed=False``）。
+    """
+    perpendicular = "Y" if projection == "XZ" else "X"
+    axis_index = 1 if projection == "XZ" else 0
+    color = dict(DFN_LAYER_COLORS)
+    segments: list[list[list[float]]] = []
+    colors: list[str] = []
+    widths: list[float] = []
+    scales: list[str] = []
+    crossed: list[bool] = []
+    for index, vertices in enumerate(polygons):
+        if index >= len(patches):
+            break
+        row = patches.iloc[index]
+        center = vertices.mean(axis=0)
+        center_time = float(center[2])
+        well_perp = float(interp_track(track, np.array([center_time]), perpendicular)[0])
+        distance = abs(float(center[axis_index]) - well_perp)
+        scale_key = str(row.get("FractureScale", "")).strip().lower()
+        line = None
+        is_crossed = False
+        if distance <= half_width:
+            line = plane_polygon_intersection_line(vertices, axis=axis_index, value=well_perp)
+            is_crossed = line is not None
+        if line is None and scale_key == "small" and distance <= projection_half_width:
+            line = projected_polygon_line(vertices, projection)
+            is_crossed = False
+        if line is None:
+            continue
+        segments.append([[line[0][0], line[0][1]], [line[1][0], line[1][1]]])
+        colors.append(color.get(str(row.get("LayerGroup", "")), "#7b1fa2"))
+        widths.append(DFN_SCALE_WIDTH.get(scale_key, 0.9))
+        scales.append(scale_key)
+        crossed.append(bool(is_crossed))
+    return segments, colors, widths, scales, crossed
+
+
 def patch_segments(patches: pd.DataFrame, track: pd.DataFrame, projection: str,
                    half_width: float) -> tuple[list[list[list[float]]], list[str], list[float], list[str], list[bool]]:
     """DFN 裂缝片在剖面内的迹线：与成像层同口径，取"裂缝面 ∩ 剖面面"交线。
 
-    注意两套方位约定的差别：
-
-    * Step7/Step8 合同的 `AzimuthDeg` 是**走向**（0–180，axial），VTK 几何也按走向建面，
-      所以这里先 `+90°` 转成"倾向方位"再交给 `apparent_dip_trace`；
-    * Step3 成像的 `FracAzimuth` 本身就是**真倾向方位**（甲方 LAS 参数块写明
-      `TLFamily_Azimuth = True Dip Azimuth`），直接使用。
+    **方位口径（2026-09-22 统一）**：DFN 片表以 `DipAzimuthDeg`（真倾向方位 0–360）为准，
+    直接送入 `apparent_dip_trace`。`AzimuthDeg`（派生走向）仅在缺 `DipAzimuthDeg` 时回退
+    （按 `strike_from_xy_line_angle → dip_azimuth_from_strike` 换算）。
 
     旧实现把水平分量取成"倾向方位的水平分量"、并给 `|lateral|` 加 0.08 下限，
     结果是：绝大多数片子被画成真倾角，而走向≈垂直剖面时（`lateral→0`）直接翻成
     竖直——本该接近水平的高角度缝反而画成竖线，和成像标签完全对不上。
     """
+    has_dip_azimuth = "DipAzimuthDeg" in patches.columns
+
+    def dip_azimuth_of(row) -> float:
+        if has_dip_azimuth:
+            value = pd.to_numeric(pd.Series([getattr(row, "DipAzimuthDeg", np.nan)]), errors="coerce").iloc[0]
+            if np.isfinite(value):
+                return float(value) % 360.0
+        legacy = float(getattr(row, "AzimuthDeg", 0.0))
+        return convention.dip_azimuth_from_strike(
+            convention.strike_from_xy_line_angle(legacy)
+        )
+
     centers_t = patches["CenterTime"].to_numpy(np.float64)
     perpendicular = "Y" if projection == "XZ" else "X"
     center_perp = patches[f"Center{perpendicular}"].to_numpy(np.float64)
@@ -724,7 +944,7 @@ def patch_segments(patches: pd.DataFrame, track: pd.DataFrame, projection: str,
     for row in selected.itertuples(index=False):
         cx = float(row.CenterX if projection == "XZ" else row.CenterY)
         ct = float(row.CenterTime)
-        dip_azimuth = (float(row.AzimuthDeg) + 90.0) % 360.0
+        dip_azimuth = dip_azimuth_of(row)
         trace = apparent_dip_trace(dip_azimuth, float(row.DipDeg), projection)
         if trace is None:
             continue
@@ -741,14 +961,17 @@ def patch_segments(patches: pd.DataFrame, track: pd.DataFrame, projection: str,
         # 判断"剖面是否真的穿过这个片"：片的走向/倾角决定它在剖面法向（XZ→Y，YZ→X）
         # 上占多宽，若片中心在该方向上的距离小于片自身半宽，就是这个剖面真实切到的片。
         # 真实交线画在最上层（对齐砂砾岩 13.0/13.2），其余只作井周投影（半透明、12.7）。
-        theta = math.radians(float(row.AzimuthDeg))
+        # "剖面是否真的切到这片"用的也是同一个方位口径：换算成**走向角**再算片在剖面法向的半宽。
+        # 半径方向改用**真倾向方位**直接算：长边沿走向 (cosD, -sinD)，短边沿下倾 (sinD, cosD)。
+        theta = math.radians(dip_azimuth)
         height_time = float(getattr(row, "HeightTimeMs", np.nan))
         half_dip_m = (
             (0.5 * height_time * 2.0) / max(math.tan(math.radians(min(max(float(row.DipDeg), 1.0), 89.9))), 1.0e-6)
             if np.isfinite(height_time) else 0.0
         )
-        dx_half = half * abs(math.sin(theta)) + half_dip_m * abs(math.cos(theta))
-        dy_half = half * abs(math.cos(theta)) + half_dip_m * abs(math.sin(theta))
+        # 长边 (cosD, -sinD)、短边 (sinD, cosD) 在 X/Y 上的投影宽度
+        dx_half = half * abs(math.cos(theta)) + half_dip_m * abs(math.sin(theta))
+        dy_half = half * abs(math.sin(theta)) + half_dip_m * abs(math.cos(theta))
         half_extent = dy_half if projection == "XZ" else dx_half
         row_perp = float(row.CenterY) if projection == "XZ" else float(row.CenterX)
         well_perp_center = float(interp_track(track, np.array([ct]), perpendicular)[0])
@@ -778,10 +1001,23 @@ def draw_overlays(ax, projection: str, coords: np.ndarray, times: np.ndarray, tr
         ax.plot([], [], color=FAULT_TRACE_COLOR, lw=2.5, linestyle=fault_style,
                 label="原始断层（黄色，非预测）")
     real_track = (times >= float(track["TIME"].min())) & (times <= float(track["TIME"].max()))
-    # 常规测井段（Step2 的 405 常规测井采样区间）：绿色加粗虚线，独立于成像井段
+    # 常规测井段（需求方 2026-09-22 口径）：**只取目标地层（层位窗口）内的井轨迹**，
+    # 不考虑目标地层范围之外的区域；层内按实际采样点连续绘制，不做跨缺口插值。
+    # 405 在目标层内的常规测井数据是完整的（两期测井互补：2016-06-17 覆盖 4180–4471，
+    # 2016-06-10 覆盖 4183–4813，4471–4480 的数据缺口由 06-10 补上），因此层内不应出现断口。
     conventional_label = "埕北古斜405常规测井段"
-    ax.plot(well_h[real_track], times[real_track], color=CONVENTIONAL_LOG_COLOR, lw=7.5,
-            linestyle=(0, (7, 3)), alpha=0.9, zorder=10.05, label=conventional_label)
+    if "InHorizonLayer" in track.columns:
+        layer_rows = track[pd.to_numeric(track["InHorizonLayer"], errors="coerce").fillna(0).eq(1)].copy()
+    else:
+        layer_rows = track.copy()
+    layer_rows = layer_rows.sort_values("TIME").drop_duplicates("TIME")
+    if len(layer_rows) >= 2:
+        layer_h = layer_rows["X" if projection == "XZ" else "Y"].to_numpy(np.float64)
+        ax.plot(layer_h, layer_rows["TIME"].to_numpy(np.float64), color=CONVENTIONAL_LOG_COLOR, lw=7.5,
+                linestyle=(0, (7, 3)), alpha=0.9, zorder=10.05, label=conventional_label)
+    else:
+        ax.plot(well_h[real_track], times[real_track], color=CONVENTIONAL_LOG_COLOR, lw=7.5,
+                linestyle=(0, (7, 3)), alpha=0.9, zorder=10.05, label=conventional_label)
     # 井轨迹：浅色描边 + 深色实线，画在叠加层最上面，保证在密集裂缝片之上仍可辨认
     ax.plot(well_h[real_track], times[real_track], color=WELL_TRACK_HALO, lw=3.6, alpha=0.9, zorder=12.4)
     ax.plot(well_h[real_track], times[real_track], color=WELL_TRACK_COLOR, lw=2.0,
@@ -795,7 +1031,20 @@ def draw_overlays(ax, projection: str, coords: np.ndarray, times: np.ndarray, tr
             ax.plot(imaging_h, imaging_t, color=IMAGING_TRACK_GLOW, lw=5.2, alpha=.78, zorder=12.5)
             ax.plot(imaging_h, imaging_t, color=IMAGING_TRACK_COLOR, lw=2.8, alpha=.96, zorder=12.55,
                     label=f"{config.get('profile_well', '')}成像测井段轨迹")
-    segments, colors, widths, scales, crossed = patch_segments(patches, track, projection, half_width)
+    # DFN 片绘制口径（2026-09-22）：
+    #   fields   —— 旧口径：按 (AzimuthDeg, DipDeg) 合成迹线（长度=片的走向长度）；
+    #   geometry —— 对齐砂砾岩 Step9：按 Step8 VTK 的真实多边形在剖面内求交/投影。
+    # 2026-09-22 统一口径：默认按 Step8 VTK 的**真实多边形**求交（几何 = 字段）；
+    # `fields` 仅保留为对照分支（按字段合成迹线，非正式）。
+    draw_mode = str(config.get("dfn_draw_mode", "geometry")).strip().lower()
+    if draw_mode == "geometry":
+        polygons = load_patch_polygons(config)
+        segments, colors, widths, scales, crossed = patch_segments_from_geometry(
+            polygons, patches, track, projection, half_width,
+            float(config.get("dfn_small_projection_half_width_m", half_width)),
+        )
+    else:
+        segments, colors, widths, scales, crossed = patch_segments(patches, track, projection, half_width)
     if segments:
         projected_index = [index for index, flag in enumerate(crossed) if not flag]
         crossed_index = [index for index, flag in enumerate(crossed) if flag]
@@ -867,8 +1116,21 @@ def draw_overlays(ax, projection: str, coords: np.ndarray, times: np.ndarray, tr
     if {"InImagingInterval", "InHorizonLayer"}.issubset(track.columns):
         imaging_rows = track[pd.to_numeric(track["InImagingInterval"], errors="coerce").fillna(0).eq(1)]
         horizon_rows = track[pd.to_numeric(track["InHorizonLayer"], errors="coerce").fillna(0).eq(1)]
+        layer_series = horizon_rows.sort_values("TIME").drop_duplicates("TIME")["TIME"].to_numpy(np.float64)
+        layer_steps = np.diff(layer_series) if len(layer_series) > 1 else np.asarray([], dtype=np.float64)
+        layer_step_median = float(np.median(layer_steps)) if layer_steps.size else float("nan")
+        layer_gap_threshold = max(5.0 * layer_step_median, 2.0) if layer_steps.size else float("nan")
+        layer_gap_count = int((layer_steps > layer_gap_threshold).sum()) if layer_steps.size else 0
         window_audit = {
-            "conventional_log_time_ms": [float(track["TIME"].min()), float(track["TIME"].max())],
+            # 常规测井段 = 目标地层内的井轨迹（需求方 2026-09-22 口径）
+            "conventional_log_time_ms": (
+                [float(layer_series.min()), float(layer_series.max())] if len(layer_series) else None
+            ),
+            "conventional_log_sample_count": int(len(layer_series)),
+            "conventional_log_step_median_ms": layer_step_median,
+            "conventional_log_gap_count": layer_gap_count,
+            "conventional_log_gap_threshold_ms": layer_gap_threshold,
+            "track_time_ms": [float(track["TIME"].min()), float(track["TIME"].max())],
             "imaging_interval_time_ms": (
                 [float(imaging_rows["TIME"].min()), float(imaging_rows["TIME"].max())] if len(imaging_rows) else None
             ),
@@ -894,10 +1156,11 @@ def draw_overlays(ax, projection: str, coords: np.ndarray, times: np.ndarray, tr
         "imaging_point_count": kept_imaging,
         "imaging_patch_count": len(patch_lines),
         "imaging_orientation_tick_count": len(orientation_ticks),
-        "conventional_log_interval_ms": [
-            float(track["TIME"].min()),
-            float(track["TIME"].max()),
-        ],
+        # 常规测井段 = 目标地层内的井轨迹（需求方 2026-09-22 口径）；完整轨迹见 window_audit.track_time_ms
+        "conventional_log_interval_ms": (
+            window_audit.get("conventional_log_time_ms")
+            or [float(track["TIME"].min()), float(track["TIME"].max())]
+        ),
         "dfn_scale_segment_counts": {
             scale: int(scales.count(scale)) for scale in ("small", "medium", "large")
         },
@@ -1000,10 +1263,15 @@ def main() -> int:
             "segment_counts": {projection: int(len(fault_segments[projection])) for projection in ("XZ", "YZ")},
         }
         print(f"[Step9] 原始断层剖面迹线 XZ={len(fault_segments['XZ'])} YZ={len(fault_segments['YZ'])}", flush=True)
-    patch_cols = ["CenterX","CenterY","CenterTime","AzimuthDeg","DipDeg","PatchLengthM","LengthM","LayerGroup","FractureScale"]
+    patch_cols = ["CenterX","CenterY","CenterTime","DipAzimuthDeg","AzimuthDeg","DipDeg","PatchLengthM","LengthM","LayerGroup","FractureScale"]
     available = pd.read_csv(pth(config, "step8_patches_csv"), nrows=0).columns
     patches = pd.read_csv(pth(config, "step8_patches_csv"), usecols=[c for c in patch_cols if c in available])
-    patches = numeric(patches, ("CenterX","CenterY","CenterTime","AzimuthDeg","DipDeg","PatchLengthM","LengthM")).dropna(subset=["CenterX","CenterY","CenterTime","AzimuthDeg","DipDeg"])
+    numeric_cols = ("CenterX","CenterY","CenterTime","DipAzimuthDeg","AzimuthDeg","DipDeg","PatchLengthM","LengthM")
+    patches = numeric(patches, tuple(c for c in numeric_cols if c in patches.columns))
+    required_cols = [c for c in ("CenterX","CenterY","CenterTime","AzimuthDeg","DipDeg") if c in patches.columns]
+    patches = patches.dropna(subset=required_cols)
+    # 2026-09-22 统一口径：DipAzimuthDeg 是唯一真值（0–360 倾向方位），AzimuthDeg 是派生走向。
+    patches.attrs["azimuth_semantics"] = "dip_azimuth"
     # 纵向范围改为"逐剖面自适应"（对齐砂砾岩 Step9 口径：用该剖面自己画出来的层位曲线
     # 的 min/max ± padding），不再让 overview 与 local_200m 共用"全工区层位合同的全局 min/max"。
     # 方案 B：scope_time_padding_ms = 100 ms，层位上下各留 100 ms 上下文。

@@ -1,0 +1,135 @@
+{
+  "wellhead_path": "/data/shared/project-oil/wx数据/埕岛太古界/参与井井头信息.dat",
+  "time_depth_dir": "/data/shared/project-oil/wx数据/埕岛太古界/时深",
+  "surface_paths": {
+    "top": "/data/shared/project-oil/wx数据/埕岛太古界/层位/Grid_上部复合层T-a-1.dat",
+    "middle": "/data/shared/project-oil/wx数据/埕岛太古界/层位/Grid_太古界顶Art_1.dat",
+    "bottom": "/data/shared/project-oil/wx数据/埕岛太古界/层位/Grid_风化壳底Art_d1-1.dat"
+  },
+  "regular_las_roots": [
+    "/data/shared/project-oil/wx数据/埕岛太古界/侧向电阻率曲线/常规测井/RD"
+  ],
+  "max_surface_match_distance_m": 100.0,
+  "output_dir": "太古界/step1_strata_contracts/output/taigu_step1_contracts_md1",
+  "_note": "md1（2026-09-22）：成像解释区间为 MD（甲方测深）口径。键名 imaging_md_contracts / interpreted_md_intervals / boundary_md；数值与 v1 逐字一致（v1 的数值本来就是甲方测深，只是被写成了 TVD）。source_depth_checks 用于核对合同区间两端与甲方文件自身深度范围（容差 1 m）。",
+  "imaging_md_contracts": [
+    {
+      "well_name": "埕北305",
+      "interpreted_md_intervals": [[3782.11, 4325.57]],
+      "boundary_md": 4221.0,
+      "upper_strata": "上部复合层",
+      "lower_strata": "太古界风化壳",
+      "status": "prediction_only",
+      "source_kind": "imaging_interpretation_manual"
+    },
+    {
+      "well_name": "埕北310",
+      "interpreted_md_intervals": [[3408.16, 4052.53]],
+      "single_strata": "上部复合层",
+      "status": "candidate_supervision",
+      "source_kind": "imaging_interpretation_manual"
+    },
+    {
+      "well_name": "埕北313",
+      "interpreted_md_intervals": [[4174.1, 4627.0], [4751.0, 4884.0]],
+      "boundary_md": 4783.0,
+      "upper_strata": "上部复合层",
+      "lower_strata": "太古界风化壳",
+      "status": "candidate_supervision",
+      "source_kind": "imaging_interpretation_manual"
+    },
+    {
+      "well_name": "埕北816",
+      "interpreted_md_intervals": [[3537.85, 3612.48]],
+      "single_strata": "太古界风化壳",
+      "status": "candidate_supervision",
+      "source_kind": "imaging_interpretation_manual"
+    },
+    {
+      "well_name": "埕北古7",
+      "interpreted_md_intervals": [[3146.06, 3340.21]],
+      "single_strata": "太古界风化壳",
+      "status": "candidate_supervision",
+      "source_kind": "imaging_interpretation_manual"
+    },
+    {
+      "well_name": "埕北古斜405",
+      "interpreted_md_intervals": [[3676.5, 3998.1]],
+      "single_strata": "上部复合层",
+      "status": "candidate_supervision",
+      "source_kind": "imaging_interpretation_manual"
+    },
+    {
+      "well_name": "桩海102",
+      "interpreted_md_intervals": [[4316.56, 4697.06]],
+      "single_strata": "上部复合层",
+      "status": "candidate_density_only",
+      "source_kind": "imaging_interpretation_manual"
+    },
+    {
+      "well_name": "桩斜169",
+      "interpreted_md_intervals": [[4264.6, 4925.48]],
+      "single_strata": "上部复合层",
+      "status": "candidate_supervision",
+      "source_kind": "imaging_interpretation_manual"
+    }
+  ],
+  "source_depth_checks": [
+    {
+      "well_name": "埕北310",
+      "path": "/data/shared/project-oil/wx数据/埕岛太古界/埕岛-桩海地区成像测井/埕北310井xrmi成果归档/cb310-xrmi-facture.TXT",
+      "format": "whitespace",
+      "depth_index": 0,
+      "tolerance_m": 1.0
+    },
+    {
+      "well_name": "埕北313",
+      "path": "/data/shared/project-oil/wx数据/埕岛太古界/埕岛-桩海地区成像测井/埕北313井FMI_ELAN解释成果数据/FMI/CSV/埕北313井_FractureLogs裂缝参数_4174-4627m.csv",
+      "format": "csv",
+      "depth_column": "TDEP",
+      "tolerance_m": 1.0
+    },
+    {
+      "well_name": "埕北313",
+      "path": "/data/shared/project-oil/wx数据/埕岛太古界/埕岛-桩海地区成像测井/埕北313井FMI_ELAN解释成果数据/FMI/CSV/埕北313井_FractureLogs裂缝参数_4751-4884m.csv",
+      "format": "csv",
+      "depth_column": "TDEP",
+      "tolerance_m": 1.0
+    },
+    {
+      "well_name": "埕北816",
+      "path": "/data/shared/project-oil/wx数据/埕岛太古界/埕岛-桩海地区成像测井/中石化_胜利油田_埕北816井/FMI_delivery/TXT/埕北816井连续型高导缝计算结果.txt",
+      "format": "whitespace",
+      "depth_index": 0,
+      "tolerance_m": 1.0
+    },
+    {
+      "well_name": "埕北古7",
+      "path": "/data/shared/project-oil/wx数据/埕岛太古界/埕岛-桩海地区成像测井/胜利_埕北古7井FMI_Petrophysics_递交资料/FMI测井部分/TXT/Chengbeigu7_fracture_par.txt",
+      "format": "whitespace",
+      "depth_index": 0,
+      "tolerance_m": 1.0
+    },
+    {
+      "well_name": "埕北古斜405",
+      "path": "/data/shared/project-oil/wx数据/埕岛太古界/埕岛-桩海地区成像测井/中国石化胜利油田埕北古斜405井FMI成像测井解释成果/埕北古斜405井FMI成像解释成果数据文件/CSV/埕北古斜405井_Fracture parameter_Final_裂缝参数.csv",
+      "format": "csv",
+      "depth_column": "MD",
+      "tolerance_m": 1.0
+    },
+    {
+      "well_name": "桩海102",
+      "path": "/data/shared/project-oil/wx数据/埕岛太古界/埕岛-桩海地区成像测井/桩海102/ascii/fracture_data.dat",
+      "format": "whitespace",
+      "depth_index": 0,
+      "tolerance_m": 1.0
+    },
+    {
+      "well_name": "桩斜169",
+      "path": "/data/shared/project-oil/wx数据/埕岛太古界/埕岛-桩海地区成像测井/中国石化胜利油田桩斜169井测井解释成果/桩斜169井FMI成像解释数据文件/FMI/ASCII/桩斜169井裂缝参数.csv",
+      "format": "csv",
+      "depth_column": "TDEP",
+      "tolerance_m": 1.0
+    }
+  ]
+}

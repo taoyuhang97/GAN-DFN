@@ -26,6 +26,7 @@ if str(SURFACE_TOOL_DIR) not in sys.path:
     sys.path.insert(0, str(SURFACE_TOOL_DIR))
 
 from surface_tools import load_surface_tables, validate_surface_order  # noqa: E402
+from common.orientation_frame import convention as orientation  # noqa: E402
 
 
 ALLOWED_LAYERS = ["沙三段", "沙四段"]
@@ -750,10 +751,15 @@ def sample_candidate_voxels_multiscale(
 
 
 def _azimuth_from_xy_vector(vector: np.ndarray, fallback: float) -> float:
+    """水平延伸轴的**罗盘走向**（0–180）：``atan2(东分量, 北分量)``。
+
+    2026-09-22 统一口径：旧实现用 ``atan2(y, x)``（自东逆时针的平面角），
+    与全链"罗盘 azimuth"不符；这里改成罗盘走向，调用点再派生成倾向方位。
+    """
     xy = np.asarray(vector[:2], dtype=float)
     if float(np.linalg.norm(xy)) < 1.0e-8:
         return float(fallback)
-    return float(np.degrees(np.arctan2(xy[1], xy[0])) % 180.0)
+    return float(np.degrees(np.arctan2(xy[0], xy[1])) % 180.0)
 
 
 def _object_band_rows(
@@ -783,6 +789,8 @@ def _object_band_rows(
         axis = -axis
     fallback_azimuth = layer_param(config, "fallback_azimuth_deg", str(group["LayerGroup"].iloc[0]), 60.0)
     band_azimuth = _azimuth_from_xy_vector(axis, fallback=fallback_azimuth)
+    # 2026-09-22 统一口径：带的长轴是走向 → 真倾向方位 = 走向 + 90°
+    band_dip_azimuth = orientation.dip_azimuth_from_strike(band_azimuth)
     axis_vertical = abs(float(axis[2]))
     trend_dip = float(np.degrees(np.arctan2(axis_vertical, max(float(np.linalg.norm(axis[:2])), 1.0e-6))))
     band_dip = float(np.clip(max(trend_dip, float(scale_cfg.get("min_band_dip_deg", config.get("min_dip_deg", 60.0)))), float(config.get("min_dip_deg", 60.0)), float(config.get("max_dip_deg", 89.0))))
@@ -821,6 +829,7 @@ def _object_band_rows(
             row["BandPatchSpacingM"] = float(spacing)
             row["BandMeanDensity"] = float(group["SourceDensity"].mean())
             row["ObjectBandAzimuthDeg"] = float(band_azimuth)
+            row["ObjectBandDipAzimuthDeg"] = float(band_dip_azimuth)
             row["ObjectBandDipDeg"] = float(band_dip)
             row["ObjectBandLengthM"] = float(axis_length)
             row["ObjectBandCenterSpacingM"] = float(spacing)
@@ -828,6 +837,7 @@ def _object_band_rows(
             row["OverrideLengthM"] = float(length)
             row["OverrideHeightTimeMs"] = float(height)
             row["OverrideAzimuthDeg"] = float(band_azimuth)
+            row["OverrideDipAzimuthDeg"] = float(band_dip_azimuth)
             row["OverrideDipDeg"] = float(band_dip)
             local_used.add(original_idx)
             selected_rows.append(row)
@@ -844,6 +854,7 @@ def _object_band_rows(
         "mean_density": float(group["SourceDensity"].mean()),
         "density_mass": float(group["SourceDensity"].sum()),
         "azimuth_deg": float(band_azimuth),
+        "dip_azimuth_deg": float(band_dip_azimuth),
         "dip_deg": float(band_dip),
         "center_spacing_m": float(spacing),
         "mean_overlap_ratio": float(np.mean([float(row["ObjectBandOverlapRatio"]) for row in selected_rows])) if selected_rows else 0.0,
@@ -1233,7 +1244,14 @@ def estimate_local_orientation(
     vertical_scale = float(config.get("orientation_time_scale_m_per_ms", 1.0))
     min_points = int(config.get("min_orientation_points", 12))
     min_planarity = float(config.get("min_orientation_planarity", 0.08))
-    fallback_azimuth = layer_param(config, "fallback_azimuth_deg", layer, layer_param(config, "base_azimuth_deg", layer, 60.0))
+    # 2026-09-22 统一口径：内部一律用**真倾向方位 0–360**。
+    # 兼容旧配置键 `fallback_azimuth_deg`（历史上写的是走向）。
+    if "fallback_dip_azimuth_deg" in config:
+        fallback_azimuth = layer_param(config, "fallback_dip_azimuth_deg", layer, 150.0)
+    else:
+        fallback_azimuth = orientation.dip_azimuth_from_strike(
+            layer_param(config, "fallback_azimuth_deg", layer, layer_param(config, "base_azimuth_deg", layer, 60.0))
+        )
     fallback_dip = layer_param(config, "fallback_dip_deg", layer, layer_param(config, "base_dip_deg", layer, 72.0))
 
     y0 = max(0, y_idx - ry)
@@ -1245,7 +1263,7 @@ def estimate_local_orientation(
     block = density[y0:y1, x0:x1, t0:t1]
     if block.size == 0:
         return {
-            "azimuth": fallback_azimuth,
+            "dip_azimuth": fallback_azimuth,
             "dip": fallback_dip,
             "source": "fallback_layer_template_empty_window",
             "point_count": 0,
@@ -1260,7 +1278,7 @@ def estimate_local_orientation(
         yy, xx, tt = np.where(block > 0.0)
     if yy.size < min_points:
         return {
-            "azimuth": fallback_azimuth,
+            "dip_azimuth": fallback_azimuth,
             "dip": fallback_dip,
             "source": "fallback_layer_template_insufficient_points",
             "point_count": int(yy.size),
@@ -1285,7 +1303,7 @@ def estimate_local_orientation(
     total = float(eigvals.sum())
     if total <= 0:
         return {
-            "azimuth": fallback_azimuth,
+            "dip_azimuth": fallback_azimuth,
             "dip": fallback_dip,
             "source": "fallback_layer_template_degenerate_pca",
             "point_count": int(yy.size),
@@ -1300,7 +1318,7 @@ def estimate_local_orientation(
     normal_norm = float(np.linalg.norm(normal))
     if normal_norm <= 0 or planarity < min_planarity:
         return {
-            "azimuth": fallback_azimuth,
+            "dip_azimuth": fallback_azimuth,
             "dip": fallback_dip,
             "source": "fallback_layer_template_low_planarity",
             "point_count": int(yy.size),
@@ -1312,16 +1330,16 @@ def estimate_local_orientation(
     vertical_component = abs(float(normal[2]))
     dip = float(np.degrees(np.arccos(np.clip(vertical_component, 0.0, 1.0))))
     dip = float(np.clip(dip, float(config.get("min_dip_deg", 45.0)), float(config.get("max_dip_deg", 89.0))))
-    strike = np.asarray([-normal[1], normal[0]], dtype=float)
-    if float(np.linalg.norm(strike)) < 1.0e-8:
+    # `coords` 的第三维是 TIME * vertical_scale（向下为正）→ 用"向下帧"换算。
+    if float(np.linalg.norm(normal[:2])) < 1.0e-8:
         azimuth = fallback_azimuth
         source = "fallback_azimuth_vertical_normal_pca_dip"
     else:
-        azimuth = float(np.degrees(np.arctan2(strike[1], strike[0])) % 180.0)
+        azimuth, _dip_from_normal = orientation.dip_azimuth_dip_from_normal_depth(normal)
         source = "local_3d_density_pca_plane"
 
     return {
-        "azimuth": azimuth,
+        "dip_azimuth": azimuth,
         "dip": dip,
         "source": source,
         "point_count": int(yy.size),
@@ -1378,7 +1396,7 @@ def build_patch_table(
         y_idx = int(row["IY"])
         x_idx = int(row["IX"])
         t_idx = int(row["IT"])
-        orientation = estimate_local_orientation(
+        local_orientation = estimate_local_orientation(
             density=density,
             y_idx=y_idx,
             x_idx=x_idx,
@@ -1388,12 +1406,18 @@ def build_patch_table(
             density_p95=density_p95.get(layer, source_density),
             config=config,
         )
-        if np.isfinite(float(row.get("OverrideAzimuthDeg", np.nan))):
-            orientation["azimuth"] = float(row["OverrideAzimuthDeg"])
-            orientation["source"] = "object_band_centerline_smoothed"
+        if np.isfinite(float(row.get("OverrideDipAzimuthDeg", np.nan))):
+            local_orientation["dip_azimuth"] = float(row["OverrideDipAzimuthDeg"]) % 360.0
+            local_orientation["source"] = "object_band_centerline_smoothed"
+        elif np.isfinite(float(row.get("OverrideAzimuthDeg", np.nan))):
+            # 兼容旧字段：历史 `OverrideAzimuthDeg` 写的是"走向"
+            local_orientation["dip_azimuth"] = orientation.dip_azimuth_from_strike(
+                float(row["OverrideAzimuthDeg"])
+            )
+            local_orientation["source"] = "object_band_centerline_smoothed_from_strike"
         if np.isfinite(float(row.get("OverrideDipDeg", np.nan))):
-            orientation["dip"] = float(row["OverrideDipDeg"])
-            orientation["source"] = "object_band_centerline_smoothed"
+            local_orientation["dip"] = float(row["OverrideDipDeg"])
+            local_orientation["source"] = "object_band_centerline_smoothed"
         center_x = float(x_values[x_idx])
         center_y = float(y_values[y_idx])
         patch_id = f"init3d_dfn_{patch_idx + 1:06d}"
@@ -1428,8 +1452,9 @@ def build_patch_table(
                 "HeightM": float(height_m),
                 "PatchAreaM2": float(area_m2),
                 "PatchEquivalentRadiusM": float(equivalent_radius_m),
-                "AzimuthDeg": float(orientation["azimuth"]),
-                "DipDeg": float(orientation["dip"]),
+                "DipAzimuthDeg": float(local_orientation["dip_azimuth"]),
+                "AzimuthDeg": orientation.strike_from_dip_azimuth(float(local_orientation["dip_azimuth"])),
+                "DipDeg": float(local_orientation["dip"]),
                 "TraceGridDX": float(config.get("trace_spacing_x_m", 12.5)),
                 "TraceGridDY": float(config.get("trace_spacing_y_m", 12.5)),
                 "VoxelIX": x_idx,
@@ -1438,14 +1463,14 @@ def build_patch_table(
                 "ComponentID": int(row["ComponentID"]),
                 "ComponentVoxelCount": int(row["ComponentVoxelCount"]),
                 "LayerDensityThreshold": float(row["LayerDensityThreshold"]),
-                "LocalOrientationPointCount": int(orientation["point_count"]),
-                "LocalDensityLinearity": float(orientation["linearity"]),
-                "LocalDensityPlanarity": float(orientation["planarity"]),
-                "LocalEigenvalue1": float(orientation["eigenvalues"][0]),
-                "LocalEigenvalue2": float(orientation["eigenvalues"][1]),
-                "LocalEigenvalue3": float(orientation["eigenvalues"][2]),
+                "LocalOrientationPointCount": int(local_orientation["point_count"]),
+                "LocalDensityLinearity": float(local_orientation["linearity"]),
+                "LocalDensityPlanarity": float(local_orientation["planarity"]),
+                "LocalEigenvalue1": float(local_orientation["eigenvalues"][0]),
+                "LocalEigenvalue2": float(local_orientation["eigenvalues"][1]),
+                "LocalEigenvalue3": float(local_orientation["eigenvalues"][2]),
                 "DensitySizeFactor": density_factor,
-                "OrientationSource": str(orientation["source"]),
+                "OrientationSource": str(local_orientation["source"]),
                 "SizeRule": "base_size_scaled_by_3d_density_quantile",
                 "SamplingRule": str(row.get("BandContinuityMode", "")) or ("low_coherence_guided_weighted_sampling_from_3d_density_voxels" if coherence_guidance_config(config).get("enabled", False) else "weighted_sampling_from_3d_high_density_connected_voxels"),
                 "FractureScale": fracture_scale,
@@ -1458,6 +1483,7 @@ def build_patch_table(
                 "BandTimeExtentMs": float(row.get("BandTimeExtentMs", 0.0)),
                 "BandPatchSpacingM": float(row.get("BandPatchSpacingM", 0.0)),
                 "BandMeanDensity": float(row.get("BandMeanDensity", source_density)),
+                "ObjectBandDipAzimuthDeg": float(row.get("ObjectBandDipAzimuthDeg", np.nan)),
                 "ObjectBandAzimuthDeg": float(row.get("ObjectBandAzimuthDeg", np.nan)),
                 "ObjectBandDipDeg": float(row.get("ObjectBandDipDeg", np.nan)),
                 "ObjectBandLengthM": float(row.get("ObjectBandLengthM", 0.0)),
@@ -1477,12 +1503,24 @@ def build_patch_table(
 
 
 def patch_vertices(row: pd.Series, display: bool, display_z_scale: float, geometry_time_scale_m_per_ms: float) -> list[tuple[float, float, float]]:
-    azimuth = np.deg2rad(float(row["AzimuthDeg"]))
+    """片的四个顶点。
+
+    **口径（2026-09-22 统一）**：由 ``DipAzimuthDeg``（真倾向方位 0–360）构造
+    ——长边沿走向线 ``(cosD, -sinD)``，短边沿下倾方向 ``(sinD, cosD)``，z 为 TIME（向下为正）。
+    旧实现把 ``AzimuthDeg`` 当"倾向方位的镜像"用（长边 ``(cosA, sinA)``、
+    下倾方向 ``(-sinA, cosA)``），与甲方真值口径不符；仅在缺 ``DipAzimuthDeg`` 时回退。
+    """
+    if "DipAzimuthDeg" in row.index and np.isfinite(float(row["DipAzimuthDeg"])):
+        dip_azimuth = np.deg2rad(float(row["DipAzimuthDeg"]) % 360.0)
+    else:
+        # 旧产物：AzimuthDeg 是"走向"（历史口径按 (90 - A) 的罗盘走向解释）
+        legacy_strike = orientation.strike_from_xy_line_angle(float(row["AzimuthDeg"]))
+        dip_azimuth = np.deg2rad(orientation.dip_azimuth_from_strike(legacy_strike))
     dip = np.deg2rad(float(np.clip(row["DipDeg"], 1.0, 89.9)))
     half_length = 0.5 * float(row["LengthM"])
     half_height_time = 0.5 * float(row["HeightTimeMs"])
-    strike = np.asarray([np.cos(azimuth), np.sin(azimuth)], dtype=float)
-    dip_horizontal = np.asarray([-np.sin(azimuth), np.cos(azimuth)], dtype=float)
+    strike = np.asarray([np.cos(dip_azimuth), -np.sin(dip_azimuth)], dtype=float)
+    dip_horizontal = np.asarray([np.sin(dip_azimuth), np.cos(dip_azimuth)], dtype=float)
     horizontal_dip_half = (half_height_time * geometry_time_scale_m_per_ms) / max(np.tan(dip), 1.0e-6)
 
     center_x = float(row["CenterX"])
@@ -1521,6 +1559,7 @@ def write_patch_vtk(path: Path, patch_df: pd.DataFrame, title: str, display: boo
         ("HeightM", patch_df["HeightM"].to_numpy(), "float"),
         ("PatchAreaM2", patch_df["PatchAreaM2"].to_numpy(), "float"),
         ("PatchEquivalentRadiusM", patch_df["PatchEquivalentRadiusM"].to_numpy(), "float"),
+        ("DipAzimuthDeg", patch_df["DipAzimuthDeg"].to_numpy(), "float"),
         ("AzimuthDeg", patch_df["AzimuthDeg"].to_numpy(), "float"),
         ("DipDeg", patch_df["DipDeg"].to_numpy(), "float"),
         ("DensitySizeFactor", patch_df["DensitySizeFactor"].to_numpy(), "float"),
@@ -1590,6 +1629,7 @@ def write_band_centerline_vtk(path: Path, band_summaries: list[dict[str, Any]]) 
         "BandTimeExtentMs": [],
         "SelectedPatchCount": [],
         "MeanOverlapRatio": [],
+        "DipAzimuthDeg": [],
         "AzimuthDeg": [],
         "DipDeg": [],
     }
@@ -1607,6 +1647,7 @@ def write_band_centerline_vtk(path: Path, band_summaries: list[dict[str, Any]]) 
         cell_scalars["BandTimeExtentMs"].append(float(band.get("time_extent_ms", 0.0)))
         cell_scalars["SelectedPatchCount"].append(float(band.get("selected_patch_count", 0.0)))
         cell_scalars["MeanOverlapRatio"].append(float(band.get("mean_overlap_ratio", 0.0)))
+        cell_scalars["DipAzimuthDeg"].append(float(band.get("dip_azimuth_deg", 0.0)))
         cell_scalars["AzimuthDeg"].append(float(band.get("azimuth_deg", 0.0)))
         cell_scalars["DipDeg"].append(float(band.get("dip_deg", 0.0)))
     total_line_size = sum(len(cell) + 1 for cell in lines_cells)
@@ -1657,6 +1698,7 @@ def build_audit(patch_df: pd.DataFrame) -> pd.DataFrame:
         "HeightM",
         "PatchAreaM2",
         "PatchEquivalentRadiusM",
+        "DipAzimuthDeg",
         "AzimuthDeg",
         "DipDeg",
         "ComponentID",

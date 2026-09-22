@@ -23,6 +23,7 @@ DEFAULT_CONFIG = CURRENT_DIR / "configs/taigu_step7c_large_v3_attribute_v3.json"
 if str(FORMAL_ROOT) not in sys.path:
     sys.path.insert(0, str(FORMAL_ROOT))
 from common.dfn_geometry import initial_dfn_geometry as geometry  # noqa: E402
+from common.orientation_frame import convention as orientation  # noqa: E402
 
 UNIFIED_VTK_MODULE = REPO_ROOT / "优化阶段二" / "正式主线" / "common" / "unified_dfn_vtk.py"
 _unified_spec = importlib.util.spec_from_file_location("taigu_step7c_unified_dfn_vtk", UNIFIED_VTK_MODULE)
@@ -433,14 +434,12 @@ def normalize(vec: np.ndarray, fallback: np.ndarray) -> np.ndarray:
 
 
 def strike_dip_from_normal(normal: np.ndarray) -> tuple[float, float]:
+    """**向下帧**面法向 → ``(真倾向方位[0,360), 倾角)``（2026-09-22 统一口径）。
+
+    函数名保留兼容；返回值第一项已由"走向"改为"真倾向方位"。
+    """
     n = normalize(normal, np.array([0.0, 0.0, 1.0]))
-    strike = np.array([-n[1], n[0], 0.0], dtype=float)
-    if float(np.linalg.norm(strike)) < 1.0e-9:
-        azimuth = 0.0
-    else:
-        azimuth = float(np.degrees(np.arctan2(strike[1], strike[0])) % 180.0)
-    dip = float(np.degrees(np.arccos(np.clip(abs(float(n[2])), 0.0, 1.0))))
-    return azimuth, dip
+    return orientation.dip_azimuth_dip_from_normal_depth(n)
 
 
 def plane_axes(points: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray, float, float]:
@@ -530,7 +529,8 @@ def make_patch(
         "HeightM": float(height),
         "PatchAreaM2": float(length * height),
         "PatchEquivalentRadiusM": float(np.sqrt(max(length * height, 0.0) / np.pi)),
-        "AzimuthDeg": float(azimuth % 180.0),
+        "DipAzimuthDeg": float(azimuth % 360.0),
+        "AzimuthDeg": orientation.strike_from_dip_azimuth(float(azimuth)),
         "DipDeg": float(np.clip(dip, 0.0, 89.0)),
         "TraceGridDX": 12.5,
         "TraceGridDY": 12.5,
@@ -566,7 +566,8 @@ def make_patch(
         "BandTimeExtentMs": float(height),
         "BandPatchSpacingM": 0.0,
         "BandMeanDensity": float(source_density),
-        "ObjectBandAzimuthDeg": float(azimuth % 180.0),
+        "ObjectBandDipAzimuthDeg": float(azimuth % 360.0),
+        "ObjectBandAzimuthDeg": orientation.strike_from_dip_azimuth(float(azimuth)),
         "ObjectBandDipDeg": float(np.clip(dip, 0.0, 89.0)),
         "ObjectBandLengthM": float(length),
         "ObjectBandCenterSpacingM": 0.0,
@@ -631,7 +632,7 @@ def build_fault_surface_panels(fault_df: pd.DataFrame, config: dict[str, Any]) -
                 ],
                 dtype=float,
             )
-            surface_polys.append((vertices, {"FaultName": str(fault_name), "Flag": int(flag), "PatchID": patch_id, "AzimuthDeg": azimuth, "DipDeg": dip}))
+            surface_polys.append((vertices, {"FaultName": str(fault_name), "Flag": int(flag), "PatchID": patch_id, "DipAzimuthDeg": azimuth, "AzimuthDeg": orientation.strike_from_dip_azimuth(azimuth), "DipDeg": dip}))
             for damage_idx in range(damage_count):
                 side = -1.0 if damage_idx % 2 == 0 else 1.0
                 offset_center = center + side * damage_offset * normal
@@ -660,14 +661,31 @@ def build_fault_surface_panels(fault_df: pd.DataFrame, config: dict[str, Any]) -
 
 
 def axis_from_azimuth_deg(azimuth_deg: float) -> np.ndarray:
+    """**倾向方位**对应的走向线方向（水平）：``(cosD, -sinD, 0)``。"""
     az = np.deg2rad(float(azimuth_deg))
-    return normalize(np.asarray([np.cos(az), np.sin(az), 0.0], dtype=float), np.asarray([1.0, 0.0, 0.0]))
+    return normalize(np.asarray([np.cos(az), -np.sin(az), 0.0], dtype=float), np.asarray([1.0, 0.0, 0.0]))
 
 
 def axes_from_strike_dip(strike_deg: float, dip_deg: float) -> tuple[np.ndarray, np.ndarray, np.ndarray, float, float]:
-    axis1 = axis_from_azimuth_deg(strike_deg)
+    """兼容入口：入参按**走向**解释，内部转成倾向方位后建轴。
+
+    新代码请直接用 :func:`axes_from_dip_azimuth_dip`。
+    """
+    return axes_from_dip_azimuth_dip(
+        orientation.dip_azimuth_from_strike(strike_deg), dip_deg
+    )
+
+
+def axes_from_dip_azimuth_dip(
+    dip_azimuth_deg: float, dip_deg: float
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, float, float]:
+    """由**真倾向方位（0–360）**与倾角建轴：轴1 = 走向线，轴2 = 下倾方向。"""
+    az = np.deg2rad(float(dip_azimuth_deg) % 360.0)
+    axis1 = normalize(
+        np.asarray([np.cos(az), -np.sin(az), 0.0], dtype=float), np.asarray([1.0, 0.0, 0.0])
+    )
     dip_rad = np.deg2rad(float(np.clip(dip_deg, 1.0, 89.0)))
-    horizontal_dip = normalize(np.asarray([-axis1[1], axis1[0], 0.0], dtype=float), np.asarray([0.0, 1.0, 0.0]))
+    horizontal_dip = normalize(np.asarray([np.sin(az), np.cos(az), 0.0], dtype=float), np.asarray([0.0, 1.0, 0.0]))
     axis2 = normalize(
         np.asarray(
             [
@@ -680,7 +698,8 @@ def axes_from_strike_dip(strike_deg: float, dip_deg: float) -> tuple[np.ndarray,
         np.asarray([0.0, 0.0, 1.0]),
     )
     normal = normalize(np.cross(axis1, axis2), np.asarray([0.0, 1.0, 0.0]))
-    azimuth, dip = strike_dip_from_normal(normal)
+    # 本模块顶点/点的第三维是 TIME（向下为正）→ 用"向下帧"换算。
+    azimuth, dip = orientation.dip_azimuth_dip_from_normal_depth(normal)
     return axis1, axis2, normal, azimuth, dip
 
 
@@ -844,7 +863,7 @@ def build_fault_panel_and_influence_rows(panel_csv: Path, config: dict[str, Any]
                 axis2=dip_vec,
                 length=max(float(panel_row.get("PanelLength", main["LengthM"])) * length_multiplier, 1.0),
                 height=max(float(panel_row.get("PanelHeight", main["HeightTimeMs"])) * height_multiplier, 1.0),
-                azimuth=float(panel_row.get("StrikeDeg", main["AzimuthDeg"])),
+                azimuth=float(panel_row.get("DipAzimuthDeg", main["DipAzimuthDeg"])),
                 dip=float(panel_row.get("DipDeg", main["DipDeg"])),
                 layer=CRUST_LAYER,
                 source_type="large_original_fault_damage_zone",
@@ -949,7 +968,7 @@ def build_segmented_fault_panels(config: dict[str, Any]) -> tuple[pd.DataFrame, 
             ],
             dtype=float,
         )
-        surface_polys.append((vertices, {"FaultName": fault_name, "PatchID": patch_id, "AzimuthDeg": azimuth, "DipDeg": dip}))
+        surface_polys.append((vertices, {"FaultName": fault_name, "PatchID": patch_id, "DipAzimuthDeg": azimuth, "AzimuthDeg": orientation.strike_from_dip_azimuth(azimuth), "DipDeg": dip}))
         for damage_idx in range(damage_count):
             side = -1.0 if damage_idx % 2 == 0 else 1.0
             patch_idx += 1
@@ -1027,7 +1046,15 @@ def build_large_lowcoh_supplements(config: dict[str, Any]) -> pd.DataFrame:
                 ],
                 dtype=float,
             )
-            axis1, axis2, _normal, azimuth, dip = axes_from_strike_dip(float(row.pca_azimuth_deg), float(row.pca_dip_deg))
+            component_dip_azimuth = (
+                float(row.pca_dip_azimuth_deg)
+                if "pca_dip_azimuth_deg" in component_df.columns
+                and pd.notna(getattr(row, "pca_dip_azimuth_deg", None))
+                else orientation.dip_azimuth_from_strike(float(row.pca_azimuth_deg))
+            )
+            axis1, axis2, _normal, azimuth, dip = axes_from_dip_azimuth_dip(
+                component_dip_azimuth, float(row.pca_dip_deg)
+            )
             horizontal_extent = max(float(row.x_max) - float(row.x_min), float(row.y_max) - float(row.y_min))
             time_extent = float(row.time_max_ms) - float(row.time_min_ms)
             length = float(
@@ -1253,6 +1280,7 @@ def build_lowcoh_component_panels(config: dict[str, Any]) -> pd.DataFrame:
                     "ComponentPanelCount": int(len(panel_rows)),
                     "ComponentPanelOrdinal": int(row.get("BandPatchOrdinal", 1)),
                     "ComponentPanelMode": "component_slice_panel_group",
+                    "ComponentPCADipAzimuthDeg": float(getattr(comp_row, "pca_dip_azimuth_deg", np.nan)),
                     "ComponentPCAAzimuthDeg": float(comp_row.pca_azimuth_deg),
                     "ComponentPCADipDeg": float(comp_row.pca_dip_deg),
                     "SelectionScore": float(comp_row.selection_score),
@@ -1295,7 +1323,14 @@ def build_inferred_surface_panels(config: dict[str, Any]) -> pd.DataFrame:
         panel_count = int(surface_row.get("panel_count_in_chain", 1))
         length = float(max(surface_row.get("surface_length_m", vertex_length), vertex_length, 1.0))
         height = float(max(surface_row.get("surface_height_time_ms", vertex_height), vertex_height, 1.0))
-        azimuth = float(surface_row.get("pca_azimuth_deg", vertex_azimuth))
+        if "pca_dip_azimuth_deg" in surface_row.index and pd.notna(
+            surface_row.get("pca_dip_azimuth_deg", None)
+        ):
+            azimuth = float(surface_row["pca_dip_azimuth_deg"])
+        elif "pca_azimuth_deg" in surface_row.index and pd.notna(surface_row.get("pca_azimuth_deg", None)):
+            azimuth = orientation.dip_azimuth_from_strike(float(surface_row["pca_azimuth_deg"]))
+        else:
+            azimuth = float(vertex_azimuth)
         dip = float(surface_row.get("pca_dip_deg", vertex_dip))
         score_mean = float(surface_row.get("score_mean", 0.0))
         confidence = float(np.clip(0.55 + 0.35 * score_mean, 0.55, 0.90))
@@ -1363,12 +1398,19 @@ def build_inferred_surface_panels(config: dict[str, Any]) -> pd.DataFrame:
 def patch_vertices(row: pd.Series) -> list[tuple[float, float, float]]:
     if has_vertex_columns(row):
         return [(float(x), float(y), float(z)) for x, y, z in vertices_from_row(row)]
-    azimuth = np.deg2rad(float(row["AzimuthDeg"]))
+    if "DipAzimuthDeg" in row.index and np.isfinite(float(row["DipAzimuthDeg"])):
+        azimuth = np.deg2rad(float(row["DipAzimuthDeg"]) % 360.0)
+    else:
+        azimuth = np.deg2rad(
+            orientation.dip_azimuth_from_strike(
+                orientation.strike_from_xy_line_angle(float(row["AzimuthDeg"]))
+            )
+        )
     dip = np.deg2rad(float(np.clip(row["DipDeg"], 1.0, 89.9)))
     half_length = 0.5 * float(row["LengthM"])
     half_height_time = 0.5 * float(row["HeightTimeMs"])
-    strike = np.asarray([np.cos(azimuth), np.sin(azimuth)], dtype=float)
-    dip_horizontal = np.asarray([-np.sin(azimuth), np.cos(azimuth)], dtype=float)
+    strike = np.asarray([np.cos(azimuth), -np.sin(azimuth)], dtype=float)
+    dip_horizontal = np.asarray([np.sin(azimuth), np.cos(azimuth)], dtype=float)
     horizontal_dip_half = half_height_time / max(np.tan(dip), 1.0e-6)
     center_xy = np.asarray([float(row["CenterX"]), float(row["CenterY"])], dtype=float)
     center_t = float(row["CenterTime"])
@@ -1391,7 +1433,7 @@ def write_patch_vtk(path: Path, df: pd.DataFrame, title: str) -> None:
     lines.append(f"POLYGONS {len(polygons)} {sum(len(p)+1 for p in polygons)}")
     lines.extend(f"{len(p)} {' '.join(str(i) for i in p)}" for p in polygons)
     lines.append(f"CELL_DATA {len(polygons)}")
-    scalar_cols = ["FractureScaleCode", "SourceDensity", "Confidence", "LengthM", "HeightTimeMs", "PatchAreaM2", "AzimuthDeg", "DipDeg"]
+    scalar_cols = ["FractureScaleCode", "SourceDensity", "Confidence", "LengthM", "HeightTimeMs", "PatchAreaM2", "DipAzimuthDeg", "AzimuthDeg", "DipDeg"]
     for col in scalar_cols:
         if col not in df.columns:
             continue
@@ -1409,19 +1451,21 @@ def write_surface_vtk(path: Path, surfaces: list[tuple[np.ndarray, dict[str, Any
     points: list[tuple[float, float, float]] = []
     polygons: list[list[int]] = []
     azimuths: list[float] = []
+    dip_azimuths: list[float] = []
     dips: list[float] = []
     for vertices, meta in surfaces:
         base = len(points)
         points.extend([(float(x), float(y), float(z)) for x, y, z in vertices])
         polygons.append([base, base + 1, base + 2, base + 3])
         azimuths.append(float(meta.get("AzimuthDeg", 0.0)))
+        dip_azimuths.append(float(meta.get("DipAzimuthDeg", 0.0)))
         dips.append(float(meta.get("DipDeg", 0.0)))
     lines = ["# vtk DataFile Version 3.0", title, "ASCII", "DATASET POLYDATA", f"POINTS {len(points)} float"]
     lines.extend(f"{x:.6f} {y:.6f} {z:.6f}" for x, y, z in points)
     lines.append(f"POLYGONS {len(polygons)} {sum(len(p)+1 for p in polygons)}")
     lines.extend(f"{len(p)} {' '.join(str(i) for i in p)}" for p in polygons)
     lines.append(f"CELL_DATA {len(polygons)}")
-    for name, values in [("AzimuthDeg", azimuths), ("DipDeg", dips)]:
+    for name, values in [("DipAzimuthDeg", dip_azimuths), ("AzimuthDeg", azimuths), ("DipDeg", dips)]:
         lines.append(f"SCALARS {name} float 1")
         lines.append("LOOKUP_TABLE default")
         lines.extend(f"{float(v):.6f}" for v in values)

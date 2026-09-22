@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 """
+当前脚本不好用,请使用label_well_trajectories_paraview_all.py
 ParaView Python 脚本 —— 井轨迹 + 井顶端点 + ASCII 3D Text 井名标签
 ====================================================================
 

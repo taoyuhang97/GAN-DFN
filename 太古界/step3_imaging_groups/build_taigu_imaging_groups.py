@@ -1,10 +1,14 @@
 #!/usr/bin/env python3
-"""Attach TaiGuJie imaging density and fracture points to Step2 v3 segments.
+"""Attach TaiGuJie imaging density and fracture points to Step2 segments.
+
+md1 changes (2026-09-22):
+- Depth semantics are **MD**: density and point depths from the imaging
+  interpretation are measured depth (甲方 LAS ``TLFamily_TDEP = Measured Depth``、
+  DLIS index ``BOREHOLE-DEPTH``、成果图"深度（测深）"、报告"处理井段…共计 XXX 米");
+  Step2 segments carry both MD and TVD, so labels are interpolated/attached by MD.
+  TVD stays as per-row metadata.
 
 v3 changes (2026-08-12):
-- Depth semantics are TVD: density and point depths from the imaging
-  interpretation are TVD, and Step2 segments carry both MD and TVD, so labels
-  are interpolated/attached by TVD;
 - Reads the Step2 v3 segment manifest and aggregates all segments of a well;
 - Point mapping is performed once at well level (`DroppedPointRows` counts
   unique unmapped points);
@@ -49,12 +53,12 @@ LABEL_COLUMNS = [
     "DensitySupportStatus", "SupervisionStatus", "SupervisionTier",
     # v5：Step2 的取样窗口标记（成像段管标签、层位段管预测）
     "InImagingInterval", "InHorizonLayer", "UseCase",
-    "LayerGroupByHorizon", "LayerGroupByImaging", "ImagingTVDMin", "ImagingTVDMax",
+    "LayerGroupByHorizon", "LayerGroupByImaging", "ImagingMDMin", "ImagingMDMax",
 ]
 
 WINDOW_COLUMNS = [
     "InImagingInterval", "InHorizonLayer", "UseCase",
-    "LayerGroupByHorizon", "LayerGroupByImaging", "ImagingTVDMin", "ImagingTVDMax",
+    "LayerGroupByHorizon", "LayerGroupByImaging", "ImagingMDMin", "ImagingMDMax",
 ]
 
 
@@ -64,7 +68,7 @@ def ensure_window_columns(frame: pd.DataFrame) -> pd.DataFrame:
     defaults: dict[str, object] = {
         "InImagingInterval": 0, "InHorizonLayer": 1, "UseCase": "layer_only",
         "LayerGroupByHorizon": out.get("StrataName", ""), "LayerGroupByImaging": "",
-        "ImagingTVDMin": np.nan, "ImagingTVDMax": np.nan,
+        "ImagingMDMin": np.nan, "ImagingMDMax": np.nan,
     }
     for column, default in defaults.items():
         if column not in out.columns:
@@ -77,14 +81,14 @@ def select_overlapping_passes(frames: list[pd.DataFrame], dates: list[str],
     """同一口井多测次在深度上重叠时择一（v5 新增）。
 
     Step2 按"一个 LAS 文件 = 一段"输出，405 的两份 2016 年测井在
-    TVD 3729–3998 完全重叠且深度网格错开 0.02 m，直接拼接会让同一深度
+    MD 3729–3998 完全重叠且深度网格错开 0.02 m，直接拼接会让同一深度
     出现两条不同批次的样本（采样密度 8 行/m → 16 行/m）。这里按测井日期
     优先保留最新一次，旧测次只保留未被覆盖的深度段。
     """
     if not frames:
         return pd.DataFrame(), {"policy": policy, "inputRows": 0, "keptRows": 0, "droppedRows": 0}
     if not policy or policy == "keep_all" or len(frames) == 1:
-        merged = pd.concat(frames, ignore_index=True).sort_values("TVD").reset_index(drop=True)
+        merged = pd.concat(frames, ignore_index=True).sort_values("MD").reset_index(drop=True)
         return merged, {"policy": "keep_all", "inputRows": int(len(merged)), "keptRows": int(len(merged)),
                         "droppedRows": 0, "contributions": []}
     order = sorted(range(len(frames)), key=lambda index: str(dates[index]), reverse=True)
@@ -94,19 +98,19 @@ def select_overlapping_passes(frames: list[pd.DataFrame], dates: list[str],
     input_rows = int(sum(len(frame) for frame in frames))
     for index in order:
         frame = frames[index]
-        depth = pd.to_numeric(frame["TVD"], errors="coerce").to_numpy(dtype=float)
+        depth = pd.to_numeric(frame["MD"], errors="coerce").to_numpy(dtype=float)
         keep = np.isfinite(depth)
         for lo, hi in covered:
             keep &= ~((depth >= lo) & (depth <= hi))
         part = frame.loc[keep].copy()
         if part.empty:
-            contributions.append({"logDate": str(dates[index]), "rows": 0, "TVD": ""})
+            contributions.append({"logDate": str(dates[index]), "rows": 0, "MD": ""})
             continue
         kept_parts.append(part)
-        lo, hi = float(part["TVD"].min()), float(part["TVD"].max())
+        lo, hi = float(part["MD"].min()), float(part["MD"].max())
         covered = merge_ranges(covered + [(lo, hi)])
-        contributions.append({"logDate": str(dates[index]), "rows": int(len(part)), "TVD": "%.1f–%.1f" % (lo, hi)})
-    merged = pd.concat(kept_parts, ignore_index=True).sort_values("TVD").reset_index(drop=True) if kept_parts else pd.DataFrame()
+        contributions.append({"logDate": str(dates[index]), "rows": int(len(part)), "MD": "%.1f–%.1f" % (lo, hi)})
+    merged = pd.concat(kept_parts, ignore_index=True).sort_values("MD").reset_index(drop=True) if kept_parts else pd.DataFrame()
     return merged, {
         "policy": policy,
         "inputRows": input_rows,
@@ -228,24 +232,24 @@ def read_density(item: dict[str, Any], window_id: str) -> tuple[pd.DataFrame, di
         rows = numeric_rows(path)
         depth_index, value_index = int(item["depth_index"]), int(item["value_index"])
         data = [[row[depth_index], row[value_index]] for row in rows if len(row) > max(depth_index, value_index)]
-        df = pd.DataFrame(data, columns=["TVD", "Density"])
+        df = pd.DataFrame(data, columns=["MD", "Density"])
     elif fmt == "csv":
         raw = read_csv(path)
         df = raw[[item["depth_column"], item["value_column"]]].rename(
-            columns={item["depth_column"]: "TVD", item["value_column"]: "Density"}
+            columns={item["depth_column"]: "MD", item["value_column"]: "Density"}
         )
     else:
         raise ValueError(f"unsupported density format: {fmt}")
-    df["TVD"], df["Density"] = clean(df["TVD"]), clean(df["Density"])
-    df = df.dropna(subset=["TVD", "Density"]).sort_values("TVD").groupby("TVD", as_index=False)["Density"].mean()
+    df["MD"], df["Density"] = clean(df["MD"]), clean(df["Density"])
+    df = df.dropna(subset=["MD", "Density"]).sort_values("MD").groupby("MD", as_index=False)["Density"].mean()
     rows_in_file = int(len(df))
     declared_min = item.get("depth_min_m")
     declared_max = item.get("depth_max_m")
-    window_min = float(declared_min) if declared_min is not None else float(df["TVD"].min())
-    window_max = float(declared_max) if declared_max is not None else float(df["TVD"].max())
-    keep = (df["TVD"].to_numpy(dtype=float) >= window_min) & (df["TVD"].to_numpy(dtype=float) <= window_max)
+    window_min = float(declared_min) if declared_min is not None else float(df["MD"].min())
+    window_max = float(declared_max) if declared_max is not None else float(df["MD"].max())
+    keep = (df["MD"].to_numpy(dtype=float) >= window_min) & (df["MD"].to_numpy(dtype=float) <= window_max)
     df = df[keep].reset_index(drop=True)
-    positive = df.loc[df.Density.gt(0.0), "TVD"]
+    positive = df.loc[df.Density.gt(0.0), "MD"]
     df["DensitySourcePath"] = str(path)
     df["WindowID"] = window_id
     stat: dict[str, object] = {
@@ -260,28 +264,28 @@ def read_density(item: dict[str, Any], window_id: str) -> tuple[pd.DataFrame, di
         "RowsAfterRangeClip": int(len(df)),
         "PaddingRowsDropped": rows_in_file - int(len(df)),
         "PositiveRows": int(df.Density.gt(0.0).sum()),
-        "PositiveTVDMin": float(positive.min()) if len(positive) else None,
-        "PositiveTVDMax": float(positive.max()) if len(positive) else None,
+        "PositiveMDMin": float(positive.min()) if len(positive) else None,
+        "PositiveMDMax": float(positive.max()) if len(positive) else None,
     }
     return df, stat
 
 
 def merge_density_sources(parts: list[pd.DataFrame]) -> tuple[pd.DataFrame, int]:
-    """把同一口井的多个解释窗口按 TVD 拼成一条曲线。
+    """把同一口井的多个解释窗口按 MD 拼成一条曲线。
 
     每个窗口已经按自己的解释区间裁剪过，所以正常情况下窗口之间没有重叠；仍然保留
     "同深度取最大值"作为兜底规则，并返回"同一深度有多个窗口同时给出正值且数值不同"
     的深度个数，用于审计是否真的存在口径冲突。
     """
     if not parts:
-        return pd.DataFrame(columns=["TVD", "Density", "WindowID", "SourceCount"]), 0
+        return pd.DataFrame(columns=["MD", "Density", "WindowID", "SourceCount"]), 0
     stacked_parts = []
     for frame in parts:
-        part = frame[["TVD", "Density", "WindowID"]].copy()
+        part = frame[["MD", "Density", "WindowID"]].copy()
         part["_SourceIndex"] = part["WindowID"].astype(str)
         stacked_parts.append(part)
     stacked = pd.concat(stacked_parts, ignore_index=True)
-    grouped = stacked.groupby("TVD", as_index=False).agg(
+    grouped = stacked.groupby("MD", as_index=False).agg(
         Density=("Density", "max"),
         SourceCount=("_SourceIndex", "nunique"),
         PositiveSourceCount=("Density", lambda values: int((values > 0.0).sum())),
@@ -292,13 +296,13 @@ def merge_density_sources(parts: list[pd.DataFrame]) -> tuple[pd.DataFrame, int]
         ((grouped.PositiveSourceCount > 1) & ((grouped.PositiveMax - grouped.PositiveMin) > 1.0e-9)).sum()
     )
     owner = (
-        stacked.sort_values(["TVD", "Density"], ascending=[True, False], kind="stable")
-        .drop_duplicates("TVD", keep="first")[["TVD", "WindowID"]]
+        stacked.sort_values(["MD", "Density"], ascending=[True, False], kind="stable")
+        .drop_duplicates("MD", keep="first")[["MD", "WindowID"]]
     )
     merged = (
-        grouped.merge(owner, on="TVD", how="left")
-        .sort_values("TVD")
-        .reset_index(drop=True)[["TVD", "Density", "WindowID", "SourceCount"]]
+        grouped.merge(owner, on="MD", how="left")
+        .sort_values("MD")
+        .reset_index(drop=True)[["MD", "Density", "WindowID", "SourceCount"]]
     )
     return merged, conflicts
 
@@ -310,21 +314,21 @@ def read_points(item: dict[str, Any]) -> pd.DataFrame:
         rows = numeric_rows(path)
         indices = [int(item[key]) for key in ("depth_index", "azimuth_index", "dip_index")]
         data = [[row[i] for i in indices] for row in rows if len(row) > max(indices)]
-        df = pd.DataFrame(data, columns=["TVD", "FracAzimuth", "FracDip"])
+        df = pd.DataFrame(data, columns=["MD", "FracAzimuth", "FracDip"])
     elif fmt == "csv":
         raw = read_csv(path)
         df = raw[[item["depth_column"], item["azimuth_column"], item["dip_column"]]].rename(
-            columns={item["depth_column"]: "TVD", item["azimuth_column"]: "FracAzimuth", item["dip_column"]: "FracDip"}
+            columns={item["depth_column"]: "MD", item["azimuth_column"]: "FracAzimuth", item["dip_column"]: "FracDip"}
         )
     else:
         raise ValueError(f"unsupported point format: {fmt}")
-    for column in ("TVD", "FracAzimuth", "FracDip"):
+    for column in ("MD", "FracAzimuth", "FracDip"):
         df[column] = clean(df[column])
-    return df.dropna(subset=["TVD"]).assign(PointSourcePath=str(path))
+    return df.dropna(subset=["MD"]).assign(PointSourcePath=str(path))
 
 
 def interpolate_density(density: pd.DataFrame, target_tvd: pd.Series, max_gap_m: float) -> np.ndarray:
-    x, y = density["TVD"].to_numpy(float), density["Density"].to_numpy(float)
+    x, y = density["MD"].to_numpy(float), density["Density"].to_numpy(float)
     target = target_tvd.to_numpy(float)
     if len(x) < 2:
         return np.full(len(target), np.nan)
@@ -342,7 +346,7 @@ def attach_points(
     points: pd.DataFrame,
     coverage: list[tuple[float, float]] | None = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame, dict[str, float]]:
-    """Attach points once at well level by TVD.
+    """Attach points once at well level by MD.
 
     Returns `(labels, unmapped, residual_stats)`。**覆盖判定取代容差判定**：只要点落在常规
     测井覆盖内，就吸附到最近的采样点（不再因为离网格超过容差而丢弃），残差只记录不拦截；
@@ -354,8 +358,8 @@ def attach_points(
     out["FracAzimuth"] = np.nan
     out["FracDip"] = np.nan
     unmapped_columns = [
-        "PointRowIndex", "TVD", "FracAzimuth", "FracDip", "PointSourcePath", "Reason",
-        "NearestGridTVD", "DistanceToGridM",
+        "PointRowIndex", "MD", "FracAzimuth", "FracDip", "PointSourcePath", "Reason",
+        "NearestGridMD", "DistanceToGridM",
     ]
     empty_stats = {
         "GridStepM": np.nan,
@@ -367,9 +371,9 @@ def attach_points(
     }
     if out.empty or points.empty:
         return out, pd.DataFrame(columns=unmapped_columns), empty_stats
-    tvd = out["TVD"].to_numpy(float)
-    step = float(np.median(np.diff(tvd))) if len(tvd) > 1 else 0.1
-    ranges = merge_ranges(coverage) if coverage else [(float(tvd.min()), float(tvd.max()))]
+    md = out["MD"].to_numpy(float)
+    step = float(np.median(np.diff(md))) if len(md) > 1 else 0.1
+    ranges = merge_ranges(coverage) if coverage else [(float(md.min()), float(md.max()))]
 
     def inside_coverage(value: float) -> bool:
         return any(lo - 1.0e-6 <= value <= hi + 1.0e-6 for lo, hi in ranges)
@@ -377,19 +381,19 @@ def attach_points(
     unmapped_rows: list[dict[str, object]] = []
     residuals: list[float] = []
     for point in points.itertuples(index=False):
-        pos = int(np.searchsorted(tvd, point.TVD))
-        candidates = [idx for idx in (pos - 1, pos) if 0 <= idx < len(tvd)]
-        idx = min(candidates, key=lambda value: abs(tvd[value] - point.TVD)) if candidates else None
-        distance = abs(tvd[idx] - point.TVD) if idx is not None else np.inf
-        if idx is None or not inside_coverage(float(point.TVD)):
+        pos = int(np.searchsorted(md, point.MD))
+        candidates = [idx for idx in (pos - 1, pos) if 0 <= idx < len(md)]
+        idx = min(candidates, key=lambda value: abs(md[value] - point.MD)) if candidates else None
+        distance = abs(md[idx] - point.MD) if idx is not None else np.inf
+        if idx is None or not inside_coverage(float(point.MD)):
             unmapped_rows.append({
                 "PointRowIndex": int(getattr(point, "PointRowIndex", -1)),
-                "TVD": float(point.TVD),
+                "MD": float(point.MD),
                 "FracAzimuth": float(point.FracAzimuth) if pd.notna(point.FracAzimuth) else np.nan,
                 "FracDip": float(point.FracDip) if pd.notna(point.FracDip) else np.nan,
                 "PointSourcePath": str(getattr(point, "PointSourcePath", "")),
                 "Reason": "outside_log_coverage",
-                "NearestGridTVD": float(tvd[idx]) if idx is not None else np.nan,
+                "NearestGridMD": float(md[idx]) if idx is not None else np.nan,
                 "DistanceToGridM": float(distance) if np.isfinite(distance) else np.nan,
             })
             continue
@@ -412,14 +416,14 @@ def attach_points(
 
 
 def split_groups(labels: pd.DataFrame) -> list[pd.DataFrame]:
-    usable = labels[labels["Density"].notna()].copy().sort_values("TVD").reset_index(drop=True)
+    usable = labels[labels["Density"].notna()].copy().sort_values("MD").reset_index(drop=True)
     if usable.empty:
         return []
-    step = float(np.median(np.diff(usable["TVD"]))) if len(usable) > 1 else 0.1
+    step = float(np.median(np.diff(usable["MD"]))) if len(usable) > 1 else 0.1
     new_group = (
         usable["StrataName"].ne(usable["StrataName"].shift())
         | usable["ImagingWindowID"].astype(str).ne(usable["ImagingWindowID"].astype(str).shift())
-        | usable["TVD"].diff().gt(max(step * 3.0, 0.5))
+        | usable["MD"].diff().gt(max(step * 3.0, 0.5))
     )
     usable["DensityCoverageSegmentID"] = new_group.cumsum().astype(int)
     return [frame.reset_index(drop=True) for _, frame in usable.groupby("DensityCoverageSegmentID", sort=True)]
@@ -472,7 +476,7 @@ def main() -> int:
         points = (
             pd.concat([read_points(item) for item in well_cfg.get("point_sources", [])], ignore_index=True)
             if well_cfg.get("point_sources")
-            else pd.DataFrame(columns=["TVD", "FracAzimuth", "FracDip", "PointSourcePath"])
+            else pd.DataFrame(columns=["MD", "FracAzimuth", "FracDip", "PointSourcePath"])
         )
         points["PointRowIndex"] = np.arange(len(points), dtype=int)
         density_paths = "|".join(str(item["path"]) for item in well_cfg["density_sources"])
@@ -506,17 +510,17 @@ def main() -> int:
         )
         if base.empty:
             continue
-        coverage = merge_ranges([(float(frame.TVD.min()), float(frame.TVD.max())) for frame in frames])
+        coverage = merge_ranges([(float(frame.MD.min()), float(frame.MD.max())) for frame in frames])
         coverage_m = float(sum(hi - lo for lo, hi in coverage))
-        density_depth = density.TVD.to_numpy(dtype=float)
+        density_depth = density.MD.to_numpy(dtype=float)
         density_gap_m = gap_break_for(density_depth)
         inside_mask = np.zeros(len(density), dtype=bool)
         for lo, hi in coverage:
             inside_mask |= (density_depth >= lo) & (density_depth <= hi)
         labels = base[["MD", "TVD", "StrataName", "InputSegmentPath"] + WINDOW_COLUMNS].copy()
         labels["WellName"] = well
-        labels["ImagingWindowID"] = lookup_window_id(labels.TVD.to_numpy(dtype=float), windows)
-        labels["Density"] = interpolate_density(density, labels["TVD"], float(well_cfg["max_density_interpolation_gap_m"]))
+        labels["ImagingWindowID"] = lookup_window_id(labels.MD.to_numpy(dtype=float), windows)
+        labels["Density"] = interpolate_density(density, labels["MD"], float(well_cfg["max_density_interpolation_gap_m"]))
         # v5：只有落在甲方成像解释区间内的行才可能带标签；层内但成像段外的行标签为 NaN
         imaging_mask = pd.to_numeric(labels["InImagingInterval"], errors="coerce").fillna(0).astype(int).eq(1)
         labels.loc[~imaging_mask, "Density"] = np.nan
@@ -543,10 +547,10 @@ def main() -> int:
                 low, high = max(a, lo), min(b, hi)
                 if high <= low:
                     continue
-                subset = density[(density.TVD >= low) & (density.TVD <= high)]
+                subset = density[(density.MD >= low) & (density.MD <= high)]
                 if len(subset) >= 2:
                     total += integrate_runs(
-                        subset.TVD.to_numpy(dtype=float), subset.Density.to_numpy(dtype=float), density_gap_m
+                        subset.MD.to_numpy(dtype=float), subset.Density.to_numpy(dtype=float), density_gap_m
                     )
             return total
 
@@ -555,7 +559,7 @@ def main() -> int:
         well_points_total = 0
         for window_id, lo, hi in windows:
             mass = window_mass(window_id, lo, hi)
-            points_in_window = int(((mapped.TVD >= lo) & (mapped.TVD <= hi)).sum()) if len(mapped) else 0
+            points_in_window = int(((mapped.MD >= lo) & (mapped.MD <= hi)).sum()) if len(mapped) else 0
             well_mass_total += mass
             well_points_total += points_in_window
             scale = float(points_in_window / mass) if (mass > 1.0e-9 and points_in_window > 0) else 1.0
@@ -582,14 +586,14 @@ def main() -> int:
 
         # ---- 段外成像数据审计：密度段外部分 + 未吸附的产状点 ----
         outside = density[~inside_mask]
-        for lo, hi in runs_of(outside.TVD.to_numpy(dtype=float), density_gap_m):
+        for lo, hi in runs_of(outside.MD.to_numpy(dtype=float), density_gap_m):
             if hi - lo <= 0.05:
                 continue
-            subset = outside[(outside.TVD >= lo) & (outside.TVD <= hi)]
+            subset = outside[(outside.MD >= lo) & (outside.MD <= hi)]
             out_of_coverage_rows.append({
-                "WellName": well, "DataType": "density", "TVDStart": lo, "TVDEnd": hi,
+                "WellName": well, "DataType": "density", "MDStart": lo, "MDEnd": hi,
                 "ThicknessM": round(hi - lo, 2),
-                "DensityMass": round(integrate_runs(subset.TVD.to_numpy(dtype=float),
+                "DensityMass": round(integrate_runs(subset.MD.to_numpy(dtype=float),
                                                     subset.Density.to_numpy(dtype=float), density_gap_m), 2),
                 "PointCount": 0,
                 "Reason": "outside_log_coverage",
@@ -599,7 +603,7 @@ def main() -> int:
                 continue
             unmapped_rows.extend(subset.assign(WellName=well).to_dict("records"))
             if reason == "outside_log_coverage":
-                depths = np.sort(subset.TVD.to_numpy(dtype=float))
+                depths = np.sort(subset.MD.to_numpy(dtype=float))
                 start = depths[0]
                 for index in range(1, len(depths) + 1):
                     if index == len(depths) or depths[index] - depths[index - 1] > 5.0:
@@ -607,7 +611,7 @@ def main() -> int:
                         count = int(((depths >= start) & (depths <= end)).sum())
                         out_of_coverage_rows.append({
                             "WellName": well, "DataType": "point",
-                            "TVDStart": float(start), "TVDEnd": float(end),
+                            "MDStart": float(start), "MDEnd": float(end),
                             "ThicknessM": round(float(end - start), 2),
                             "DensityMass": 0.0, "PointCount": count,
                             "Reason": "outside_log_coverage",
@@ -650,7 +654,7 @@ def main() -> int:
             group_rows.append({
                 "GroupID": group_id, "WellName": well, "DensityCoverageSegmentID": coverage_index,
                 "StrataName": group.StrataName.iloc[0], "MDMin": float(group.MD.min()), "MDMax": float(group.MD.max()),
-                "TVDMin": float(group.TVD.min()), "TVDMax": float(group.TVD.max()),
+                "MDMin": float(group.MD.min()), "MDMax": float(group.MD.max()),
                 "Rows": int(len(group)),
                 "DensityPositiveRows": int(group.HasFractureDensity.sum()),
                 "DensityZeroRows": int(group.Density.eq(0.0).sum()),
@@ -704,8 +708,8 @@ def main() -> int:
     out_of_coverage_df = pd.DataFrame(out_of_coverage_rows)
     unmapped_df = pd.DataFrame(
         unmapped_rows,
-        columns=["WellName", "PointRowIndex", "TVD", "FracAzimuth", "FracDip", "PointSourcePath",
-                 "Reason", "NearestGridTVD", "DistanceToGridM"],
+        columns=["WellName", "PointRowIndex", "MD", "FracAzimuth", "FracDip", "PointSourcePath",
+                 "Reason", "NearestGridMD", "DistanceToGridM"],
     )
     group_df.to_csv(output / "sample_group_manifest.csv", index=False, encoding="utf-8-sig")
     source_df.to_csv(output / "source_manifest.csv", index=False, encoding="utf-8-sig")
@@ -717,11 +721,11 @@ def main() -> int:
     unmapped_df.to_csv(output / "unmapped_imaging_points.csv", index=False, encoding="utf-8-sig")
     pd.DataFrame(wells_without_groups).to_csv(output / "wells_without_groups.csv", index=False, encoding="utf-8-sig")
 
-    # 解释段 TVD 覆盖完整度（成像井，well 级）
+    # 解释段 MD 覆盖完整度（成像井，well 级）
     well_meta = pd.read_csv(step2_root / "taigu_step2_well_metadata.csv", encoding="utf-8-sig")
     interpreted: dict[str, list[list[float]]] = {}
     for _, r in well_meta.iterrows():
-        iv = r.InterpretedTVDIntervals
+        iv = r.InterpretedMDIntervals
         if isinstance(iv, str) and iv.strip():
             try:
                 interpreted[str(r.WellName)] = [[float(a), float(b)] for a, b in json.loads(iv)]
@@ -733,13 +737,13 @@ def main() -> int:
         groups = group_df[group_df.WellName.eq(well)] if not group_df.empty else pd.DataFrame()
         if groups.empty:
             continue
-        merged = merge_ranges([(float(g.TVDMin), float(g.TVDMax)) for _, g in groups.iterrows()])
+        merged = merge_ranges([(float(g.MDMin), float(g.MDMax)) for _, g in groups.iterrows()])
         for a, b in intervals:
             covered = sum(max(0.0, min(hi, b) - max(lo, a)) for lo, hi in merged if max(lo, a) < min(hi, b))
             uncovered = (b - a) - covered
             if uncovered > 1.0:
                 coverage_gaps.append({
-                    "WellName": well, "TVDInterval": [a, b],
+                    "WellName": well, "MDInterval": [a, b],
                     "CoveredM": round(covered, 2), "UncoveredM": round(uncovered, 2),
                     "UncoveredRatio": round(uncovered / max(b - a, 1e-9), 3),
                 })
@@ -779,7 +783,7 @@ def main() -> int:
         "out_of_log_coverage": out_of_coverage_rows,
         "unmapped_point_rows": int(len(unmapped_df)),
         "point_mapping_scope": "well_level_unique",
-        "depth_semantics": "labels_and_segments_in_tvd",
+        "depth_semantics": "labels_and_segments_in_md",
     }
     (output / "step3_acceptance_summary.json").write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
     print(json.dumps(summary, ensure_ascii=False, indent=2))

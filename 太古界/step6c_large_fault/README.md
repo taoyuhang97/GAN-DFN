@@ -25,3 +25,18 @@ python code/build_step6c_large_fault_prior.py \
 
 主要结果包括 `original_fault_*`、`inferred_fault_*` 和合并后的 `large_fault_*` SGY/NPZ/VTK/CSV，
 以及 `large_fault_qc.json`。
+
+
+---
+
+## 口径变更（2026-09-22，azi1）
+
+产状统一为 **真倾向方位 0–360（自北顺时针）+ 倾角**，唯一实现见
+`太古界/common/orientation_frame/convention.py`（换算规则与验证见该目录 README）。
+
+- `DipAzimuthDeg` = 唯一真值字段；`AzimuthDeg` 降级为派生走向 `(DipAzimuthDeg-90)%180`。
+- 第三维为 `TIME`（向下为正）的帧一律走 `*_depth` 变体换算。
+- 旧口径开关（`family_azimuth_semantics` / `ridge_azimuth_semantics` /
+  `vertex_convention` / `dfn_azimuth_semantics`）已删除，不再保留双口径分支。
+- 背景：`太古界/太古界流程梳理与问题记录_20260915.md` §0.37；
+  施工方案：`太古界/太古界产状口径统一施工方案_20260922.md`。

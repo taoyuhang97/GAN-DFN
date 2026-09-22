@@ -1,5 +1,32 @@
 # 太古界 Step9 正式多背景剖面
 
+## 2026-09-22 两项修改（md1 轮次）
+
+### (a) 常规测井段 = 目标地层内的井轨迹（需求方口径）
+
+- 旧口径：绿色虚线"埕北古斜405常规测井段"画的是**整条采样轨迹**（含成像解释段，且在
+  MD 3998–4180 的未采样空档上做直线插值）。
+- 新口径：**只取 `InHorizonLayer==1` 的目标层内井轨迹**，按实际采样点连续绘制，不跨缺口插值；
+  目标层之外的区域不再计入常规测井段（成像段由青色"成像测井段轨迹"单独表示）。
+- 每张图的 `overlay.conventional_log_interval_ms` 与 `overlay.window_audit` 同步给出
+  `conventional_log_time_ms / sample_count / step_median_ms / gap_count / gap_threshold_ms` 与
+  `track_time_ms`（完整轨迹）。405 md1 实测：常规测井段 TIME **2950.96–3132.29 ms**、
+  7,369 个采样点、**gap_count = 0**（层内数据完整，两期测井互补：2016-06-17 覆盖 4180–4471 m、
+  2016-06-10 覆盖 4183–4813 m，4471–4480 m 由 06-10 补齐）。
+- 完整井轨迹（黑色）仍按物理路径绘制，跨越未采样空档（`track_time_ms` 2746.84–3132.29 m）；
+  它是井斜曲线的积分结果，不代表该段有常规测井采样。
+
+### (b) 图例字体改用简体中文（SC）字面
+
+- 旧实现 `configure_fonts()` 用 `NotoSansCJK-Regular.ttc` + `addfont()`，而 matplotlib 只注册
+  ttc 的**第一个字面（JP）**，导致图例里的"复""壳"等字按**日文字形**渲染（结构不同）。
+- 新实现 `register_simplified_chinese_font()`：用 fontTools 从 ttc 里挑出名字含 `SC` 的字面
+  （Noto Sans CJK ttc 的 face 顺序为 JP/KR/**SC**/TC/HK/Mono…），抽出成
+  `~/.cache/taigu_step9_fonts/*.otf` 后注册，`font.sans-serif` 首选该字体；
+  取不到 SC 字面时回退旧逻辑并打印告警。运行日志会打印
+  `[Step9] 中文字体：Noto Sans CJK SC（简体字面…）`，`section_summary.json` 的
+  `contracts.matplotlib_chinese_font` 记录实际使用的字体名。
+
 正式入口为 `build_taigu_multibackground_sections.py`，流程结构继承砂砾岩正式
 Step9，但使用太古界自己的三属性主道头、OBN独立道头、Top/Mid/Base层位合同
 及Step8最终多尺度DFN。
@@ -128,3 +155,18 @@ python 太古界/step9_sections/build_taigu_multibackground_sections.py \
 ```
 
 正式长任务应在tmux中运行，并将标准输出和错误输出写入Step9输出目录的日志。
+
+
+---
+
+## 口径变更（2026-09-22，azi1）
+
+产状统一为 **真倾向方位 0–360（自北顺时针）+ 倾角**，唯一实现见
+`太古界/common/orientation_frame/convention.py`（换算规则与验证见该目录 README）。
+
+- `DipAzimuthDeg` = 唯一真值字段；`AzimuthDeg` 降级为派生走向 `(DipAzimuthDeg-90)%180`。
+- 第三维为 `TIME`（向下为正）的帧一律走 `*_depth` 变体换算。
+- 旧口径开关（`family_azimuth_semantics` / `ridge_azimuth_semantics` /
+  `vertex_convention` / `dfn_azimuth_semantics`）已删除，不再保留双口径分支。
+- 背景：`太古界/太古界流程梳理与问题记录_20260915.md` §0.37；
+  施工方案：`太古界/太古界产状口径统一施工方案_20260922.md`。

@@ -1,0 +1,19 @@
+{
+  "small_dfn_csv": "/home/tyh/projects/petroleum/code/GAN-DFN/太古界/step7a_small_scale_dfn/output/taigu_step7a_attribute_v3_regen_full_azi1/fracture_patches.csv",
+  "medium_dfn_csv": "/home/tyh/projects/petroleum/code/GAN-DFN/太古界/step7b_multiscale_initial_dfn/output/taigu_medium_v7_anttrack_led_azi1/medium_dfn_patches.csv",
+  "large_dfn_csv": "/home/tyh/projects/petroleum/code/GAN-DFN/太古界/step7c_large_fault_dfn/output/taigu_step7c_large_v3_attribute_v3_azi1/large_fault_dfn_patches.csv",
+  "large_dfn_vtk": "/home/tyh/projects/petroleum/code/GAN-DFN/太古界/step7c_large_fault_dfn/output/taigu_step7c_large_v3_attribute_v3_azi1/large_fault_dfn_raw_time.vtk",
+  "original_fault_manifest_csv": "/home/tyh/projects/petroleum/code/GAN-DFN/太古界/step7c_large_fault_dfn/output/taigu_step7c_large_v3_attribute_v3_azi1/original_fault_unit_manifest.csv",
+  "horizon_contract_table": "/home/tyh/projects/petroleum/code/GAN-DFN/太古界/common/horizon_contract/output/taigu_attribute_full_horizon_contract_v1/demo_horizon_contract.csv",
+  "output_dir": "/home/tyh/projects/petroleum/code/GAN-DFN/太古界/step7d_multiscale_fused_dfn/output/taigu_step7d_fused_v1_azi1",
+  "target_block": {
+    "name": "taigu_attribute_demo_5km_405center",
+    "x_min": 662925.0,
+    "x_max": 667925.0,
+    "y_min": 4240113.0,
+    "y_max": 4245113.0
+  },
+  "write_vtk": true,
+  "small_downsample_near_major_radius_m": 70.0,
+  "_note": "azi1（2026-09-22）：输入改为 7A/7B/7C azi1；融合表透传 DipAzimuthDeg。"
+}

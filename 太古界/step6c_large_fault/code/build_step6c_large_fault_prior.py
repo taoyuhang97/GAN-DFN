@@ -37,6 +37,7 @@ from common.multiscale_density.build_multiscale_density_bundle import (
     write_sgy_like,
 )
 from common.attribute_sampling.attribute_contract import score_attribute
+from common.orientation_frame import convention as orientation
 
 
 FORMAL_ROOT = CURRENT_DIR.parent
@@ -541,16 +542,20 @@ def rasterize_original_faults(
 
 
 def pca_orientation(points: np.ndarray) -> tuple[float | None, float | None, float | None]:
+    """点簇 PCA → ``(真倾向方位[0,360), 倾角[0,90], 线性度)``。
+
+    **口径（2026-09-22 统一）**：``points`` 第三维是 ``TIME * time_scale``，**向下为正**，
+    走 :func:`common.orientation_frame.convention.dip_azimuth_dip_from_normal_depth`。
+    旧实现返回的 ``atan2(main[0], main[1])``（罗盘走向）已废弃。
+    """
     if points.shape[0] < 3:
         return None, None, None
     centered = points - points.mean(axis=0, keepdims=True)
     _, s, vh = np.linalg.svd(centered, full_matrices=False)
-    main = vh[0]
     normal = vh[-1]
-    azimuth = float((np.degrees(np.arctan2(main[0], main[1])) + 360.0) % 180.0)
-    dip = float(np.degrees(np.arccos(np.clip(abs(float(normal[2])) / max(float(np.linalg.norm(normal)), 1.0e-9), 0.0, 1.0))))
+    dip_azimuth, dip = orientation.dip_azimuth_dip_from_normal_depth(normal)
     linearity = float(s[0] / max(s[1], 1.0e-9)) if len(s) > 1 else None
-    return azimuth, dip, linearity
+    return dip_azimuth, dip, linearity
 
 
 def normalize_vector(vec: np.ndarray, fallback: np.ndarray | None = None) -> np.ndarray:
@@ -566,16 +571,12 @@ def normalize_vector(vec: np.ndarray, fallback: np.ndarray | None = None) -> np.
 
 
 def strike_dip_from_normal(normal: np.ndarray) -> tuple[float, float]:
+    """**向下三维帧**（``x=东, y=北, z=TIME*scale``）面法向 → ``(真倾向方位[0,360), 倾角)``。
+
+    函数名保留以兼容调用点，但**返回值第一项已由"走向"改为"真倾向方位"**（2026-09-22 统一口径）。
+    """
     n = normalize_vector(normal, np.array([0.0, 0.0, 1.0], dtype=np.float64))
-    strike = np.array([-n[1], n[0], 0.0], dtype=np.float64)
-    strike_norm = float(np.linalg.norm(strike))
-    if strike_norm <= 1.0e-12:
-        azimuth = 0.0
-    else:
-        strike /= strike_norm
-        azimuth = float((np.degrees(np.arctan2(strike[0], strike[1])) + 360.0) % 180.0)
-    dip = float(np.degrees(np.arccos(np.clip(abs(float(n[2])), 0.0, 1.0))))
-    return azimuth, dip
+    return orientation.dip_azimuth_dip_from_normal_depth(n)
 
 
 def plane_axes_from_points(points_scaled: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray, float, float, float]:
@@ -586,9 +587,9 @@ def plane_axes_from_points(points_scaled: np.ndarray) -> tuple[np.ndarray, np.nd
     axis2 = normalize_vector(np.cross(normal, axis1), np.array([0.0, 0.0, 1.0]))
     if axis2[2] < 0:
         axis2 = -axis2
-    azimuth, dip = strike_dip_from_normal(normal)
+    dip_azimuth, dip = strike_dip_from_normal(normal)
     planarity = float((s[1] - s[2]) / max(s[0], 1.0e-9)) if len(s) >= 3 else 0.0
-    return axis1, axis2, normal, azimuth, dip, planarity
+    return axis1, axis2, normal, dip_azimuth, dip, planarity
 
 
 def quad_area(vertices: np.ndarray) -> float:
@@ -608,7 +609,7 @@ def surface_vertices_from_inliers(
     max_height_ms: float,
 ) -> tuple[np.ndarray, dict[str, float]]:
     center_scaled = points_scaled.mean(axis=0)
-    axis1, axis2, normal, azimuth, dip, planarity = plane_axes_from_points(points_scaled)
+    axis1, axis2, normal, dip_azimuth, dip, planarity = plane_axes_from_points(points_scaled)
     local = np.column_stack(
         [
             (points_scaled - center_scaled) @ axis1,
@@ -642,7 +643,7 @@ def surface_vertices_from_inliers(
         "length_m": float(length),
         "height_time_ms": float(height_ms),
         "area_m2": float(quad_area(vertices)),
-        "azimuth_deg": float(azimuth),
+        "dip_azimuth_deg": float(dip_azimuth),
         "dip_deg": float(dip),
         "planarity": float(planarity),
         "x_min": float(points_unscaled[:, 0].min()),
@@ -914,7 +915,7 @@ def extract_inferred_faults(
                 rejected_low_support += 1
                 continue
             points = np.column_stack([x_values[gxx], y_values[gyy], samples[gtt] * time_scale]).astype(np.float64)
-            azimuth, dip, linearity = pca_orientation(points)
+            dip_azimuth, dip, linearity = pca_orientation(points)
             layer_like = bool(
                 dip is not None
                 and dip <= float(args.layer_like_max_dip_deg)
@@ -946,7 +947,12 @@ def extract_inferred_faults(
                     "x_extent_m": x_extent,
                     "y_extent_m": y_extent,
                     "time_extent_ms": t_extent,
-                    "pca_azimuth_deg": azimuth,
+                    "pca_dip_azimuth_deg": dip_azimuth,
+                    "pca_azimuth_deg": (
+                        orientation.strike_from_dip_azimuth(dip_azimuth)
+                        if dip_azimuth is not None
+                        else None
+                    ),
                     "pca_dip_deg": dip,
                     "pca_linearity": linearity,
                     "layer_like": layer_like,
@@ -1261,7 +1267,9 @@ def extract_inferred_fault_surfaces(
                     "x_extent_m": x_extent, "y_extent_m": y_extent, "time_extent_ms": t_extent,
                     "center_x": geom["center_x"], "center_y": geom["center_y"], "center_time_ms": geom["center_time_ms"],
                     "surface_length_m": geom["length_m"], "surface_height_time_ms": geom["height_time_ms"],
-                    "surface_area_m2": geom["area_m2"], "pca_azimuth_deg": geom["azimuth_deg"],
+                    "surface_area_m2": geom["area_m2"],
+                    "pca_dip_azimuth_deg": geom["dip_azimuth_deg"],
+                    "pca_azimuth_deg": orientation.strike_from_dip_azimuth(geom["dip_azimuth_deg"]),
                     "pca_dip_deg": geom["dip_deg"], "pca_linearity": np.nan,
                     "surface_planarity": geom["planarity"], "layer_like": layer_like,
                     "strat_following": strat_following, **relative_stats,
@@ -1278,7 +1286,7 @@ def extract_inferred_fault_surfaces(
                         "score": score_grid[pyy, pxx, ptt].astype(np.float32).copy(),
                         "support": support_values.astype(np.float32).copy(),
                         "candidate_branch": "lowcoherence_weighted_local_sheet",
-                        "azimuth_deg": float(geom["azimuth_deg"]), "dip_deg": float(geom["dip_deg"]),
+                        "dip_azimuth_deg": float(geom["dip_azimuth_deg"]), "dip_deg": float(geom["dip_deg"]),
                         "surface_area_m2": float(geom["area_m2"]), "surface_planarity": float(geom["planarity"]),
                     }
                 )
@@ -1398,6 +1406,7 @@ def write_surface_candidate_vtk(path: Path, surface_df: pd.DataFrame) -> dict[st
         "VoxelCount": [],
         "ScoreMean": [],
         "SupportMean": [],
+        "DipAzimuthDeg": [],
         "AzimuthDeg": [],
         "DipDeg": [],
         "SurfaceAreaM2": [],
@@ -1413,6 +1422,7 @@ def write_surface_candidate_vtk(path: Path, surface_df: pd.DataFrame) -> dict[st
         cell_data["VoxelCount"].append(int(row["voxel_count"]))
         cell_data["ScoreMean"].append(float(row["score_mean"]))
         cell_data["SupportMean"].append(float(row["support_mean"]))
+        cell_data["DipAzimuthDeg"].append(float(row["pca_dip_azimuth_deg"]))
         cell_data["AzimuthDeg"].append(float(row["pca_azimuth_deg"]))
         cell_data["DipDeg"].append(float(row["pca_dip_deg"]))
         cell_data["SurfaceAreaM2"].append(float(row["surface_area_m2"]))
@@ -1441,6 +1451,7 @@ def write_irregular_surface_candidate_vtk(
         "RawComponentID": [],
         "ScoreMean": [],
         "SupportMean": [],
+        "DipAzimuthDeg": [],
         "AzimuthDeg": [],
         "DipDeg": [],
         "SurfaceAreaM2": [],
@@ -1491,7 +1502,10 @@ def write_irregular_surface_candidate_vtk(
             cell_data["RawComponentID"].append(int(surface["raw_component_id"]))
             cell_data["ScoreMean"].append(score_mean)
             cell_data["SupportMean"].append(support_mean)
-            cell_data["AzimuthDeg"].append(float(surface["azimuth_deg"]))
+            cell_data["DipAzimuthDeg"].append(float(surface["dip_azimuth_deg"]))
+            cell_data["AzimuthDeg"].append(
+                float(orientation.strike_from_dip_azimuth(surface["dip_azimuth_deg"]))
+            )
             cell_data["DipDeg"].append(float(surface["dip_deg"]))
             cell_data["SurfaceAreaM2"].append(float(surface["surface_area_m2"]))
             cell_data["SurfacePlanarity"].append(float(surface["surface_planarity"]))

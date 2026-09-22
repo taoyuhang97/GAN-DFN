@@ -297,15 +297,117 @@ def build_regular_contracts(config: dict[str, Any], config_path: Path, output_di
     return summary, points
 
 
+def read_source_depth_range(spec: dict[str, Any], window: tuple[float, float] | None = None) -> tuple[float, float] | None:
+    """读取甲方源文件的自身深度范围（用于核对合同区间 = 甲方测深）。
+
+    `spec` 支持两种格式：
+
+    * ``{"format": "csv", "path": ..., "depth_column": "MD"}``
+    * ``{"format": "whitespace", "path": ..., "depth_index": 0}``
+
+    `window` 给出"关心区间"（合同区间 ± 余量）：只统计落在该区间内的深度值，
+    这样既避开甲方为写满深度轴而填的占位行（例如 313 文件里的 0.5 / 100.0），
+    也避开同一文件里与本次解释无关的其它深度段。
+    """
+    path = Path(str(spec.get("path", "")))
+    if not path.exists():
+        return None
+    fmt = str(spec.get("format", "csv")).strip().lower()
+    try:
+        if fmt == "csv":
+            column = str(spec["depth_column"])
+            frame = pd.read_csv(path, low_memory=False)
+            if column not in frame.columns:
+                return None
+            values = clean_numeric(frame[column])
+        else:
+            index = int(spec.get("depth_index", 0))
+            parsed: list[float] = []
+            for raw in path.read_text(encoding="utf-8", errors="ignore").splitlines():
+                parts = raw.split()
+                if len(parts) <= index:
+                    continue
+                try:
+                    parsed.append(float(parts[index]))
+                except ValueError:
+                    continue
+            values = clean_numeric(pd.Series(parsed, dtype=float))
+    except Exception:
+        return None
+    values = values[np.isfinite(values)]
+    if window is not None:
+        values = values[(values >= float(window[0])) & (values <= float(window[1]))]
+    # 兜底：剔除明显为占位/非井深的极小值
+    values = values[values > float(spec.get("min_valid_depth_m", 1.0))]
+    if values.empty:
+        return None
+    return float(values.min()), float(values.max())
+
+
+def read_source_depth_axis(spec: dict[str, Any]) -> np.ndarray | None:
+    """读取甲方源文件的深度轴全部数值（不做窗口裁剪，用于端点比对）。"""
+    path = Path(str(spec.get("path", "")))
+    if not path.exists():
+        return None
+    fmt = str(spec.get("format", "csv")).strip().lower()
+    try:
+        if fmt == "csv":
+            column = str(spec["depth_column"])
+            frame = pd.read_csv(path, low_memory=False)
+            if column not in frame.columns:
+                return None
+            values = clean_numeric(frame[column])
+        else:
+            index = int(spec.get("depth_index", 0))
+            parsed: list[float] = []
+            for raw in path.read_text(encoding="utf-8", errors="ignore").splitlines():
+                parts = raw.split()
+                if len(parts) <= index:
+                    continue
+                try:
+                    parsed.append(float(parts[index]))
+                except ValueError:
+                    continue
+            values = pd.Series(parsed, dtype=float)
+    except Exception:
+        return None
+    array = np.asarray(values, dtype=float)
+    array = array[np.isfinite(array)]
+    if array.size == 0:
+        return None
+    return np.sort(array)
+
+
 def build_imaging_contracts(config: dict[str, Any], output_dir: Path) -> pd.DataFrame:
+    """成像解释合同（MD 口径）。
+
+    深度语义（2026-09-22 修正）：甲方成像解释成果里的深度是**测深 MD**
+    （LAS 参数块 ``TLFamily_TDEP = Measured Depth``、DLIS index ``BOREHOLE-DEPTH``、
+    成果图图头"深度（测深）"、报告"处理井段…共计 XXX 米"= 两端之差），
+    因此合同字段一律以 MD 命名，不再使用 ``InterpretedTVD*``。
+
+    兼容：配置仍使用旧键 ``imaging_tvd_contracts`` / ``interpreted_tvd_intervals`` /
+    ``boundary_tvd`` 时按旧名读取（仅用于复现历史版本），输出仍是 MD 列名。
+    """
     rows: list[dict[str, object]] = []
     qc_rows: list[dict[str, object]] = []
-    for item in config.get("imaging_tvd_contracts", []):
+    contract_items = config.get("imaging_md_contracts")
+    if contract_items is None:
+        contract_items = config.get("imaging_tvd_contracts", [])
+    for item in contract_items:
         name = str(item["well_name"])
         status = str(item.get("status", "candidate_supervision"))
         source_kind = str(item.get("source_kind", "imaging_interpretation_manual"))
-        intervals = [[float(a), float(b)] for a, b in item.get("interpreted_tvd_intervals", [])]
-        boundary = float(item["boundary_tvd"]) if "boundary_tvd" in item else np.nan
+        raw_intervals = item.get("interpreted_md_intervals")
+        if raw_intervals is None:
+            raw_intervals = item.get("interpreted_tvd_intervals", [])
+        intervals = [[float(a), float(b)] for a, b in raw_intervals]
+        if "boundary_md" in item:
+            boundary = float(item["boundary_md"])
+        elif "boundary_tvd" in item:
+            boundary = float(item["boundary_tvd"])
+        else:
+            boundary = np.nan
         single = str(item["single_strata"]) if "single_strata" in item else ""
         upper = str(item.get("upper_strata", ""))
         lower = str(item.get("lower_strata", ""))
@@ -314,10 +416,10 @@ def build_imaging_contracts(config: dict[str, Any], output_dir: Path) -> pd.Data
         rows.append(
             {
                 "WellName": name,
-                "InterpretedTVDMin": min(a for a, _ in intervals) if intervals else np.nan,
-                "InterpretedTVDMax": max(b for _, b in intervals) if intervals else np.nan,
-                "InterpretedTVDIntervals": json.dumps(intervals, ensure_ascii=False) if intervals else "",
-                "BoundaryTVD": boundary,
+                "InterpretedMDMin": min(a for a, _ in intervals) if intervals else np.nan,
+                "InterpretedMDMax": max(b for _, b in intervals) if intervals else np.nan,
+                "InterpretedMDIntervals": json.dumps(intervals, ensure_ascii=False) if intervals else "",
+                "BoundaryMD": boundary,
                 "StrataNames": strata_names,
                 "HasExplicitMdBounds": bool(has_bounds),
                 "StrataEvidence": "imaging_interpretation_document_6_2",
@@ -328,7 +430,7 @@ def build_imaging_contracts(config: dict[str, Any], output_dir: Path) -> pd.Data
         qc_rows.append(
             {
                 "WellName": name,
-                "BoundaryTVD": boundary,
+                "BoundaryMD": boundary,
                 "BoundaryValid": has_bounds or not intervals,
                 "IntervalCount": len(intervals),
                 "ContractStatus": status,
@@ -336,8 +438,90 @@ def build_imaging_contracts(config: dict[str, Any], output_dir: Path) -> pd.Data
             }
         )
     result = pd.DataFrame(rows)
-    result.to_csv(output_dir / "imaging_tvd_strata_contract.csv", index=False, encoding="utf-8-sig")
-    pd.DataFrame(qc_rows).to_csv(output_dir / "imaging_tvd_strata_qc.csv", index=False, encoding="utf-8-sig")
+
+    # 来源核对：合同区间两端应与甲方文件自身深度轴一致。
+    #
+    # 判据：把合同区间的**两个端点**拿到甲方文件的深度轴上去找最近值，差值就是核对残差。
+    #   * ``pass``：两端残差都 <= tolerance_m（默认 1.0 m）——合同数值就取自这条深度轴；
+    #   * ``pass_report_interval``：<= report_tolerance_m（默认 30 m）——合同取自报告井段，
+    #     与文件轴端点略有出入；
+    #   * 其余为 ``diff_exceeds_tolerance``：真正的深度轴错位会在这里暴露（把 MD 数值当
+    #     TVD 用时会差出数百米）。
+    # 注：不用"文件深度范围包含合同区间"作为判据——甲方文件常把深度轴从 0.5 m 写满
+    # （如 313 的 FractureLogs），范围本身没有信息量；端点比对才反映"数值落在哪条轴上"。
+    source_rows: list[dict[str, object]] = []
+    for spec in config.get("source_depth_checks", []):
+        name = str(spec["well_name"])
+        match = result[result["WellName"].astype(str).eq(name)]
+        intervals: list[list[float]] = []
+        if len(match):
+            raw = match["InterpretedMDIntervals"].iloc[0]
+            if isinstance(raw, str) and raw.strip():
+                try:
+                    intervals = [[float(a), float(b)] for a, b in json.loads(raw)]
+                except Exception:
+                    intervals = []
+        axis = read_source_depth_axis(spec)
+        # 同一口井有多个源文件时，取"与该文件深度轴重叠最大"的合同区间做端点比对。
+        if len(intervals) > 1 and axis is not None and len(axis):
+            axis_lo, axis_hi = float(axis.min()), float(axis.max())
+            overlap = [min(b, axis_hi) - max(a, axis_lo) for a, b in intervals]
+            chosen = intervals[int(np.argmax(overlap))]
+        else:
+            chosen = intervals[0] if intervals else None
+        if axis is None or not len(axis) or chosen is None:
+            source_rows.append(
+                {
+                    "WellName": name,
+                    "SourceFile": str(spec.get("path", "")),
+                    "SourceStrtM": np.nan,
+                    "SourceStopM": np.nan,
+                    "SourceSampleCount": 0,
+                    "ContractMDMin": np.nan,
+                    "ContractMDMax": np.nan,
+                    "AbsDiffTopM": np.nan,
+                    "AbsDiffBottomM": np.nan,
+                    "CheckStatus": "source_unavailable",
+                }
+            )
+            continue
+        strt, stop = float(axis.min()), float(axis.max())
+        contract_min, contract_max = float(chosen[0]), float(chosen[1])
+        diff_top = float(np.min(np.abs(axis - contract_min)))
+        diff_bottom = float(np.min(np.abs(axis - contract_max)))
+        tolerance = float(spec.get("tolerance_m", 1.0))
+        report_tolerance = float(spec.get("report_tolerance_m", 30.0))
+        exact = bool(diff_top <= tolerance and diff_bottom <= tolerance)
+        report_level = bool(diff_top <= report_tolerance and diff_bottom <= report_tolerance)
+        if exact:
+            status_value = "pass"
+        elif report_level:
+            status_value = "pass_report_interval"
+        else:
+            status_value = "diff_exceeds_tolerance"
+        source_rows.append(
+            {
+                "WellName": name,
+                "SourceFile": str(spec.get("path", "")),
+                "SourceStrtM": strt,
+                "SourceStopM": stop,
+                "SourceSampleCount": int(len(axis)),
+                "ContractMDMin": contract_min,
+                "ContractMDMax": contract_max,
+                "AbsDiffTopM": diff_top,
+                "AbsDiffBottomM": diff_bottom,
+                "CheckStatus": status_value,
+            }
+        )
+    source_qc = pd.DataFrame(source_rows)
+    result.to_csv(output_dir / "imaging_md_strata_contract.csv", index=False, encoding="utf-8-sig")
+    qc_frame = pd.DataFrame(qc_rows)
+    if not source_qc.empty:
+        qc_frame = qc_frame.merge(source_qc, on="WellName", how="outer")
+        qc_frame["CheckStatus"] = qc_frame["CheckStatus"].fillna("not_configured")
+    qc_frame.to_csv(output_dir / "imaging_md_strata_qc.csv", index=False, encoding="utf-8-sig")
+    if not source_qc.empty:
+        source_qc.to_csv(output_dir / "imaging_md_strata_source_check.csv", index=False, encoding="utf-8-sig")
     return result
 
 
@@ -355,6 +539,23 @@ def main() -> int:
 
     regular_summary, regular_points = build_regular_contracts(config, config_path, output_dir)
     imaging_contract = build_imaging_contracts(config, output_dir)
+    source_check_path = output_dir / "imaging_md_strata_source_check.csv"
+    source_check: dict[str, object] = {"checked_wells": 0, "status": "not_configured"}
+    if source_check_path.exists():
+        check = pd.read_csv(source_check_path, encoding="utf-8-sig")
+        status_series = check["CheckStatus"].astype(str)
+        ok_mask = status_series.isin({"pass", "pass_report_interval"})
+        worst_top = float(pd.to_numeric(check["AbsDiffTopM"], errors="coerce").max()) if len(check) else np.nan
+        worst_bottom = float(pd.to_numeric(check["AbsDiffBottomM"], errors="coerce").max()) if len(check) else np.nan
+        source_check = {
+            "checked_rows": int(len(check)),
+            "passed_rows": int(ok_mask.sum()),
+            "well_rows": int(len(check)),
+            "max_abs_diff_top_m": worst_top,
+            "max_abs_diff_bottom_m": worst_bottom,
+            "status_counts": {str(k): int(v) for k, v in status_series.value_counts().items()},
+            "status": "pass" if int(ok_mask.sum()) == int(len(check)) and int(len(check)) > 0 else "needs_review",
+        }
     acceptance = {
         "regular_well_count": int(len(regular_summary)),
         "regular_eligible_wells": int(regular_summary["ContractStatus"].eq("eligible").sum()),
@@ -366,9 +567,10 @@ def main() -> int:
         "strata_names": [STRATA_UPPER, STRATA_LOWER],
         "coordinate_policy": "wellhead_xy_nearest_surface_grid",
         "regular_depth_policy": "own_well_md_to_time_only",
-        "imaging_depth_policy": "interpretation_tvd_only",
+        "imaging_depth_policy": "interpretation_md_only",
         "single_strata_wells_have_explicit_md_bounds": False,
-        "interpretation_depth_semantics": "tvd_true_vertical_depth",
+        "interpretation_depth_semantics": "measured_depth",
+        "imaging_md_source_check": source_check,
     }
     (output_dir / "step1_acceptance_summary.json").write_text(json.dumps(acceptance, ensure_ascii=False, indent=2), encoding="utf-8")
     print(json.dumps(acceptance, ensure_ascii=False, indent=2))

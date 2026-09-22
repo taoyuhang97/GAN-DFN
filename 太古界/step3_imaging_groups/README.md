@@ -3,13 +3,27 @@
 # Step 3 Imaging Supervision Samples
 
 > 本目录同时保留砂砾岩正式主线的 README 与脚本。**太古界实际入口是
-> `build_taigu_imaging_groups.py`**（配置 `configs/taigu_step3_imaging_groups.json`，
-> 输出 `output/taigu_step3_imaging_v3`），它读取 Step2 v3 的
-> `taigu_step2_segment_manifest.csv` 聚合各段并按 **TVD** 贴成像密度/点位标签；`groups/*.csv`
+> `build_taigu_imaging_groups.py`**（md1 配置 `configs/taigu_step3_imaging_groups_md1.json`，
+> 输出 `output/taigu_step3_imaging_md1`），它读取 Step2 的
+> `taigu_step2_segment_manifest.csv` 聚合各段并按 **MD** 贴成像密度/点位标签；`groups/*.csv`
 > 是 Step4 的唯一监督输入。构建后必须运行 `validate_taigu_rebuild_delivery.py`
 > （列合同 + 逐井放行 + 点位账目 + 覆盖完整度，`delivery_acceptance_summary.json`
 > 的 `status=pass` 为放行条件）。下方正文是砂砾岩 `formal_rebuild` 的参考说明，
 > 不能直接用于太古界。
+
+## 深度口径（2026-09-22，md1 修正）
+
+甲方成像解释深度是**测深 MD**（LAS 参数块 `TLFamily_TDEP = Measured Depth`、DLIS index
+`BOREHOLE-DEPTH`、成果图"深度（测深）"、报告"处理井段…共计 XXX 米"= 两端之差）。
+因此本步把密度曲线与产状点**按 MD** 贴到 Step2 段行：
+
+- `read_density()` / `read_points()` 把配置里的 `depth_column`（405 是 `MD`、313/169 是 `TDEP`）
+  统一改名为 **`MD`**（不再叫 TVD）；
+- 覆盖判定、窗口质量积分、缺口审计、点位吸附全部按 MD；审计列名同步为
+  `MDStart/MDEnd/MDMin/MDMax/NearestGridMD/PositiveMDMin/PositiveMDMax`，
+  解释段覆盖缺口列 `MDInterval`；
+- 输出行仍带 Step2 的 `TVD` 列（元数据），但标签位置由 MD 决定；
+- md1 前后对比（405）：标签从 MD 4104.7–4557.8 回到 **3676.6–3998.0**（甲方解释井段）。
 
 本次同时落地第三步（监督门控 + 产状点吸附放宽）：
 

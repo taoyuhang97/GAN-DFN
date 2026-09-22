@@ -91,3 +91,18 @@ v5将中尺度片长目标中位数设为80至100 m、上限145 m，脊线片间
 - 裂缝片大小由局部发育带宽度、局部时间厚度和局部密度共同控制。
 - 同时输出两类中心线：`fracture_band_centerlines_raw_time.vtk` 表示候选裂缝带骨架，`fracture_patch_centerlines_raw_time.vtk` 表示最终裂缝片中心线。
 - 当前 v3 暴露出一个上游问题：大尺度低相干候选中存在近水平层状结构，导致局部 PCA 计算出低倾角裂缝片。这不应在 Step7B 中强行改成陡倾角，后续应在 Step6C 大尺度先验中先过滤层界面。
+
+
+---
+
+## 口径变更（2026-09-22，azi1）
+
+产状统一为 **真倾向方位 0–360（自北顺时针）+ 倾角**，唯一实现见
+`太古界/common/orientation_frame/convention.py`（换算规则与验证见该目录 README）。
+
+- `DipAzimuthDeg` = 唯一真值字段；`AzimuthDeg` 降级为派生走向 `(DipAzimuthDeg-90)%180`。
+- 第三维为 `TIME`（向下为正）的帧一律走 `*_depth` 变体换算。
+- 旧口径开关（`family_azimuth_semantics` / `ridge_azimuth_semantics` /
+  `vertex_convention` / `dfn_azimuth_semantics`）已删除，不再保留双口径分支。
+- 背景：`太古界/太古界流程梳理与问题记录_20260915.md` §0.37；
+  施工方案：`太古界/太古界产状口径统一施工方案_20260922.md`。

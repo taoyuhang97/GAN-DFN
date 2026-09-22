@@ -26,6 +26,7 @@ if str(TAIGU_ROOT / "step1_strata_contracts") not in sys.path:
     sys.path.insert(0, str(TAIGU_ROOT / "step1_strata_contracts"))
 
 from common.dfn_geometry import initial_dfn_geometry as geometry  # noqa: E402
+from common.orientation_frame import convention as orientation  # noqa: E402
 geometry.ALLOWED_LAYERS = ["上部复合层", "太古界风化壳"]
 geometry.LAYER_CODE = {"上部复合层": 1.0, "太古界风化壳": 2.0}
 from horizon_trace_table.horizon_contract import (  # noqa: E402
@@ -359,6 +360,12 @@ def component_candidates_from_step6b(
                     "ComponentID": component_id,
                     "ComponentVoxelCount": int(comp_row.voxel_count),
                     "GlobalComponentAzimuthDeg": float(comp_row.pca_azimuth_deg),
+                    "GlobalComponentDipAzimuthDeg": (
+                        float(comp_row.pca_dip_azimuth_deg)
+                        if hasattr(comp_row, "pca_dip_azimuth_deg")
+                        and np.isfinite(float(getattr(comp_row, "pca_dip_azimuth_deg", np.nan)))
+                        else orientation.dip_azimuth_from_strike(float(comp_row.pca_azimuth_deg))
+                    ),
                     "GlobalComponentDipDeg": float(comp_row.pca_dip_deg),
                     "GlobalComponentLinearity": float(comp_row.pca_linearity),
                     "GlobalComponentXExtentM": float(comp_row.x_extent_m),
@@ -383,6 +390,12 @@ def component_candidates_from_step6b(
                     "ScoreMax": float(np.max(lscore)),
                     "TimeExtentMs": float(frame["CenterTime"].max() - frame["CenterTime"].min()),
                     "GlobalAzimuthDeg": float(comp_row.pca_azimuth_deg),
+                    "GlobalDipAzimuthDeg": (
+                        float(comp_row.pca_dip_azimuth_deg)
+                        if hasattr(comp_row, "pca_dip_azimuth_deg")
+                        and np.isfinite(float(getattr(comp_row, "pca_dip_azimuth_deg", np.nan)))
+                        else orientation.dip_azimuth_from_strike(float(comp_row.pca_azimuth_deg))
+                    ),
                     "GlobalDipDeg": float(comp_row.pca_dip_deg),
                     "GlobalLinearity": float(comp_row.pca_linearity),
                     "GlobalXExtentM": float(comp_row.x_extent_m),
@@ -416,7 +429,15 @@ def local_geometry(
     )
     center = coords[int(local_idx)]
     source_row = group.iloc[int(local_idx)]
-    global_azimuth = float(source_row.get("GlobalComponentAzimuthDeg", config.get("fallback_azimuth_deg", 60.0)))
+    if "GlobalComponentDipAzimuthDeg" in source_row.index and np.isfinite(
+        float(source_row.get("GlobalComponentDipAzimuthDeg", np.nan))
+    ):
+        global_azimuth = float(source_row["GlobalComponentDipAzimuthDeg"]) % 360.0
+    else:
+        # 旧字段是走向（历史口径），换算成倾向方位
+        global_azimuth = orientation.dip_azimuth_from_strike(
+            float(source_row.get("GlobalComponentAzimuthDeg", config.get("fallback_azimuth_deg", 60.0)))
+        )
     global_dip = float(source_row.get("GlobalComponentDipDeg", config.get("fallback_dip_deg", 70.0)))
     global_xy_extent = max(
         float(source_row.get("GlobalComponentXExtentM", 0.0)),
@@ -448,7 +469,7 @@ def local_geometry(
         return {
             "ok": True,
             "reason": "step6_component_global_geometry_insufficient_local_points",
-            "azimuth_deg": global_azimuth,
+            "dip_azimuth_deg": global_azimuth,
             "dip_deg": global_dip,
             "length_m": length,
             "height_time_ms": height,
@@ -472,11 +493,8 @@ def local_geometry(
     normal = normal / max(float(np.linalg.norm(normal)), 1.0e-9)
     dip = float(np.degrees(np.arccos(np.clip(abs(float(normal[2])), 0.0, 1.0))))
     dip = float(np.clip(dip, float(config.get("orientation_safety_min_dip_deg", 8.0)), float(config.get("orientation_safety_max_dip_deg", 89.0))))
-    strike = np.asarray([-normal[1], normal[0]], dtype=float)
-    if float(np.linalg.norm(strike)) < 1.0e-8:
-        azimuth = float(np.degrees(np.arctan2(axis1[1], axis1[0])) % 180.0)
-    else:
-        azimuth = float(np.degrees(np.arctan2(strike[1], strike[0])) % 180.0)
+    # `coords` 的第三维是 CenterTime * time_scale（向下为正）→ 用"向下帧"换算。
+    azimuth, _dip_from_normal = orientation.dip_azimuth_dip_from_normal_depth(normal)
     total = float(eigvals.sum())
     linearity = float((eigvals[0] - eigvals[1]) / max(eigvals[0], 1.0e-12)) if total > 0 else 0.0
     planarity = float((eigvals[1] - eigvals[2]) / max(eigvals[0], 1.0e-12)) if total > 0 else 0.0
@@ -520,7 +538,7 @@ def local_geometry(
     return {
         "ok": True,
         "reason": "step6_component_global_orientation_fallback" if use_global_orientation else "local_medium_candidate_band_pca",
-        "azimuth_deg": azimuth,
+        "dip_azimuth_deg": azimuth,
         "dip_deg": dip,
         "length_m": length,
         "height_time_ms": height,
@@ -827,7 +845,14 @@ def select_medium_patches(candidates: pd.DataFrame, grid: dict[str, Any], config
                     raw_dip = global_dip
                     final_dip = global_dip
                     geom["dip_deg"] = global_dip
-                    geom["azimuth_deg"] = float(row.get("GlobalComponentAzimuthDeg", geom["azimuth_deg"]))
+                    geom["dip_azimuth_deg"] = float(
+                        row.get(
+                            "GlobalComponentDipAzimuthDeg",
+                            orientation.dip_azimuth_from_strike(
+                                float(row.get("GlobalComponentAzimuthDeg", 0.0))
+                            ),
+                        )
+                    )
                     geom["reason"] = "step6_component_global_orientation_low_local_dip"
                     orientation_adjusted = 1
                     low_dip_adjusted_count += 1
@@ -846,7 +871,7 @@ def select_medium_patches(candidates: pd.DataFrame, grid: dict[str, Any], config
             row["BandTimeExtentMs"] = float(group["CenterTime"].max() - group["CenterTime"].min())
             row["BandPatchSpacingM"] = 0.0
             row["BandMeanDensity"] = float(group["SourceDensity"].mean())
-            row["OverrideAzimuthDeg"] = float(geom["azimuth_deg"])
+            row["OverrideDipAzimuthDeg"] = float(geom["dip_azimuth_deg"]) % 360.0
             row["RawDipDeg"] = raw_dip
             row["OverrideDipDeg"] = final_dip
             row["OrientationAdjusted"] = orientation_adjusted
@@ -883,7 +908,7 @@ def select_medium_patches(candidates: pd.DataFrame, grid: dict[str, Any], config
                     "ScoreMean": float(group["SamplingWeight"].mean()),
                     "TimeExtentMs": float(group["CenterTime"].max() - group["CenterTime"].min()),
                     "DipMedianDeg": float(selected["OverrideDipDeg"].median()),
-                    "AzimuthMedianDeg": float(selected["OverrideAzimuthDeg"].median()),
+                    "DipAzimuthMedianDeg": float(selected["OverrideDipAzimuthDeg"].median()),
                     "LengthMedianM": float(selected["OverrideLengthM"].median()),
                     "HeightMedianMs": float(selected["OverrideHeightTimeMs"].median()),
                     "CandidateBranch": str(group["CandidateBranch"].iloc[0]) if "CandidateBranch" in group.columns else "unknown",

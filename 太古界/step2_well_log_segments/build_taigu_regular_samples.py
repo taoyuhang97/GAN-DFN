@@ -1,15 +1,18 @@
 #!/usr/bin/env python3
-"""Build TaiGuJie Step2 regular-log segment bottoms (v3).
+"""Build TaiGuJie Step2 regular-log segment bottoms (md1).
 
-v3 changes (2026-08-12):
+md1 changes (2026-09-22):
 1. Depth semantics: interpretation products (intervals, boundaries, density and
-   point depths) are TVD (true vertical depth); LAS DEPT is measured depth (MD).
+   point depths) are **measured depth (MD)**; LAS DEPT is the same MD axis.
+   TVD is derived per row from the deviation survey and kept as metadata only.
+   Evidence: 甲方 LAS parameter block ``TLFamily_TDEP = Measured Depth``, DLIS
+   index ``BOREHOLE-DEPTH``, 成果图 "深度（测深）", 报告 "处理井段…共计 XXX 米" = 两端之差.
    Every row therefore gets MD, TVD, X, Y and TIME.
 2. Per-well trajectory: deviation file > LAS DEV/AZIM integration > vertical
    assumption. Imaging wells have no deviation files and use LAS DEV/AZIM
    (first valid row assumed vertical above, start at wellhead X/Y).
-3. Imaging wells: strata/filtering are applied in TVD space using the Step1
-   imaging TVD contract (InterpretedTVDIntervals + BoundaryTVD) and TVD windows.
+3. Imaging wells: strata/filtering are applied in **MD** space using the Step1
+   imaging MD contract (InterpretedMDIntervals + BoundaryMD) and MD windows.
 4. Regular wells: strata are classified per row by querying the three surfaces
    at each row's X/Y (per-row horizon attachment, same as the glutenite line).
 5. Segment manifest carries completeness ratio (RawRowsRead/CompleteRows) and
@@ -42,7 +45,7 @@ OUT_OF_TARGET = "OUT_OF_TARGET"
 WINDOW_COLUMNS = [
     "TopTime", "MiddleTime", "BottomTime",
     "InImagingInterval", "InHorizonLayer", "UseCase",
-    "LayerGroupByHorizon", "LayerGroupByImaging", "ImagingTVDMin", "ImagingTVDMax",
+    "LayerGroupByHorizon", "LayerGroupByImaging", "ImagingMDMin", "ImagingMDMax",
 ]
 SEGMENT_COLUMNS = ["MD", "TVD", "X", "Y", "TIME", "StrataName", "GR", "RD", "RS"] + WINDOW_COLUMNS
 
@@ -54,7 +57,7 @@ def fill_window_defaults(log: pd.DataFrame) -> pd.DataFrame:
         "TopTime": np.nan, "MiddleTime": np.nan, "BottomTime": np.nan,
         "InImagingInterval": 0, "InHorizonLayer": 1, "UseCase": "layer_only",
         "LayerGroupByHorizon": out["StrataName"], "LayerGroupByImaging": "",
-        "ImagingTVDMin": np.nan, "ImagingTVDMax": np.nan,
+        "ImagingMDMin": np.nan, "ImagingMDMax": np.nan,
     }
     for column, default in defaults.items():
         if column not in out.columns:
@@ -386,46 +389,55 @@ def classify_time(df: pd.DataFrame, top: np.ndarray, middle: np.ndarray, bottom:
 
 
 def imaging_strata_mask(df: pd.DataFrame, contract_row: pd.Series) -> pd.Series:
+    """成像区间内的层属（MD 口径）。
+
+    2026-09-22 修正：甲方成像解释深度是**测深 MD**，此处按 ``BoundaryMD`` / ``InterpretedMDIntervals``
+    与行的 ``MD`` 比较（旧实现按 TVD 比较，对斜井 405 会整体错位 ~428 m）。
+    """
     result = pd.Series(OUT_OF_TARGET, index=df.index, dtype="object")
-    boundary = contract_row.BoundaryTVD
+    boundary = contract_row.BoundaryMD
     if pd.notna(boundary):
         names = str(contract_row.StrataNames).split("|")
         upper = names[0] if names else STRATA_UPPER
         lower = names[1] if len(names) > 1 else STRATA_LOWER
-        result.loc[df["TVD"].lt(float(boundary))] = upper
-        result.loc[df["TVD"].ge(float(boundary))] = lower
+        result.loc[df["MD"].lt(float(boundary))] = upper
+        result.loc[df["MD"].ge(float(boundary))] = lower
     else:
         result.loc[:] = str(contract_row.StrataNames)
     inside = pd.Series(False, index=df.index)
-    intervals = json.loads(contract_row.InterpretedTVDIntervals or "[]")
+    intervals = json.loads(contract_row.InterpretedMDIntervals or "[]")
     for lo, hi in intervals:
-        inside |= df["TVD"].ge(float(lo)) & df["TVD"].le(float(hi))
+        inside |= df["MD"].ge(float(lo)) & df["MD"].le(float(hi))
     result.loc[~inside] = OUT_OF_TARGET
     return result
 
 
 def classify_imaging_window(log: pd.DataFrame, contract_row: pd.Series,
                             surfaces: dict[str, Any]) -> pd.DataFrame:
-    """成像井取样窗口（v5）：甲方成像解释区间 ∪ 层位合同区间。
+    """成像井取样窗口（md1）：甲方成像解释区间 ∪ 层位合同区间。
 
     旧口径把甲方成像 TVD 区间直接当取样窗口，导致"层内但成像段之外"的常规测井
     （405 是 MD 4557.9–4812.6）被丢弃、也无法在成像段之外预测。v5 改成并集，
     并逐行打标记，由下游按用途取用：
 
-    * ``InImagingInterval``：TVD 落在甲方成像解释区间内（有监督标签的候选行）；
+    * ``InImagingInterval``：**MD** 落在甲方成像解释区间内（有监督标签的候选行）；
     * ``InHorizonLayer``  ：TIME 落在沿线层位 [Top, Base] 内（可进 DFN 的行）；
     * ``UseCase``         ：``both`` / ``imaging_only`` / ``layer_only``；
     * ``StrataName``      ：成像区间内用甲方层属，否则用层位层属（保持监督口径不变）。
+
+    2026-09-22（md1）：甲方解释深度 = 测深 MD（LAS 参数块 ``TLFamily_TDEP = Measured Depth``、
+    DLIS index ``BOREHOLE-DEPTH``、成果图"深度（测深）"、报告"处理井段…共计 XXX 米"= 两端之差），
+    因此区间成员判定改按 ``MD``；``TVD`` 仍由轨迹逐行算出，只作元数据。
     """
     out = log.copy()
-    intervals = json.loads(contract_row.InterpretedTVDIntervals or "[]")
-    tvd = pd.to_numeric(out["TVD"], errors="coerce")
+    intervals = json.loads(contract_row.InterpretedMDIntervals or "[]")
+    md = pd.to_numeric(out["MD"], errors="coerce")
     in_imaging = pd.Series(False, index=out.index)
     for lo, hi in intervals:
-        in_imaging |= tvd.between(float(lo), float(hi))
+        in_imaging |= md.between(float(lo), float(hi))
     out["InImagingInterval"] = in_imaging.astype(int)
-    out["ImagingTVDMin"] = float(contract_row.InterpretedTVDMin) if pd.notna(contract_row.InterpretedTVDMin) else np.nan
-    out["ImagingTVDMax"] = float(contract_row.InterpretedTVDMax) if pd.notna(contract_row.InterpretedTVDMax) else np.nan
+    out["ImagingMDMin"] = float(contract_row.InterpretedMDMin) if pd.notna(contract_row.InterpretedMDMin) else np.nan
+    out["ImagingMDMax"] = float(contract_row.InterpretedMDMax) if pd.notna(contract_row.InterpretedMDMax) else np.nan
     out["LayerGroupByImaging"] = imaging_strata_mask(out, contract_row)
 
     top = np.full(len(out), np.nan)
@@ -501,18 +513,19 @@ def query_surface(raw: np.ndarray, query_xy: np.ndarray) -> pd.DataFrame:
     )
 
 
-def apply_tvd_windows(log: pd.DataFrame, windows: list[list[float]]) -> pd.DataFrame:
+def apply_md_windows(log: pd.DataFrame, windows: list[list[float]]) -> pd.DataFrame:
+    """按 MD 窗口裁剪（窗口数值来自甲方解释井段/合同，本来就是测深）。"""
     if not windows:
         return log
     keep = pd.Series(False, index=log.index)
     for lo, hi in windows:
-        keep |= log.TVD.ge(float(lo)) & log.TVD.le(float(hi))
+        keep |= log.MD.ge(float(lo)) & log.MD.le(float(hi))
     return log[keep].copy()
 
 
-def window_id(well: str, tvd: float, windows: dict[str, list[list[float]]]) -> str:
+def window_id(well: str, md: float, windows: dict[str, list[list[float]]]) -> str:
     for i, (lo, hi) in enumerate(windows.get(well, []), start=1):
-        if float(lo) <= tvd <= float(hi):
+        if float(lo) <= md <= float(hi):
             return f"w{i}"
     return ""
 
@@ -617,7 +630,7 @@ def process_well_segments(well: str, source_kind: str, candidates: list[tuple[Pa
             if piece.empty:
                 continue
             seg_seq += 1
-            wid = window_id(well, float(piece.TVD.median()), windows)
+            wid = window_id(well, float(piece.MD.median()), windows)
             row, _ = make_segment(well, source_kind, seg_seq, path, piece, meta, td_source,
                                   borrowed_from, borrow_distance, borrow_coverage, wid, traj_source,
                                   raw_rows, well_dir)
@@ -647,7 +660,7 @@ def main() -> int:
     if not step1_dir.is_absolute():
         step1_dir = Path(__file__).resolve().parents[2] / step1_dir
     regular_contract = pd.read_csv(step1_dir / "regular_well_time_strata_contract.csv", encoding="utf-8-sig")
-    imaging_contract = pd.read_csv(step1_dir / "imaging_tvd_strata_contract.csv", encoding="utf-8-sig")
+    imaging_contract = pd.read_csv(step1_dir / "imaging_md_strata_contract.csv", encoding="utf-8-sig")
     td_points = pd.read_csv(step1_dir / "regular_time_depth_strata_points.csv", encoding="utf-8-sig")
     td_by_well = {w: g[["MD", "TIME"]].copy() for w, g in td_points.groupby("WellName")}
     regular_by_well = {str(row.WellName): row for _, row in regular_contract.iterrows()}
@@ -667,7 +680,14 @@ def main() -> int:
     imaging_files = index_las_files([Path(x) for x in cfg["imaging_las_roots"]], set(imaging_by_well))
 
     gap_factor = float(cfg.get("source_internal_gap_factor", 3.0))
-    windows = {str(k): [[float(a), float(b)] for a, b in v] for k, v in cfg.get("well_tvd_windows", {}).items()}
+    window_spec = cfg.get("well_md_windows")
+    if window_spec is None:
+        # 兼容旧配置（键名 well_tvd_windows）：数值本身就是测深，按 MD 应用；
+        # 对按直井处理的井（如埕北313）MD≡TVD，结果与旧版一致。
+        window_spec = cfg.get("well_tvd_windows", {})
+        if window_spec:
+            print("[step2] 提示：配置使用旧键 well_tvd_windows，md1 起按 MD 应用", flush=True)
+    windows = {str(k): [[float(a), float(b)] for a, b in v] for k, v in window_spec.items()}
 
     segment_rows: list[dict[str, object]] = []
     imaging_audit_rows: list[dict[str, object]] = []
@@ -719,7 +739,7 @@ def main() -> int:
             log = log.loc[pos & log.TopTime.notna()].copy()
             log["StrataName"] = classify_time(log, log.TopTime.to_numpy(), log.MiddleTime.to_numpy(), log.BottomTime.to_numpy())
             log = log[log.StrataName.ne(OUT_OF_TARGET)].copy()
-            log = apply_tvd_windows(log, windows.get(well, []))
+            log = apply_md_windows(log, windows.get(well, []))
             log = fill_window_defaults(log)
             if not log.empty:
                 candidates.append((path, log, meta, raw_rows))
@@ -748,8 +768,8 @@ def main() -> int:
             "TimeDepthSource": "own", "TimeDepthPath": str(c.TimeDepthPath),
             "BorrowedFrom": "", "BorrowDistanceM": np.nan, "BorrowCoverageStatus": "",
             "TopTime": float(c.TopTime), "MiddleTime": float(c.MiddleTime), "BottomTime": float(c.BottomTime),
-            "InterpretedTVDMin": np.nan, "InterpretedTVDMax": np.nan, "InterpretedTVDIntervals": "",
-            "BoundaryTVD": np.nan, "StrataNames": "", "StrataEvidence": "", "HasExplicitMdBounds": "",
+            "InterpretedMDMin": np.nan, "InterpretedMDMax": np.nan, "InterpretedMDIntervals": "",
+            "BoundaryMD": np.nan, "StrataNames": "", "StrataEvidence": "", "HasExplicitMdBounds": "",
             "TrajectorySource": traj["source"], "TrajectoryStartMD": traj["start_md"],
             "InclinationMedianDeg": traj["inc_median_deg"],
             "TrajectoryPath": traj.get("path", ""),
@@ -766,7 +786,7 @@ def main() -> int:
         borrow_code = borrow.get(well)
         neighbor_name = code_to_name.get(borrow_code, "") if borrow_code else ""
         neighbor_td = td_by_well.get(neighbor_name)
-        intervals = json.loads(ic.InterpretedTVDIntervals or "[]")
+        intervals = json.loads(ic.InterpretedMDIntervals or "[]")
         horizon_rows = {
             name: query_surface(surfaces[name], np.array([[coords[0], coords[1]]], dtype=float)).iloc[0]
             for name in ("top", "middle", "bottom")
@@ -786,8 +806,8 @@ def main() -> int:
                 "ContractStatus": str(ic.ContractStatus), "TimeDepthSource": "borrowed_neighbor",
                 "TimeDepthPath": "", "BorrowedFrom": borrow_code or "", "BorrowDistanceM": np.nan,
                 "BorrowCoverageStatus": "none", "TopTime": np.nan, "MiddleTime": np.nan, "BottomTime": np.nan,
-                "InterpretedTVDMin": ic.InterpretedTVDMin, "InterpretedTVDMax": ic.InterpretedTVDMax,
-                "InterpretedTVDIntervals": ic.InterpretedTVDIntervals, "BoundaryTVD": ic.BoundaryTVD,
+                "InterpretedMDMin": ic.InterpretedMDMin, "InterpretedMDMax": ic.InterpretedMDMax,
+                "InterpretedMDIntervals": ic.InterpretedMDIntervals, "BoundaryMD": ic.BoundaryMD,
                 "StrataNames": ic.StrataNames, "StrataEvidence": ic.StrataEvidence,
                 "HasExplicitMdBounds": ic.HasExplicitMdBounds, "TrajectorySource": "",
                 "TrajectoryStartMD": np.nan, "InclinationMedianDeg": np.nan,
@@ -820,7 +840,7 @@ def main() -> int:
             log = log[log.TVD.notna()].copy()
             # v5：取样窗口 = 甲方成像区间 ∪ 层位区间（并集），并逐行打标记
             log = classify_imaging_window(log, ic, surfaces)
-            log = apply_tvd_windows(log, windows.get(well, []))
+            log = apply_md_windows(log, windows.get(well, []))
             log = log[log.StrataName.isin({STRATA_UPPER, STRATA_LOWER})].copy()
             if not log.empty:
                 candidates.append((path, log, meta, raw_rows))
@@ -861,8 +881,8 @@ def main() -> int:
             "BorrowedFrom": borrow_code or "", "BorrowDistanceM": dist, "BorrowCoverageStatus": coverage,
             "TopTime": float(horizon_rows["top"].SurfaceTime), "MiddleTime": float(horizon_rows["middle"].SurfaceTime),
             "BottomTime": float(horizon_rows["bottom"].SurfaceTime),
-            "InterpretedTVDMin": ic.InterpretedTVDMin, "InterpretedTVDMax": ic.InterpretedTVDMax,
-            "InterpretedTVDIntervals": ic.InterpretedTVDIntervals, "BoundaryTVD": ic.BoundaryTVD,
+            "InterpretedMDMin": ic.InterpretedMDMin, "InterpretedMDMax": ic.InterpretedMDMax,
+            "InterpretedMDIntervals": ic.InterpretedMDIntervals, "BoundaryMD": ic.BoundaryMD,
             "StrataNames": ic.StrataNames, "StrataEvidence": ic.StrataEvidence,
             "HasExplicitMdBounds": ic.HasExplicitMdBounds, "TrajectorySource": traj["source"],
             "TrajectoryStartMD": traj["start_md"], "InclinationMedianDeg": traj["inc_median_deg"],
@@ -887,8 +907,8 @@ def main() -> int:
             "TimeDepthSource": "own", "TimeDepthPath": str(c.TimeDepthPath),
             "BorrowedFrom": "", "BorrowDistanceM": np.nan, "BorrowCoverageStatus": "",
             "TopTime": float(c.TopTime), "MiddleTime": float(c.MiddleTime), "BottomTime": float(c.BottomTime),
-            "InterpretedTVDMin": np.nan, "InterpretedTVDMax": np.nan, "InterpretedTVDIntervals": "",
-            "BoundaryTVD": np.nan, "StrataNames": "", "StrataEvidence": "", "HasExplicitMdBounds": "",
+            "InterpretedMDMin": np.nan, "InterpretedMDMax": np.nan, "InterpretedMDIntervals": "",
+            "BoundaryMD": np.nan, "StrataNames": "", "StrataEvidence": "", "HasExplicitMdBounds": "",
             "TrajectorySource": "", "TrajectoryStartMD": np.nan, "InclinationMedianDeg": np.nan,
             "Step2Status": "rejected", "RejectReason": str(c.ContractStatus),
             "SegmentCount": 0, "TotalRows": 0,
@@ -917,9 +937,9 @@ def main() -> int:
         "trajectory_sources": {str(k): int(v) for k, v in well_df.TrajectorySource.value_counts().items()} if not well_df.empty else {},
         "imaging_borrow": borrow_audit,
         "trajectory_audit": trajectory_audit,
-        "well_tvd_windows": windows,
+        "well_md_windows": windows,
         "data_layout": "one_segment_per_las_source; per-row MD/TVD/X/Y/TIME; metadata separated",
-        "depth_semantics": "interpretation=tvd; las_depth=md; per-row md_to_tvd via trajectory",
+        "depth_semantics": "interpretation=md; las_depth=md; tvd_from_trajectory",
     }
     (out_dir / "taigu_step2_acceptance_summary.json").write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
     print(json.dumps(summary, ensure_ascii=False, indent=2))

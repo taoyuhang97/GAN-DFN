@@ -1,19 +1,29 @@
 # Step 2 TaiGuJie Regular-Log Samples
 
-太古界实际入口是 `build_taigu_regular_samples.py`（v3，配置
-`configs/taigu_step2_contracts_v3.json`），原有的
+太古界实际入口是 `build_taigu_regular_samples.py`（**md1**，配置
+`configs/taigu_step2_contracts_md1.json`；上一轮 v5 配置与产物保留），原有的
 `build_real_well_t4_t7_samples.py` 和 `build_gr_resistivity_samples.py`
 保留为砂砾岩正式主线参考，不能直接用于太古界。v1/v2 早期结果已清除，
-当前正式输出为 `output/taigu_step2_regular_v3`。
+md1 输出为 `output/taigu_step2_regular_md1`。
+
+## 深度口径（2026-09-22，md1 修正）
+
+- **甲方成像解释深度 = 测深 MD**（证据：甲方 LAS 参数块 `TLFamily_TDEP = Measured Depth`、
+  裂缝参数 DLIS index `BOREHOLE-DEPTH` 且深度道名就是 `MD`、成果图图头"深度（测深）"、
+  解释报告"处理井段…共计 XXX 米"= 两端之差）。因此 `InImagingInterval` 等窗口标记、
+  `ImagingMDMin/ImagingMDMax` 一律按 **MD** 判定（旧 md1 之前的版本按 TVD，斜井 405 会整体错位 ~428 m）。
+- `TVD` 仍由轨迹（井斜文件 / PRN `DEV+AZIM` 积分 / 直井声明）逐行算出，保留在段表里作为
+  **元数据**，不再参与与甲方解释深度的比较。
+- `well_tvd_windows` 键改名为 `well_md_windows`（数值本来就是测深；旧键仍可读，按 MD 应用）。
 
 ## 输入与职责
 
-- 深度语义：解释段上下界/密度/点位 = TVD；LAS DEPT = MD；
+- 深度语义：解释段上下界/密度/点位 = **MD**；LAS DEPT = 同一条 MD 轴；
 - 逐行轨迹：井斜文件 > LAS DEV/AZIM 积分 > 直井回退，逐行输出 `TVD/X/Y`；
 - 常规井：读取 Step1 的本井 MD-TIME 层位合同，在 LAS 原始 MD 行上附加
   `TVD/X/Y/TIME/StrataName`，按**逐行 X/Y 挂层位**（每行查三界面时间）分类；
 - 成像井：读取 Step1 的 TVD 合同，`StrataName` 按合同并裁剪到解释段
-  TVD 区间；`TIME` 用临时借用常规井时深标注
+  **MD 区间**（`InterpretedMDIntervals`/`BoundaryMD`）；`TIME` 用临时借用常规井时深标注
   （`temporary_neighbor_time_depth`），只作标注、不作层位门控；
 - 曲线列按 `GR > GR1 > GRSL` 优先选取，实际使用列写入段清单；
 - 输出分离：段数据文件只有 `MD/TVD/X/Y/TIME/StrataName/GR/RD/RS`；井级/段级字段

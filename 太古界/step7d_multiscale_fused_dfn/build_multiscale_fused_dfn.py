@@ -20,6 +20,7 @@ DEFAULT_CONFIG = CURRENT_DIR / "configs/taigu_step7d_fused_v1.json"
 CSV_ENCODINGS = ("utf-8-sig", "utf-8", "gb18030", "gbk")
 if str(FORMAL_ROOT) not in sys.path:
     sys.path.insert(0, str(FORMAL_ROOT))
+from common.orientation_frame import convention as orientation  # noqa: E402
 _vtk_path = REPO_ROOT / "优化阶段二" / "正式主线" / "common" / "unified_dfn_vtk.py"
 _spec = importlib.util.spec_from_file_location("taigu_step7d_unified_vtk", _vtk_path)
 if _spec is None or _spec.loader is None:
@@ -90,6 +91,24 @@ def normalize_input(df: pd.DataFrame, scale: str, source_file: Path) -> pd.DataF
     missing = [col for col in required if col not in out.columns]
     if missing:
         raise ValueError(f"{source_file} missing columns: {missing}")
+    # 2026-09-22 统一口径：优先透传上游的 DipAzimuthDeg（真倾向方位 0–360）；
+    # 若上游仍是旧口径（只有 AzimuthDeg=走向），换算补齐。
+    if "DipAzimuthDeg" not in out.columns:
+        out["DipAzimuthDeg"] = [
+            orientation.dip_azimuth_from_strike(
+                orientation.strike_from_xy_line_angle(float(value))
+            )
+            if pd.notna(value)
+            else np.nan
+            for value in pd.to_numeric(out["AzimuthDeg"], errors="coerce")
+        ]
+    else:
+        out["DipAzimuthDeg"] = pd.to_numeric(out["DipAzimuthDeg"], errors="coerce")
+    # 统一以 DipAzimuthDeg 为准重算派生走向
+    out["AzimuthDeg"] = [
+        orientation.strike_from_dip_azimuth(float(value)) if pd.notna(value) else np.nan
+        for value in out["DipAzimuthDeg"]
+    ]
     out["FractureScale"] = scale
     out["FractureScaleCode"] = {"small": 1, "medium": 2, "large": 3}[scale]
     if "SourceType" not in out.columns:
@@ -106,7 +125,7 @@ def normalize_input(df: pd.DataFrame, scale: str, source_file: Path) -> pd.DataF
             if scale == "medium"
             else "major_structure_hard_constraint"
         )
-    for col in ["CenterX", "CenterY", "CenterTime", "LengthM", "HeightTimeMs", "AzimuthDeg", "DipDeg", "PatchAreaM2", "SourceDensity", "Confidence"]:
+    for col in ["CenterX", "CenterY", "CenterTime", "LengthM", "HeightTimeMs", "DipAzimuthDeg", "AzimuthDeg", "DipDeg", "PatchAreaM2", "SourceDensity", "Confidence"]:
         if col in out.columns:
             out[col] = pd.to_numeric(out[col], errors="coerce")
     if "PatchAreaM2" not in out.columns:
@@ -219,12 +238,19 @@ def patch_vertices(row: pd.Series, geometry_time_scale: float = 1.0) -> list[tup
             (float(row[f"V{vertex_idx}X"]), float(row[f"V{vertex_idx}Y"]), float(row[f"V{vertex_idx}Z"]))
             for vertex_idx in range(1, 5)
         ]
-    azimuth = np.deg2rad(float(row["AzimuthDeg"]))
+    if "DipAzimuthDeg" in row.index and pd.notna(row.get("DipAzimuthDeg")):
+        azimuth = np.deg2rad(float(row["DipAzimuthDeg"]) % 360.0)
+    else:
+        azimuth = np.deg2rad(
+            orientation.dip_azimuth_from_strike(
+                orientation.strike_from_xy_line_angle(float(row["AzimuthDeg"]))
+            )
+        )
     dip = np.deg2rad(float(np.clip(row["DipDeg"], 1.0, 89.9)))
     half_length = 0.5 * float(row["LengthM"])
     half_height_time = 0.5 * float(row["HeightTimeMs"])
-    strike = np.asarray([np.cos(azimuth), np.sin(azimuth)], dtype=float)
-    dip_horizontal = np.asarray([-np.sin(azimuth), np.cos(azimuth)], dtype=float)
+    strike = np.asarray([np.cos(azimuth), -np.sin(azimuth)], dtype=float)
+    dip_horizontal = np.asarray([np.sin(azimuth), np.cos(azimuth)], dtype=float)
     horizontal_dip_half = (half_height_time * float(geometry_time_scale)) / max(np.tan(dip), 1.0e-6)
     center_xy = np.asarray([float(row["CenterX"]), float(row["CenterY"])], dtype=float)
     center_t = float(row["CenterTime"])
@@ -255,6 +281,7 @@ def write_vtk(path: Path, df: pd.DataFrame, title: str, geometry_time_scale: flo
         ("LengthM", "float"),
         ("HeightTimeMs", "float"),
         ("PatchAreaM2", "float"),
+        ("DipAzimuthDeg", "float"),
         ("AzimuthDeg", "float"),
         ("DipDeg", "float"),
     ]
@@ -304,7 +331,7 @@ def main() -> int:
     fused["PatchID"] = [f"fused_multiscale_{idx + 1:06d}" for idx in range(len(fused))]
     fused = add_render_columns(fused)
     fused.to_csv(paths["dfn_csv"], index=False, encoding="utf-8-sig")
-    audit_cols = ["PatchID", "FractureScale", "SourceType", "ConstraintLevel", "CenterX", "CenterY", "CenterTime", "LengthM", "HeightTimeMs", "AzimuthDeg", "DipDeg", "PatchAreaM2", "Step7SourceFile"]
+    audit_cols = ["PatchID", "FractureScale", "SourceType", "ConstraintLevel", "CenterX", "CenterY", "CenterTime", "LengthM", "HeightTimeMs", "DipAzimuthDeg", "AzimuthDeg", "DipDeg", "PatchAreaM2", "Step7SourceFile"]
     if "StructuralRelation" in fused.columns:
         audit_cols.extend(["StructuralRelation", "NearestMajorPatchID", "NearestMajorScale", "NearestMajorDistanceM"])
     audit = fused[audit_cols].copy()
@@ -344,6 +371,7 @@ def main() -> int:
             "length_m": finite_stats(fused["LengthM"]),
             "height_time_ms": finite_stats(fused["HeightTimeMs"]),
             "area_m2": finite_stats(fused["PatchAreaM2"]),
+            "dip_azimuth_deg": finite_stats(fused["DipAzimuthDeg"]),
             "azimuth_deg": finite_stats(fused["AzimuthDeg"]),
             "dip_deg": finite_stats(fused["DipDeg"]),
         },

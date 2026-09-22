@@ -243,6 +243,7 @@ from common.well_segment_join import (  # noqa: E402
     list_segment_files as list_well_segment_files,
     summarize_join,
 )
+from common.orientation_frame import convention as orientation  # noqa: E402
 
 
 def build_control_sample_ids(prefix: str, frame: pd.DataFrame) -> list[str]:
@@ -1136,16 +1137,31 @@ def config_layer_value(config: dict[str, Any], key: str, layer: str, default: fl
 
 
 def control_orientation(template: pd.Series, control: pd.Series, config: dict[str, Any]) -> tuple[float, float, str]:
+    """控制点 → (真倾向方位 0–360, 倾角, 来源)。
+
+    **合同口径（2026-09-22 统一）：`DipAzimuthDeg` 是唯一真值字段**，即
+    "缝往哪边倒"（自北顺时针 0–360）；`AzimuthDeg` 由它派生成走向
+    ``(DipAzimuthDeg - 90) % 180``（兼容字段，不再直接参与几何）。
+
+    甲方成像真值 `Frac_Azimuth`（LAS 参数块 `TLFamily_Azimuth = True Dip Azimuth`）
+    本身就是倾向方位，**原值直接用**；模板回退分支把历史的走向字段换算过来。
+    """
     is_gt = int(control.get("IsImagingGroundTruth", 0) or 0) == 1
     azimuth = pd.to_numeric(pd.Series([control.get("Frac_Azimuth")]), errors="coerce").iloc[0]
     dip = pd.to_numeric(pd.Series([control.get("Frac_Dip")]), errors="coerce").iloc[0]
     if is_gt and np.isfinite(azimuth) and np.isfinite(dip):
-        return float(azimuth) % 180.0, float(np.clip(dip, 1.0, 89.0)), "step3_imaging_gt_orientation"
-    template_azimuth = float(template["AzimuthDeg"]) % 180.0
+        return (
+            float(azimuth % 360.0),
+            float(np.clip(dip, 1.0, 89.0)),
+            "step3_imaging_gt_orientation",
+        )
+    template_dip_azimuth = orientation.dip_azimuth_from_strike(
+        orientation.strike_from_xy_line_angle(float(template["AzimuthDeg"]))
+    )
     template_dip = float(np.clip(template["DipDeg"], 1.0, 89.0))
     policy = dict(config.get("step4_small_orientation_policy", {}))
     if not bool(policy.get("enabled", False)):
-        return template_azimuth, template_dip, "well_control_template_from_nearest_initial_patch"
+        return template_dip_azimuth, template_dip, "well_control_template_from_nearest_initial_patch"
     layer = str(control.get("LayerGroup", template.get("LayerGroup", "")))
     target_dip = config_layer_value(policy, "target_dip_deg", layer, 62.0)
     min_dip = float(policy.get("min_dip_deg", 35.0))
@@ -1155,7 +1171,9 @@ def control_orientation(template: pd.Series, control: pd.Series, config: dict[st
     az_jitter = float(policy.get("azimuth_jitter_deg", 8.0))
     dip_jitter = float(policy.get("dip_jitter_deg", 5.0))
     key = f"{control.get('WellName', '')}|{control.get('WellControlSampleID', '')}|{layer}"
-    azimuth = (template_azimuth + stable_unit_value(key + "|azimuth") * az_jitter) % 180.0
+    azimuth = (
+        template_dip_azimuth + stable_unit_value(key + "|azimuth") * az_jitter
+    ) % 360.0
     clipped_template_dip = float(np.clip(template_dip, min_dip, max_dip))
     use_blend = steep_blend if template_dip > max_dip else blend
     dip = (1.0 - use_blend) * clipped_template_dip + use_blend * target_dip
@@ -1177,7 +1195,7 @@ def force_well_control_small_scale(row: dict[str, Any], control: pd.Series, conf
     return row
 
 
-def offset_center_near_control(control: pd.Series, azimuth_deg: float, dip_deg: float, length_m: float, height_time_ms: float, config: dict[str, Any]) -> dict[str, float]:
+def offset_center_near_control(control: pd.Series, dip_azimuth_deg: float, dip_deg: float, length_m: float, height_time_ms: float, config: dict[str, Any]) -> dict[str, float]:
     if not bool(config.get("enable_well_control_center_offset", True)):
         return {
             "CenterX": float(control["X"]),
@@ -1187,10 +1205,11 @@ def offset_center_near_control(control: pd.Series, azimuth_deg: float, dip_deg: 
             "CenterOffsetTimeMs": 0.0,
             "ControlInsidePatchEnvelope": 1,
         }
-    theta = np.deg2rad(float(azimuth_deg))
+    # 2026-09-22 统一口径：入参是**真倾向方位**；长边沿走向线 (cosD, -sinD)，短边沿下倾方向 (sinD, cosD)。
+    theta = np.deg2rad(float(dip_azimuth_deg) % 360.0)
     dip = np.deg2rad(float(np.clip(dip_deg, 1.0, 89.0)))
-    strike = np.asarray([np.cos(theta), np.sin(theta)], dtype=float)
-    dip_horizontal = np.asarray([-np.sin(theta), np.cos(theta)], dtype=float)
+    strike = np.asarray([np.cos(theta), -np.sin(theta)], dtype=float)
+    dip_horizontal = np.asarray([np.sin(theta), np.cos(theta)], dtype=float)
     time_scale = float(config.get("geometry_time_scale_m_per_ms", config.get("time_scale_m_per_ms", 2.0)))
     half_length = 0.5 * float(length_m)
     half_height = 0.5 * float(height_time_ms)
@@ -1233,14 +1252,15 @@ def offset_center_near_control(control: pd.Series, azimuth_deg: float, dip_deg: 
 
 def apply_geometry_from_control(row: pd.Series | dict[str, Any], template: pd.Series, control: pd.Series, config: dict[str, Any]) -> dict[str, Any]:
     out = dict(row)
-    azimuth, dip, orientation_source = control_orientation(template=template, control=control, config=config)
+    dip_azimuth, dip, orientation_source = control_orientation(template=template, control=control, config=config)
     length = float(control["WellControlLengthM"]) if "WellControlLengthM" in control and pd.notna(control["WellControlLengthM"]) else float(template["LengthM"])
     height = float(control["WellControlHeightTimeMs"]) if "WellControlHeightTimeMs" in control and pd.notna(control["WellControlHeightTimeMs"]) else float(template["HeightTimeMs"])
-    center = offset_center_near_control(control=control, azimuth_deg=azimuth, dip_deg=dip, length_m=length, height_time_ms=height, config=config)
+    center = offset_center_near_control(control=control, dip_azimuth_deg=dip_azimuth, dip_deg=dip, length_m=length, height_time_ms=height, config=config)
     out.update(center)
     out["LengthM"] = length
     out["HeightTimeMs"] = height
-    out["AzimuthDeg"] = azimuth
+    out["DipAzimuthDeg"] = float(dip_azimuth) % 360.0
+    out["AzimuthDeg"] = orientation.strike_from_dip_azimuth(float(dip_azimuth))
     out["DipDeg"] = dip
     out["OrientationSource"] = orientation_source
     out["SizeRule"] = "well_control_density_scaled"
@@ -1516,11 +1536,26 @@ def patch_vertices(
     display_z_scale: float,
     use_dip_geometry: bool,
     geometry_time_scale_m_per_ms: float,
+    rebuild_all_vertices: bool = False,
+    vertex_convention: str = "compass_strike",
 ) -> list[tuple[float, float, float]]:
+    """片的四个顶点。
+
+    **口径（2026-09-22 统一）**：由 `DipAzimuthDeg`（真倾向方位 0–360）构造，
+    长边沿走向线 ``(cosD, -sinD)``，短边沿下倾方向 ``(sinD, cosD)``；
+    `AzimuthDeg`（派生走向）仅在缺 `DipAzimuthDeg` 时回退。
+
+    ``rebuild_all_vertices``：为 True 时**所有片**都按字段重建顶点（不再沿用 Step7D 透传的
+    V1..V4），这样"几何 = 字段"，Step9 才能按几何出图。2026-09-22 起默认改为 True。
+    """
     vertex_cols = [f"V{vertex_idx}{axis}" for vertex_idx in range(1, 5) for axis in ("X", "Y", "Z")]
     preserve_vertices = all(col in row.index and pd.notna(row.get(col)) for col in vertex_cols)
     correction_action = str(row.get("CorrectionAction", "unchanged_density_volume"))
-    if preserve_vertices and correction_action not in {"add_well_control_patch", "adjust_to_well_control"}:
+    if (
+        preserve_vertices
+        and not rebuild_all_vertices
+        and correction_action not in {"add_well_control_patch", "adjust_to_well_control"}
+    ):
         points = []
         for vertex_idx in range(1, 5):
             x = float(row[f"V{vertex_idx}X"])
@@ -1531,17 +1566,24 @@ def patch_vertices(
             points.append((x, y, z))
         return points
 
-    theta = np.deg2rad(float(row["AzimuthDeg"]))
+    if "DipAzimuthDeg" in row.index and pd.notna(row.get("DipAzimuthDeg")):
+        theta = np.deg2rad(float(row["DipAzimuthDeg"]) % 360.0)
+    else:
+        theta = np.deg2rad(
+            orientation.dip_azimuth_from_strike(
+                orientation.strike_from_xy_line_angle(float(row["AzimuthDeg"]))
+            )
+        )
     half_length = 0.5 * float(row["LengthM"])
     half_h = 0.5 * float(row["HeightTimeMs"])
     center_x = float(row["CenterX"])
     center_y = float(row["CenterY"])
     center_time = float(row["CenterTime"])
-    strike = np.asarray([np.cos(theta), np.sin(theta)], dtype=float)
+    strike = np.asarray([np.cos(theta), -np.sin(theta)], dtype=float)
+    dip_horizontal = np.asarray([np.sin(theta), np.cos(theta)], dtype=float)
 
     if use_dip_geometry:
         dip = np.deg2rad(float(np.clip(row["DipDeg"], 1.0, 89.9)))
-        dip_horizontal = np.asarray([-np.sin(theta), np.cos(theta)], dtype=float)
         half_dip_xy = (half_h * geometry_time_scale_m_per_ms) / max(np.tan(dip), 1.0e-6)
         corners: list[tuple[float, float, float]] = []
         for strike_sign, dip_sign in [(-1, -1), (1, -1), (1, 1), (-1, 1)]:
@@ -1552,8 +1594,8 @@ def patch_vertices(
             corners.append((float(xy[0]), float(xy[1]), float(z)))
         return corners
 
-    half_dx = half_length * np.cos(theta)
-    half_dy = half_length * np.sin(theta)
+    half_dx = half_length * float(strike[0])
+    half_dy = half_length * float(strike[1])
     z0 = center_time - half_h
     z1 = center_time + half_h
     if display:
@@ -1580,6 +1622,8 @@ def refresh_well_control_vertices(
     patch_df: pd.DataFrame,
     use_dip_geometry: bool,
     geometry_time_scale_m_per_ms: float,
+    rebuild_all_vertices: bool = False,
+    vertex_convention: str = "math_angle_strike",
 ) -> pd.DataFrame:
     out = patch_df.copy()
     if "CorrectionAction" not in out.columns:
@@ -1598,6 +1642,8 @@ def refresh_well_control_vertices(
             display_z_scale=1.0,
             use_dip_geometry=use_dip_geometry,
             geometry_time_scale_m_per_ms=geometry_time_scale_m_per_ms,
+            rebuild_all_vertices=rebuild_all_vertices,
+            vertex_convention=vertex_convention,
         )
         for vertex_idx, point in enumerate(points, start=1):
             out.loc[idx, f"V{vertex_idx}X"] = float(point[0])
@@ -1612,6 +1658,8 @@ def materialize_and_clip_vertices_to_horizon_contract(
     lookup: TaiguHorizonSpatialLookup,
     use_dip_geometry: bool,
     geometry_time_scale_m_per_ms: float,
+    rebuild_all_vertices: bool = False,
+    vertex_convention: str = "math_angle_strike",
 ) -> tuple[pd.DataFrame, dict[str, Any]]:
     out = patch_df.reset_index(drop=True).copy()
     vertex_cols = [f"V{vertex_idx}{axis}" for vertex_idx in range(1, 5) for axis in ("X", "Y", "Z")]
@@ -1628,6 +1676,8 @@ def materialize_and_clip_vertices_to_horizon_contract(
                 display_z_scale=1.0,
                 use_dip_geometry=use_dip_geometry,
                 geometry_time_scale_m_per_ms=geometry_time_scale_m_per_ms,
+                rebuild_all_vertices=rebuild_all_vertices,
+                vertex_convention=vertex_convention,
             ),
             dtype=np.float64,
         )
@@ -1749,6 +1799,8 @@ def write_legacy_vtk(
     display_z_scale: float,
     use_dip_geometry: bool = False,
     geometry_time_scale_m_per_ms: float = 1.0,
+    rebuild_all_vertices: bool = False,
+    vertex_convention: str = "math_angle_strike",
 ) -> None:
     points: list[tuple[float, float, float]] = []
     polygons: list[list[int]] = []
@@ -1761,6 +1813,8 @@ def write_legacy_vtk(
                 display_z_scale=display_z_scale,
                 use_dip_geometry=use_dip_geometry,
                 geometry_time_scale_m_per_ms=geometry_time_scale_m_per_ms,
+                rebuild_all_vertices=rebuild_all_vertices,
+                vertex_convention=vertex_convention,
             )
         )
         polygons.append([base, base + 1, base + 2, base + 3])
@@ -1804,6 +1858,13 @@ def write_legacy_vtk(
             safe_numeric(patch_df["PatchAreaM2"]).fillna(0.0).to_numpy()
             if "PatchAreaM2" in patch_df.columns
             else (safe_numeric(patch_df["LengthM"]).fillna(0.0) * safe_numeric(patch_df["HeightTimeMs"]).fillna(0.0)).to_numpy(),
+            "float",
+        ),
+        (
+            "DipAzimuthDeg",
+            safe_numeric(patch_df["DipAzimuthDeg"]).to_numpy()
+            if "DipAzimuthDeg" in patch_df.columns
+            else np.full(len(patch_df), np.nan, dtype=float),
             "float",
         ),
         ("AzimuthDeg", safe_numeric(patch_df["AzimuthDeg"]).to_numpy(), "float"),
@@ -2099,6 +2160,13 @@ def build_summary(
             or (
                 int(config.get("_imaging_well_region_summary", {}).get("control_point_count", 0)) > 0
                 and int(config.get("_imaging_well_region_summary", {}).get("within_radius_candidate_count", 0)) == 0
+            )
+            # 不适用分支：本区块没有可用成像井控（含"成像解释段整体在目标层之外"，
+            # 见问题记录 §0.33 R1）——此时记 status/skip_reason 与层内/层外账目，
+            # 不视为失败；只要账目缺失（reason 为空）仍然判失败。
+            or bool(
+                str(config.get("_imaging_well_region_summary", {}).get("status", "")).startswith("not_applicable")
+                and config.get("_imaging_well_region_summary", {}).get("skip_reason")
             )
         ),
     }
@@ -2398,6 +2466,15 @@ def main() -> int:
         "outside_assigned_layer_count": int((input_qc["ControlTimeInsideAssignedLayer"] == 0).sum()),
         "temporary_time_depth_count": int(safe_numeric(input_qc["temporary_neighbor_time_depth"]).fillna(0).sum()),
     }
+    # 成像井控的"层内/层外"账目：md1（甲方解释深度=测深 MD）之后，405 的成像解释段整体
+    # 位于目标层窗口之上（借用时深/层位标定问题，见问题记录 §0.33 R1），本区块因此没有
+    # 可用的成像井控。这里把账目显式记录，供验收判定"成像区域校正 = 不适用"而不是静默通过。
+    imaging_flag = safe_numeric(input_qc.get("IsImagingGroundTruth", pd.Series(0, index=input_qc.index))).fillna(0).astype(int).eq(1)
+    config["_imaging_control_layer_qc"] = {
+        "imaging_control_count_input": int(imaging_flag.sum()),
+        "imaging_control_inside_layer_count": int((imaging_flag & inside_mask).sum()),
+        "imaging_control_outside_layer_count": int((imaging_flag & ~inside_mask).sum()),
+    }
     # Keep layer-outside observations for audit, but do not use them as hard
     # controls and never clamp them onto a horizon boundary.
     eligible_positions = np.flatnonzero(inside_mask.to_numpy())
@@ -2438,6 +2515,30 @@ def main() -> int:
             (region_audit_df["CorrectedSourceDensity"] - region_audit_df["OriginalSourceDensity"]).mean()
         ) if not region_audit_df.empty else 0.0,
     }
+    # 显式状态：应用 / 无候选（井控存在但区域内无片）/ 不适用（本区块没有可用成像井控）
+    imaging_layer_qc = dict(config.get("_imaging_control_layer_qc", {}))
+    region_summary = dict(config["_imaging_well_region_summary"])
+    if not region_summary["enabled"]:
+        region_status, region_reason = "disabled", "config_disabled"
+    elif region_summary["corrected_patch_count"] > 0:
+        region_status, region_reason = "applied", ""
+    elif region_summary["control_point_count"] > 0:
+        region_status, region_reason = "not_applicable_no_candidates_within_radius", "no_patch_within_xy_time_radius"
+    elif int(imaging_layer_qc.get("imaging_control_count_input", 0)) == 0:
+        region_status, region_reason = "not_applicable_no_imaging_controls", "no_imaging_control_in_block"
+    else:
+        region_status, region_reason = (
+            "not_applicable_imaging_controls_outside_target_layer",
+            "all_imaging_controls_fall_outside_the_assigned_target_layer_window",
+        )
+    region_summary.update(
+        {
+            "status": region_status,
+            "skip_reason": region_reason,
+            **imaging_layer_qc,
+        }
+    )
+    config["_imaging_well_region_summary"] = region_summary
     log("[Step8 5/7] 检查新增/移动小尺度片的太古界层位合同")
     corrected_df, final_horizon_qc = enforce_final_center_horizon_contract(corrected_df, surface_lookup)
     after_dist = nearest_patch_distances(corrected_df, control_df, time_scale=time_scale)
@@ -2445,16 +2546,24 @@ def main() -> int:
     display_z_scale = float(config.get("display_z_scale", 5.0))
     use_dip_geometry = bool(config.get("use_dip_geometry", False))
     geometry_time_scale = float(config.get("geometry_time_scale_m_per_ms", 1.0))
+    # 2026-09-22 统一口径：全量按 DipAzimuthDeg 重建顶点，保证"几何 = 字段"（默认开启；
+    # 只有显式把 rebuild_all_vertices 设为 false 时才沿用上游顶点，用于对照实验）。
+    rebuild_all_vertices = bool(config.get("rebuild_all_vertices", True))
+    vertex_convention = "compass_strike"
     corrected_df = refresh_well_control_vertices(
         corrected_df,
         use_dip_geometry=use_dip_geometry,
         geometry_time_scale_m_per_ms=geometry_time_scale,
+        rebuild_all_vertices=rebuild_all_vertices,
+        vertex_convention=vertex_convention,
     )
     corrected_df, vertex_horizon_qc = materialize_and_clip_vertices_to_horizon_contract(
         corrected_df,
         lookup=surface_lookup,
         use_dip_geometry=use_dip_geometry,
         geometry_time_scale_m_per_ms=geometry_time_scale,
+        rebuild_all_vertices=rebuild_all_vertices,
+        vertex_convention=vertex_convention,
     )
     log("[Step8 6/7] 写出预测裂缝和原始断层统一 VTK")
     final_horizon_qc["vertex_geometry"] = vertex_horizon_qc

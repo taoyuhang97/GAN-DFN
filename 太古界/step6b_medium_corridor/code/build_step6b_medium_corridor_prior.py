@@ -37,6 +37,7 @@ from common.multiscale_density.build_multiscale_density_bundle import (
 )
 from common.multiscale_density.build_multiscale_density_bundle import _resample_matrix
 from common.attribute_sampling.attribute_contract import score_attribute
+from common.orientation_frame import convention as orientation
 
 
 FORMAL_ROOT = CURRENT_DIR.parent
@@ -349,16 +350,21 @@ def grid_axis_values(mapping: dict[str, np.ndarray]) -> tuple[np.ndarray, np.nda
 
 
 def pca_orientation(points: np.ndarray) -> tuple[float | None, float | None, float | None]:
+    """点簇 PCA → ``(真倾向方位[0,360), 倾角[0,90], 线性度)``。
+
+    **口径（2026-09-22 统一）**：``points`` 的第三维是 ``TIME * time_scale``，
+    **向下为正**，因此走 :func:`common.orientation_frame.convention.dip_azimuth_dip_from_normal_depth`。
+    旧实现返回 ``atan2(main[0], main[1])``（罗盘**走向**，0–180），与下游按 XY 平面角
+    消费的字段口径冲突，已废弃。
+    """
     if points.shape[0] < 3:
         return None, None, None
     centered = points - points.mean(axis=0, keepdims=True)
     _, s, vh = np.linalg.svd(centered, full_matrices=False)
-    main = vh[0]
     normal = vh[-1]
-    azimuth = float((np.degrees(np.arctan2(main[0], main[1])) + 360.0) % 180.0)
-    dip = float(np.degrees(np.arccos(np.clip(abs(float(normal[2])) / max(float(np.linalg.norm(normal)), 1.0e-9), 0.0, 1.0))))
+    dip_azimuth, dip = orientation.dip_azimuth_dip_from_normal_depth(normal)
     linearity = float(s[0] / max(s[1], 1.0e-9)) if len(s) > 1 else None
-    return azimuth, dip, linearity
+    return dip_azimuth, dip, linearity
 
 
 def build_local_support_grids(
@@ -547,7 +553,7 @@ def build_medium_components(
                 rejected_thin += 1
                 continue
             points = np.column_stack([x_values[gxx], y_values[gyy], samples[gtt] * time_scale]).astype(np.float64)
-            azimuth, dip, linearity = pca_orientation(points)
+            dip_azimuth, dip, linearity = pca_orientation(points)
             score_mean = float(np.mean(score[gyy, gxx, gtt]))
             branch_values = branch_code[gyy, gxx, gtt].astype(np.uint8)
             required_score_mean = float(args.min_component_score_mean)
@@ -616,7 +622,12 @@ def build_medium_components(
                     "x_extent_m": x_extent,
                     "y_extent_m": y_extent,
                     "time_extent_ms": t_extent,
-                    "pca_azimuth_deg": azimuth,
+                    "pca_dip_azimuth_deg": dip_azimuth,
+                    "pca_azimuth_deg": (
+                        orientation.strike_from_dip_azimuth(dip_azimuth)
+                        if dip_azimuth is not None
+                        else None
+                    ),
                     "pca_dip_deg": dip,
                     "pca_linearity": linearity,
                     "layer_like": layer_like,

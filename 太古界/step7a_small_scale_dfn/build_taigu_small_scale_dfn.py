@@ -54,6 +54,7 @@ from common.well_segment_join import (  # noqa: E402
     attach_geometry_per_segment,
     summarize_join,
 )
+from common.orientation_frame import convention as orientation  # noqa: E402
 
 
 def parse_args() -> argparse.Namespace:
@@ -151,19 +152,17 @@ def thin_by_3d_spacing(
 
 
 def normal_to_dip_azimuth(normal: np.ndarray) -> tuple[float, float]:
+    """**向下三维帧**面法向 → ``(真倾角, 真倾向方位[0,360))``。
+
+    2026-09-22 统一口径：本函数只保留"罗盘倾向方位"一种语义，
+    历史 ``math_angle`` / ``compass_strike`` 两个开关已删除
+    （口径混乱正是本轮剖面异常的根因）。换算统一走
+    :mod:`common.orientation_frame.convention`。
+    """
     normal = np.asarray(normal, dtype=np.float64)
     normal = normal / (np.linalg.norm(normal) + 1.0e-12)
-    dip = float(np.degrees(np.arccos(np.clip(abs(normal[2]), 0.0, 1.0))))
-    horizontal = np.array([normal[0], normal[1]], dtype=np.float64)
-    hnorm = np.linalg.norm(horizontal)
-    if hnorm < 1.0e-6:
-        azimuth = 0.0
-    else:
-        normal_azimuth = float(np.degrees(np.arctan2(horizontal[1], horizontal[0]))) % 180.0
-        # The DFN geometry interprets AzimuthDeg as strike.  A plane normal's
-        # horizontal projection is the dip direction, so rotate it by 90 deg.
-        azimuth = (normal_azimuth + 90.0) % 180.0
-    return dip, azimuth
+    dip_azimuth, dip = orientation.dip_azimuth_dip_from_normal_depth(normal)
+    return dip, dip_azimuth
 
 
 def write_legacy_vtk(path: Path, points: np.ndarray, quads: np.ndarray, cell_data: dict[str, np.ndarray]) -> None:
@@ -191,8 +190,13 @@ def write_legacy_vtk(path: Path, points: np.ndarray, quads: np.ndarray, cell_dat
     path.write_text("\n".join(lines) + "\n", encoding="ascii")
 
 
-def axial_mean_std_deg(degrees: np.ndarray, weights: np.ndarray | None = None) -> tuple[float, float]:
-    """Mean/spread for fracture strike where theta and theta+180 are equal."""
+def dip_azimuth_mean_std_deg(degrees: np.ndarray, weights: np.ndarray | None = None) -> tuple[float, float]:
+    """**全圆**平均/离散：真倾向方位 ``0–360``（不是 axial 0–180）。
+
+    2026-09-22 统一口径：倾向方位有方向性（"往哪边倒"），不能按
+    ``theta`` 与 ``theta+180`` 等价来统计。旧实现 ``axial_mean_std_deg``
+    把倾向方位按半圆统计，是口径混乱的一部分，已删除。
+    """
     angle = np.asarray(degrees, dtype=np.float64)
     valid = np.isfinite(angle)
     angle = angle[valid]
@@ -200,11 +204,10 @@ def axial_mean_std_deg(degrees: np.ndarray, weights: np.ndarray | None = None) -
         return np.nan, np.nan
     weight = np.ones(len(angle), dtype=np.float64) if weights is None else np.asarray(weights, dtype=np.float64)[valid]
     weight = weight / max(float(weight.sum()), 1.0e-12)
-    doubled = np.deg2rad(2.0 * angle)
-    vector = np.sum(weight * np.exp(1j * doubled))
-    mean = float((np.rad2deg(np.angle(vector)) / 2.0) % 180.0)
+    vector = np.sum(weight * np.exp(1j * np.deg2rad(angle)))
+    mean = float(np.rad2deg(np.angle(vector)) % 360.0)
     resultant = float(np.clip(abs(vector), 1.0e-12, 1.0))
-    std = float(np.rad2deg(np.sqrt(max(-2.0 * np.log(resultant), 0.0))) / 2.0)
+    std = float(np.rad2deg(np.sqrt(max(-2.0 * np.log(resultant), 0.0))))
     return mean, std
 
 
@@ -228,7 +231,9 @@ def load_multiwell_orientation_points(
         if group.empty or not required.issubset(group.columns):
             continue
         points = group[group["GT_POINT_FLAG"].fillna(0).astype(int).eq(1)].copy()
-        points["FracAzimuth"] = pd.to_numeric(points["FracAzimuth"], errors="coerce") % 180.0
+        # 2026-09-22 统一口径：甲方 FracAzimuth 是**真倾向方位**（0–360，自北顺时针），
+        # 不能再折叠到 0–180（折叠会把"往哪边倒"抹掉，与下游倾向方位口径冲突）。
+        points["FracAzimuth"] = pd.to_numeric(points["FracAzimuth"], errors="coerce") % 360.0
         points["FracDip"] = pd.to_numeric(points["FracDip"], errors="coerce")
         points["MD"] = pd.to_numeric(points["MD"], errors="coerce")
         points = points.dropna(subset=["FracAzimuth", "FracDip", "MD"])
@@ -262,7 +267,15 @@ def load_multiwell_orientation_points(
 
 
 def build_orientation_families(points: pd.DataFrame, config: dict[str, Any]) -> dict[str, list[dict[str, Any]]]:
-    """Cluster axial strike/dip observations with approximately equal well influence."""
+    """按井近似等权，对甲方**真倾向方位**做全圆 KMeans，得到每层的产状家族。
+
+    **口径（2026-09-22 统一）**：家族角度字段 ``dip_azimuth_deg`` 是
+    **真倾向方位 0–360（自北顺时针）**，与甲方 ``FracAzimuth``（LAS 参数块
+    ``TLFamily_Azimuth = True Dip Azimuth``）同义。
+
+    旧实现把倾向方位当"走向"按半圆（``2*angle``）聚类，再被下游按走向消费，
+    造成整族差 90°；配置开关 ``family_azimuth_semantics`` 已删除。
+    """
     families: dict[str, list[dict[str, Any]]] = {}
     random_state = int(config.get("family_random_seed", 20260822))
     dip_weight = float(config.get("family_dip_feature_weight", 0.7))
@@ -272,7 +285,9 @@ def build_orientation_families(points: pd.DataFrame, config: dict[str, Any]) -> 
         if cluster_count <= 0:
             families[layer] = []
             continue
-        angle = np.deg2rad(2.0 * sub["FracAzimuth"].to_numpy(dtype=np.float64))
+        azimuth_observations = sub["FracAzimuth"].to_numpy(dtype=np.float64) % 360.0
+        # 全圆特征：倾向方位有方向性，用 (cos, sin) 而不是半圆的 (cos2θ, sin2θ)。
+        angle = np.deg2rad(azimuth_observations)
         dip = sub["FracDip"].to_numpy(dtype=np.float64)
         features = np.column_stack([np.cos(angle), np.sin(angle), dip_weight * (dip - 55.0) / 25.0])
         per_well_count = sub.groupby("WellName")["WellName"].transform("size").to_numpy(dtype=np.float64)
@@ -285,8 +300,9 @@ def build_orientation_families(points: pd.DataFrame, config: dict[str, Any]) -> 
             family_points = sub[sub["FamilyLabel"].eq(label)].copy()
             family_well_count = family_points.groupby("WellName")["WellName"].transform("size").to_numpy(dtype=np.float64)
             balanced_weight = 1.0 / np.maximum(family_well_count, 1.0)
-            azimuth, azimuth_std = axial_mean_std_deg(
-                family_points["FracAzimuth"].to_numpy(dtype=np.float64), balanced_weight
+            dip_azimuth, azimuth_std = dip_azimuth_mean_std_deg(
+                family_points["FracAzimuth"].to_numpy(dtype=np.float64) % 360.0,
+                balanced_weight,
             )
             balanced_weight /= balanced_weight.sum()
             dip_values = family_points["FracDip"].to_numpy(dtype=np.float64)
@@ -308,7 +324,8 @@ def build_orientation_families(points: pd.DataFrame, config: dict[str, Any]) -> 
             layer_families.append(
                 {
                     "family_id": f"{layer}_family_{label + 1}",
-                    "azimuth_deg": azimuth,
+                    "dip_azimuth_deg": dip_azimuth,
+                    "strike_deg": orientation.strike_from_dip_azimuth(dip_azimuth),
                     "azimuth_std_deg": azimuth_std,
                     "dip_deg": dip_mean,
                     "dip_std_deg": dip_std,
@@ -342,11 +359,12 @@ def choose_orientation_family(
     return families[index], float(probability[index])
 
 
-def blend_axial_azimuth(family_azimuth: float, local_azimuth: float, local_weight: float) -> float:
+def blend_dip_azimuth(family_azimuth: float, local_azimuth: float, local_weight: float) -> float:
+    """真倾向方位（0–360）的**全圆**加权平均。"""
     weight = float(np.clip(local_weight, 0.0, 1.0))
-    family_vector = np.exp(1j * np.deg2rad(2.0 * family_azimuth))
-    local_vector = np.exp(1j * np.deg2rad(2.0 * local_azimuth))
-    return float((np.rad2deg(np.angle((1.0 - weight) * family_vector + weight * local_vector)) / 2.0) % 180.0)
+    family_vector = np.exp(1j * np.deg2rad(family_azimuth))
+    local_vector = np.exp(1j * np.deg2rad(local_azimuth))
+    return float(np.rad2deg(np.angle((1.0 - weight) * family_vector + weight * local_vector)) % 360.0)
 
 
 def local_gradient_ridge_orientation(
@@ -367,7 +385,12 @@ def local_gradient_ridge_orientation(
     gradient_quantile: float,
     smoothing_sigma: float,
 ) -> dict[str, float | int]:
-    """Estimate fracture-plane normal from local density edges and ridges."""
+    """由局部密度梯度/脊线估计裂缝面法向，返回**真倾向方位**（0–360）。
+
+    2026-09-22 统一口径：``normal`` 在 ``(x=东, y=北, z=TIME向下)`` 帧里，
+    方位换算走 :func:`common.orientation_frame.convention.dip_azimuth_dip_from_normal_depth`；
+    旧开关 ``ridge_azimuth_semantics`` 已删除。
+    """
     shape = (2 * xy_radius + 1, 2 * xy_radius + 1, 2 * time_radius + 1)
     cube = np.full(shape, np.nan, dtype=np.float64)
     center_ix, center_iy = int(row_to_ix[row]), int(row_to_iy[row])
@@ -383,7 +406,7 @@ def local_gradient_ridge_orientation(
                     cube[xi, yi, zi] = float(trace[source_sample])
     valid = np.isfinite(cube)
     if int(valid.sum()) < 27:
-        return {"dip": np.nan, "azimuth": np.nan, "anisotropy": 0.0, "gradient_strength": 0.0,
+        return {"dip": np.nan, "dip_azimuth": np.nan, "anisotropy": 0.0, "gradient_strength": 0.0,
                 "ridge_strength": 0.0, "quality": 0.0, "support_count": int(valid.sum())}
     fill_value = float(np.nanmedian(cube))
     filled = np.where(valid, cube, fill_value)
@@ -393,7 +416,7 @@ def local_gradient_ridge_orientation(
     gradient_magnitude = np.sqrt(gx * gx + gy * gy + gz * gz)
     finite_gradient = gradient_magnitude[valid]
     if not len(finite_gradient) or float(np.nanmax(finite_gradient)) <= 0.0:
-        return {"dip": np.nan, "azimuth": np.nan, "anisotropy": 0.0, "gradient_strength": 0.0,
+        return {"dip": np.nan, "dip_azimuth": np.nan, "anisotropy": 0.0, "gradient_strength": 0.0,
                 "ridge_strength": 0.0, "quality": 0.0, "support_count": int(valid.sum())}
     gradient_threshold = float(np.quantile(finite_gradient, gradient_quantile))
     gxx = np.gradient(gx, dx_m, axis=0, edge_order=1)
@@ -405,7 +428,7 @@ def local_gradient_ridge_orientation(
     )
     support_count = int(evidence.sum())
     if support_count < 8:
-        return {"dip": np.nan, "azimuth": np.nan, "anisotropy": 0.0, "gradient_strength": 0.0,
+        return {"dip": np.nan, "dip_azimuth": np.nan, "anisotropy": 0.0, "gradient_strength": 0.0,
                 "ridge_strength": 0.0, "quality": 0.0, "support_count": support_count}
     vectors = np.column_stack([gx[evidence], gy[evidence], gz[evidence]])
     local_gradient = gradient_magnitude[evidence]
@@ -419,14 +442,14 @@ def local_gradient_ridge_orientation(
     leading, second = float(eigenvalues[order[0]]), float(eigenvalues[order[1]])
     anisotropy = max((leading - second) / max(leading, 1.0e-12), 0.0)
     normal = eigenvectors[:, order[0]]
-    dip, azimuth = normal_to_dip_azimuth(normal)
+    dip, dip_azimuth = normal_to_dip_azimuth(normal)
     p50 = float(np.quantile(finite_gradient, 0.50))
     p90 = float(np.quantile(finite_gradient, 0.90))
     gradient_strength = float(np.clip((p90 - p50) / max(p90, 1.0e-12), 0.0, 1.0))
     ridge_strength = float(np.clip(np.median(ridge_norm), 0.0, 1.0))
     quality = float(np.clip(0.65 * anisotropy + 0.25 * gradient_strength + 0.10 * ridge_strength, 0.0, 1.0))
     return {
-        "dip": dip, "azimuth": azimuth, "anisotropy": anisotropy,
+        "dip": dip, "dip_azimuth": dip_azimuth, "anisotropy": anisotropy,
         "gradient_strength": gradient_strength, "ridge_strength": ridge_strength,
         "quality": quality, "support_count": support_count,
     }
@@ -912,7 +935,7 @@ def main() -> int:
     config["_orientation_join_qc"] = dict(orientation_join_qc)
     orientation_families = build_orientation_families(imaging_points, orient_cfg)
     write_json(families_json_path, json_ready({
-        "method": "balanced_multiwell_axial_kmeans",
+        "method": "balanced_multiwell_fullcircle_dip_azimuth_kmeans",
         "imaging_wells_by_layer": orient_cfg["imaging_wells_by_layer"],
         "point_count": int(len(imaging_points)),
         "families": orientation_families,
@@ -949,9 +972,9 @@ def main() -> int:
         raise RuntimeError("cannot derive physical attribute-grid spacing for local orientation")
 
     dips: list[float] = []
-    azimuths: list[float] = []
+    dip_azimuths: list[float] = []
     local_dips: list[float] = []
-    local_azimuths: list[float] = []
+    local_dip_azimuths: list[float] = []
     local_gradient_strengths: list[float] = []
     local_anisotropies: list[float] = []
     local_ridge_strengths: list[float] = []
@@ -997,7 +1020,7 @@ def main() -> int:
                         family_distance_scale, orientation_rng,
                     )
                     family_id = str(selected_family["family_id"])
-                    family_azimuth = float(selected_family["azimuth_deg"])
+                    family_dip_azimuth = float(selected_family["dip_azimuth_deg"])
                     family_dip = float(selected_family["dip_deg"])
                     family_az_jitter = min(az_jitter, max(2.0, 0.35 * float(selected_family["azimuth_std_deg"])))
                     family_dip_jitter = min(dip_jitter, max(1.0, 0.35 * float(selected_family["dip_std_deg"])))
@@ -1005,37 +1028,52 @@ def main() -> int:
                     selected_family = None
                     family_probability = 1.0
                     family_id = f"{layer}_manual_fallback"
-                    family_azimuth = float(fallback[layer]["azimuth_deg"])
-                    family_dip = float(fallback[layer]["dip_deg"])
+                    fallback_entry = fallback[layer]
+                    if "dip_azimuth_deg" in fallback_entry:
+                        family_dip_azimuth = float(fallback_entry["dip_azimuth_deg"])
+                    else:
+                        # 旧配置写的是走向，换算成倾向方位（2026-09-22 统一口径）
+                        family_dip_azimuth = orientation.dip_azimuth_from_strike(
+                            float(fallback_entry["azimuth_deg"])
+                        )
+                    family_dip = float(fallback_entry["dip_deg"])
                     family_az_jitter, family_dip_jitter = az_jitter, dip_jitter
                 local_dip = float(local["dip"])
-                local_az = float(local["azimuth"])
-                local_valid = np.isfinite(local_dip) and np.isfinite(local_az) and min_dip <= local_dip <= max_dip
+                local_dip_azimuth = float(local["dip_azimuth"])
+                local_valid = (
+                    np.isfinite(local_dip)
+                    and np.isfinite(local_dip_azimuth)
+                    and min_dip <= local_dip <= max_dip
+                )
                 quality = float(local["quality"])
                 if local_valid and quality >= local_high_quality:
-                    base_azimuth, base_dip = local_az, local_dip
+                    base_dip_azimuth, base_dip = local_dip_azimuth, local_dip
                     source, confidence = "local_gradient_ridge", quality
                     azimuth_noise = family_az_jitter * 0.25 * (1.0 - quality)
                     dip_noise = family_dip_jitter * 0.25 * (1.0 - quality)
                 elif local_valid and quality >= local_medium_quality:
                     fraction = (quality - local_medium_quality) / max(local_high_quality - local_medium_quality, 1.0e-12)
                     local_weight = medium_weight_min + fraction * (medium_weight_max - medium_weight_min)
-                    base_azimuth = blend_axial_azimuth(family_azimuth, local_az, local_weight)
+                    base_dip_azimuth = blend_dip_azimuth(
+                        family_dip_azimuth, local_dip_azimuth, local_weight
+                    )
                     base_dip = (1.0 - local_weight) * family_dip + local_weight * local_dip
                     source, confidence = "multiwell_local_blend", 0.5 * quality + 0.5 * family_probability
                     azimuth_noise = family_az_jitter * (1.0 - local_weight)
                     dip_noise = family_dip_jitter * (1.0 - local_weight)
                 else:
-                    base_azimuth, base_dip = family_azimuth, family_dip
+                    base_dip_azimuth, base_dip = family_dip_azimuth, family_dip
                     source = "multiwell_family" if selected_family is not None else "manual_fallback"
                     confidence = family_probability
                     azimuth_noise, dip_noise = family_az_jitter, family_dip_jitter
-                azimuth = float((base_azimuth + orientation_rng.normal(0.0, azimuth_noise)) % 180.0)
+                dip_azimuth = float(
+                    (base_dip_azimuth + orientation_rng.normal(0.0, azimuth_noise)) % 360.0
+                )
                 dip = float(np.clip(base_dip + orientation_rng.normal(0.0, dip_noise), min_dip, max_dip))
-                azimuths.append(azimuth)
+                dip_azimuths.append(dip_azimuth)
                 dips.append(dip)
                 local_dips.append(local_dip)
-                local_azimuths.append(local_az)
+                local_dip_azimuths.append(local_dip_azimuth)
                 local_gradient_strengths.append(float(local["gradient_strength"]))
                 local_anisotropies.append(float(local["anisotropy"]))
                 local_ridge_strengths.append(float(local["ridge_strength"]))
@@ -1061,13 +1099,21 @@ def main() -> int:
             "LayerGroup": accepted_layer,
             "Density": accepted_density,
             "DipDeg": dips,
-            "AzimuthDeg": azimuths,
+            # 2026-09-22 统一口径：唯一真值字段是倾向方位（0–360）。
+            "DipAzimuthDeg": dip_azimuths,
+            "AzimuthDeg": [orientation.strike_from_dip_azimuth(value) for value in dip_azimuths],
             "LocalGradientDipDeg": local_dips,
-            "LocalGradientAzimuthDeg": local_azimuths,
+            "LocalGradientDipAzimuthDeg": local_dip_azimuths,
+            "LocalGradientAzimuthDeg": [
+                orientation.strike_from_dip_azimuth(value) for value in local_dip_azimuths
+            ],
             # Compatibility aliases for consumers of the previous Step7A
             # schema. They now expose gradient/ridge estimates, not PCA fits.
             "LocalPcaDipDeg": local_dips,
-            "LocalPcaAzimuthDeg": local_azimuths,
+            "LocalPcaDipAzimuthDeg": local_dip_azimuths,
+            "LocalPcaAzimuthDeg": [
+                orientation.strike_from_dip_azimuth(value) for value in local_dip_azimuths
+            ],
             "LocalGradientStrength": local_gradient_strengths,
             "LocalAnisotropy": local_anisotropies,
             "LocalRidgeStrength": local_ridge_strengths,
@@ -1098,9 +1144,12 @@ def main() -> int:
     quads: list[np.ndarray] = []
     for i, patch in patches.iterrows():
         center = np.array([patch["X"], patch["Y"], patch["TIME"] * vtk_z_scale])
-        strike_rad = np.radians(patch["AzimuthDeg"])
-        strike = np.array([np.cos(strike_rad), np.sin(strike_rad), 0.0])
-        dip_dir = np.array([-np.sin(strike_rad), np.cos(strike_rad), 0.0])
+        # 2026-09-22 统一口径：由**真倾向方位**构造，长边 = 走向线，短边沿下倾方向。
+        # 帧内 z = TIME * vtk_z_scale（向下为正），故下倾方向 z 分量为 +sin(dip)。
+        dip_azimuth_rad = np.radians(float(patch["DipAzimuthDeg"]))
+        cos_az, sin_az = np.cos(dip_azimuth_rad), np.sin(dip_azimuth_rad)
+        strike = np.array([cos_az, -sin_az, 0.0])
+        dip_dir = np.array([sin_az, cos_az, 0.0])
         dip_rad = np.radians(patch["DipDeg"])
         dip_vec = np.array([np.sin(dip_rad) * dip_dir[0], np.sin(dip_rad) * dip_dir[1], np.cos(dip_rad)])
         half_l = patch["PatchLengthM"] / 2.0
@@ -1118,6 +1167,7 @@ def main() -> int:
         "PatchID": np.arange(len(patches), dtype=np.int64),
         "Density": patches["Density"].to_numpy(dtype=np.float64),
         "DipDeg": patches["DipDeg"].to_numpy(dtype=np.float64),
+        "DipAzimuthDeg": patches["DipAzimuthDeg"].to_numpy(dtype=np.float64),
         "AzimuthDeg": patches["AzimuthDeg"].to_numpy(dtype=np.float64),
         "PatchAreaM2": patches["PatchAreaM2"].to_numpy(dtype=np.float64),
         "PatchLengthM": patches["PatchLengthM"].to_numpy(dtype=np.float64),
@@ -1231,7 +1281,18 @@ def main() -> int:
             > int((patches["SmallDomain"] == damage_domain_name).sum())
         ),
         "all_patches_main_window": bool((patches["WindowCode"] == 1).all()),
-        "orientation_ranges_valid": bool(patches["DipDeg"].between(0, 90).all() and patches["AzimuthDeg"].between(0, 180).all()),
+        "orientation_ranges_valid": bool(
+            patches["DipDeg"].between(0, 90).all()
+            and patches["DipAzimuthDeg"].between(0, 360).all()
+            and patches["AzimuthDeg"].between(0, 180).all()
+        ),
+        "azimuth_is_derived_strike": bool(
+            np.allclose(
+                patches["AzimuthDeg"].to_numpy(dtype=np.float64),
+                (patches["DipAzimuthDeg"].to_numpy(dtype=np.float64) - 90.0) % 180.0,
+                atol=1e-9,
+            )
+        ),
         "dip_min_constraint": bool((patches["DipDeg"] >= min_dip - 1.0e-6).all()),
         "geometry_finite": bool(np.isfinite(patches[["X", "Y", "TIME", "PatchAreaM2"]]).all().all()),
         "imaging_match_qc_exists": qc_csv.exists(),
@@ -1312,6 +1373,12 @@ def main() -> int:
             "family_counts": patches["OrientationFamily"].value_counts().to_dict(),
             "local_quality_thresholds": {"medium": local_medium_quality, "high": local_high_quality},
             "dip_stats": {"min": float(patches["DipDeg"].min()), "max": float(patches["DipDeg"].max()), "mean": float(patches["DipDeg"].mean())},
+            "dip_azimuth_stats": {
+                "min": float(patches["DipAzimuthDeg"].min()),
+                "max": float(patches["DipAzimuthDeg"].max()),
+                "circular_mean": orientation.circular_mean_dip_azimuth(patches["DipAzimuthDeg"]),
+            },
+            "azimuth_semantics": "AzimuthDeg = (DipAzimuthDeg - 90) % 180 （派生走向，兼容字段）",
             "azimuth_stats": {"min": float(patches["AzimuthDeg"].min()), "max": float(patches["AzimuthDeg"].max()), "mean": float(patches["AzimuthDeg"].mean())},
         },
         "accepted_patch_count": int(len(patches)),

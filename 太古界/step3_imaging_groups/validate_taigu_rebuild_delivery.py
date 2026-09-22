@@ -123,7 +123,8 @@ def main() -> int:
     step3_summary = json.loads((output / "step3_acceptance_summary.json").read_text(encoding="utf-8"))
     coverage_gaps = step3_summary.get("coverage_gaps", [])
     for gap in coverage_gaps:
-        gaps.append(f"{gap['WellName']} 解释段 {gap['TVDInterval']} 未覆盖 {gap['UncoveredM']} m（{gap['UncoveredRatio']*100:.1f}%）")
+        interval = gap.get("MDInterval", gap.get("TVDInterval"))
+        gaps.append(f"{gap['WellName']} 解释段 {interval} 未覆盖 {gap['UncoveredM']} m（{gap['UncoveredRatio']*100:.1f}%）")
     for text in gaps:
         warnings.append(f"[coverage] {text}")
 
