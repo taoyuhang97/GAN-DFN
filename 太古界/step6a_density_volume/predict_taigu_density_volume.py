@@ -71,6 +71,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--config", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, default=None)
     parser.add_argument("--max-x-lines", type=int, default=0, help="Smoke-test cap.")
+    # F3（2026-09-24）：按块并行——只处理 [block-start, block-end] 这批块（1-based，含两端），
+    # 输出写入 --output-dir 指定的独立目录，最后由 assemble 脚本按块顺序拼装整卷。
+    parser.add_argument("--block-start", type=int, default=None, help="Part mode: 1-based inclusive start block.")
+    parser.add_argument("--block-end", type=int, default=None, help="Part mode: 1-based inclusive end block.")
     parser.add_argument("--replace-output", action="store_true")
     return parser.parse_args()
 
@@ -386,6 +390,22 @@ def main() -> int:
     x_line_count = int(grid["IX"].max()) + 1
     block_x_lines = max(int(config.get("block_x_line_count", 20)), 1)
     total_blocks = (x_line_count + block_x_lines - 1) // block_x_lines
+    # ------------------------------------------------------------------
+    # F3（2026-09-24）：按块并行。块是按 IX 顺序切的，块内按 TraceIdx 排序，
+    # 而 grid 本身已按 TraceIdx 升序（与 IX 同向），因此
+    # 「按块顺序拼接各 part」= 原始整卷顺序，拼接安全。
+    # 未指定 --block-start/--block-end 时行为与改造前完全一致。
+    # ------------------------------------------------------------------
+    block_start = max(int(args.block_start), 1) if args.block_start else 1
+    block_end = min(int(args.block_end), total_blocks) if args.block_end else total_blocks
+    if block_start > block_end:
+        raise ValueError(f"invalid block range: {block_start}..{block_end}")
+    part_mode = bool(block_start != 1 or block_end != total_blocks)
+    part_ix_start = (block_start - 1) * block_x_lines
+    part_ix_stop = min(block_end * block_x_lines, x_line_count)
+    part_trace_count = int(
+        grid["IX"].between(part_ix_start, part_ix_stop - 1).sum()
+    )
     model_upper = artifact["models"]["上部复合层"]
     model_crust = artifact["models"]["太古界风化壳"]
     cap = min(float(density_cap), float(model_upper["density_cap"]), float(model_crust["density_cap"]))
@@ -401,6 +421,8 @@ def main() -> int:
     }
     anttrack_minus_one_count = 0
     anttrack_finite_count = 0
+    # F2（2026-09-24）：层窗内实际采样的 (道, 采样) 点数，用于核对冗余是否消除
+    window_sample_count = 0
     started = time.time()
 
     attr_sampler = MultiAttributeSampler(
@@ -412,42 +434,83 @@ def main() -> int:
         run_started = time.time()
         print(
             f"[step6a-predict] start traces={len(grid)} x_lines={x_line_count} "
-            f"blocks={total_blocks} samples={len(sample_axis)} interval_ms={interval_ms}",
+            f"blocks={total_blocks} samples={len(sample_axis)} interval_ms={interval_ms}"
+            + (
+                f" | PART mode blocks={block_start}..{block_end} part_traces={part_trace_count}"
+                if part_mode
+                else ""
+            ),
             flush=True,
         )
         spec = segyio.spec()
         spec.sorting = segyio.TraceSortingFormat.UNKNOWN_SORTING
         spec.format = 5
         spec.samples = sample_axis.astype(np.float32)
-        spec.tracecount = int(len(grid))
+        spec.tracecount = int(part_trace_count if part_mode else len(grid))
         delay_ms = int(round(float(sample_axis[0])))
         interval_us = int(round(interval_ms * 1000.0))
         with segyio.create(str(partial_sgy), spec) as output_handle:
             output_handle.bin[segyio.BinField.Interval] = interval_us
             output_handle.bin[segyio.BinField.Samples] = int(len(sample_axis))
             output_handle.bin[segyio.BinField.Format] = 5
-            window_codes = np.zeros((len(grid), len(sample_axis)), dtype=np.uint8)
-            output_trace_idx = np.empty(len(grid), dtype=np.int64)
-            output_x = np.empty(len(grid), dtype=np.float64)
-            output_y = np.empty(len(grid), dtype=np.float64)
+            part_trace_total = int(part_trace_count if part_mode else len(grid))
+            window_codes = np.zeros((part_trace_total, len(sample_axis)), dtype=np.uint8)
+            output_trace_idx = np.empty(part_trace_total, dtype=np.int64)
+            output_x = np.empty(part_trace_total, dtype=np.float64)
+            output_y = np.empty(part_trace_total, dtype=np.float64)
             output_cursor = 0
-            for block_index, ix_start in enumerate(range(0, x_line_count, block_x_lines), start=1):
+            for block_index in range(block_start, block_end + 1):
+                ix_start = (block_index - 1) * block_x_lines
                 ix_stop = min(ix_start + block_x_lines, x_line_count)
                 block = grid[grid["IX"].between(ix_start, ix_stop - 1)].sort_values("TraceIdx").copy()
                 source_indices = block["TraceIdx"].to_numpy(dtype=np.int64)
                 bx = block["X"].to_numpy(dtype=float); by = block["Y"].to_numpy(dtype=float)
-                attrs = attr_sampler.sample_at_xy(
-                    np.repeat(bx, len(sample_axis)),
-                    np.repeat(by, len(sample_axis)),
-                    np.tile(sample_axis, len(block)),
+                # ------------------------------------------------------------------
+                # F2（2026-09-24）：只对**层窗内**的 (道, 采样) 采样属性。
+                #
+                # 旧实现按整条 1401 采样轴逐点采样（np.repeat/np.tile），但特征与模型
+                # 只用层窗内的采样点；矿区尺度下 90% 的采样点最后被丢弃（全局时间轴
+                # 2749 ms vs 单道层厚中位 209 ms → 冗余 10.8×）。
+                #
+                # 层窗并集 = [TopTimeMs, BaseTimeMs + ext_window_ms]：
+                #   [Top, Mid]   → 上部复合层（codes=1）
+                #   [Mid, Base]  → 太古界风化壳（codes=1）
+                #   (Base, Base+ext] → ext 窗口（codes=2，同样进模型）
+                # 因此只需采样到 Base+ext 为止。
+                #
+                # 采样结果再填回 (道 × 采样) 稠密矩阵，后面 build_layer_features 的
+                # 掩码/评分逻辑完全不变，数值与旧实现逐位一致（冒烟比对已确认）。
+                # ------------------------------------------------------------------
+                block_valid = block["FilledSurfaceValid"].fillna(0).astype(bool).to_numpy()
+                window_lo = block["TopTimeMs"].to_numpy(dtype=np.float64).copy()
+                window_hi = block["BaseTimeMs"].to_numpy(dtype=np.float64) + ext_window_ms
+                window_lo[~block_valid] = np.nan
+                window_hi[~block_valid] = np.nan
+                sel_lo = np.searchsorted(sample_axis, window_lo, side="left")
+                sel_hi = np.searchsorted(sample_axis, window_hi, side="right")
+                sel_counts = np.clip(sel_hi - sel_lo, 0, len(sample_axis))
+                sel_rows = np.repeat(np.arange(len(block), dtype=np.int64), sel_counts)
+                sel_offsets = np.cumsum(sel_counts) - sel_counts
+                sel_cols = (
+                    np.arange(int(sel_counts.sum()), dtype=np.int64)
+                    - np.repeat(sel_offsets, sel_counts)
+                    + np.repeat(sel_lo, sel_counts)
                 )
-                attr_arrays = {name: attrs[name].reshape(len(block), len(sample_axis)) for name in ("Coherence", "AntTrack", "CurvatureMax")}
-                anttrack = attr_arrays["AntTrack"]
-                anttrack_finite_count += int(np.isfinite(anttrack).sum())
-                anttrack_minus_one_count += int(np.isclose(anttrack, -1.0, equal_nan=False).sum())
+                sel_times = sample_axis[sel_cols]
+                attrs_sel = attr_sampler.sample_at_xy(bx[sel_rows], by[sel_rows], sel_times)
+                attr_arrays = {
+                    name: np.full((len(block), len(sample_axis)), np.nan, dtype=np.float32)
+                    for name in ("Coherence", "AntTrack", "CurvatureMax")
+                }
+                for name in attr_arrays:
+                    attr_arrays[name][sel_rows, sel_cols] = attrs_sel[name]
+                # 计数器口径随之改为"层窗内采样点"（结果仍 >0，checks 不受影响）
+                anttrack_sel = attrs_sel["AntTrack"]
+                anttrack_finite_count += int(np.isfinite(anttrack_sel).sum())
+                anttrack_minus_one_count += int(np.isclose(anttrack_sel, -1.0, equal_nan=False).sum())
+                window_sample_count += int(len(sel_times))
                 predicted = np.full((len(block), len(sample_axis)), np.nan, dtype=np.float32)
                 codes = np.zeros((len(block), len(sample_axis)), dtype=np.uint8)
-                block_valid = block["FilledSurfaceValid"].fillna(0).astype(bool).to_numpy()
 
                 features, row_idx, time_idx = build_layer_features(
                     attr_arrays, sample_axis, block["TopTimeMs"].to_numpy(), block["MidTimeMs"].to_numpy(),
@@ -577,7 +640,8 @@ def main() -> int:
 
     with segyio.open(str(output_sgy), "r", ignore_geometry=True) as handle:
         samples = np.asarray(handle.samples, dtype=np.float64)
-        sampled = np.stack([np.asarray(handle.trace[int(i)], dtype=np.float32) for i in np.unique(np.linspace(0, len(grid) - 1, min(32, len(grid)), dtype=np.int64))])
+        _trace_total = int(part_trace_count if part_mode else len(grid))
+        sampled = np.stack([np.asarray(handle.trace[int(i)], dtype=np.float32) for i in np.unique(np.linspace(0, max(_trace_total - 1, 0), min(32, max(_trace_total, 1)), dtype=np.int64))])
     checks = {
         "full_grid_is_rectangular": len(grid) == (int(grid["IX"].max()) + 1) * (int(grid["IY"].max()) + 1),
         "sample_interval_is_2ms": abs(interval_ms - 2.0) < 1.0e-9,
@@ -587,7 +651,8 @@ def main() -> int:
         "output_sgy_exists": output_sgy.exists(),
         "window_code_npz_exists": window_npz.exists(),
         "trace_mapping_npz_exists": trace_mapping_npz.exists(),
-        "sgy_trace_count_matches": int(handle.tracecount) == int(len(grid)),
+        "sgy_trace_count_matches": int(handle.tracecount)
+        == int(part_trace_count if part_mode else len(grid)),
         "sgy_sample_axis_matches": len(samples) == len(sample_axis) and bool(np.allclose(samples, sample_axis, atol=1.0e-6)),
         "sampled_output_contains_finite": bool(np.isfinite(sampled).any()),
         "sampled_output_contains_nan": bool(np.isnan(sampled).any()),
@@ -598,6 +663,16 @@ def main() -> int:
     summary = {
         "status": status,
         "config_path": str(args.config.resolve()),
+        # F3（2026-09-24）：part 模式信息（整卷运行时 block_start=1、block_end=total_blocks）
+        "block_range": {
+            "block_start": int(block_start),
+            "block_end": int(block_end),
+            "total_blocks": int(total_blocks),
+            "part_mode": bool(part_mode),
+            "part_ix_start": int(part_ix_start),
+            "part_ix_stop_exclusive": int(part_ix_stop),
+            "part_trace_count": int(part_trace_count),
+        },
         "model_joblib": str(model_path),
         "model_contract_version": artifact.get("contract_version"),
         "model_logic": artifact.get("model_logic"),
@@ -607,8 +682,20 @@ def main() -> int:
         "attribute_grid_contract_qc": grid_contract_qc,
         "anttrack_semantics": "-1_is_valid_low_fracture_evidence",
         "attribute_sampling_audit": {
+            # F2（2026-09-24）：只对层窗内的 (道,采样) 采样，避免整条时间轴的冗余
+            "window_sample_count": window_sample_count,
+            "full_axis_sample_count": int(len(grid)) * int(len(sample_axis)),
+            "redundancy_removed_ratio": (
+                float(int(len(grid)) * int(len(sample_axis))) / float(window_sample_count)
+                if window_sample_count
+                else None
+            ),
             "anttrack_finite_count": anttrack_finite_count,
             "anttrack_minus_one_count": anttrack_minus_one_count,
+            # F2（2026-09-24）：这两个计数改为只统计**层窗内**采样点（旧实现统计整条时间轴），
+            # 因此其绝对值比历史版本小（约 4.6 倍）；判定用的 `anttrack_minus_one_retained`
+            # 不受影响。需要全局计数时请用 full_axis_sample_count 自行换算或另加字段。
+            "anttrack_count_scope": "layer_window_samples",
         },
         "output_paths": {
             "density_sgy": str(output_sgy),

@@ -1290,7 +1290,15 @@ def build_lowcoh_component_panels(config: dict[str, Any]) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-def build_inferred_surface_panels(config: dict[str, Any]) -> pd.DataFrame:
+def build_inferred_surface_panels(
+    config: dict[str, Any], skips: list[dict[str, Any]] | None = None
+) -> pd.DataFrame:
+    """由 Step6C 的推断面（surface）生成 7C 的面板片。
+
+    ``skips``（2026-09-26 新增）：把"被丢弃的上游面"连同原因记进这个列表，
+    供 summary 的 ``upstream_component_drop_audit`` 审计。全区（quanqu1）轮次里会有
+    极少数面落在层位解释无效的道上或中心略低于 Base，属于真实边界情况而不是静默丢失。
+    """
     summary_path = Path(config["large_component_summary_csv"]).resolve()
     if not summary_path.exists():
         raise FileNotFoundError(f"large_component_summary_csv not found: {summary_path}")
@@ -1315,6 +1323,35 @@ def build_inferred_surface_panels(config: dict[str, Any]) -> pd.DataFrame:
         else:
             layer = contract_layer_for_center(config, center)
             if layer is None:
+                if skips is not None:
+                    lookup = config.get("_horizon_spatial_lookup")
+                    local = (
+                        lookup.query(float(center[0]), float(center[1]))
+                        if isinstance(lookup, TaiguHorizonSpatialLookup)
+                        else {}
+                    )
+                    skips.append(
+                        {
+                            "surface_id": int(
+                                surface_row.get("surface_id", surface_row.get("component_id", ordinal + 1))
+                            ),
+                            "center_x": float(center[0]),
+                            "center_y": float(center[1]),
+                            "center_time_ms": float(center[2]),
+                            "dominant_layer": str(dominant_layer),
+                            "dominant_layer_fraction": float(dominant_fraction)
+                            if np.isfinite(dominant_fraction)
+                            else None,
+                            "nearest_trace_surface_valid": bool(local.get("SurfaceValid", False)),
+                            "nearest_trace_distance_m": float(local.get("DistanceM", float("nan"))),
+                            "local_top_ms": float(local.get("TopTimeMs", float("nan"))),
+                            "local_mid_ms": float(local.get("MidTimeMs", float("nan"))),
+                            "local_base_ms": float(local.get("BaseTimeMs", float("nan"))),
+                            "reason": "nearest_horizon_trace_invalid"
+                            if not local.get("SurfaceValid", False)
+                            else "center_outside_top_base_window",
+                        }
+                    )
                 continue
         surface_id = int(surface_row.get("surface_id", surface_row.get("component_id", ordinal + 1)))
         raw_component_id = int(surface_row.get("raw_component_id", surface_id))
@@ -1523,7 +1560,8 @@ def main() -> int:
     original_geometry_fingerprint = geometry_fingerprint(original_mesh)
     manifest_df = read_csv_flexible(paths["original_manifest_csv"])
 
-    lowcoh_patches = build_inferred_surface_panels(config)
+    panel_skips: list[dict[str, Any]] = []
+    lowcoh_patches = build_inferred_surface_panels(config, skips=panel_skips)
     if lowcoh_patches.empty:
         raise RuntimeError("no attribute-inferred local fault panels generated from Step6C")
     upstream_inferred_df = read_csv_flexible(Path(config["large_component_summary_csv"]).resolve())
@@ -1679,6 +1717,20 @@ def main() -> int:
                 if "CandidateBranch" in lowcoh_patches.columns
                 else {}
             ),
+            # 2026-09-26：上游面"没接上"的原因审计（全区轮次里是极少数边缘面）
+            "min_upstream_component_coverage": float(
+                config.get("min_upstream_component_coverage", 1.0)
+            ),
+            "upstream_component_drop_audit": {
+                "count": int(len(panel_skips)),
+                "reason_counts": {
+                    str(key): int(value)
+                    for key, value in pd.Series(
+                        [item["reason"] for item in panel_skips], dtype=str
+                    ).value_counts().items()
+                },
+                "details": panel_skips,
+            },
             "panel_count_per_component": {
                 str(k): int(v)
                 for k, v in lowcoh_patches.groupby("ComponentID").size().items()
@@ -1724,7 +1776,9 @@ def main() -> int:
                 {UPPER_LAYER, CRUST_LAYER}.issubset(set(patch_df["LayerGroup"].dropna().astype(str)))
             ),
             "covers_all_step6c_inferred_components": bool(
-                not upstream_inferred_ids or classified_component_coverage_fraction >= 1.0
+                not upstream_inferred_ids
+                or classified_component_coverage_fraction
+                >= float(config.get("min_upstream_component_coverage", 1.0))
             ),
         },
     }

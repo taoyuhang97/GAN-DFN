@@ -22,7 +22,7 @@ md1 输出为 `output/taigu_step2_regular_md1`。
 - 逐行轨迹：井斜文件 > LAS DEV/AZIM 积分 > 直井回退，逐行输出 `TVD/X/Y`；
 - 常规井：读取 Step1 的本井 MD-TIME 层位合同，在 LAS 原始 MD 行上附加
   `TVD/X/Y/TIME/StrataName`，按**逐行 X/Y 挂层位**（每行查三界面时间）分类；
-- 成像井：读取 Step1 的 TVD 合同，`StrataName` 按合同并裁剪到解释段
+- 成像井：读取 Step1 的 MD 合同，`StrataName` 按合同并裁剪到解释段
   **MD 区间**（`InterpretedMDIntervals`/`BoundaryMD`）；`TIME` 用临时借用常规井时深标注
   （`temporary_neighbor_time_depth`），只作标注、不作层位门控；
 - 曲线列按 `GR > GR1 > GRSL` 优先选取，实际使用列写入段清单；
@@ -45,15 +45,16 @@ md1 输出为 `output/taigu_step2_regular_md1`。
 
 ## 埕北313特殊规则
 
-埕北313走成像井 TVD 合同，地层界面为 4783 m（TVD）。同时它仅保留已确认的两个连续解释窗口：
+埕北313走成像井 MD 合同，地层界面为 4783 m（MD）。同时它仅保留已确认的两个连续解释窗口：
 
 ```text
 4174-4627 m
 4751-4884 m
 ```
 
-窗口之间的 `4627-4751 m`（TVD）作为真实中断段，输出中没有样点；不得在该段插值、填零或
-拼接前后两段。该规则配置在 `configs/taigu_step2_contracts_v3.json`。
+窗口之间的 `4627-4751 m`（MD）作为真实中断段，输出中没有样点；不得在该段插值、填零或
+拼接前后两段。该规则配置在 md1 配置 `configs/taigu_step2_contracts_md1.json`
+（旧键名 `well_tvd_windows` 的 v3 配置仍可读，数值本来就是测深）。
 
 ## 运行
 
@@ -91,7 +92,7 @@ output/taigu_step2_regular_v3/
 | 输出组织 | 每口井独立主表、区间表、QC | 每井每 LAS 来源独立段文件 + 根目录清单/元数据/放弃表 | v3 分离井级与段级字段 |
 | 多 LAS | 独立 GR/电阻率补充脚本按覆盖优先级合并 | 各 LAS 独立成段、重叠保留，预测后再合并 | v3 不在 Step2 做不可逆选源 |
 | 深度网格 | 主样点表的 `DEPT` 网格 | 原始 LAS 的 `MD` 网格 + 逐行 `TVD/X/Y` | v3 增加轨迹与 TVD |
-| 层位挂接 | 逐样点 X/Y 挂 T4-T7 | 常规井逐行 X/Y 挂三界面；成像井按 TVD 合同 | v3 与砂砾岩对齐 |
+| 层位挂接 | 逐样点 X/Y 挂 T4-T7 | 常规井逐行 X/Y 挂三界面；成像井按 MD 合同 | v3 与砂砾岩对齐 |
 | 时深 | 井点进入时间层位与地震属性 | 常规 LAS 本井时深；成像井借用时深仅作 TIME 标注 | v2；成像井层位仍走人工 MD 合同 |
 | 地震与空间属性 | 读取 X/Y/TIME、地震体和 3x3 邻域 | 不读取 | 合理，当前模型只用 GR/RD/RS |
 

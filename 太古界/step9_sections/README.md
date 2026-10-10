@@ -1,5 +1,58 @@
 # 太古界 Step9 正式多背景剖面
 
+## 2026-09-29 展示口径对齐砂砾岩（变密度黑白 + 变面积全道 + 像素画布）
+
+需求方反馈"5 km 与矿区剖面效果不太好"：变密度红白蓝和 DFN 叠加线打架、变面积道抽太稀。
+对照砂砾岩 formal 后按下面三条改（**只动展示，不动数值**）：
+
+| 项 | 改前 | 改后（= 砂砾岩口径） | 配置键 |
+|---|---|---|---|
+| 地震变密度配色 | `cmap="seismic"`（红白蓝） | **`gray_r` + `Normalize(0, q99(\|振幅\|))`**（0=白、强振幅=黑）；红白蓝另存 `red_white_blue_backup/` | `seismic_density_style`、`seismic_density_backup_style`、`seismic_density_backup_dir` |
+| 地震变面积抽道 | 固定 80 条（矿区 20.6 km 上间距 261 m、摆幅 ±110 m） | **画剖面上全部道**（间距=地震 bin 12.5 m、摆幅 ±5.25 m）；后备可按米抽道 | `wiggle_max_trace_count`（0=全画）、`wiggle_trace_spacing_m` |
+| 画布 | 15.5×7.8 in @180 dpi = 3343 px | **5280×1968 @240 dpi**（像素口径，与砂砾岩同义） | `xz_total_width_px`、`yz_total_width_px`、`figure_height_px`、`render_dpi` |
+
+其它新增的可配项：`wiggle_lateral_scale_fraction`（0.42）、`wiggle_linewidth`（0.35）、
+`wiggle_positive_fill_alpha`（0.55）、`colorbar_column_width_in`、`overlay_column_gap_in`。
+
+两点实现说明：
+
+* **两遍布局**：先量分组图例的**实际**宽度，再定画布宽度 / 色标列 / 图例锚点。
+  第一版把色标写死在 `right+0.008`，结果色标刻度与竖排标签压在分组图例上（见问题记录 §0.44）。
+* **图例不照搬砂砾岩**：砂砾岩是平铺图例（约 10 项），太古界是 5 组 18 项的分组图例，
+  条目多一倍，分组更可读。只借砂砾岩"色标独立成列、图例在坐标区外侧"两点。
+
+新增开关：
+
+```bash
+# 纯展示口径迭代：复用 section_samples/*.npz，只重画图（不重采样）
+python 太古界/step9_sections/build_taigu_multibackground_sections.py \
+  --config <cfg.json> --reuse-samples --replace-output
+```
+
+`render_scopes` / `render_tokens` 可只出子集（编号仍按正式 20 张的序号走）；
+`section_summary.json` 新增 `display` 段记录配色口径、抽道规则与各剖面画布像素。
+对照小样见 `output/_step9_style_probe/`（含四联对比图 `compare_wiggle_xz.png`）。
+
+### 最终选定的抽道口径（2026-09-29）
+
+| 剖面 | 抽道 | 配置 |
+|---|---|---|
+| 矿区/全区（quanqu1，20.6 km） | **按米抽道 25 m**（825/1650 条 = 50%） | `wiggle_trace_spacing_m: 25` |
+| 5 km（azi4，5×5 km） | **全部道**（约 400 条，12.5 m） | `wiggle_max_trace_count: 0` |
+
+两者共用黑白变密度、5280×1968 @240 dpi、线宽 0.35 / 填充 alpha 0.55、全 NaN 道不画。
+重跑：`bash 太古界/run_step9_display_v2.sh`（正式跑，不复用采样缓存）。
+
+## 2026-09-26 quanqu1（矿区/全区）口径
+
+- `target_block` 改为**全区范围**（X 658887–679500 / Y 4231662–4247987，与
+  `taigu_attribute_grid_quanqu1` 一致），因此 `overview` 剖面横跨整个矿区（约 20.6 km × 16.3 km），
+  即需求方指定的"整矿区一张总剖面"；`local_200m` 仍是 405 井周 200 m 细剖面，两者并存。
+- `expected_demo_trace_count` 随范围改为 **2,156,550**（`attribute_demo_grid_complete` 检查用）。
+- 新增配置项 `scope_labels`：`overview` 图题由硬编码的"5 km Demo区"改为**"矿区全区"**，
+  避免图题与实际范围不符（代码里 `SCOPE_LABELS` 仍作为默认值）。
+- 背景：派生 quanqu1 配置时曾漏改 `target_block`，导致 7C/7D/Step8 一并按老 5 km 过滤（见问题记录 §0.42）。
+
 ## 2026-09-22 两项修改（md1 轮次）
 
 ### (a) 常规测井段 = 目标地层内的井轨迹（需求方口径）
@@ -170,3 +223,25 @@ python 太古界/step9_sections/build_taigu_multibackground_sections.py \
   `vertex_convention` / `dfn_azimuth_semantics`）已删除，不再保留双口径分支。
 - 背景：`太古界/太古界流程梳理与问题记录_20260915.md` §0.37；
   施工方案：`太古界/太古界产状口径统一施工方案_20260922.md`。
+
+
+---
+
+## 井周投影线画法（2026-09-23，方案 a，可选）
+
+Step9 的 geometry 模式有两种线：**真实交线**（裂缝面∩剖面面，角度=视倾角）与
+**井周投影线**（剖面没真切到该片时的参考线）。
+
+旧画法把四边形投影到剖面后取 PCA 主轴，而片的**长边是水平走向线**，导致投影线接近水平
+（实测 YZ 中位 11.4°、XZ 中位 0.8°），而真实交线/成像粉线的视倾角中位是 73.3°/73.6°——
+这就是"图上看 DFN 比成像粉线平得多"的原因（问题记录 §0.40）。
+
+**方案 a**：配置 `projected_line_mode = "apparent_dip"` 时，井周投影线改按该片的真实视倾角方向画
+（`apparent_dip_projected_line()`），位置信息保留。实测投影线中位变为 YZ 61.7° / XZ 43.4°。
+
+* **2026-09-23 起 `apparent_dip` 已升为默认**（`patch_segments_from_geometry()` 默认参数与
+  `draw_overlays()` 读取默认值都已改），`polygon_projection` 降为对照口径；
+* 正式 azi4 已按新默认重跑；`section_summary.json` 的 `contracts.projected_line_mode` 会记录实际画法；
+* 旧画法可复现：`configs/taigu_step9_multibackground_v2_azi4_polygonproj.json`
+  → `output/taigu_step9_multibackground_v2_azi4_polygonproj/`；
+* 对照图（上＝旧、下＝新）：`太古界/output_azi1_logs/compare_projected_line_mode_{YZ,XZ}.png`。

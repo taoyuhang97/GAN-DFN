@@ -53,3 +53,25 @@
   `vertex_convention` / `dfn_azimuth_semantics`）已删除，不再保留双口径分支。
 - 背景：`太古界/太古界流程梳理与问题记录_20260915.md` §0.37；
   施工方案：`太古界/太古界产状口径统一施工方案_20260922.md`。
+
+
+---
+
+## 产状赋值逻辑变更（2026-09-23，azi4）
+
+小尺度片的产状不再由"多井家族 KMeans + 均值"给出，改为
+**按井经验分布重采样 + 局部几何 β 门控**：
+
+1. 按 `(层, 井)` 保留原始 `(倾向方位, 倾角)` 经验库（不聚类、不平均），库内包含**全部**成像点；
+2. 用**高斯距离核**给最近的几口井加权（`well_weight_scale_m`），权重随位置处处连续；
+3. 用**空间相关随机场**（`well_assignment_coherence_m`）抽井，保证相邻片倾向同一口井；
+4. 从抽中井的经验库重采样并加小幅抖动（`azimuth_jitter_std_deg` / `dip_jitter_std_deg`）；
+5. **局部地震几何只在走向差 ≤ `local_geometry_strike_tolerance_deg` 时**才允许以
+   ≤ `local_geometry_dip_blend_max` 的权重融合倾角，否则完全忽略。
+
+输出文件由 `orientation_families.json/csv` 改为 `orientation_well_library.json/csv`（按井审计表）；
+片表新增审计列 `OrientationWellDraw` / `OrientationWellWeights` / `OrientationEffectiveWellCount` /
+`LocalGeometryUsed` / `LocalGeometryBlendWeight` / `LocalGeometryStrikeDeltaDeg`。
+
+方案与实测：`太古界/太古界DFN产状赋值逻辑修正方案_20260923.md`；
+问题记录 §0.38。本轮**只改小尺度（7A）**，中尺度按决策 D4 保持蚂蚁体来源不变。

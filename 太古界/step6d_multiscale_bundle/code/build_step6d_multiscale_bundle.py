@@ -507,20 +507,39 @@ def main() -> int:
         ]
     ).astype(np.float32)
 
-    write_sgy_like(output_dir / "background_small_density.sgy", input_density_sgy, background_small_density, samples)
-    write_sgy_like(output_dir / "medium_damage_small_density.sgy", input_density_sgy, medium_damage_small_density, samples)
-    write_sgy_like(output_dir / "large_damage_small_density.sgy", input_density_sgy, large_damage_small_density, samples)
-    write_sgy_like(output_dir / "small_domain_label.sgy", input_density_sgy, small_domain_label.astype(np.float32), samples)
-    write_sgy_like(output_dir / "small_domain_confidence.sgy", input_density_sgy, small_domain_confidence, samples)
-    write_sgy_like(output_dir / "final_small_density.sgy", input_density_sgy, final_small_density, samples)
-    write_sgy_like(output_dir / "final_small_candidate_mask.sgy", input_density_sgy, final_small_candidate_mask.astype(np.float32), samples)
-    write_sgy_like(output_dir / "medium_damage_density.sgy", input_density_sgy, medium_damage.astype(np.float32), samples)
-    write_sgy_like(output_dir / "large_damage_density.sgy", input_density_sgy, large_damage.astype(np.float32), samples)
-    write_sgy_like(output_dir / "integrated_sampling_density.sgy", input_density_sgy, integrated, samples)
-    write_sgy_like(output_dir / "scale_label.sgy", input_density_sgy, scale_label.astype(np.float32), samples)
-    write_sgy_like(output_dir / "scale_confidence.sgy", input_density_sgy, scale_confidence, samples)
+    # 2026-09-23：可配置写哪些密度体。默认写全部（与改造前完全一致）；
+    # 矿区（quanqu1）尺度下 12 个体文件约 145 GB，而下游只消费其中两个，
+    # 因此允许用 `written_volumes` 只写必要项（方案 A，见 run_quanqu1_from_6a.sh 文件头）。
+    volume_arrays: dict[str, Any] = {
+        "background_small_density": background_small_density,
+        "medium_damage_small_density": medium_damage_small_density,
+        "large_damage_small_density": large_damage_small_density,
+        "small_domain_label": small_domain_label.astype(np.float32),
+        "small_domain_confidence": small_domain_confidence,
+        "final_small_density": final_small_density,
+        "final_small_candidate_mask": final_small_candidate_mask.astype(np.float32),
+        "medium_damage_density": medium_damage.astype(np.float32),
+        "large_damage_density": large_damage.astype(np.float32),
+        "integrated_sampling_density": integrated,
+        "scale_label": scale_label.astype(np.float32),
+        "scale_confidence": scale_confidence,
+    }
+    requested_volumes = config.get("written_volumes")
+    if requested_volumes is None:
+        requested_volumes = list(volume_arrays)
+    requested_volumes = [str(name) for name in requested_volumes]
+    unknown_volumes = [name for name in requested_volumes if name not in volume_arrays]
+    if unknown_volumes:
+        raise ValueError(f"written_volumes 含未知密度体: {unknown_volumes}")
+    skipped_volumes = [name for name in volume_arrays if name not in requested_volumes]
+    for name in requested_volumes:
+        write_sgy_like(output_dir / f"{name}.sgy", input_density_sgy, volume_arrays[name], samples)
 
-    np.savez_compressed(
+    # 2026-09-23：`multiscale_prior_bundle.npz` 在矿区尺度约 13 GB，当前链条无消费者，
+    # 允许用 `write_prior_bundle_npz=false` 跳过（默认仍写出，保持原行为）。
+    write_prior_bundle_npz = bool(config.get("write_prior_bundle_npz", True))
+    if write_prior_bundle_npz:
+        np.savez_compressed(
         output_dir / "multiscale_prior_bundle.npz",
         small_density=small_density,
         small_score=small_score,
@@ -576,6 +595,10 @@ def main() -> int:
             "scale_label_sgy": str(output_dir / "scale_label.sgy"),
         },
         "input_density_sgy": str(input_density_sgy),
+        # 2026-09-23：可配置写哪些密度体（默认全部）。矿区尺度用于控制磁盘占用。
+        "written_volumes": requested_volumes,
+        "skipped_volumes": skipped_volumes,
+        "write_prior_bundle_npz": bool(config.get("write_prior_bundle_npz", True)),
         "trace_mapping_npz": str(trace_mapping_npz),
         "step6a_dir": str(step6a_dir),
         "step6b_dir": str(step6b_dir),

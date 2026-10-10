@@ -20,6 +20,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--center-x", type=float, default=663000.0)
     parser.add_argument("--center-y", type=float, default=4240900.0)
     parser.add_argument("--half-size-m", type=float, default=2500.0)
+    # 2026-09-23：矿区（全区）范围通常不是正方形，允许分别指定 X/Y 半长（默认沿用 --half-size-m）。
+    parser.add_argument("--half-size-x-m", type=float, default=None)
+    parser.add_argument("--half-size-y-m", type=float, default=None)
     parser.add_argument("--grid-spacing-m", type=float, default=12.5)
     parser.add_argument("--max-match-distance-m", type=float, default=2.0)
     return parser.parse_args()
@@ -59,14 +62,16 @@ def main() -> int:
     if header["TraceIdx"].duplicated().any():
         raise RuntimeError("attribute trace header contains duplicate TraceIdx")
 
+    half_x = float(args.half_size_x_m) if args.half_size_x_m is not None else float(args.half_size_m)
+    half_y = float(args.half_size_y_m) if args.half_size_y_m is not None else float(args.half_size_m)
     x_axis = rounded_axis(
-        args.center_x - args.half_size_m,
-        args.center_x + args.half_size_m,
+        args.center_x - half_x,
+        args.center_x + half_x,
         args.grid_spacing_m,
     )
     y_axis = rounded_axis(
-        args.center_y - args.half_size_m,
-        args.center_y + args.half_size_m,
+        args.center_y - half_y,
+        args.center_y + half_y,
         args.grid_spacing_m,
     )
     ix = np.repeat(np.arange(len(x_axis), dtype=np.int32), len(y_axis))
@@ -110,6 +115,8 @@ def main() -> int:
             "center_x": float(args.center_x),
             "center_y": float(args.center_y),
             "half_size_m": float(args.half_size_m),
+            "half_size_x_m": float(half_x),
+            "half_size_y_m": float(half_y),
             "grid_spacing_m": float(args.grid_spacing_m),
         },
         "grid": {

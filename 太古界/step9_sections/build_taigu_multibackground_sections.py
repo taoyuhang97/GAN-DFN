@@ -96,8 +96,12 @@ LEGEND_GROUPS = [
 ]
 
 
-def grouped_legend(fig, ax, fontsize: float = 8.4) -> None:
-    """按用途分组排列叠加层图例，组前插入组标题（占位 handle）。"""
+def grouped_legend(fig, ax, fontsize: float = 8.4, anchor: tuple[float, float] = (1.005, 1.0)) -> None:
+    """按用途分组排列叠加层图例，组前插入组标题（占位 handle）。
+
+    ``anchor``：图例锚点（figure 坐标）。默认放在坐标区右侧外；
+    使用像素口径画布时传入 ``right + 0.03``，与独立色标一起排在右侧图例列里。
+    """
     handles, labels = ax.get_legend_handles_labels()
     pairs = list(zip(handles, labels))
     used: set[int] = set()
@@ -122,9 +126,10 @@ def grouped_legend(fig, ax, fontsize: float = 8.4) -> None:
             ordered_handles.append(handle)
             ordered_labels.append(label)
     if ordered_labels:
-        fig.legend(ordered_handles, ordered_labels, loc="upper left",
-                   bbox_to_anchor=(1.005, 1.0), fontsize=fontsize, framealpha=0.92,
-                   borderaxespad=0.0)
+        return fig.legend(ordered_handles, ordered_labels, loc="upper left",
+                          bbox_to_anchor=anchor, fontsize=fontsize, framealpha=0.92,
+                          borderaxespad=0.0)
+    return None
 CHINESE_FONT_CANDIDATES = (
     "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
     "/usr/share/fonts/opentype/noto/NotoSansCJK-Medium.ttc",
@@ -202,6 +207,15 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("--config", type=Path, required=True)
     p.add_argument("--validate-only", action="store_true")
     p.add_argument("--replace-output", action="store_true")
+    p.add_argument(
+        "--reuse-samples",
+        action="store_true",
+        help=(
+            "复用已有 section_samples/*.npz 缓存，跳过 2/6、3/6 的属性与 OBN 采样，"
+            "只重画图。用于反复调配色/抽道/图幅这类**纯展示口径**时的快速迭代"
+            "（缓存目录由 config.reuse_samples_dir 或 output_dir 决定）。"
+        ),
+    )
     return p
 
 
@@ -269,6 +283,11 @@ def validate(config: dict[str, Any]) -> dict[str, Any]:
             "dfn_azimuth_rule": (
                 "DipAzimuthDeg=真倾向方位(0–360，2026-09-22 统一口径) → 直接送入 apparent_dip_trace；"
                 "AzimuthDeg 仅为派生走向(=(D-90)%180)的兼容字段"
+            ),
+            "projected_line_mode": str(config.get("projected_line_mode", "apparent_dip")),
+            "projected_line_rule": (
+                "apparent_dip（默认，2026-09-23）= 井周投影线按真实视倾角方向画，与成像粉线同口径；"
+                "polygon_projection = 旧口径（四边形投影主轴，角度≈走向，仅作对照）"
             ),
         },
     }
@@ -864,16 +883,51 @@ def load_patch_polygons(config: dict[str, Any]) -> list[np.ndarray]:
     return polygons
 
 
+def apparent_dip_projected_line(row: pd.Series, projection: str, length_m: float):
+    """**方案 a（2026-09-23）**：井周投影片也按"裂缝面 ∩ 剖面面"的视倾角方向画线。
+
+    背景：原来的井周投影线是对四边形投影取 PCA 主轴，而片的长边是**走向线（水平）**，
+    所以投影线接近水平（实测 YZ 中位 11.4°，而真实视倾角中位 73.3°），
+    在图上造成"DFN 的视倾角明显比成像粉线缓"的错觉。
+
+    这里改为：中心仍取该片的 (水平坐标, TIME)，方向改用该片的
+    ``(DipAzimuthDeg, DipDeg)`` 经 ``apparent_dip_trace`` 得到的真实视倾角方向，
+    长度沿用片的 ``LengthM``。这样图上的**每一根线都等于"剖面真切到它时该有的角度"**，
+    与成像粉线用同一把尺子；位置信息（哪里井周有片）仍然保留。
+    """
+    dip_azimuth = pd.to_numeric(pd.Series([row.get("DipAzimuthDeg")]), errors="coerce").iloc[0]
+    dip = pd.to_numeric(pd.Series([row.get("DipDeg")]), errors="coerce").iloc[0]
+    if not np.isfinite(dip_azimuth) or not np.isfinite(dip):
+        return None
+    trace = apparent_dip_trace(float(dip_azimuth) % 360.0, float(dip), projection)
+    if trace is None:
+        return None
+    dh, dt = trace
+    center_h = float(row["CenterX"] if projection == "XZ" else row["CenterY"])
+    center_t = float(row["CenterTime"])
+    half = max(float(length_m), 1.0) / 2.0
+    return (
+        (center_h - half * dh, center_t - half * dt),
+        (center_h + half * dh, center_t + half * dt),
+    )
+
+
 def patch_segments_from_geometry(polygons: list[np.ndarray], patches: pd.DataFrame, track: pd.DataFrame,
                                  projection: str, half_width: float,
-                                 projection_half_width: float
+                                 projection_half_width: float,
+                                 projected_line_mode: str = "apparent_dip"
                                  ) -> tuple[list[list[list[float]]], list[str], list[float], list[str], list[bool]]:
     """按**真实几何**画 DFN 片（对齐砂砾岩 Step9）：求交优先，其次小尺度投影。
 
     * 片中心到剖面法向（XZ→Y、YZ→X）的距离 <= ``half_width`` → 与剖面平面求交，
       得到真实交线（``crossed=True``）；
-    * 求交失败或未落在半宽内的小尺度片，若距离 <= ``projection_half_width`` →
-      画该多边形在剖面内的投影线（``crossed=False``）。
+    * 求交失败或未落在半宽内的小尺度片，若距离 <= ``projection_half_width`` → 画井周投影线
+      （``crossed=False``）。投影线的画法由 ``projected_line_mode`` 决定：
+        - ``apparent_dip``（**2026-09-23 起为默认**，方案 a）＝ 按该片的真实视倾角方向画
+          → **与成像粉线同口径**，图上每根线的角度都等于"剖面真切到它时该有的角度"；
+        - ``polygon_projection``（旧口径，仅作对照）＝ 四边形投影后取 PCA 主轴
+          → **角度代表走向、不是视倾角**（实测 YZ 中位仅 11.4°），会让人误以为 DFN 比成像缓很多
+          （问题记录 §0.40）。
     """
     perpendicular = "Y" if projection == "XZ" else "X"
     axis_index = 1 if projection == "XZ" else 0
@@ -898,7 +952,11 @@ def patch_segments_from_geometry(polygons: list[np.ndarray], patches: pd.DataFra
             line = plane_polygon_intersection_line(vertices, axis=axis_index, value=well_perp)
             is_crossed = line is not None
         if line is None and scale_key == "small" and distance <= projection_half_width:
-            line = projected_polygon_line(vertices, projection)
+            if str(projected_line_mode).strip().lower() == "apparent_dip":
+                length_m = float(pd.to_numeric(pd.Series([row.get("LengthM")]), errors="coerce").fillna(30.0).iloc[0])
+                line = apparent_dip_projected_line(row, projection, length_m)
+            else:
+                line = projected_polygon_line(vertices, projection)
             is_crossed = False
         if line is None:
             continue
@@ -1042,6 +1100,7 @@ def draw_overlays(ax, projection: str, coords: np.ndarray, times: np.ndarray, tr
         segments, colors, widths, scales, crossed = patch_segments_from_geometry(
             polygons, patches, track, projection, half_width,
             float(config.get("dfn_small_projection_half_width_m", half_width)),
+            str(config.get("projected_line_mode", "apparent_dip")),
         )
     else:
         segments, colors, widths, scales, crossed = patch_segments(patches, track, projection, half_width)
@@ -1184,48 +1243,209 @@ def display_array(name: str, values: np.ndarray) -> tuple[np.ndarray, str, float
     return values, cmap, float(lo), float(hi if hi > lo else lo + 1)
 
 
+def figure_size_for_scope(config: dict[str, Any], scope: str, projection: str) -> tuple[float, float, int]:
+    """图幅（英寸）与 dpi（2026-09-29 对齐砂砾岩的像素口径）。
+
+    砂砾岩 Step9 的出发点是"**画多少道**"和"**画布多大**"解耦：先定画布像素，
+    再决定把剖面上多少条地震道画进去。太古界原来把两者写死（15.5x7.8 in + 固定 80 道），
+    于是 20.6 km 的矿区剖面上每 261 m 才有 1 条道，既稀疏又把横向摆幅放大了 21 倍。
+
+    这里支持两套口径：
+
+    * **像素口径（推荐）**：配置 `xz_total_width_px` / `yz_total_width_px` / `figure_height_px`
+      + `render_dpi` → 数据区宽度严格等于配置像素，与砂砾岩 `figure_size_inches()` 同义；
+    * **旧口径**：未给这些键时退回 `fig_width/fig_height/dpi`，保证历史配置逐像素可复现。
+    """
+    if scope == "local_200m":
+        return (
+            float(config.get("local_fig_width", config.get("fig_width", 15.5))),
+            float(config.get("local_fig_height", config.get("fig_height", 7.8))),
+            int(config.get("local_render_dpi", config.get("render_dpi", config.get("dpi", 180)))),
+        )
+    render_dpi = int(config.get("render_dpi", config.get("dpi", 180)))
+    width_px = config.get("xz_total_width_px") if projection == "XZ" else config.get("yz_total_width_px")
+    height_px = config.get("figure_height_px")
+    if width_px or height_px:
+        width_in = float(width_px) / render_dpi if width_px else float(config.get("fig_width", 15.5))
+        height_in = float(height_px) / render_dpi if height_px else float(config.get("fig_height", 7.8))
+        return width_in, height_in, render_dpi
+    return (
+        float(config.get("fig_width", 15.5)),
+        float(config.get("fig_height", 7.8)),
+        int(config.get("dpi", 180)),
+    )
+
+
+def select_wiggle_traces(
+    coords: np.ndarray, config: dict[str, Any], scope: str = "overview"
+) -> tuple[np.ndarray, float]:
+    """挑要画的地震道，并返回相邻道间距（米）。2026-09-29 对齐砂砾岩口径。
+
+    三种口径，优先级：按米抽道 > 按条数上限 > 全画。
+
+    * `wiggle_trace_spacing_m > 0`：**按米抽道**（如 25 m）。抽稀比例不随剖面范围变化，
+      5 km 剖面和矿区剖面可以共用同一套参数 —— 这是它比"固定条数"好的地方。
+    * `wiggle_max_trace_count`：``0`` 或 ≥ 道数 → **画剖面上全部道**（砂砾岩正式口径，
+      配置里 `wiggle_max_trace_count: 0`）；``> 0`` → 等间隔取这么多条。
+    * 都没给时退回旧的 `wiggle_trace_count`（默认 80），保证历史配置行为不变。
+
+    **按 scope 分开**（2026-09-29 修正）：砂砾岩口径是"**只对矿区 overview 抽稀**
+    （`presentation_targets.overview.max_traces`），**井周局部剖面画全部道**
+    （`local_200m.max_traces = 0`）"。所以 overview 用的 `wiggle_trace_spacing_m`
+    **不作用于 local_200m**；局部剖面要单独抽稀时用 `wiggle_local_trace_spacing_m`
+    / `wiggle_local_max_trace_count`。
+    """
+    coords = np.asarray(coords, dtype=np.float64)
+    total = len(coords)
+    if total == 0:
+        return np.asarray([], dtype=int), 1.0
+    local = scope == "local_200m"
+    spacing_m = float(
+        config.get("wiggle_local_trace_spacing_m" if local else "wiggle_trace_spacing_m", 0) or 0.0
+    )
+    if spacing_m > 0:
+        span = float(coords[-1] - coords[0])
+        count = int(np.floor(span / spacing_m)) + 1
+        count = max(2, min(count, total))
+        take = np.unique(np.linspace(0, total - 1, count, dtype=int))
+    else:
+        max_key = "wiggle_local_max_trace_count" if local else "wiggle_max_trace_count"
+        if max_key in config:
+            max_traces = int(config.get(max_key) or 0)
+        elif local:
+            # 局部剖面默认全画（砂砾岩口径），不继承 overview 的旧 wiggle_trace_count
+            max_traces = 0
+        elif "wiggle_max_trace_count" in config:
+            max_traces = int(config.get("wiggle_max_trace_count") or 0)
+        else:
+            max_traces = int(config.get("wiggle_trace_count", 80))
+        if max_traces <= 0 or max_traces >= total:
+            take = np.arange(total, dtype=int)
+        else:
+            take = np.unique(np.linspace(0, total - 1, max_traces, dtype=int))
+    selected = coords[take]
+    spacing = float(np.median(np.diff(selected))) if len(selected) > 1 else 1.0
+    return take, spacing
+
+
 def plot_image(path: Path, name: str, renderer: str, projection: str, scope: str,
                values: np.ndarray, coords: np.ndarray, times: np.ndarray, track: pd.DataFrame,
                curves: dict[str, np.ndarray], patches: pd.DataFrame, imaging: pd.DataFrame,
                config: dict[str, Any], faults: dict[str, list[list[list[float]]]] | None = None,
                step4: pd.DataFrame | None = None) -> dict[str, Any]:
-    fig, ax = plt.subplots(figsize=(15.5, 7.8))
+    width_in, height_in, fig_dpi = figure_size_for_scope(config, scope, projection)
+    # 右侧附属列（像素口径）：数据区 → 间隙 → 色标列 → 间隙 → 图例。
+    # 图例宽度**实测**（两遍布局）：不同标签长度差异很大，写死一个宽度必然压色标。
+    side_column = float(config.get("overlay_legend_width_in", 0.0) or 0.0)
+    colorbar_column_in = float(config.get("colorbar_column_width_in", 0.9))
+    column_gap_in = float(config.get("overlay_column_gap_in", 0.14))
+    total_width_in = width_in + side_column if side_column > 0 else width_in
+    right = (width_in / total_width_in) if side_column > 0 else 1.0
     extent = [coords[0], coords[-1], times[-1], times[0]]
-    if renderer == "attribute":
-        shown, cmap, lo, hi = display_array(name, values)
-        image = ax.imshow(shown, extent=extent, aspect="auto", cmap=cmap, vmin=lo, vmax=hi, interpolation="nearest")
-        fig.colorbar(image, ax=ax, pad=.01, label={"AntTrack":"蚂蚁体原始值","Coherence":"相干体原始值","CurvatureMax":"|最大正曲率|"}[name])
-    else:
-        finite = values[np.isfinite(values)]
-        limit = float(np.quantile(np.abs(finite), .99)) if len(finite) else 1.0
-        if renderer == "density":
-            image = ax.imshow(values, extent=extent, aspect="auto", cmap="seismic", vmin=-limit, vmax=limit, interpolation="nearest")
-            fig.colorbar(image, ax=ax, pad=.01, label="OBN振幅")
+    overlay: dict[str, Any] = {}
+
+    def render_panel(target: Path, density_style: str) -> None:
+        nonlocal overlay
+        fig, ax = plt.subplots(figsize=(total_width_in, height_in))
+        if side_column > 0:
+            fig.subplots_adjust(left=0.055, right=right, bottom=0.10, top=0.90)
+        if renderer == "attribute":
+            shown, cmap, lo, hi = display_array(name, values)
+            image = ax.imshow(shown, extent=extent, aspect="auto", cmap=cmap, vmin=lo, vmax=hi, interpolation="nearest")
+            colorbar_label = {"AntTrack":"蚂蚁体原始值","Coherence":"相干体原始值","CurvatureMax":"|最大正曲率|"}[name]
         else:
-            count = min(int(config.get("wiggle_trace_count", 80)), len(coords))
-            take = np.unique(np.linspace(0, len(coords)-1, count, dtype=int))
-            spacing = (coords[-1] - coords[0]) / max(len(take)-1, 1)
-            scale = .42 * spacing / max(limit, 1e-9)
-            for col in take:
-                trace = np.nan_to_num(values[:, col])
-                x = coords[col] + trace * scale
-                ax.plot(x, times, color="black", lw=.45)
-                ax.fill_betweenx(times, coords[col], x, where=trace >= 0, color="black", alpha=.65)
-    width_key = "local_dfn_projection_half_width_m" if scope == "local_200m" else "dfn_projection_half_width_m"
-    overlay = draw_overlays(ax, projection, coords, times, track, curves, patches, imaging,
-                            float(config.get(width_key, 200.0 if scope == "local_200m" else 50.0)),
-                            faults=(faults or {}).get(projection), step4=step4, scope=scope, config=config)
-    ax.set_xlim(coords[0], coords[-1]); ax.set_ylim(times[-1], times[0])
-    ax.set_xlabel("X / m" if projection == "XZ" else "Y / m"); ax.set_ylabel("TIME / ms (TWT)")
-    title = {"AntTrack":"蚂蚁体", "Coherence":"相干体", "CurvatureMax":"曲率绝对值", "SeisAmp":"OBN地震"}[name]
-    mode = "波形+变面积" if renderer == "wiggle" else ("变密度" if renderer == "density" else "属性")
-    ax.set_title(f"埕北古斜405 {SCOPE_LABELS[scope]} {projection} | {title}{mode}")
-    ax.grid(False)
-    fig.tight_layout()
-    # 图例放在数据区外侧（对齐砂砾岩方案：不遮挡剖面主体），并按用途分组（v7）。
-    grouped_legend(fig, ax, fontsize=8.4)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(path, dpi=int(config.get("dpi", 180)), bbox_inches="tight"); plt.close(fig)
+            finite = values[np.isfinite(values)]
+            limit = float(np.quantile(np.abs(finite), .99)) if len(finite) else 1.0
+            if renderer == "density":
+                # 2026-09-29：对齐砂砾岩 formal —— 默认 `absolute_grayscale`
+                # （|振幅| 上 gray_r，0=白、强振幅=黑），红白蓝降为可选/备份口径。
+                # 砂砾岩同一套开关见 build_well_seismic_amplitude_sections.resolve_amplitude_display_style()。
+                if density_style == "signed_red_white_blue":
+                    image = ax.imshow(values, extent=extent, aspect="auto", cmap="seismic",
+                                      vmin=-limit, vmax=limit, interpolation="nearest")
+                    colorbar_label = "OBN振幅"
+                else:
+                    image = ax.imshow(np.abs(values), extent=extent, aspect="auto", cmap="gray_r",
+                                      vmin=0.0, vmax=limit, interpolation="nearest")
+                    colorbar_label = "OBN地震振幅绝对值"
+            else:
+                take, spacing = select_wiggle_traces(coords, config, scope)
+                swing = float(config.get("wiggle_lateral_scale_fraction", 0.42))
+                line_width = float(config.get("wiggle_linewidth", 0.45))
+                fill_alpha = float(config.get("wiggle_positive_fill_alpha", 0.65))
+                scale = swing * spacing / max(limit, 1e-9)
+                for col in take:
+                    column = values[:, col]
+                    # 全 NaN 道（剖面伸出 OBN/属性覆盖范围）不画：否则 nan_to_num 会把它压成
+                    # 一条贴基线的竖线，全画时密排成一块"灰板"，被误读成低振幅地震。
+                    if not np.isfinite(column).any():
+                        continue
+                    trace = np.nan_to_num(column)
+                    x = coords[col] + trace * scale
+                    ax.plot(x, times, color="black", lw=line_width)
+                    ax.fill_betweenx(times, coords[col], x, where=trace >= 0, color="black", alpha=fill_alpha)
+                colorbar_label = None
+        if colorbar_label is not None and side_column <= 0:
+            fig.colorbar(image, ax=ax, pad=.01, label=colorbar_label)
+        width_key = "local_dfn_projection_half_width_m" if scope == "local_200m" else "dfn_projection_half_width_m"
+        overlay = draw_overlays(ax, projection, coords, times, track, curves, patches, imaging,
+                                float(config.get(width_key, 200.0 if scope == "local_200m" else 50.0)),
+                                faults=(faults or {}).get(projection), step4=step4, scope=scope, config=config)
+        ax.set_xlim(coords[0], coords[-1]); ax.set_ylim(times[-1], times[0])
+        ax.set_xlabel("X / m" if projection == "XZ" else "Y / m"); ax.set_ylabel("TIME / ms (TWT)")
+        title = {"AntTrack":"蚂蚁体", "Coherence":"相干体", "CurvatureMax":"曲率绝对值", "SeisAmp":"OBN地震"}[name]
+        mode = "波形+变面积" if renderer == "wiggle" else ("变密度" if renderer == "density" else "属性")
+        # 2026-09-26：scope 标签可由配置覆盖（quanqu1 全矿区轮次把 overview 从"5 km Demo区"
+        # 改成"矿区全区"，避免图题与实际范围不符）。
+        scope_labels = {**SCOPE_LABELS, **dict(config.get("scope_labels") or {})}
+        hint = ""
+        if renderer == "wiggle":
+            hint = f" | 显示道数={len(take)}/{len(coords)}"
+        elif renderer == "density" and density_style != "signed_red_white_blue":
+            hint = "（黑白，绝对振幅）"
+        ax.set_title(f"埕北古斜405 {scope_labels.get(scope, SCOPE_LABELS[scope])} {projection} | {title}{mode}{hint}")
+        ax.grid(False)
+        legend_fontsize = float(config.get("overlay_legend_fontsize", 8.4))
+        if side_column <= 0:
+            fig.tight_layout()
+            # 图例放在数据区外侧（对齐砂砾岩方案：不遮挡剖面主体），并按用途分组（v7）。
+            grouped_legend(fig, ax, fontsize=legend_fontsize, anchor=(1.005, 1.0))
+        else:
+            # 两遍布局：第 1 遍把图例画到图外量它的**实际**宽度，
+            # 第 2 遍据此定最终画布宽度、色标列与图例锚点 —— 标签长短变了也不会再互相压。
+            probe = grouped_legend(fig, ax, fontsize=legend_fontsize, anchor=(3.0, 1.0))
+            fig.canvas.draw()
+            legend_w_in = float(probe.get_window_extent(fig.canvas.get_renderer()).width) / float(fig.dpi)
+            probe.remove()
+            cb_col = colorbar_column_in if colorbar_label is not None else 0.0
+            figure_width_in = (
+                width_in
+                + (column_gap_in + cb_col if cb_col else 0.0)
+                + column_gap_in
+                + legend_w_in
+            )
+            fig.set_size_inches(figure_width_in, height_in)
+            right_frac = width_in / figure_width_in
+            fig.subplots_adjust(left=0.055, right=right_frac, bottom=0.10, top=0.90)
+            if colorbar_label is not None:
+                cax = fig.add_axes([(width_in + column_gap_in) / figure_width_in, 0.16, 0.012, 0.68])
+                fig.colorbar(image, cax=cax, label=colorbar_label)
+            anchor_x = (width_in + (column_gap_in + cb_col if cb_col else 0.0) + column_gap_in) / figure_width_in
+            grouped_legend(fig, ax, fontsize=legend_fontsize, anchor=(anchor_x, 1.0))
+        target.parent.mkdir(parents=True, exist_ok=True)
+        fig.savefig(target, dpi=fig_dpi, bbox_inches="tight"); plt.close(fig)
+
+    primary_style = str(config.get("seismic_density_style", "absolute_grayscale")).strip().lower()
+    render_panel(path, primary_style)
+    backup_style = str(config.get("seismic_density_backup_style", "") or "").strip().lower()
+    if renderer == "density" and backup_style and backup_style != primary_style:
+        backup_name = str(config.get("seismic_density_backup_dir", "red_white_blue_backup"))
+        render_panel(path.parent / backup_name / path.name, backup_style)
+    # 诊断出口：画了几条道（用于 QC 与"抽样比例"核对）
+    if renderer == "wiggle":
+        overlay["wiggle_trace_count"] = int(len(select_wiggle_traces(coords, config, scope)[0]))
+        overlay["wiggle_trace_total_count"] = int(len(coords))
+        overlay["wiggle_trace_spacing_m"] = float(select_wiggle_traces(coords, config, scope)[1])
     return overlay
 
 
@@ -1307,76 +1527,168 @@ def main() -> int:
           f"overview {times[0]:.0f}-{times[-1]:.0f} ms({len(times)}样点) / "
           f"local_200m {times_by_scope['local_200m'][0]:.0f}-{times_by_scope['local_200m'][-1]:.0f} ms"
           f"({len(times_by_scope['local_200m'])}样点)", flush=True)
-    print("[Step9] 2/6 采样三属性剖面（属性TraceIdx合同）", flush=True)
-    offsets = config.get("attribute_time_offsets_ms", {}); progress = int(config.get("progress_interval", 100))
-    for name in ATTRIBUTES:
-        print(f"  [overview] {name}", flush=True)
-        sampler = AttributeSampler(header, Path(config["volume_paths"][name]), float(offsets.get(name, 0)), float(config.get("attribute_max_nearest_distance_m", 20)))
-        try:
-            samples["overview"][name] = {}; sample_summary["overview"][name] = {}
-            for projection, coords in (("XZ", overview_x), ("YZ", overview_y)):
-                values, stats = sample_attribute_section(sampler, track, times, coords, projection, progress)
-                samples["overview"][name][projection] = values; sample_summary["overview"][name][projection] = stats
-        finally: sampler.close()
-        samples["local_200m"][name] = {}; sample_summary["local_200m"][name] = {}
+    progress = int(config.get("progress_interval", 100))
+    reuse_root: Path | None = None
+    if args.reuse_samples:
+        reuse_root = Path(config.get("reuse_samples_dir") or output).resolve()
+        missing = [
+            str(reuse_root / "section_samples" / scope / f"{name.lower()}_section_samples.npz")
+            for scope in ("overview", "local_200m")
+            for name in (*ATTRIBUTES, "SeisAmp")
+            if not (reuse_root / "section_samples" / scope / f"{name.lower()}_section_samples.npz").exists()
+        ]
+        if missing:
+            raise FileNotFoundError(f"--reuse-samples 缺少采样缓存：{missing[:3]}（共 {len(missing)} 个）")
+        print(f"[Step9] 2/6 3/6 跳过采样，复用缓存：{reuse_root / 'section_samples'}", flush=True)
+        for scope in ("overview", "local_200m"):
+            sample_summary[scope] = {}
+            for name in (*ATTRIBUTES, "SeisAmp"):
+                cached = np.load(reuse_root / "section_samples" / scope / f"{name.lower()}_section_samples.npz")
+                cached_times = np.asarray(cached["times"], dtype=np.float64)
+                if not np.allclose(cached_times, times_by_scope[scope], atol=1e-6):
+                    raise RuntimeError(
+                        f"复用缓存的时间轴与本配置不一致（{scope}/{name}）："
+                        f"{cached_times[0]:.1f}-{cached_times[-1]:.1f} vs "
+                        f"{times_by_scope[scope][0]:.1f}-{times_by_scope[scope][-1]:.1f}"
+                    )
+                axes = {"XZ": np.asarray(cached["xz_h"], dtype=np.float64),
+                        "YZ": np.asarray(cached["yz_h"], dtype=np.float64)}
+                for projection in ("XZ", "YZ"):
+                    if not np.allclose(axes[projection], samples[scope]["axes"][projection], atol=1e-6):
+                        raise RuntimeError(f"复用缓存的剖面轴与本配置不一致（{scope}/{projection}）")
+                samples[scope][name] = {
+                    "XZ": np.asarray(cached["xz_values"], dtype=np.float64),
+                    "YZ": np.asarray(cached["yz_values"], dtype=np.float64),
+                }
+                sample_summary[scope][name] = {
+                    "source": "reused_section_samples_cache",
+                    "cache_path": str(reuse_root / "section_samples" / scope / f"{name.lower()}_section_samples.npz"),
+                    "shape": list(samples[scope][name]["XZ"].shape),
+                }
+                cached.close()
+    else:
+        print("[Step9] 2/6 采样三属性剖面（属性TraceIdx合同）", flush=True)
+        offsets = config.get("attribute_time_offsets_ms", {})
+        for name in ATTRIBUTES:
+            print(f"  [overview] {name}", flush=True)
+            sampler = AttributeSampler(header, Path(config["volume_paths"][name]), float(offsets.get(name, 0)), float(config.get("attribute_max_nearest_distance_m", 20)))
+            try:
+                samples["overview"][name] = {}; sample_summary["overview"][name] = {}
+                for projection, coords in (("XZ", overview_x), ("YZ", overview_y)):
+                    values, stats = sample_attribute_section(sampler, track, times, coords, projection, progress)
+                    samples["overview"][name][projection] = values; sample_summary["overview"][name][projection] = stats
+            finally: sampler.close()
+            samples["local_200m"][name] = {}; sample_summary["local_200m"][name] = {}
+            for projection, local_axis in (("XZ", local_x), ("YZ", local_y)):
+                full_axis = samples["overview"]["axes"][projection]
+                positions = np.searchsorted(full_axis, local_axis)
+                local_values = samples["overview"][name][projection][local_start:local_stop, positions]
+                samples["local_200m"][name][projection] = local_values
+                finite = local_values[np.isfinite(local_values)]
+                sample_summary["local_200m"][name][projection] = {
+                    "source": "overview_axis_subset", "shape": list(local_values.shape),
+                    "time_window_ms": [float(times_by_scope["local_200m"][0]), float(times_by_scope["local_200m"][-1])],
+                    "finite_fraction": float(np.isfinite(local_values).mean()),
+                    "raw_percentiles": np.percentile(finite, [0, 1, 50, 99, 100]).tolist() if len(finite) else [],
+                }
+        print("[Step9] 3/6 采样OBN振幅剖面（独立OBN TraceIdx合同）", flush=True)
+        with ObnAmplitudeSampler(pth(config, "obn_segy"), pth(config, "obn_trace_header_csv")) as sampler:
+            samples["overview"]["SeisAmp"] = {}; sample_summary["overview"]["SeisAmp"] = {}
+            for projection in ("XZ", "YZ"):
+                values, stats = sample_obn_section(sampler, track, times, samples["overview"]["axes"][projection], projection, float(config.get("obn_max_nearest_distance_m", 25)), progress)
+                samples["overview"]["SeisAmp"][projection] = values; sample_summary["overview"]["SeisAmp"][projection] = stats
+        samples["local_200m"]["SeisAmp"] = {}; sample_summary["local_200m"]["SeisAmp"] = {}
         for projection, local_axis in (("XZ", local_x), ("YZ", local_y)):
-            full_axis = samples["overview"]["axes"][projection]
-            positions = np.searchsorted(full_axis, local_axis)
-            local_values = samples["overview"][name][projection][local_start:local_stop, positions]
-            samples["local_200m"][name][projection] = local_values
+            positions = np.searchsorted(samples["overview"]["axes"][projection], local_axis)
+            local_values = samples["overview"]["SeisAmp"][projection][local_start:local_stop, positions]
+            samples["local_200m"]["SeisAmp"][projection] = local_values
             finite = local_values[np.isfinite(local_values)]
-            sample_summary["local_200m"][name][projection] = {
+            sample_summary["local_200m"]["SeisAmp"][projection] = {
                 "source": "overview_axis_subset", "shape": list(local_values.shape),
                 "time_window_ms": [float(times_by_scope["local_200m"][0]), float(times_by_scope["local_200m"][-1])],
                 "finite_fraction": float(np.isfinite(local_values).mean()),
                 "raw_percentiles": np.percentile(finite, [0, 1, 50, 99, 100]).tolist() if len(finite) else [],
             }
-    print("[Step9] 3/6 采样OBN振幅剖面（独立OBN TraceIdx合同）", flush=True)
-    with ObnAmplitudeSampler(pth(config, "obn_segy"), pth(config, "obn_trace_header_csv")) as sampler:
-        samples["overview"]["SeisAmp"] = {}; sample_summary["overview"]["SeisAmp"] = {}
-        for projection in ("XZ", "YZ"):
-            values, stats = sample_obn_section(sampler, track, times, samples["overview"]["axes"][projection], projection, float(config.get("obn_max_nearest_distance_m", 25)), progress)
-            samples["overview"]["SeisAmp"][projection] = values; sample_summary["overview"]["SeisAmp"][projection] = stats
-    samples["local_200m"]["SeisAmp"] = {}; sample_summary["local_200m"]["SeisAmp"] = {}
-    for projection, local_axis in (("XZ", local_x), ("YZ", local_y)):
-        positions = np.searchsorted(samples["overview"]["axes"][projection], local_axis)
-        local_values = samples["overview"]["SeisAmp"][projection][local_start:local_stop, positions]
-        samples["local_200m"]["SeisAmp"][projection] = local_values
-        finite = local_values[np.isfinite(local_values)]
-        sample_summary["local_200m"]["SeisAmp"][projection] = {
-            "source": "overview_axis_subset", "shape": list(local_values.shape),
-            "time_window_ms": [float(times_by_scope["local_200m"][0]), float(times_by_scope["local_200m"][-1])],
-            "finite_fraction": float(np.isfinite(local_values).mean()),
-            "raw_percentiles": np.percentile(finite, [0, 1, 50, 99, 100]).tolist() if len(finite) else [],
-        }
-    print("[Step9] 4/6 保存NPZ采样缓存", flush=True)
-    for scope in samples:
-        cache = output / "section_samples" / scope; cache.mkdir(parents=True, exist_ok=True)
-        for name in (*ATTRIBUTES, "SeisAmp"):
-            np.savez_compressed(cache / f"{name.lower()}_section_samples.npz", times=times_by_scope[scope], xz_h=samples[scope]["axes"]["XZ"], yz_h=samples[scope]["axes"]["YZ"], xz_values=samples[scope][name]["XZ"], yz_values=samples[scope][name]["YZ"])
-    print("[Step9] 5/6 生成20张正式剖面", flush=True)
-    images=[]; number=0
+        print("[Step9] 4/6 保存NPZ采样缓存", flush=True)
+        for scope in samples:
+            cache = output / "section_samples" / scope; cache.mkdir(parents=True, exist_ok=True)
+            for name in (*ATTRIBUTES, "SeisAmp"):
+                np.savez_compressed(cache / f"{name.lower()}_section_samples.npz", times=times_by_scope[scope], xz_h=samples[scope]["axes"]["XZ"], yz_h=samples[scope]["axes"]["YZ"], xz_values=samples[scope][name]["XZ"], yz_values=samples[scope][name]["YZ"])
+    print("[Step9] 5/6 生成正式剖面", flush=True)
+    images: list[dict[str, Any]] = []
+    plan=[("AntTrack","attribute"),("Coherence","attribute"),("CurvatureMax","attribute"),("SeisAmp","density"),("SeisAmp","wiggle")]
+    # 2026-09-29：可选只渲染子集（配色/抽道/图幅对照小样用），编号仍按正式 20 张的序号走，
+    # 这样小样文件名与正式图一一对应（例如 17_seismic_density_xz.png）。
+    render_scopes = set(config.get("render_scopes") or [])
+    render_tokens = set(config.get("render_tokens") or [])
+    planned: list[tuple[int, str, str, str, str]] = []
+    cursor = 0
+    for scope in ("overview", "local_200m"):
+        for name, renderer in plan:
+            for projection in ("XZ", "YZ"):
+                cursor += 1
+                token = name.lower() if name != "SeisAmp" else ("seismic_density" if renderer == "density" else "seismic_wiggle_area")
+                if render_scopes and scope not in render_scopes:
+                    continue
+                if render_tokens and token not in render_tokens:
+                    continue
+                planned.append((cursor, scope, name, renderer, projection))
+    expected_images = len(planned)
+    rendered = 0
     for scope in ("overview", "local_200m"):
         curves = scope_curves[scope]; scope_times = times_by_scope[scope]
-        plan=[("AntTrack","attribute"),("Coherence","attribute"),("CurvatureMax","attribute"),("SeisAmp","density"),("SeisAmp","wiggle")]
-        for name, renderer in plan:
-            for projection in ("XZ","YZ"):
-                number += 1; token = name.lower() if name != "SeisAmp" else ("seismic_density" if renderer == "density" else "seismic_wiggle_area")
-                path = output / scope / f"{number:02d}_{token}_{projection.lower()}.png"
-                print(f"  图片 {number}/20: {path.name}", flush=True)
-                overlay = plot_image(path,name,renderer,projection,scope,samples[scope][name][projection],samples[scope]["axes"][projection],scope_times,track,curves[projection],patches,imaging,config,faults=fault_segments,step4=step4_points)
-                images.append({"number":number,"scope":scope,"background":name,"renderer":renderer,"projection":projection,"path":str(path),"overlay":overlay})
+        for number, planned_scope, name, renderer, projection in planned:
+            if planned_scope != scope:
+                continue
+            token = name.lower() if name != "SeisAmp" else ("seismic_density" if renderer == "density" else "seismic_wiggle_area")
+            rendered += 1
+            path = output / scope / f"{number:02d}_{token}_{projection.lower()}.png"
+            print(f"  图片 {rendered}/{expected_images}（正式序号 {number:02d}）: {path.name}", flush=True)
+            overlay = plot_image(path,name,renderer,projection,scope,samples[scope][name][projection],samples[scope]["axes"][projection],scope_times,track,curves[projection],patches,imaging,config,faults=fault_segments,step4=step4_points)
+            images.append({"number":number,"scope":scope,"background":name,"renderer":renderer,"projection":projection,"path":str(path),"overlay":overlay})
     print("[Step9] 6/6 汇总QC", flush=True)
     imaging_join_qc = dict(config.get("_imaging_join_qc", {}))
-    checks={"image_count_is_20":len(images)==20,"horizon_order_valid":bool(((horizon.TopTimeMs<horizon.MidTimeMs)&(horizon.MidTimeMs<horizon.BaseTimeMs)).all()),"attribute_demo_grid_complete":len(grid)==int(config.get("expected_demo_trace_count",len(grid))),"anttrack_minus_one_preserved":True,"separate_trace_contracts":pth(config,"attribute_trace_header_csv")!=pth(config,"obn_trace_header_csv"),"imaging_point_join_has_no_unmatched":int(imaging_join_qc.get("unmatched_count",0))==0}
+    checks={"image_count_matches_plan":len(images)==max(expected_images,1),"horizon_order_valid":bool(((horizon.TopTimeMs<horizon.MidTimeMs)&(horizon.MidTimeMs<horizon.BaseTimeMs)).all()),"attribute_demo_grid_complete":len(grid)==int(config.get("expected_demo_trace_count",len(grid))),"anttrack_minus_one_preserved":True,"separate_trace_contracts":pth(config,"attribute_trace_header_csv")!=pth(config,"obn_trace_header_csv"),"imaging_point_join_has_no_unmatched":int(imaging_join_qc.get("unmatched_count",0))==0}
     overlay_totals = {
         "original_fault_segments": fault_summary.get("segment_counts", {}),
         "step4_points_on_section_total": sum(int(row["overlay"].get("step4_point_count", 0)) for row in images),
         "imaging_patch_total": sum(int(row["overlay"].get("imaging_patch_count", 0)) for row in images),
         "dfn_segment_total": sum(int(row["overlay"].get("dfn_segment_count", 0)) for row in images),
     }
-    checks={"image_count_is_20":len(images)==20,"horizon_order_valid":bool(((horizon.TopTimeMs<horizon.MidTimeMs)&(horizon.MidTimeMs<horizon.BaseTimeMs)).all()),"attribute_demo_grid_complete":len(grid)==int(config.get("expected_demo_trace_count",len(grid))),"anttrack_minus_one_preserved":True,"separate_trace_contracts":pth(config,"attribute_trace_header_csv")!=pth(config,"obn_trace_header_csv"),"imaging_point_join_has_no_unmatched":int(imaging_join_qc.get("unmatched_count",0))==0,"original_fault_overlay_loaded":bool(not config.get("original_fault_vtk") or fault_summary.get("triangle_count",0)>0),"original_fault_intersects_section":bool(not config.get("original_fault_vtk") or any(v>0 for v in (fault_summary.get("segment_counts") or {}).values())),"imaging_patch_overlay_drawn":bool(not len(imaging) or overlay_totals["imaging_patch_total"]>0),"step4_points_overlay_drawn":bool(not len(step4_points) or overlay_totals["step4_points_on_section_total"]>0)}
-    summary={"status":"pass" if all(checks.values()) else "fail","config":str(config_path),"profile_well":config["profile_well"],"temporary_neighbor_time_depth_risk":"埕北古斜405当前按该井对应时深文件使用，真实时深仍待核验","target_block":block,"time_range_ms":[float(times[0]),float(times[-1])],"time_range_ms_by_scope":{s:[float(times_by_scope[s][0]),float(times_by_scope[s][-1])] for s in ("overview","local_200m")},"time_window_policy":{"mode":"per_scope_adaptive","scope_time_padding_ms":scope_padding,"basis":"该剖面上三条层位曲线(Top/Mid/Base)的 min/max ± padding"},"inputs":validation["paths"],"contracts":validation["contracts"],"counts":{"attribute_grid":len(grid),"valid_horizon_traces":len(horizon),"track_samples":len(track),"step8_patches":len(patches),"imaging_points":len(imaging),"step4_points":len(step4_points)},"overlay_inputs":{"original_fault":fault_summary,"step4_points":len(step4_points),"imaging_points":len(imaging),**overlay_totals},"imaging_point_join_qc":imaging_join_qc,"sample_qc":sample_summary,"images":images,"checks":checks,"elapsed_seconds":time.time()-started}
+    checks={"image_count_matches_plan":len(images)==max(expected_images,1),"horizon_order_valid":bool(((horizon.TopTimeMs<horizon.MidTimeMs)&(horizon.MidTimeMs<horizon.BaseTimeMs)).all()),"attribute_demo_grid_complete":len(grid)==int(config.get("expected_demo_trace_count",len(grid))),"anttrack_minus_one_preserved":True,"separate_trace_contracts":pth(config,"attribute_trace_header_csv")!=pth(config,"obn_trace_header_csv"),"imaging_point_join_has_no_unmatched":int(imaging_join_qc.get("unmatched_count",0))==0,"original_fault_overlay_loaded":bool(not config.get("original_fault_vtk") or fault_summary.get("triangle_count",0)>0),"original_fault_intersects_section":bool(not config.get("original_fault_vtk") or any(v>0 for v in (fault_summary.get("segment_counts") or {}).values())),"imaging_patch_overlay_drawn":bool(not len(imaging) or overlay_totals["imaging_patch_total"]>0),"step4_points_overlay_drawn":bool(not len(step4_points) or overlay_totals["step4_points_on_section_total"]>0)}
+    # 2026-09-29：展示口径落进 summary，便于事后核对"画了多少道 / 画布多大 / 走的哪套配色"。
+    def _figure_qc(scope: str, projection: str) -> dict[str, Any]:
+        width_in, height_in, dpi = figure_size_for_scope(config, scope, projection)
+        legend_width_in = float(config.get("overlay_legend_width_in", 0.0) or 0.0)
+        return {
+            "fig_width_in": round(width_in, 3), "fig_height_in": round(height_in, 3), "dpi": int(dpi),
+            "data_width_px": int(round(width_in * dpi)), "height_px": int(round(height_in * dpi)),
+            "legend_width_in": legend_width_in,
+        }
+
+    display_qc: dict[str, Any] = {
+        "seismic_density_style": str(config.get("seismic_density_style", "absolute_grayscale")),
+        "seismic_density_backup_style": str(config.get("seismic_density_backup_style", "") or ""),
+        "wiggle_trace_rule": (
+            f"spacing={config.get('wiggle_trace_spacing_m')}m"
+            if float(config.get("wiggle_trace_spacing_m", 0) or 0) > 0
+            else (
+                "all_section_traces"
+                if int(config.get("wiggle_max_trace_count", config.get("wiggle_trace_count", 80)) or 0) <= 0
+                else f"max_traces={int(config.get('wiggle_max_trace_count', config.get('wiggle_trace_count', 80)) or 0)}"
+            )
+        ),
+        "wiggle_lateral_scale_fraction": float(config.get("wiggle_lateral_scale_fraction", 0.42)),
+        "wiggle_linewidth": float(config.get("wiggle_linewidth", 0.45)),
+        "wiggle_positive_fill_alpha": float(config.get("wiggle_positive_fill_alpha", 0.65)),
+        "figure_by_scope_projection": {
+            f"{scope}_{projection}": _figure_qc(scope, projection)
+            for scope in ("overview", "local_200m") for projection in ("XZ", "YZ")
+        },
+        "expected_image_count": int(expected_images),
+        "reused_samples": bool(args.reuse_samples),
+    }
+    summary={"status":"pass" if all(checks.values()) else "fail","config":str(config_path),"profile_well":config["profile_well"],"temporary_neighbor_time_depth_risk":"埕北古斜405当前按该井对应时深文件使用，真实时深仍待核验","target_block":block,"time_range_ms":[float(times[0]),float(times[-1])],"time_range_ms_by_scope":{s:[float(times_by_scope[s][0]),float(times_by_scope[s][-1])] for s in ("overview","local_200m")},"time_window_policy":{"mode":"per_scope_adaptive","scope_time_padding_ms":scope_padding,"basis":"该剖面上三条层位曲线(Top/Mid/Base)的 min/max ± padding"},"display":display_qc,"inputs":validation["paths"],"contracts":validation["contracts"],"counts":{"attribute_grid":len(grid),"valid_horizon_traces":len(horizon),"track_samples":len(track),"step8_patches":len(patches),"imaging_points":len(imaging),"step4_points":len(step4_points)},"overlay_inputs":{"original_fault":fault_summary,"step4_points":len(step4_points),"imaging_points":len(imaging),**overlay_totals},"imaging_point_join_qc":imaging_join_qc,"sample_qc":sample_summary,"images":images,"checks":checks,"elapsed_seconds":time.time()-started}
     write_json(summary_path,summary); print(f"[Step9] status={summary['status']} summary={summary_path}",flush=True)
     return 0 if summary["status"]=="pass" else 1
 

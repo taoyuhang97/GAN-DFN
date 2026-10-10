@@ -1,0 +1,20 @@
+{
+  "small_dfn_csv": "/home/tyh/projects/petroleum/code/GAN-DFN/太古界/step7a_small_scale_dfn/output/taigu_step7a_attribute_v3_regen_full_azi2/fracture_patches.csv",
+  "medium_dfn_csv": "/home/tyh/projects/petroleum/code/GAN-DFN/太古界/step7b_multiscale_initial_dfn/output/taigu_medium_v7_anttrack_led_azi3/medium_dfn_patches.csv",
+  "large_dfn_csv": "/home/tyh/projects/petroleum/code/GAN-DFN/太古界/step7c_large_fault_dfn/output/taigu_step7c_large_v3_attribute_v3_azi3/large_fault_dfn_patches.csv",
+  "large_dfn_vtk": "/home/tyh/projects/petroleum/code/GAN-DFN/太古界/step7c_large_fault_dfn/output/taigu_step7c_large_v3_attribute_v3_azi3/large_fault_dfn_raw_time.vtk",
+  "original_fault_manifest_csv": "/home/tyh/projects/petroleum/code/GAN-DFN/太古界/step7c_large_fault_dfn/output/taigu_step7c_large_v3_attribute_v3_azi3/original_fault_unit_manifest.csv",
+  "horizon_contract_table": "/home/tyh/projects/petroleum/code/GAN-DFN/太古界/common/horizon_contract/output/taigu_attribute_full_horizon_contract_v1/demo_horizon_contract.csv",
+  "output_dir": "/home/tyh/projects/petroleum/code/GAN-DFN/太古界/step7d_multiscale_fused_dfn/output/taigu_step7d_fused_v1_azi3",
+  "target_block": {
+    "name": "taigu_attribute_demo_5km_405center",
+    "x_min": 662925.0,
+    "x_max": 667925.0,
+    "y_min": 4240113.0,
+    "y_max": 4245113.0
+  },
+  "write_vtk": true,
+  "small_downsample_near_major_radius_m": 70.0,
+  "_note": "azi3（2026-09-23）：中尺度\"全局兜底产状\"改用多口成像测井的统计倾角先验（global_fallback_dip_prior_deg），因为太古界 Step6B 分量本身是压扁薄片、其 PCA 倾角中位仅 30.6°（砂砾岩同名分量 57.3°）。7A 复用 azi2 产物。",
+  "small_dfn_vtk": "/home/tyh/projects/petroleum/code/GAN-DFN/太古界/step7a_small_scale_dfn/output/taigu_step7a_attribute_v3_regen_full_azi2/fracture_patches.vtk"
+}

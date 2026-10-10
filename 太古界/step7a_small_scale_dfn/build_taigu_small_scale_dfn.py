@@ -15,7 +15,7 @@ Changes vs v1:
 
 Outputs (config.output_dir):
   fracture_patches.csv / fracture_patches.vtk
-  orientation_families.json / orientation_families.csv
+  orientation_families.json / orientation_families.csv（现为“按井经验产状库”审计表）
   step7a_imaging_match_qc.csv
   step7a_summary.json    status=pass
 
@@ -43,7 +43,6 @@ import pandas as pd
 import segyio
 from scipy.ndimage import gaussian_filter
 from scipy.spatial import cKDTree
-from sklearn.cluster import KMeans
 from tqdm import tqdm
 
 # P0-4：测井段坐标回接统一走公共模块（太古界/common/well_segment_join）
@@ -252,7 +251,7 @@ def load_multiwell_orientation_points(
             geometry_source="step7a_orientation",
             samples_root=samples_root,
         )
-        # 保持与改造前一致的行序（段 × MD）：方位族用 KMeans，顺序变化会改变分族结果。
+        # 保持固定的行序（段 × MD）：抽井用的平滑随机场与片序无关，但固定顺序便于复现。
         if {"InputSegmentPath", "MD"}.issubset(matched.columns):
             matched = matched.sort_values(["InputSegmentPath", "MD"], kind="mergesort").reset_index(drop=True)
         parts.append(matched)
@@ -262,109 +261,205 @@ def load_multiwell_orientation_points(
     merged_all = pd.concat(parts, ignore_index=True)
     join_summary = summarize_join(pd.concat(audits, ignore_index=True) if audits else pd.DataFrame())
     matched_mask = merged_all["MDJoinStatus"].astype(str).eq("matched")
-    keep_columns = ["WellName", "StrataName", "FracAzimuth", "FracDip", "X", "Y"]
-    return merged_all.loc[matched_mask, keep_columns].dropna().reset_index(drop=True), join_summary
+    keep_columns = ["WellName", "StrataName", "FracAzimuth", "FracDip", "X", "Y", "InHorizonLayer"]
+    keep_columns = [column for column in keep_columns if column in merged_all.columns]
+    essential = [column for column in ("WellName", "StrataName", "FracAzimuth", "FracDip", "X", "Y") if column in keep_columns]
+    return (
+        merged_all.loc[matched_mask, keep_columns].dropna(subset=essential).reset_index(drop=True),
+        join_summary,
+    )
 
 
-def build_orientation_families(points: pd.DataFrame, config: dict[str, Any]) -> dict[str, list[dict[str, Any]]]:
-    """按井近似等权，对甲方**真倾向方位**做全圆 KMeans，得到每层的产状家族。
-
-    **口径（2026-09-22 统一）**：家族角度字段 ``dip_azimuth_deg`` 是
-    **真倾向方位 0–360（自北顺时针）**，与甲方 ``FracAzimuth``（LAS 参数块
-    ``TLFamily_Azimuth = True Dip Azimuth``）同义。
-
-    旧实现把倾向方位当"走向"按半圆（``2*angle``）聚类，再被下游按走向消费，
-    造成整族差 90°；配置开关 ``family_azimuth_semantics`` 已删除。
-    """
-    families: dict[str, list[dict[str, Any]]] = {}
-    random_state = int(config.get("family_random_seed", 20260822))
-    dip_weight = float(config.get("family_dip_feature_weight", 0.7))
-    for layer in ("上部复合层", "太古界风化壳"):
-        sub = points[points["StrataName"].astype(str).eq(layer)].copy().reset_index(drop=True)
-        cluster_count = min(int(config["family_count_by_layer"][layer]), len(sub))
-        if cluster_count <= 0:
-            families[layer] = []
-            continue
-        azimuth_observations = sub["FracAzimuth"].to_numpy(dtype=np.float64) % 360.0
-        # 全圆特征：倾向方位有方向性，用 (cos, sin) 而不是半圆的 (cos2θ, sin2θ)。
-        angle = np.deg2rad(azimuth_observations)
-        dip = sub["FracDip"].to_numpy(dtype=np.float64)
-        features = np.column_stack([np.cos(angle), np.sin(angle), dip_weight * (dip - 55.0) / 25.0])
-        per_well_count = sub.groupby("WellName")["WellName"].transform("size").to_numpy(dtype=np.float64)
-        fit_weight = 1.0 / np.maximum(per_well_count, 1.0)
-        model = KMeans(n_clusters=cluster_count, random_state=random_state, n_init=20)
-        labels = model.fit_predict(features, sample_weight=fit_weight)
-        sub["FamilyLabel"] = labels
-        layer_families: list[dict[str, Any]] = []
-        for label in range(cluster_count):
-            family_points = sub[sub["FamilyLabel"].eq(label)].copy()
-            family_well_count = family_points.groupby("WellName")["WellName"].transform("size").to_numpy(dtype=np.float64)
-            balanced_weight = 1.0 / np.maximum(family_well_count, 1.0)
-            dip_azimuth, azimuth_std = dip_azimuth_mean_std_deg(
-                family_points["FracAzimuth"].to_numpy(dtype=np.float64) % 360.0,
-                balanced_weight,
-            )
-            balanced_weight /= balanced_weight.sum()
-            dip_values = family_points["FracDip"].to_numpy(dtype=np.float64)
-            dip_mean = float(np.sum(balanced_weight * dip_values))
-            dip_std = float(np.sqrt(np.sum(balanced_weight * np.square(dip_values - dip_mean))))
-            contributions = []
-            for well, well_points in family_points.groupby("WellName"):
-                all_well_count = int(sub["WellName"].eq(well).sum())
-                contributions.append(
-                    {
-                        "well": str(well),
-                        "family_point_count": int(len(well_points)),
-                        "well_point_count": all_well_count,
-                        "within_well_fraction": float(len(well_points) / max(all_well_count, 1)),
-                        "x": float(well_points["X"].median()),
-                        "y": float(well_points["Y"].median()),
-                    }
-                )
-            layer_families.append(
-                {
-                    "family_id": f"{layer}_family_{label + 1}",
-                    "dip_azimuth_deg": dip_azimuth,
-                    "strike_deg": orientation.strike_from_dip_azimuth(dip_azimuth),
-                    "azimuth_std_deg": azimuth_std,
-                    "dip_deg": dip_mean,
-                    "dip_std_deg": dip_std,
-                    "point_count": int(len(family_points)),
-                    "well_count": int(family_points["WellName"].nunique()),
-                    "well_contributions": contributions,
-                }
-            )
-        layer_families.sort(key=lambda item: (-item["well_count"], -item["point_count"]))
-        for index, family in enumerate(layer_families, start=1):
-            family["family_id"] = f"{layer}_family_{index}"
-        families[layer] = layer_families
-    return families
-
-
-def choose_orientation_family(
-    families: list[dict[str, Any]], x: float, y: float, distance_scale_m: float, rng: np.random.Generator
-) -> tuple[dict[str, Any], float]:
-    scores = []
-    for family in families:
-        score = 0.0
-        for source in family["well_contributions"]:
-            distance = float(np.hypot(x - source["x"], y - source["y"]))
-            score += source["within_well_fraction"] * np.exp(-distance / max(distance_scale_m, 1.0))
-        scores.append(score)
-    probability = np.asarray(scores, dtype=np.float64)
-    if not np.isfinite(probability).all() or probability.sum() <= 0.0:
-        probability = np.ones(len(families), dtype=np.float64)
-    probability /= probability.sum()
-    index = int(rng.choice(len(families), p=probability))
-    return families[index], float(probability[index])
-
-
-def blend_dip_azimuth(family_azimuth: float, local_azimuth: float, local_weight: float) -> float:
+def blend_dip_azimuth(base_azimuth: float, other_azimuth: float, weight: float) -> float:
     """真倾向方位（0–360）的**全圆**加权平均。"""
-    weight = float(np.clip(local_weight, 0.0, 1.0))
-    family_vector = np.exp(1j * np.deg2rad(family_azimuth))
-    local_vector = np.exp(1j * np.deg2rad(local_azimuth))
-    return float(np.rad2deg(np.angle((1.0 - weight) * family_vector + weight * local_vector)) % 360.0)
+    weight = float(np.clip(weight, 0.0, 1.0))
+    base_vector = np.exp(1j * np.deg2rad(base_azimuth))
+    other_vector = np.exp(1j * np.deg2rad(other_azimuth))
+    return float(np.rad2deg(np.angle((1.0 - weight) * base_vector + weight * other_vector)) % 360.0)
+
+
+def build_well_orientation_library(
+    points: pd.DataFrame,
+    wells_by_layer: dict[str, list[str]],
+    config: dict[str, Any],
+) -> dict[str, dict[str, dict[str, Any]]]:
+    """按 ``(层, 井)`` 建立**经验产状库**：原样保留该井的 (倾向方位, 倾角) 点集。
+
+    **不做聚类、不做平均**——聚类/取均值会把多峰与陡倾尾巴抹掉，正是上一轮
+    "DFN 与成像分布对不上"的根因（见 `太古界DFN产状赋值逻辑修正方案_20260923.md` §1）。
+
+    决策 D1：使用**全部**成像点（含落在目标层外的点），并额外记录层内占比供审计。
+    """
+    library: dict[str, dict[str, dict[str, Any]]] = {}
+    min_points = int(config.get("well_library_min_points", 5))
+    full_weight_points = int(config.get("well_library_min_points_for_full_weight", 50))
+    small_sample_discount = float(config.get("well_library_small_sample_discount", 0.5))
+    for layer, wells in wells_by_layer.items():
+        entries: dict[str, dict[str, Any]] = {}
+        for well in wells:
+            sub = points[
+                points["StrataName"].astype(str).eq(str(layer))
+                & points["WellName"].astype(str).eq(str(well))
+            ]
+            if sub.empty:
+                continue
+            dip_azimuth = pd.to_numeric(sub["FracAzimuth"], errors="coerce").to_numpy(dtype=np.float64) % 360.0
+            dip = pd.to_numeric(sub["FracDip"], errors="coerce").to_numpy(dtype=np.float64)
+            valid = np.isfinite(dip_azimuth) & np.isfinite(dip)
+            dip_azimuth, dip = dip_azimuth[valid], dip[valid]
+            if len(dip_azimuth) < min_points:
+                continue
+            if "InHorizonLayer" in sub.columns:
+                in_horizon = pd.to_numeric(sub["InHorizonLayer"], errors="coerce").fillna(0).to_numpy(dtype=np.float64)[valid]
+                in_horizon_fraction = float(np.mean(in_horizon > 0.5)) if len(in_horizon) else 0.0
+            else:
+                in_horizon_fraction = float("nan")
+            entries[str(well)] = {
+                "dip_azimuth_deg": dip_azimuth,
+                "dip_deg": dip,
+                "x": float(pd.to_numeric(sub["X"], errors="coerce").median()),
+                "y": float(pd.to_numeric(sub["Y"], errors="coerce").median()),
+                "point_count": int(len(dip_azimuth)),
+                # R2：点数过少的井（如埕北310 仅 34 点）经验分布不稳，降权
+                "sample_weight_scale": 1.0 if len(dip_azimuth) >= full_weight_points else small_sample_discount,
+                "in_horizon_fraction": in_horizon_fraction,
+                "dip_azimuth_circular_mean_deg": orientation.circular_mean_dip_azimuth(dip_azimuth),
+                "dip_median_deg": float(np.median(dip)),
+            }
+        library[str(layer)] = entries
+    return library
+
+
+def well_distance_weights(
+    x: float,
+    y: float,
+    entries: dict[str, dict[str, Any]],
+    config: dict[str, Any],
+) -> tuple[list[str], np.ndarray]:
+    """按**高斯距离核**给出该点各井的权重（决策 D2）。
+
+    用高斯核而不是硬性"最近 K 口井"：硬截断会在 K 边界产生权重跳变，
+    高斯核处处光滑，实际效果等价于"只受最近 2–4 口井支配"。
+    """
+    scale_m = float(config.get("well_weight_scale_m", 6000.0))
+    min_share = float(config.get("well_weight_min_share", 0.02))
+    names: list[str] = []
+    raw: list[float] = []
+    for well, entry in entries.items():
+        distance = float(np.hypot(x - float(entry["x"]), y - float(entry["y"])))
+        kernel = float(np.exp(-((distance / max(scale_m, 1.0)) ** 2)))
+        names.append(well)
+        raw.append(kernel * float(entry.get("sample_weight_scale", 1.0)))
+    weights = np.asarray(raw, dtype=np.float64)
+    if not np.isfinite(weights).all() or float(weights.sum()) <= 0.0:
+        weights = np.ones(len(names), dtype=np.float64)
+    weights = weights / weights.sum()
+    keep = weights >= min_share
+    if not keep.any():
+        keep = np.zeros(len(names), dtype=bool)
+        keep[int(np.argmax(weights))] = True
+    names = [name for name, flag in zip(names, keep) if flag]
+    weights = weights[keep]
+    weights = weights / weights.sum()
+    return names, weights
+
+
+class CoherentUniformField:
+    """空间相关的均匀随机场：粗格随机数 → 高斯平滑 → 双线性插值（决策 D2 的落地关键）。
+
+    逐片独立抽井会让相邻片随机来自不同井，看起来仍然"乱"；用一张平滑随机场做分位点，
+    相邻片就会倾向抽到同一口井，形成**空间连贯的产状域**。
+    """
+
+    def __init__(self, xs: np.ndarray, ys: np.ndarray, spacing_m: float, seed: int, sigma_cells: float = 1.0) -> None:
+        self.spacing = max(float(spacing_m), 1.0)
+        x0 = float(np.nanmin(xs)) - self.spacing
+        x1 = float(np.nanmax(xs)) + self.spacing
+        y0 = float(np.nanmin(ys)) - self.spacing
+        y1 = float(np.nanmax(ys)) + self.spacing
+        self.x0, self.y0 = x0, y0
+        self.nx = max(int(np.ceil((x1 - x0) / self.spacing)) + 1, 3)
+        self.ny = max(int(np.ceil((y1 - y0) / self.spacing)) + 1, 3)
+        rng = np.random.default_rng(int(seed))
+        coarse = rng.random((self.ny, self.nx))
+        self.field = gaussian_filter(coarse, sigma=float(max(sigma_cells, 0.0)), mode="nearest")
+        lo, hi = float(self.field.min()), float(self.field.max())
+        self.field = (self.field - lo) / max(hi - lo, 1e-12)
+
+    def value(self, x: float, y: float) -> float:
+        fx = (float(x) - self.x0) / self.spacing
+        fy = (float(y) - self.y0) / self.spacing
+        ix = int(np.clip(np.floor(fx), 0, self.nx - 2))
+        iy = int(np.clip(np.floor(fy), 0, self.ny - 2))
+        tx = float(np.clip(fx - ix, 0.0, 1.0))
+        ty = float(np.clip(fy - iy, 0.0, 1.0))
+        v00 = self.field[iy, ix]
+        v10 = self.field[iy, ix + 1]
+        v01 = self.field[iy + 1, ix]
+        v11 = self.field[iy + 1, ix + 1]
+        top = v00 * (1.0 - tx) + v10 * tx
+        bottom = v01 * (1.0 - tx) + v11 * tx
+        return float(np.clip(top * (1.0 - ty) + bottom * ty, 0.0, 1.0 - 1e-9))
+
+
+def sample_statistical_orientation(
+    names: list[str],
+    weights: np.ndarray,
+    entries: dict[str, dict[str, Any]],
+    quantile: float,
+    config: dict[str, Any],
+    rng: np.random.Generator,
+) -> tuple[float, float, str]:
+    """按井权重在累积权重上反查井（用空间相关分位点），再从该井经验库采样 + 抖动。"""
+    cumulative = np.cumsum(weights)
+    index = int(np.searchsorted(cumulative, float(quantile), side="right"))
+    index = int(np.clip(index, 0, len(names) - 1))
+    well = names[index]
+    entry = entries[well]
+    dip_azimuth_pool = np.asarray(entry["dip_azimuth_deg"], dtype=np.float64)
+    dip_pool = np.asarray(entry["dip_deg"], dtype=np.float64)
+    pick = int(rng.integers(0, len(dip_pool)))
+    azimuth = (float(dip_azimuth_pool[pick]) + float(rng.normal(0.0, float(config.get("azimuth_jitter_std_deg", 8.0))))) % 360.0
+    dip = float(dip_pool[pick]) + float(rng.normal(0.0, float(config.get("dip_jitter_std_deg", 5.0))))
+    dip = float(np.clip(dip, float(config.get("dip_min_deg", 5.0)), float(config.get("dip_max_deg", 89.0))))
+    return azimuth, dip, well
+
+
+def fuse_local_geometry_beta(
+    dip_azimuth: float,
+    dip: float,
+    local: dict[str, Any],
+    config: dict[str, Any],
+) -> tuple[float, float, int, float, float]:
+    """决策 D3（β 方案）：**只在走向一致时小幅融合倾角**。
+
+    比较的是**走向**（轴向 0–180）而不是倾向方位——平面法向的正负本身是任意的，
+    用走向比较才稳健。不满足条件时完全忽略局部几何。
+    """
+    local_dip = float(local.get("dip", np.nan))
+    local_azimuth = float(local.get("dip_azimuth", np.nan))
+    quality = float(local.get("quality", 0.0))
+    if not (np.isfinite(local_dip) and np.isfinite(local_azimuth)):
+        return dip_azimuth, dip, 0, 0.0, float("nan")
+    strike_delta = orientation.axial_distance_deg(
+        orientation.strike_from_dip_azimuth(dip_azimuth),
+        orientation.strike_from_dip_azimuth(local_azimuth),
+    )
+    tolerance = float(config.get("local_geometry_strike_tolerance_deg", 30.0))
+    min_quality = float(config.get("local_geometry_min_quality", 0.5))
+    max_blend = float(config.get("local_geometry_dip_blend_max", 0.30))
+    if strike_delta <= tolerance and quality >= min_quality:
+        beta = max_blend * float(np.clip(quality, 0.0, 1.0))
+        blended_dip = float(
+            np.clip(
+                (1.0 - beta) * dip + beta * local_dip,
+                float(config.get("dip_min_deg", 5.0)),
+                float(config.get("dip_max_deg", 89.0)),
+            )
+        )
+        blended_azimuth = blend_dip_azimuth(dip_azimuth, local_azimuth, beta)
+        return blended_azimuth, blended_dip, 1, beta, strike_delta
+    return dip_azimuth, dip, 0, 0.0, strike_delta
 
 
 def local_gradient_ridge_orientation(
@@ -506,8 +601,8 @@ def main() -> int:
     patches_csv = output_dir / "fracture_patches.csv"
     vtk_path = output_dir / "fracture_patches.vtk"
     qc_csv = output_dir / "step7a_imaging_match_qc.csv"
-    families_json_path = output_dir / "orientation_families.json"
-    families_csv_path = output_dir / "orientation_families.csv"
+    families_json_path = output_dir / "orientation_well_library.json"
+    families_csv_path = output_dir / "orientation_well_library.csv"
     sampling_qc_path = output_dir / "step7a_sampling_qc.json"
     summary_path = output_dir / "step7a_summary.json"
     output_paths_to_check = (sampling_qc_path,) if args.sampling_qc_only else (
@@ -633,10 +728,11 @@ def main() -> int:
     orient_time_half = float(orient_cfg["time_half_span_ms"])
     orient_time_span = int(round(orient_time_half / (sample_axis[1] - sample_axis[0])))
     orient_density_fraction = float(orient_cfg["density_fraction"])
-    min_dip = float(orient_cfg["min_dip_deg"])
-    max_dip = float(orient_cfg["max_dip_deg"])
-    az_jitter = float(orient_cfg["azimuth_jitter_std_deg"])
-    dip_jitter = float(orient_cfg["dip_jitter_std_deg"])
+    # 2026-09-23：产状改由"井经验分布重采样"给出，倾角范围取自采样器的裁剪区间
+    # （旧键 min_dip_deg/max_dip_deg 只留作参考，不再参与门控——按成像实测分布，
+    #  真实的浅倾角（<25°）应当允许出现）。
+    dip_floor = float(orient_cfg.get("dip_min_deg", 5.0))
+    dip_ceil = float(orient_cfg.get("dip_max_deg", 89.0))
     sampling_rng = np.random.default_rng(int(sampling_cfg["random_seed"]))
     orientation_rng = np.random.default_rng(int(orient_cfg["random_seed"]))
 
@@ -926,44 +1022,78 @@ def main() -> int:
         print(json.dumps(json_ready(sampling_qc), ensure_ascii=False, indent=2))
         return 0 if sampling_qc["status"] == "pass" else 1
 
-    # --- orientation: multi-well families + local gradient/ridge evidence ---
+    # --- orientation: 按井经验分布重采样 + 局部几何 β 门控 ------------------------
+    # 方案：太古界/太古界DFN产状赋值逻辑修正方案_20260923.md（决策 D1–D4）
+    #   D1 全部成像点进库；D2 最近几口井高斯加权 + 空间相关抽井；
+    #   D3 局部几何只在走向一致时小幅融合倾角；D4 中尺度不动（本步不涉及）。
     imaging_points, orientation_join_qc = load_multiwell_orientation_points(
         Path(config["step3_groups_root"]),
         orient_cfg["imaging_wells_by_layer"],
         Path(config["step2_segments_root"]),
     )
     config["_orientation_join_qc"] = dict(orientation_join_qc)
-    orientation_families = build_orientation_families(imaging_points, orient_cfg)
+    well_library = build_well_orientation_library(
+        imaging_points, orient_cfg["imaging_wells_by_layer"], orient_cfg
+    )
+    library_audit = {
+        layer: {
+            well: {
+                "point_count": int(entry["point_count"]),
+                "x": float(entry["x"]),
+                "y": float(entry["y"]),
+                "sample_weight_scale": float(entry["sample_weight_scale"]),
+                "in_horizon_fraction": (
+                    None if not np.isfinite(entry["in_horizon_fraction"]) else float(entry["in_horizon_fraction"])
+                ),
+                "dip_azimuth_circular_mean_deg": float(entry["dip_azimuth_circular_mean_deg"]),
+                "dip_median_deg": float(entry["dip_median_deg"]),
+            }
+            for well, entry in entries.items()
+        }
+        for layer, entries in well_library.items()
+    }
     write_json(families_json_path, json_ready({
-        "method": "balanced_multiwell_fullcircle_dip_azimuth_kmeans",
+        "method": "per_well_empirical_dip_azimuth_library",
+        "note": "按井保留原始 (倾向方位, 倾角) 点集，不做聚类/平均（方案 D1）",
         "imaging_wells_by_layer": orient_cfg["imaging_wells_by_layer"],
         "point_count": int(len(imaging_points)),
-        "families": orientation_families,
+        "well_library": library_audit,
+        "well_weight": {
+            "kernel": str(orient_cfg.get("well_weight_kernel", "gaussian")),
+            "scale_m": float(orient_cfg.get("well_weight_scale_m", 6000.0)),
+            "min_share": float(orient_cfg.get("well_weight_min_share", 0.02)),
+        },
+        "coherent_assignment": {
+            "coherence_m": float(orient_cfg.get("well_assignment_coherence_m", 800.0)),
+            "seed": int(orient_cfg.get("well_assignment_seed", orient_cfg.get("random_seed", 20260822))),
+        },
+        "local_geometry_gate": {
+            "strike_tolerance_deg": float(orient_cfg.get("local_geometry_strike_tolerance_deg", 30.0)),
+            "dip_blend_max": float(orient_cfg.get("local_geometry_dip_blend_max", 0.30)),
+            "min_quality": float(orient_cfg.get("local_geometry_min_quality", 0.5)),
+        },
     }))
-    family_table_rows: list[dict[str, Any]] = []
-    for layer, layer_families in orientation_families.items():
-        for family in layer_families:
-            family_row = {key: value for key, value in family.items() if key != "well_contributions"}
-            family_row["LayerGroup"] = layer
-            family_row["source_wells"] = ",".join(item["well"] for item in family["well_contributions"])
-            family_row["well_contributions_json"] = json.dumps(family["well_contributions"], ensure_ascii=False)
-            family_table_rows.append(family_row)
-    pd.DataFrame(family_table_rows).to_csv(families_csv_path, index=False, encoding="utf-8-sig")
-    missing_family_layers = [
-        layer for layer in ("上部复合层", "太古界风化壳") if not orientation_families[layer]
+    library_rows: list[dict[str, Any]] = []
+    for layer, entries in library_audit.items():
+        for well, entry in entries.items():
+            library_rows.append({"LayerGroup": layer, "WellName": well, **entry})
+    pd.DataFrame(library_rows).to_csv(families_csv_path, index=False, encoding="utf-8-sig")
+    missing_library_layers = [
+        layer for layer in ("上部复合层", "太古界风化壳") if not well_library.get(layer)
     ]
-    if missing_family_layers:
-        print(f"[step7a] warning: no imaging family for {missing_family_layers}; using manual fallback", flush=True)
+    if missing_library_layers:
+        raise RuntimeError(f"no imaging well orientation library for {missing_library_layers}")
 
-    fallback = orient_cfg["fallback_family"]
-    family_distance_scale = float(orient_cfg["family_distance_scale_m"])
     gradient_quantile = float(orient_cfg["gradient_quantile"])
     gradient_smoothing_sigma = float(orient_cfg["gradient_smoothing_sigma"])
     gradient_time_scale = float(orient_cfg["gradient_time_scale_m_per_ms"])
-    local_high_quality = float(orient_cfg["local_high_quality"])
-    local_medium_quality = float(orient_cfg["local_medium_quality"])
-    medium_weight_min = float(orient_cfg["medium_local_weight_min"])
-    medium_weight_max = float(orient_cfg["medium_local_weight_max"])
+    coherent_field = CoherentUniformField(
+        np.asarray(grid.loc[accepted_rows, "X"], dtype=np.float64),
+        np.asarray(grid.loc[accepted_rows, "Y"], dtype=np.float64),
+        float(orient_cfg.get("well_assignment_coherence_m", 800.0)),
+        int(orient_cfg.get("well_assignment_seed", orient_cfg.get("random_seed", 20260822))),
+        float(orient_cfg.get("well_assignment_sigma_cells", 1.0)),
+    )
     dx_candidates = grid.groupby("IX")["X"].median().sort_index().diff().abs().dropna()
     dy_candidates = grid.groupby("IY")["Y"].median().sort_index().diff().abs().dropna()
     dx_m = float(dx_candidates[dx_candidates > 0].median())
@@ -983,6 +1113,12 @@ def main() -> int:
     selected_family_ids: list[str] = []
     orientation_confidences: list[float] = []
     family_probabilities: list[float] = []
+    well_draws: list[str] = []
+    well_weight_jsons: list[str] = []
+    effective_well_counts: list[float] = []
+    local_geometry_used: list[int] = []
+    local_geometry_blend_weights: list[float] = []
+    local_geometry_strike_deltas: list[float] = []
     orientation_chunk = 5000
     with segyio.open(str(density_sgy), "r", ignore_geometry=True) as handle:
         for chunk_start in range(0, len(accepted_rows), orientation_chunk):
@@ -1013,63 +1149,41 @@ def main() -> int:
                     density_fraction=orient_density_fraction, gradient_quantile=gradient_quantile,
                     smoothing_sigma=gradient_smoothing_sigma,
                 )
-                layer_families = orientation_families[layer]
-                if layer_families:
-                    selected_family, family_probability = choose_orientation_family(
-                        layer_families, float(grid.loc[row, "X"]), float(grid.loc[row, "Y"]),
-                        family_distance_scale, orientation_rng,
-                    )
-                    family_id = str(selected_family["family_id"])
-                    family_dip_azimuth = float(selected_family["dip_azimuth_deg"])
-                    family_dip = float(selected_family["dip_deg"])
-                    family_az_jitter = min(az_jitter, max(2.0, 0.35 * float(selected_family["azimuth_std_deg"])))
-                    family_dip_jitter = min(dip_jitter, max(1.0, 0.35 * float(selected_family["dip_std_deg"])))
-                else:
-                    selected_family = None
-                    family_probability = 1.0
-                    family_id = f"{layer}_manual_fallback"
-                    fallback_entry = fallback[layer]
-                    if "dip_azimuth_deg" in fallback_entry:
-                        family_dip_azimuth = float(fallback_entry["dip_azimuth_deg"])
-                    else:
-                        # 旧配置写的是走向，换算成倾向方位（2026-09-22 统一口径）
-                        family_dip_azimuth = orientation.dip_azimuth_from_strike(
-                            float(fallback_entry["azimuth_deg"])
-                        )
-                    family_dip = float(fallback_entry["dip_deg"])
-                    family_az_jitter, family_dip_jitter = az_jitter, dip_jitter
                 local_dip = float(local["dip"])
                 local_dip_azimuth = float(local["dip_azimuth"])
-                local_valid = (
-                    np.isfinite(local_dip)
-                    and np.isfinite(local_dip_azimuth)
-                    and min_dip <= local_dip <= max_dip
+                # D2：按最近的几口井高斯加权（权重随位置连续变化）
+                entry_pool = well_library.get(layer, {})
+                if not entry_pool:
+                    raise RuntimeError(f"no well orientation library for layer {layer}")
+                point_x = float(grid.loc[row, "X"])
+                point_y = float(grid.loc[row, "Y"])
+                well_names, well_weights = well_distance_weights(point_x, point_y, entry_pool, orient_cfg)
+                # D2：用空间相关随机场做分位点抽井 → 相邻片倾向同一口井，保持连续
+                quantile = coherent_field.value(point_x, point_y)
+                base_dip_azimuth, base_dip, well_draw = sample_statistical_orientation(
+                    well_names, well_weights, entry_pool, quantile, orient_cfg, orientation_rng
                 )
-                quality = float(local["quality"])
-                if local_valid and quality >= local_high_quality:
-                    base_dip_azimuth, base_dip = local_dip_azimuth, local_dip
-                    source, confidence = "local_gradient_ridge", quality
-                    azimuth_noise = family_az_jitter * 0.25 * (1.0 - quality)
-                    dip_noise = family_dip_jitter * 0.25 * (1.0 - quality)
-                elif local_valid and quality >= local_medium_quality:
-                    fraction = (quality - local_medium_quality) / max(local_high_quality - local_medium_quality, 1.0e-12)
-                    local_weight = medium_weight_min + fraction * (medium_weight_max - medium_weight_min)
-                    base_dip_azimuth = blend_dip_azimuth(
-                        family_dip_azimuth, local_dip_azimuth, local_weight
-                    )
-                    base_dip = (1.0 - local_weight) * family_dip + local_weight * local_dip
-                    source, confidence = "multiwell_local_blend", 0.5 * quality + 0.5 * family_probability
-                    azimuth_noise = family_az_jitter * (1.0 - local_weight)
-                    dip_noise = family_dip_jitter * (1.0 - local_weight)
+                # D3：局部几何只在走向一致时小幅融合倾角
+                dip_azimuth, dip, used_local, beta, strike_delta = fuse_local_geometry_beta(
+                    base_dip_azimuth, base_dip, local, orient_cfg
+                )
+                if used_local:
+                    source = "statistical_well_resample_local_fused"
                 else:
-                    base_dip_azimuth, base_dip = family_dip_azimuth, family_dip
-                    source = "multiwell_family" if selected_family is not None else "manual_fallback"
-                    confidence = family_probability
-                    azimuth_noise, dip_noise = family_az_jitter, family_dip_jitter
-                dip_azimuth = float(
-                    (base_dip_azimuth + orientation_rng.normal(0.0, azimuth_noise)) % 360.0
+                    source = "statistical_well_resample"
+                confidence = float(np.clip(np.max(well_weights), 0.0, 1.0))
+                well_draws.append(well_draw)
+                well_weight_jsons.append(
+                    json.dumps({name: round(float(weight), 6) for name, weight in zip(well_names, well_weights)}, ensure_ascii=False)
                 )
-                dip = float(np.clip(base_dip + orientation_rng.normal(0.0, dip_noise), min_dip, max_dip))
+                effective_well_counts.append(1.0 / max(float(np.sum(np.square(well_weights))), 1e-12))
+                local_geometry_used.append(int(used_local))
+                local_geometry_blend_weights.append(float(beta))
+                local_geometry_strike_deltas.append(
+                    float(strike_delta) if np.isfinite(strike_delta) else float("nan")
+                )
+                selected_family_ids.append(well_draw)
+                family_probabilities.append(float(confidence))
                 dip_azimuths.append(dip_azimuth)
                 dips.append(dip)
                 local_dips.append(local_dip)
@@ -1079,9 +1193,7 @@ def main() -> int:
                 local_ridge_strengths.append(float(local["ridge_strength"]))
                 local_support_counts.append(int(local["support_count"]))
                 orientation_sources.append(source)
-                selected_family_ids.append(family_id)
                 orientation_confidences.append(float(confidence))
-                family_probabilities.append(float(family_probability))
             del dens_by_row
             gc.collect()
             print(f"[step7a] orientation chunk {chunk_start}:{chunk_end} of {len(accepted_rows)}", flush=True)
@@ -1123,6 +1235,13 @@ def main() -> int:
             "OrientationFamily": selected_family_ids,
             "OrientationConfidence": orientation_confidences,
             "OrientationFamilyProbability": family_probabilities,
+            # 方案 20260923 的审计列（D2/D3 的可追溯性）
+            "OrientationWellDraw": well_draws,
+            "OrientationWellWeights": well_weight_jsons,
+            "OrientationEffectiveWellCount": effective_well_counts,
+            "LocalGeometryUsed": local_geometry_used,
+            "LocalGeometryBlendWeight": local_geometry_blend_weights,
+            "LocalGeometryStrikeDeltaDeg": local_geometry_strike_deltas,
             "PatchLengthM": lengths,
             "PatchHeightMs": heights,
             "PatchAreaM2": areas,
@@ -1177,11 +1296,9 @@ def main() -> int:
         "FractureScale": np.full(len(patches), 1, dtype=np.int32),
         "WindowCode": np.full(len(patches), 1, dtype=np.int32),
         "OrientationSourceCode": patches["OrientationSource"].map({
-            "local_gradient_ridge": 1,
-            "multiwell_local_blend": 2,
-            "multiwell_family": 3,
-            "manual_fallback": 4,
-        }).to_numpy(dtype=np.int32),
+            "statistical_well_resample": 1,
+            "statistical_well_resample_local_fused": 2,
+        }).fillna(0).to_numpy(dtype=np.int32),
         "OrientationFamilyCode": pd.factorize(patches["OrientationFamily"], sort=True)[0].astype(np.int32) + 1,
         "OrientationConfidence": patches["OrientationConfidence"].to_numpy(dtype=np.float64),
         "LocalGradientStrength": patches["LocalGradientStrength"].to_numpy(dtype=np.float64),
@@ -1293,7 +1410,7 @@ def main() -> int:
                 atol=1e-9,
             )
         ),
-        "dip_min_constraint": bool((patches["DipDeg"] >= min_dip - 1.0e-6).all()),
+        "dip_min_constraint": bool((patches["DipDeg"] >= dip_floor - 1.0e-6).all() and (patches["DipDeg"] <= dip_ceil + 1.0e-6).all()),
         "geometry_finite": bool(np.isfinite(patches[["X", "Y", "TIME", "PatchAreaM2"]]).all().all()),
         "imaging_match_qc_exists": qc_csv.exists(),
         "orientation_point_join_has_no_unmatched": int(
@@ -1320,8 +1437,8 @@ def main() -> int:
             "patches_vtk": str(vtk_path),
             "imaging_match_qc_csv": str(qc_csv),
             "sampling_qc_json": str(sampling_qc_path),
-            "orientation_families_json": str(families_json_path),
-            "orientation_families_csv": str(families_csv_path),
+            "orientation_well_library_json": str(families_json_path),
+            "orientation_well_library_csv": str(families_csv_path),
             "summary_json": str(summary_path),
         },
         "step6a_input": {
@@ -1366,12 +1483,25 @@ def main() -> int:
             },
         },
         "orientation": {
-            "method": "multiwell_families_plus_local_gradient_ridge",
+            "method": "per_well_empirical_resample_plus_beta_gated_local_geometry",
             "imaging_point_count": int(len(imaging_points)),
-            "family_definitions": orientation_families,
+            "well_library": library_audit,
+            "well_weights_config": {
+                "scale_m": float(orient_cfg.get("well_weight_scale_m", 6000.0)),
+                "min_share": float(orient_cfg.get("well_weight_min_share", 0.02)),
+                "coherence_m": float(orient_cfg.get("well_assignment_coherence_m", 800.0)),
+                "strike_tolerance_deg": float(orient_cfg.get("local_geometry_strike_tolerance_deg", 30.0)),
+                "dip_blend_max": float(orient_cfg.get("local_geometry_dip_blend_max", 0.30)),
+            },
+            "well_draw_counts": patches["OrientationWellDraw"].value_counts().to_dict(),
+            "local_geometry_used_fraction": float(np.mean(patches["LocalGeometryUsed"])),
+            "effective_well_count_stats": {
+                "min": float(np.nanmin(patches["OrientationEffectiveWellCount"])),
+                "median": float(np.nanmedian(patches["OrientationEffectiveWellCount"])),
+                "max": float(np.nanmax(patches["OrientationEffectiveWellCount"])),
+            },
             "source_counts": patches["OrientationSource"].value_counts().to_dict(),
             "family_counts": patches["OrientationFamily"].value_counts().to_dict(),
-            "local_quality_thresholds": {"medium": local_medium_quality, "high": local_high_quality},
             "dip_stats": {"min": float(patches["DipDeg"].min()), "max": float(patches["DipDeg"].max()), "mean": float(patches["DipDeg"].mean())},
             "dip_azimuth_stats": {
                 "min": float(patches["DipAzimuthDeg"].min()),

@@ -1,0 +1,32 @@
+{
+  "version": "taigu_step6d_multiscale_quanqu1",
+  "model_contract_version": "taigu_step6a_attribute_v3_v4",
+  "compact_multiscale_flow": false,
+  "step6a_dir": "/home/tyh/projects/petroleum/code/GAN-DFN/太古界/step6a_density_volume/output/taigu_step6a_small_background_quanqu1",
+  "step6b_dir": "/home/tyh/projects/petroleum/code/GAN-DFN/太古界/step6b_medium_corridor/output/taigu_medium_v7_anttrack_led_quanqu1",
+  "step6c_dir": "/home/tyh/projects/petroleum/code/GAN-DFN/太古界/step6c_large_fault/output/taigu_step6c_large_v3_attribute_v3_quanqu1",
+  "small_score_sgy": "/home/tyh/projects/petroleum/code/GAN-DFN/太古界/step6a_density_volume/output/taigu_step6a_small_background_quanqu1/small_background_score.sgy",
+  "small_qc": "/home/tyh/projects/petroleum/code/GAN-DFN/太古界/step6a_density_volume/output/taigu_step6a_small_background_quanqu1/small_background_qc.json",
+  "input_density_sgy": "/home/tyh/projects/petroleum/code/GAN-DFN/太古界/step6a_density_volume/output/taigu_step6a_attribute_v3_full_quanqu1/volume/predicted_fracture_density.sgy",
+  "trace_mapping_npz": "/home/tyh/projects/petroleum/code/GAN-DFN/太古界/common/attribute_demo_grid/output/taigu_attribute_grid_quanqu1/attribute_demo_grid_mapping.npz",
+  "horizon_contract_table": "/home/tyh/projects/petroleum/code/GAN-DFN/太古界/common/horizon_contract/output/taigu_attribute_full_horizon_contract_v1/demo_horizon_contract.npy",
+  "output_dir": "/home/tyh/projects/petroleum/code/GAN-DFN/太古界/step6d_multiscale_bundle/output/taigu_step6d_multiscale_quanqu1",
+  "small_weight": 0.35,
+  "medium_weight": 0.55,
+  "large_weight": 1.0,
+  "medium_damage_boost": 0.35,
+  "large_damage_boost": 0.5,
+  "medium_damage_outer_decay": 0.45,
+  "large_damage_outer_decay": 0.35,
+  "medium_core_attenuation": 0.35,
+  "large_core_attenuation": 0.65,
+  "background_floor": 0.06,
+  "background_dynamic_weight": 0.85,
+  "final_small_candidate_quantile": 0.82,
+  "_note": "quanqu1（2026-09-23）：**太古界矿区/全区**范围（1650×1307 = 2,156,550 道，X 658887–679500 / Y 4231662–4247987）。预测范围由全区格网 taigu_attribute_grid_quanqu1 决定；模型沿用 md1 训练产物（Step5 训练样本本就是全区尺度，无需重训）。 ｜ 2026-09-23 方案A：矿区尺度只写下游实际消费的 background_small_density.sgy 与 large_damage_small_density.sgy（+summary），并跳过 multiscale_prior_bundle.npz，避免 6D 占用约 159 GB。",
+  "written_volumes": [
+    "background_small_density",
+    "large_damage_small_density"
+  ],
+  "write_prior_bundle_npz": false
+}
