@@ -57,3 +57,9 @@ reference/
 docs/*.docx
 # 专利交底书/技术方案（未申请前不得公开，仓库为 public）。
 优化阶段二/正式主线/专利思考/
+
+# 对外交付压缩包（约 582 MB，超过 GitHub 单文件 100 MB 上限，严禁入库）；
+# 同目录的解压说明 markdown 仍纳入版本管理。
+delivery/*.tar.gz
+delivery/*.tar
+delivery/*.zip
