@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import re
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -11,7 +12,16 @@ import pandas as pd
 from scipy.spatial import cKDTree
 
 
-SURFACE_CODES = ("T4", "T5", "T6", "T7")
+FORMAL_ROOT = Path(__file__).resolve().parents[1]
+if str(FORMAL_ROOT) not in sys.path:
+    sys.path.insert(0, str(FORMAL_ROOT))
+
+from common.strata_framework import load_framework  # noqa: E402
+
+
+FRAMEWORK = load_framework()
+# 砂砾岩正式 ID 保留 T4/T5/T6/T7，但由框架声明，不再写死在代码里
+SURFACE_CODES = FRAMEWORK.surface_ids()
 UPDATED_SURFACE_HINTS = ("20240715", "DM_Sm", "Ato", "gljm", "di_zhen", "dizhen")
 SURFACE_CODE_PATTERN = re.compile(r"^(T\d+)", flags=re.IGNORECASE)
 CSV_ENCODINGS = ("utf-8-sig", "utf-8", "gb18030", "gbk")
@@ -136,17 +146,32 @@ def assign_surface_times(records_df: pd.DataFrame, surfaces: dict[str, dict[str,
 
 
 def classify_time_domain(records_df: pd.DataFrame) -> pd.DataFrame:
+    """按框架地层单元给样本打 TimeDomainClass。
+
+    注意：Step1/Step2 历史上对所有层都用左闭右开区间（time < base），
+    与层窗契约里最末一层 inclusive_base=True 略有差异；这里保持原行为不变。
+    """
     work_df = records_df.copy()
     time_arr = pd.to_numeric(work_df["TIME"], errors="coerce").to_numpy(dtype=float)
-    t4_arr = pd.to_numeric(work_df["T4_TIME"], errors="coerce").to_numpy(dtype=float)
-    t6_arr = pd.to_numeric(work_df["T6_TIME"], errors="coerce").to_numpy(dtype=float)
-    t7_arr = pd.to_numeric(work_df["T7_TIME"], errors="coerce").to_numpy(dtype=float)
-
     labels = np.full(len(work_df), "out_of_target", dtype=object)
-    mask_sha3 = np.isfinite(time_arr) & np.isfinite(t4_arr) & np.isfinite(t6_arr) & (time_arr >= t4_arr) & (time_arr < t6_arr)
-    mask_sha4 = np.isfinite(time_arr) & np.isfinite(t6_arr) & np.isfinite(t7_arr) & (time_arr >= t6_arr) & (time_arr < t7_arr)
-    labels[mask_sha3] = "sha3_t4_t6"
-    labels[mask_sha4] = "sha4_t6_t7"
+    for layer in FRAMEWORK.layers:
+        top_col = f"{FRAMEWORK.surface(layer.top).column}_TIME"
+        base_col = f"{FRAMEWORK.surface(layer.base).column}_TIME"
+        if top_col not in work_df.columns or base_col not in work_df.columns:
+            raise ValueError(
+                f"classify_time_domain missing surface columns {top_col}/{base_col}"
+            )
+        top = pd.to_numeric(work_df[top_col], errors="coerce").to_numpy(dtype=float)
+        base = pd.to_numeric(work_df[base_col], errors="coerce").to_numpy(dtype=float)
+        mask = (
+            np.isfinite(time_arr)
+            & np.isfinite(top)
+            & np.isfinite(base)
+            & (time_arr >= top)
+            & (time_arr < base)
+        )
+        if layer.time_class:
+            labels[mask] = layer.time_class
     work_df["TimeDomainClass"] = labels
     return work_df
 

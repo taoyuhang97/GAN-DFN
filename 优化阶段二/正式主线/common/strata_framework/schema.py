@@ -54,6 +54,8 @@ class Layer:
     extension_ms: float = 0.0
     # 该层是否参与叠加（逐道）的列名；砂砾岩沿用 ShasanPresent/ShasiPresent
     presence_column: str | None = None
+    # 时间域分类键（Step1/Step2 的 TimeDomainClass），如 sha3_t4_t6
+    time_class: str | None = None
 
     def interval_label(self) -> str:
         return f"{self.top}->{self.base}"
@@ -141,6 +143,10 @@ class StrataFramework:
     def layer_code_map(self) -> dict[str, int]:
         """层名 → int 编码（替换散落在各步骤里的 LAYER_CODE 常量）。"""
         return {item.name: item.code for item in self.layers}
+
+    def time_class_map(self) -> dict[str, str]:
+        """time_class → 层名（替换 CLASS_TO_LAYER_GROUP 硬编码）。"""
+        return {item.time_class: item.name for item in self.layers if item.time_class}
 
     def legacy_presence_columns(self) -> tuple[str, ...]:
         return tuple(item.presence_column for item in self.layers if item.presence_column)

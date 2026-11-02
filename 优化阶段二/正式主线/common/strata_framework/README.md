@@ -78,10 +78,21 @@ fw.layer("Shasi")    # == fw.layer("沙四段")
 - Step5B/Step6/Step7B-initial/Step8 的 `ALLOWED_LAYERS` 改为框架派生；
 - 等价性验证脚本：`scripts/verify_strata_framework.py`。
 
-待做（后续阶段）：
+已完成（第 2 阶段，Step1–5）：
 
-- Step1 `surface_tools.py` 的 `SURFACE_CODES`、Step2 的 `T4Time..T7Time` 列；
-- Step3/4 的地层分组与专家库注册；
+- Step1 `surface_tools.py`：`SURFACE_CODES` 来自框架；
+  `classify_time_domain` 遍历 `framework.layers`（保留原有左闭右开语义）；
+- Step1 `attach_sample_horizons.py`：`TIME_OUTPUT_MAP` / `CLASS_TO_LAYER_GROUP` 由框架派生；
+- Step2 `build_real_well_t4_t7_samples.py`：`TIME_CLASS_TO_LAYER`、
+  `T4Time..T7Time` 列、井界面的 `*_DEPT/TVD/TIME` 由框架遍历生成；
+- Step4 四个专家脚本：`TARGET_STRATA` 来自框架（六专家脚本复用 v2 的定义）；
+- Step5A `build_single_source_virtual_wells.py`：新增 `layer_bounds()`，
+  去掉两处 `np.where(strata == "沙三段", ...)`；
+- Step3 `build_formal_rebuild_groups.py`：`MANUAL_STRATA` 的地层名按框架校验。
+- 验证脚本：`scripts/verify_strata_step1_5.py`。
+
+待做（第 3 阶段）：
+
 - Step6B/C 的 `T4-T7 / Shasan / Shasi` 掩膜分支；
 - Step7A 的 2 处层段映射、Step9 的 `T4->T6` 图例字符串；
 - Step9b 的 `LAYERS / LAYER_HORIZONS`；

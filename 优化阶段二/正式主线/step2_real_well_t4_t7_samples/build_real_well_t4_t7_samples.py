@@ -37,7 +37,13 @@ SURFACE_TOOL_DIR = CURRENT_DIR.parent / "step1_surface_framework"
 if str(SURFACE_TOOL_DIR) not in sys.path:
     sys.path.insert(0, str(SURFACE_TOOL_DIR))
 
-from surface_tools import assign_surface_times, classify_time_domain, load_surface_tables, validate_surface_order  # noqa: E402
+from surface_tools import (  # noqa: E402
+    FRAMEWORK,
+    assign_surface_times,
+    classify_time_domain,
+    load_surface_tables,
+    validate_surface_order,
+)
 
 
 @dataclass(frozen=True)
@@ -69,10 +75,8 @@ WELL_ALIAS_MAP = {
     "导眼井": "车页1导眼",
     "车页1HF": "车页1导眼",
 }
-TIME_CLASS_TO_LAYER = {
-    "sha3_t4_t6": "沙三段",
-    "sha4_t6_t7": "沙四段",
-}
+TIME_CLASS_TO_LAYER = FRAMEWORK.time_class_map()
+SURFACE_TIME_COLUMNS = tuple(f"{surface.column}Time" for surface in FRAMEWORK.surfaces)
 ATTRIBUTE_VALUE_RULES = {
     "SeisAmp": {"min": -1.0e5, "max": 1.0e5},
     "Coherence": {"min": 0.0, "max": 1.0e3},
@@ -499,10 +503,10 @@ def build_point_rows_for_well(
     out_df["LayerGroup"] = out_df["TimeDomainClass"].map(TIME_CLASS_TO_LAYER).fillna("OUT_OF_TARGET")
     out_df["InTargetT4T7"] = out_df["TimeDomainClass"].isin(TIME_CLASS_TO_LAYER.keys()) & out_df["Check_All"].fillna(False)
     out_df["SurfaceOrderValid"] = out_df["Check_Order_T4_T5_T6_T7"].fillna(False)
-    out_df["T4Time"] = pd.to_numeric(out_df["T4_TIME"], errors="coerce")
-    out_df["T5Time"] = pd.to_numeric(out_df["T5_TIME"], errors="coerce")
-    out_df["T6Time"] = pd.to_numeric(out_df["T6_TIME"], errors="coerce")
-    out_df["T7Time"] = pd.to_numeric(out_df["T7_TIME"], errors="coerce")
+    for surface in FRAMEWORK.surfaces:
+        out_df[f"{surface.column}Time"] = pd.to_numeric(
+            out_df[f"{surface.column}_TIME"], errors="coerce"
+        )
 
     summary = {
         "WellName": well_name,
@@ -555,11 +559,15 @@ def build_interval_table(point_df: pd.DataFrame) -> pd.DataFrame:
         idx = dist.idxmin()
         return point_df.loc[idx]
 
-    t4_row = nearest_row("T4Time")
-    t5_row = nearest_row("T5Time")
-    t6_row = nearest_row("T6Time")
-    t7_row = nearest_row("T7Time")
-    coverage_class = "FULL_T4_T7" if set(point_df["LayerGroup"].dropna().astype(str)) >= {"沙三段", "沙四段"} else "PARTIAL_T4_T7"
+    boundary_rows = {
+        surface.column: nearest_row(f"{surface.column}Time")
+        for surface in FRAMEWORK.surfaces
+    }
+    coverage_class = (
+        "FULL_T4_T7"
+        if set(point_df["LayerGroup"].dropna().astype(str)) >= set(FRAMEWORK.layer_names())
+        else "PARTIAL_T4_T7"
+    )
 
     def get_boundary_value(row: pd.Series, row_col: str, surface_col: str) -> float:
         if row.empty:
@@ -568,24 +576,18 @@ def build_interval_table(point_df: pd.DataFrame) -> pd.DataFrame:
             return float(pd.to_numeric(row.get(surface_col), errors="coerce"))
         return float(pd.to_numeric(row.get(row_col), errors="coerce"))
 
-    row = {
+    row: dict[str, Any] = {
         "WellName": str(point_df["WellName"].iloc[0]),
         "CanonicalWellName": str(point_df["WellName"].iloc[0]),
         "SourceKind": str(point_df["SourceKind"].iloc[0]) if "SourceKind" in point_df.columns else "",
         "CoverageClass": coverage_class,
-        "T4_DEPT": get_boundary_value(t4_row, "DEPT", "T4Time"),
-        "T4_TVD": get_boundary_value(t4_row, "TVD", "T4Time"),
-        "T4_TIME": get_boundary_value(t4_row, "TIME", "T4Time"),
-        "T5_DEPT": get_boundary_value(t5_row, "DEPT", "T5Time"),
-        "T5_TVD": get_boundary_value(t5_row, "TVD", "T5Time"),
-        "T5_TIME": get_boundary_value(t5_row, "TIME", "T5Time"),
-        "T6_DEPT": get_boundary_value(t6_row, "DEPT", "T6Time"),
-        "T6_TVD": get_boundary_value(t6_row, "TVD", "T6Time"),
-        "T6_TIME": get_boundary_value(t6_row, "TIME", "T6Time"),
-        "T7_DEPT": get_boundary_value(t7_row, "DEPT", "T7Time"),
-        "T7_TVD": get_boundary_value(t7_row, "TVD", "T7Time"),
-        "T7_TIME": get_boundary_value(t7_row, "TIME", "T7Time"),
     }
+    for surface in FRAMEWORK.surfaces:
+        boundary = boundary_rows[surface.column]
+        time_column = f"{surface.column}Time"
+        row[f"{surface.column}_DEPT"] = get_boundary_value(boundary, "DEPT", time_column)
+        row[f"{surface.column}_TVD"] = get_boundary_value(boundary, "TVD", time_column)
+        row[f"{surface.column}_TIME"] = get_boundary_value(boundary, "TIME", time_column)
     return pd.DataFrame([row])
 
 

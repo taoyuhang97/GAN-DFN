@@ -18,9 +18,13 @@ STEP2_OUTER_ROOT = REPO_ROOT / "优化阶段二/正式主线/step2_real_well_t4_
 STEP2_SCRIPT_ROOT = REPO_ROOT / "优化阶段二/正式主线/step2_real_well_t4_t7_samples"
 STEP3_OUTPUT_ROOT = Path(__file__).resolve().parent / "output/formal_rebuild"
 GROUP_OUTPUT_ROOT = STEP3_OUTPUT_ROOT / "groups"
+FORMAL_ROOT = Path(__file__).resolve().parent.parent
+if str(FORMAL_ROOT) not in sys.path:
+    sys.path.insert(0, str(FORMAL_ROOT))
 if str(STEP2_SCRIPT_ROOT) not in sys.path:
     sys.path.insert(0, str(STEP2_SCRIPT_ROOT))
 
+from common.strata_framework import load_framework  # noqa: E402
 from build_gr_resistivity_samples import OUTPUT_COLUMNS as GR_RESISTIVITY_TABLE_COLUMNS  # noqa: E402
 from build_gr_resistivity_samples import run_enrichment  # noqa: E402
 
@@ -159,6 +163,17 @@ MANUAL_STRATA = [
     ("车页1导眼", "沙三段", 3500.0, 3734.0),
     ("车页1导眼", "沙四段", 3734.0, 3750.0),
 ]
+
+# 地层名必须来自地层框架；新增/改名地层时这里会立刻报错，而不是静默漏组
+_FRAMEWORK = load_framework()
+_UNKNOWN_STRATA = {
+    strata_name for _, strata_name, _, _ in MANUAL_STRATA
+} - set(_FRAMEWORK.layer_names())
+if _UNKNOWN_STRATA:
+    raise RuntimeError(
+        f"MANUAL_STRATA uses unknown strata {sorted(_UNKNOWN_STRATA)}; "
+        f"framework={_FRAMEWORK.framework_id} layers={_FRAMEWORK.layer_names()}"
+    )
 
 
 @dataclass

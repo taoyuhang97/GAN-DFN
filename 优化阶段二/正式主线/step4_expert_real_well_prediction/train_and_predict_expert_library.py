@@ -29,13 +29,18 @@ from sklearn.pipeline import Pipeline
 
 CURRENT_DIR = Path(__file__).resolve().parent
 REPO_ROOT = CURRENT_DIR.parents[2]
+FORMAL_ROOT = CURRENT_DIR.parent
+if str(FORMAL_ROOT) not in sys.path:
+    sys.path.insert(0, str(FORMAL_ROOT))
+from common.strata_framework import load_framework  # noqa: E402
+
 STEP2_ROOT_DEFAULT = (
     REPO_ROOT / "优化阶段二/正式主线/step2_real_well_t4_t7_samples/output/formal_all_wells"
 )
 STEP3_GROUPS_DEFAULT = (
     REPO_ROOT / "优化阶段二/正式主线/step3_imaging_supervision_samples/output/formal_rebuild/groups"
 )
-TARGET_STRATA = ["沙三段", "沙四段"]
+TARGET_STRATA = list(load_framework().layer_names())
 DEFAULT_HOLDOUT_WELL = "车页1导眼"
 DEFAULT_FEATURE_COLUMNS = [
     "AC",

@@ -17,6 +17,7 @@ if str(CURRENT_DIR) not in sys.path:
 
 from surface_tools import (  # noqa: E402
     DEFAULT_MIN_THICKNESS,
+    FRAMEWORK,
     assign_surface_times,
     choose_surface_files,
     classify_time_domain,
@@ -27,16 +28,14 @@ from surface_tools import (  # noqa: E402
 
 REQUIRED_INPUT_COLUMNS = ["X", "Y", "TIME"]
 TIME_OUTPUT_MAP = {
-    "T4_TIME": "T4Time",
-    "T5_TIME": "T5Time",
-    "T6_TIME": "T6Time",
-    "T7_TIME": "T7Time",
+    f"{surface.column}_TIME": f"{surface.column}Time"
+    for surface in FRAMEWORK.surfaces
 }
 CLASS_TO_LAYER_GROUP = {
-    "sha3_t4_t6": "沙三段",
-    "sha4_t6_t7": "沙四段",
+    **FRAMEWORK.time_class_map(),
     "out_of_target": "OUT_OF_TARGET",
 }
+TARGET_TIME_CLASSES = tuple(FRAMEWORK.time_class_map())
 
 
 def parse_args() -> argparse.Namespace:
@@ -86,7 +85,7 @@ def enrich_samples(input_df: pd.DataFrame, layer_dir: Path, min_thickness: float
     work_df = validate_surface_order(work_df, min_thickness=min_thickness)
 
     work_df["LayerGroup"] = work_df["TimeDomainClass"].map(CLASS_TO_LAYER_GROUP).fillna("OUT_OF_TARGET")
-    work_df["InTargetT4T7"] = work_df["TimeDomainClass"].isin(["sha3_t4_t6", "sha4_t6_t7"]) & work_df["Check_All"].fillna(False)
+    work_df["InTargetT4T7"] = work_df["TimeDomainClass"].isin(TARGET_TIME_CLASSES) & work_df["Check_All"].fillna(False)
     work_df["SurfaceOrderValid"] = work_df["Check_Order_T4_T5_T6_T7"].fillna(False)
     work_df["InputRowValid"] = ~work_df[REQUIRED_INPUT_COLUMNS].isna().any(axis=1)
 

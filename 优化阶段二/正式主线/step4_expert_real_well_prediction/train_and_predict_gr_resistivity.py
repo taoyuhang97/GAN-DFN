@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import json
 import shutil
+import sys
 import tempfile
 from pathlib import Path
 from typing import Any
@@ -34,7 +35,12 @@ from sklearn.metrics import (
 
 
 CURRENT_DIR = Path(__file__).resolve().parent
-TARGET_STRATA = ("沙三段", "沙四段")
+FORMAL_ROOT = CURRENT_DIR.parent
+if str(FORMAL_ROOT) not in sys.path:
+    sys.path.insert(0, str(FORMAL_ROOT))
+from common.strata_framework import load_framework  # noqa: E402
+
+TARGET_STRATA = tuple(load_framework().layer_names())
 INVALID_SENTINELS = (-999.25, -9999.0, -99999.0, 9999.0, 99999.0)
 IDENTITY_COLUMNS = ["SampleID", "WellName", "X", "Y", "TIME", "TVD", "DEPT", "StrataName"]
 BASE_LOG_COLUMNS = ["GR", "RDeep", "RNear"]

@@ -32,7 +32,7 @@ from build_real_well_t4_t7_samples import (  # noqa: E402
     offset_to_axis_label,
     sample_trace_at_time,
 )
-from surface_tools import load_surface_tables  # noqa: E402
+from surface_tools import FRAMEWORK, load_surface_tables  # noqa: E402
 
 
 ATTRIBUTE_COLUMNS = ["SeisAmp", "Coherence", "AntTrack", "CurvatureMax"]
@@ -101,7 +101,7 @@ def resolve_step4_inputs(manifest_path: Path) -> tuple[Path, Path, dict[str, Any
 def load_surface_contexts(layer_dir: Path) -> dict[str, SurfaceContext]:
     surfaces = load_surface_tables(layer_dir)
     contexts: dict[str, SurfaceContext] = {}
-    for code in ("T4", "T6", "T7"):
+    for code in FRAMEWORK.layer_surface_columns():
         if code not in surfaces:
             raise RuntimeError(f"missing required surface: {code}")
         table = surfaces[code]["table"]
@@ -110,6 +110,30 @@ def load_surface_contexts(layer_dir: Path) -> dict[str, SurfaceContext]:
         valid = np.isfinite(xy).all(axis=1) & np.isfinite(time)
         contexts[code] = SurfaceContext(code=code, time=time[valid], tree=KDTree(xy[valid]))
     return contexts
+
+
+def layer_bounds(
+    strata: np.ndarray,
+    surface_times: dict[str, np.ndarray],
+) -> tuple[np.ndarray, np.ndarray]:
+    """按框架的地层定义取 top/base；替换原来按 '沙三段' 写死的 np.where。"""
+    top = np.full(len(strata), np.nan, dtype=float)
+    base = np.full(len(strata), np.nan, dtype=float)
+    matched = np.zeros(len(strata), dtype=bool)
+    for layer in FRAMEWORK.layers:
+        mask = strata == layer.name
+        if not mask.any():
+            continue
+        matched |= mask
+        top[mask] = surface_times[FRAMEWORK.surface(layer.top).column][mask]
+        base[mask] = surface_times[FRAMEWORK.surface(layer.base).column][mask]
+    # 历史实现里 "非沙三段" 一律走沙四段的 T6/T7；保持该兜底行为不变
+    if not matched.all():
+        fallback = FRAMEWORK.layers[-1]
+        missing = ~matched
+        top[missing] = surface_times[FRAMEWORK.surface(fallback.top).column][missing]
+        base[missing] = surface_times[FRAMEWORK.surface(fallback.base).column][missing]
+    return top, base
 
 
 def query_surface_time(context: SurfaceContext, x: np.ndarray, y: np.ndarray) -> np.ndarray:
@@ -402,8 +426,7 @@ def prepare_source_cache(
         for code, context in surfaces.items()
     }
     strata = well_df["StrataName"].astype(str).to_numpy()
-    top = np.where(strata == "沙三段", surface_times["T4"], surface_times["T6"])
-    base = np.where(strata == "沙三段", surface_times["T6"], surface_times["T7"])
+    top, base = layer_bounds(strata, surface_times)
     thickness = base - top
     relative = np.divide(
         source_time - top,
@@ -435,8 +458,7 @@ def remap_virtual_time(
         code: query_surface_time(context, virtual_x, virtual_y)
         for code, context in surfaces.items()
     }
-    top = np.where(strata == "沙三段", surface_times["T4"], surface_times["T6"])
-    base = np.where(strata == "沙三段", surface_times["T6"], surface_times["T7"])
+    top, base = layer_bounds(strata, surface_times)
     thickness = base - top
     return top + relative * thickness
 

@@ -35,7 +35,7 @@ from xgboost import XGBClassifier, XGBRegressor
 import train_and_predict_gr_resistivity_strata_library as v2
 
 
-TARGET_STRATA = ("沙三段", "沙四段")
+TARGET_STRATA = tuple(v2.TARGET_STRATA)
 PAIR_TYPES = ("LLD_LLS", "RD_RS", "RILD_RILM")
 DIRECT_PAIR_TYPES = ("LLD_LLS", "RD_RS")
 MERGE_PAIR_PRIORITY = ("RD_RS", "LLD_LLS", "RILD_RILM")
