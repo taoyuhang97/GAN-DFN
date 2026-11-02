@@ -67,8 +67,13 @@ DEFAULT_OUTPUT_DIR = (
     / "output/step9b_dfn_density_metrics/formal_mine_multiscale_flow_v1"
 )
 
+from common.strata_framework import load_framework  # noqa: E402
+
+
+FRAMEWORK = load_framework()
 SCALES = ("small", "medium", "large")
-LAYERS = ("沙三段", "沙四段")
+LAYERS = FRAMEWORK.layer_names()
+LAYER_SLUG = FRAMEWORK.layer_slug_map()
 SCALE_APERTURE_RANGE_MM = {"small": (0.1, 1.0), "medium": (0.5, 2.0), "large": (1.0, 3.0)}
 SENSITIVITY_FACTORS = (0.5, 1.0, 2.0)
 CALIBRATION_LABELED_CSV = (
@@ -77,6 +82,11 @@ CALIBRATION_LABELED_CSV = (
 )
 CALIBRATION_WELL_XY = (578803.455, 4200232.011)
 CALIBRATION_INTERVALS = {"沙三段": (3500.0, 3734.0), "沙四段": (3734.0, 3750.0)}
+_UNKNOWN_CALIBRATION = set(CALIBRATION_INTERVALS) - set(LAYERS)
+if _UNKNOWN_CALIBRATION:
+    raise RuntimeError(
+        f"CALIBRATION_INTERVALS uses unknown layers {sorted(_UNKNOWN_CALIBRATION)}; framework={LAYERS}"
+    )
 
 
 def strip_parens(text: str) -> str:
@@ -451,7 +461,7 @@ def main() -> int:
     draw_heatmap(p33_mid_total, "P33 总密度（沙三+沙四，1 mm 档）", "p33_heatmap_total.png")
     for layer in LAYERS:
         values = p33_total[1.0][layer] * 1.0e6
-        suffix = "sha3" if layer == "沙三段" else "sha4"
+        suffix = LAYER_SLUG[layer]
         draw_heatmap(values, f"P33 {layer}（1 mm 档）", f"p33_heatmap_{suffix}.png")
 
     # Imaging-calibrated heatmaps: Sha3 / Sha4 / total, with ONE shared color
@@ -479,10 +489,9 @@ def main() -> int:
             else (float(np.percentile(combined, 95)) * 1.0e4 if combined.size else 1.0)
         )
         display_plan = [
-            ("沙三段", "sha3", "成像标定 P33 沙三段（车页1导眼基准）"),
-            ("沙四段", "sha4", "成像标定 P33 沙四段（车页1导眼基准）"),
-            ("total", "total", "成像标定 P33 整体（厚度加权）"),
-        ]
+            (layer, LAYER_SLUG[layer], f"成像标定 P33 {layer}（车页1导眼基准）")
+            for layer in LAYERS
+        ] + [("total", "total", "成像标定 P33 整体（厚度加权）")]
         for key, suffix, title in display_plan:
             values = cal_maps[key] * 1.0e4
             draw_heatmap(

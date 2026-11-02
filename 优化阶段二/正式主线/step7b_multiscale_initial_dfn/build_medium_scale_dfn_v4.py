@@ -27,6 +27,9 @@ from common.horizon_trace_table.horizon_contract import (  # noqa: E402
     surface_grids_from_contract,
     validate_window_contract,
 )
+from common.strata_framework import load_framework  # noqa: E402
+
+FRAMEWORK = load_framework()
 
 
 def parse_args() -> argparse.Namespace:
@@ -93,8 +96,9 @@ def layer_candidates(
             if yy.size == 0:
                 continue
             comp_score = prior[yy, xx, tt].astype(float)
-            top = surfaces["T4_TIME"][yy, xx] if layer == "沙三段" else surfaces["T6_TIME"][yy, xx]
-            base = surfaces["T6_TIME"][yy, xx] if layer == "沙三段" else surfaces["T7_TIME"][yy, xx]
+            top_column, base_column = FRAMEWORK.surface_pair(layer)
+            top = surfaces[f"{top_column}_TIME"][yy, xx]
+            base = surfaces[f"{base_column}_TIME"][yy, xx]
             frame = pd.DataFrame(
                 {
                     "LayerGroup": layer,
@@ -201,8 +205,9 @@ def component_candidates_from_step6b(
             keep = np.argpartition(geometry_priority, -max_points)[-max_points:]
             yy, xx, tt, scores, ant_scores = yy[keep], xx[keep], tt[keep], scores[keep], ant_scores[keep]
         for layer in legacy.ALLOWED_LAYERS:
-            top = surfaces["T4_TIME"][yy, xx] if layer == "沙三段" else surfaces["T6_TIME"][yy, xx]
-            base = surfaces["T6_TIME"][yy, xx] if layer == "沙三段" else surfaces["T7_TIME"][yy, xx]
+            top_column, base_column = FRAMEWORK.surface_pair(layer)
+            top = surfaces[f"{top_column}_TIME"][yy, xx]
+            base = surfaces[f"{base_column}_TIME"][yy, xx]
             time = grid["samples"][tt]
             in_layer = np.isfinite(top) & np.isfinite(base) & (time >= top) & (time <= base)
             if not in_layer.any():

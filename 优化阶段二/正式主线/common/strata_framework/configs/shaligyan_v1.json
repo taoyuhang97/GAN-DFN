@@ -22,7 +22,8 @@
       "inclusive_base": false,
       "extension_ms": 0.0,
       "presence_column": "ShasanPresent",
-      "time_class": "sha3_t4_t6"
+      "time_class": "sha3_t4_t6",
+      "slug": "sha3"
     },
     {
       "code": 4,
@@ -34,7 +35,8 @@
       "inclusive_base": true,
       "extension_ms": 0.0,
       "presence_column": "ShasiPresent",
-      "time_class": "sha4_t6_t7"
+      "time_class": "sha4_t6_t7",
+      "slug": "sha4"
     }
   ],
   "legacy_layer_aliases": {"Shasan": "沙三段", "Shasi": "沙四段"}

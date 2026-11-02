@@ -19,6 +19,7 @@ import pyvista as pv
 from matplotlib.collections import LineCollection
 
 from build_all_area_section_visualization import (
+    FRAMEWORK,
     INTERVAL_LABELS,
     ProjectionSegment,
     SurfaceSectionCurve,
@@ -523,8 +524,8 @@ def scan_vtk_intersections(args: SimpleNamespace, surfaces: dict[str, Any], well
             if interval is None:
                 window_mode = patch_window_mode_for_index(getattr(args, "dfn_patch_metadata", None), polygon_index)
                 layer = patch_layer_for_index(getattr(args, "dfn_patch_metadata", None), polygon_index)
-                if window_mode == "voxel_coverage" and layer in ("沙三段", "沙四段"):
-                    interval = "T4->T6" if layer == "沙三段" else "T6->T7"
+                if window_mode == "voxel_coverage" and layer in FRAMEWORK.layer_names():
+                    interval = FRAMEWORK.layer(layer).interval_label()
                     voxel_coverage_interval_exemptions += 1
                 else:
                     skipped_by_interval += 1

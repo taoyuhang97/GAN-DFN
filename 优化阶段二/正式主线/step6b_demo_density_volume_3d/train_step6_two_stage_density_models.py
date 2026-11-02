@@ -124,10 +124,19 @@ def attach_layer_time_features(df: pd.DataFrame, lookups: dict[str, tuple[cKDTre
     if work.empty:
         return work
     layer = work["LayerGroup"].astype(str)
-    is_sha3 = layer.eq("沙三段")
-    is_sha4 = layer.eq("沙四段")
-    work["LayerTopTime"] = np.where(is_sha3, work["T4_TIME"], np.where(is_sha4, work["T6_TIME"], np.nan))
-    work["LayerBaseTime"] = np.where(is_sha3, work["T6_TIME"], np.where(is_sha4, work["T7_TIME"], np.nan))
+    layer_values = layer.to_numpy()
+    top_time = np.full(len(work), np.nan, dtype=float)
+    base_time = np.full(len(work), np.nan, dtype=float)
+    for item in _FRAMEWORK.layers:
+        mask = layer_values == item.name
+        if not mask.any():
+            continue
+        top_column = f"{_FRAMEWORK.surface(item.top).column}_TIME"
+        base_column = f"{_FRAMEWORK.surface(item.base).column}_TIME"
+        top_time[mask] = pd.to_numeric(work[top_column], errors="coerce").to_numpy()[mask]
+        base_time[mask] = pd.to_numeric(work[base_column], errors="coerce").to_numpy()[mask]
+    work["LayerTopTime"] = top_time
+    work["LayerBaseTime"] = base_time
     work["LayerThickness"] = work["LayerBaseTime"] - work["LayerTopTime"]
     work["TimeSinceTop"] = work["TIME"] - work["LayerTopTime"]
     work["TimeToBase"] = work["LayerBaseTime"] - work["TIME"]

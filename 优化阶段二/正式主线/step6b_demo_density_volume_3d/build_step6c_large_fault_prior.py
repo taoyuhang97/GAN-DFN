@@ -42,6 +42,9 @@ from common.horizon_trace_table.horizon_contract import (  # noqa: E402
     surface_grids_from_contract,
     validate_window_contract,
 )
+from common.strata_framework import load_framework  # noqa: E402
+
+FRAMEWORK = load_framework()
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 DEFAULT_CONFIG = CURRENT_DIR / "configs/formal_candidate_cheye1_multiscale_density_v1.json"
@@ -499,17 +502,22 @@ def local_layer_relative_position(
     time_ms: np.ndarray,
     surfaces: dict[str, np.ndarray],
 ) -> tuple[np.ndarray, np.ndarray]:
-    t4 = surfaces["T4_TIME"][yy, xx].astype(np.float64)
-    t6 = surfaces["T6_TIME"][yy, xx].astype(np.float64)
-    t7 = surfaces["T7_TIME"][yy, xx].astype(np.float64)
-    shasan = surfaces["ShasanPresent"][yy, xx].astype(bool) & (time_ms >= t4) & (time_ms <= t6)
-    shasi = surfaces["ShasiPresent"][yy, xx].astype(bool) & (time_ms >= t6) & (time_ms <= t7)
     layer_code = np.zeros(len(time_ms), dtype=np.uint8)
-    layer_code[shasan] = 1
-    layer_code[shasi] = 2
     relative = np.full(len(time_ms), np.nan, dtype=np.float64)
-    relative[shasan] = (time_ms[shasan] - t4[shasan]) / np.maximum(t6[shasan] - t4[shasan], 1.0e-6)
-    relative[shasi] = (time_ms[shasi] - t6[shasi]) / np.maximum(t7[shasi] - t6[shasi], 1.0e-6)
+    for ordinal, item in enumerate(FRAMEWORK.layers, start=1):
+        top = surfaces[f"{FRAMEWORK.surface(item.top).column}_TIME"][yy, xx].astype(np.float64)
+        base = surfaces[f"{FRAMEWORK.surface(item.base).column}_TIME"][yy, xx].astype(np.float64)
+        present = (
+            surfaces[item.presence_column][yy, xx].astype(bool)
+            if item.presence_column
+            else True
+        )
+        upper_ok = time_ms <= base if item.inclusive_base else time_ms < base
+        inside = present & (time_ms >= top) & upper_ok
+        layer_code[inside] = ordinal
+        relative[inside] = (time_ms[inside] - top[inside]) / np.maximum(
+            base[inside] - top[inside], 1.0e-6
+        )
     return layer_code, relative
 
 
@@ -520,7 +528,7 @@ def layer_relative_stats(
     surfaces: dict[str, np.ndarray],
 ) -> dict[str, Any]:
     layer_code, relative = local_layer_relative_position(yy, xx, time_ms, surfaces)
-    counts = np.bincount(layer_code, minlength=3)
+    counts = np.bincount(layer_code, minlength=len(FRAMEWORK.layers) + 1)
     dominant_code = int(np.argmax(counts[1:]) + 1) if int(counts[1:].sum()) else 0
     dominant_mask = layer_code == dominant_code
     dominant_values = relative[dominant_mask & np.isfinite(relative)]

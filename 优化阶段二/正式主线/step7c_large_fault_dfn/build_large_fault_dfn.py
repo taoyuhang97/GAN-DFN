@@ -32,6 +32,9 @@ from common.horizon_trace_table.horizon_contract import (  # noqa: E402
     surface_grids_from_contract,
     validate_window_contract,
 )
+from common.strata_framework import load_framework  # noqa: E402
+
+FRAMEWORK = load_framework()
 from common.unified_dfn_vtk import (  # noqa: E402
     geometry_fingerprint,
     unified_vtk_summary,
@@ -83,8 +86,9 @@ def enforce_center_horizon_contract(
                 continue
         else:
             row["CenterInWindow"] = 1
-            row["LayerGroup"] = "沙三段" if interval == "T4->T6" else "沙四段"
-            row["LayerCode"] = 1 if interval == "T4->T6" else 2
+            layer_item = FRAMEWORK.layer_by_interval(interval)
+            row["LayerGroup"] = layer_item.name
+            row["LayerCode"] = layer_item.code
         row["SourceTraceIdx"] = int(local["TraceIdx"])
         row["LocalT4Time"] = float(local["T4"])
         row["LocalT6Time"] = float(local["T6"])
@@ -1034,9 +1038,17 @@ def build_large_lowcoh_supplements(config: dict[str, Any]) -> pd.DataFrame:
         height = float(np.quantile(coords[:, 2], 0.92) - np.quantile(coords[:, 2], 0.08))
         length = float(np.clip(length, float(config.get("min_lowcoh_length_m", 120.0)), float(config.get("max_lowcoh_length_m", 480.0))))
         height = float(np.clip(height, float(config.get("min_lowcoh_height_ms", 35.0)), float(config.get("max_lowcoh_height_ms", 180.0))))
-        layer = "沙三段"
-        if legacy.layer_mask_for_grid("沙四段", grid["samples"], surfaces)[yy, xx, tt].sum() > yy.size / 2:
-            layer = "沙四段"
+        layer = FRAMEWORK.layers[0].name
+        best_hits = -1
+        for layer_item in FRAMEWORK.layers:
+            hits = legacy.layer_mask_for_grid(
+                layer_item.name, grid["samples"], surfaces
+            )[yy, xx, tt].sum()
+            if hits > best_hits:
+                best_hits = hits
+                layer = layer_item.name
+        if best_hits <= yy.size / 2:
+            layer = FRAMEWORK.layers[0].name
         rows.append(
             make_patch(
                 f"large_lowcoh_supplement_{ordinal:05d}",

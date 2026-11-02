@@ -22,7 +22,8 @@
       "inclusive_base": false,
       "extension_ms": 0.0,
       "presence_column": "ShasanPresent",
-      "time_class": "upper_top_mid"
+      "time_class": "upper_top_mid",
+      "slug": "upper"
     },
     {
       "code": 2,
@@ -34,7 +35,8 @@
       "inclusive_base": true,
       "extension_ms": 50.0,
       "presence_column": "ShasiPresent",
-      "time_class": "crust_mid_base"
+      "time_class": "crust_mid_base",
+      "slug": "crust"
     }
   ],
   "legacy_layer_aliases": {"Shasan": "上部复合层", "Shasi": "太古界风化壳"}

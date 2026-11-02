@@ -93,10 +93,24 @@ fw.layer("Shasi")    # == fw.layer("沙四段")
 
 待做（第 3 阶段）：
 
-- Step6B/C 的 `T4-T7 / Shasan / Shasi` 掩膜分支；
-- Step7A 的 2 处层段映射、Step9 的 `T4->T6` 图例字符串；
-- Step9b 的 `LAYERS / LAYER_HORIZONS`；
-- 太古界 `build_taigu_horizon_npy.py` 的 npy schema（改为 Top/Mid/Base）。
+已完成（第 3 阶段，Step6–9b）：
+
+- Step6 训练：`LayerTopTime/LayerBaseTime` 由框架遍历生成；
+- Step6B/6C：层窗/相对位置计算改为遍历 `framework.layers`，去掉 `Shasan/Shasi` 分支；
+- Step7A：`top_flat/base_flat` 由框架 `surface(top/base)` 生成；
+- Step7B：两处 `if layer == "沙三段"` 改为 `framework.surface_pair(layer)`；
+- Step7C：**`LayerCode` 由历史的 1/2 修正为框架 int 3/4**；
+- Step9：`INTERVAL_LABELS` 由框架生成，并校验 `INTERVAL_COLORS` 覆盖所有地层；
+- Step9b：`LAYERS / LAYER_SLUG / LAYER_KEYS` 由框架派生（保持 sha3/sha4 文件名）；
+- 验证脚本：`scripts/verify_strata_step6_9b.py`。
+
+仍待处理（第 4 阶段）：
+
+- 太古界 `build_taigu_horizon_npy.py` 的 npy schema（改为 Top/Mid/Base）；
+- Step6C 中给原始/推断断层片指定默认地层的少量 `"沙三段"/"沙四段"` 字面量
+  （属语义默认值，不是层窗定义）；
+- Step9 各文件的层段配色仍是各自调色板（只把键/标签改为框架驱动）；
+- Step2/Step3 中逐井手工层段表里的地层名（已加框架校验，数据本身保留）。
 
 ## 6. 验证
 

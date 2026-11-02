@@ -62,6 +62,7 @@ def framework_from_dict(payload: dict[str, Any], source: str = "<dict>") -> Stra
                 extension_ms=float(item.get("extension_ms", 0.0)),
                 presence_column=item.get("presence_column"),
                 time_class=item.get("time_class"),
+                slug=item.get("slug"),
             )
         )
 

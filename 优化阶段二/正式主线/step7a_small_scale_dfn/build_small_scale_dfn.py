@@ -22,11 +22,14 @@ if str(LEGACY_STEP7B_DIR) not in sys.path:
     sys.path.insert(0, str(LEGACY_STEP7B_DIR))
 
 import build_initial_dfn_from_3d_density_sgy as legacy  # noqa: E402
+from common.strata_framework import load_framework  # noqa: E402
 from common.horizon_trace_table.horizon_contract import (  # noqa: E402
     load_contract_for_mapping,
     surface_grids_from_contract,
     validate_window_contract,
 )
+
+FRAMEWORK = load_framework()
 
 
 def parse_args() -> argparse.Namespace:
@@ -444,12 +447,12 @@ def build_compact_selected_candidates(
     chunk_samples = max(int(config.get("compact_sampling_chunk_samples", 25)), 1)
 
     top_flat = {
-        "沙三段": surfaces["T4_TIME"][iy, ix],
-        "沙四段": surfaces["T6_TIME"][iy, ix],
+        layer.name: surfaces[f"{FRAMEWORK.surface(layer.top).column}_TIME"][iy, ix]
+        for layer in FRAMEWORK.layers
     }
     base_flat = {
-        "沙三段": surfaces["T6_TIME"][iy, ix],
-        "沙四段": surfaces["T7_TIME"][iy, ix],
+        layer.name: surfaces[f"{FRAMEWORK.surface(layer.base).column}_TIME"][iy, ix]
+        for layer in FRAMEWORK.layers
     }
     rows: list[pd.DataFrame] = []
     candidate_counts = {name: 0 for name in domain_names}

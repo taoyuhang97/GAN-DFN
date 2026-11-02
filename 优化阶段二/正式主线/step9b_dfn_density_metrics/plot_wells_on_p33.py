@@ -14,6 +14,8 @@ import argparse
 import csv
 import os
 import re
+import sys
+from pathlib import Path
 
 os.environ.setdefault("MPLCONFIGDIR", "/tmp/mplcache-tyh")
 
@@ -24,9 +26,19 @@ from matplotlib import font_manager
 from matplotlib.patheffects import withStroke
 import numpy as np
 
+FORMAL_ROOT = Path(__file__).resolve().parent.parent
+if str(FORMAL_ROOT) not in sys.path:
+    sys.path.insert(0, str(FORMAL_ROOT))
 
-LAYERS = ("沙三段", "沙四段")
-LAYER_KEYS = (("沙三段", "sha3", "沙三段"), ("沙四段", "sha4", "沙四段"), ("total", "total", "整体（厚度加权）"))
+from common.strata_framework import load_framework  # noqa: E402
+
+
+FRAMEWORK = load_framework()
+LAYERS = FRAMEWORK.layer_names()
+LAYER_SLUG = FRAMEWORK.layer_slug_map()
+LAYER_KEYS = tuple(
+    (layer, LAYER_SLUG[layer], layer) for layer in LAYERS
+) + (("total", "total", "整体（厚度加权）"),)
 
 
 def strip_parens(text):

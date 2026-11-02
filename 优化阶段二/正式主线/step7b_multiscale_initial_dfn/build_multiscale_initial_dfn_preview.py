@@ -12,12 +12,18 @@ from scipy.ndimage import generate_binary_structure, label
 
 
 CURRENT_DIR = Path(__file__).resolve().parent
+FORMAL_ROOT = CURRENT_DIR.parent
 DEFAULT_CONFIG = CURRENT_DIR / "configs/formal_candidate_cheye1_multiscale_preview_v1.json"
 LEGACY_STEP7B_DIR = CURRENT_DIR.parent / "step7b_initial_dfn_3d"
+if str(FORMAL_ROOT) not in sys.path:
+    sys.path.insert(0, str(FORMAL_ROOT))
 if str(LEGACY_STEP7B_DIR) not in sys.path:
     sys.path.insert(0, str(LEGACY_STEP7B_DIR))
 
 import build_initial_dfn_from_3d_density_sgy as legacy  # noqa: E402
+from common.strata_framework import load_framework  # noqa: E402
+
+FRAMEWORK = load_framework()
 
 
 SCALE_CODE = {"small": 1, "medium": 2, "large": 3}
@@ -128,8 +134,9 @@ def voxels_to_frame(
 ) -> pd.DataFrame:
     if yy.size == 0:
         return pd.DataFrame()
-    top = surfaces["T4_TIME"][yy, xx] if layer == "沙三段" else surfaces["T6_TIME"][yy, xx]
-    base = surfaces["T6_TIME"][yy, xx] if layer == "沙三段" else surfaces["T7_TIME"][yy, xx]
+    top_column, base_column = FRAMEWORK.surface_pair(layer)
+    top = surfaces[f"{top_column}_TIME"][yy, xx]
+    base = surfaces[f"{base_column}_TIME"][yy, xx]
     out = pd.DataFrame(
         {
             "LayerGroup": layer,
@@ -232,8 +239,9 @@ def nearest_grid_position(
     iy = int(np.clip(np.searchsorted(y_values, float(coord[1])), 0, len(y_values) - 1))
     if iy > 0 and abs(float(y_values[iy - 1]) - float(coord[1])) < abs(float(y_values[iy]) - float(coord[1])):
         iy -= 1
-    top = float(surfaces["T4_TIME"][iy, ix] if layer == "沙三段" else surfaces["T6_TIME"][iy, ix])
-    base = float(surfaces["T6_TIME"][iy, ix] if layer == "沙三段" else surfaces["T7_TIME"][iy, ix])
+    top_column, base_column = FRAMEWORK.surface_pair(layer)
+    top = float(surfaces[f"{top_column}_TIME"][iy, ix])
+    base = float(surfaces[f"{base_column}_TIME"][iy, ix])
     if not np.isfinite(top) or not np.isfinite(base) or base <= top:
         top = float(np.nanmin(samples))
         base = float(np.nanmax(samples))

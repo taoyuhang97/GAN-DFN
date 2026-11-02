@@ -39,6 +39,9 @@ from common.horizon_trace_table.horizon_contract import (  # noqa: E402
     surface_grids_from_contract,
     validate_window_contract,
 )
+from common.strata_framework import load_framework  # noqa: E402
+
+FRAMEWORK = load_framework()
 
 DEFAULT_CONFIG = CURRENT_DIR / "configs/formal_candidate_cheye1_multiscale_density_v1.json"
 DEFAULT_OUTPUT_DIR = CURRENT_DIR / "output/candidate_cheye1_multiscale_rebalance_v1/step6b_medium"
@@ -280,21 +283,26 @@ def build_medium_components(
             if layer_like:
                 rejected_layer_like += 1
                 continue
-            local_time = samples[gtt]
-            is_shasan = (
-                (surfaces["ShasanPresent"][gyy, gxx] > 0)
-                & (local_time >= surfaces["T4_TIME"][gyy, gxx])
-                & (local_time < surfaces["T6_TIME"][gyy, gxx])
-            )
-            is_shasi = (
-                (surfaces["ShasiPresent"][gyy, gxx] > 0)
-                & (local_time >= surfaces["T6_TIME"][gyy, gxx])
-                & (local_time <= surfaces["T7_TIME"][gyy, gxx])
-            )
-            top = np.where(is_shasan, surfaces["T4_TIME"][gyy, gxx], surfaces["T6_TIME"][gyy, gxx])
-            base = np.where(is_shasan, surfaces["T6_TIME"][gyy, gxx], surfaces["T7_TIME"][gyy, gxx])
-            relative = (local_time - top) / np.maximum(base - top, 1.0e-6)
-            relative = relative[is_shasan | is_shasi]
+            local_time = float(samples[gtt])
+            relative_values: list[float] = []
+            for item in FRAMEWORK.layers:
+                if item.presence_column and surfaces[item.presence_column][gyy, gxx] <= 0:
+                    continue
+                top_time = float(
+                    surfaces[f"{FRAMEWORK.surface(item.top).column}_TIME"][gyy, gxx]
+                )
+                base_time = float(
+                    surfaces[f"{FRAMEWORK.surface(item.base).column}_TIME"][gyy, gxx]
+                )
+                inside = local_time >= top_time and (
+                    local_time <= base_time if item.inclusive_base else local_time < base_time
+                )
+                if inside:
+                    relative_values.append(
+                        (local_time - top_time) / max(base_time - top_time, 1.0e-6)
+                    )
+                    break
+            relative = np.asarray(relative_values, dtype=float)
             relative_std = float(np.std(relative)) if relative.size else float("nan")
             relative_span = float(np.max(relative) - np.min(relative)) if relative.size else float("nan")
             strat_following = bool(

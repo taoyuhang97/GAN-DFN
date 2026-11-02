@@ -6,6 +6,7 @@ import csv
 import json
 import math
 import os
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -20,6 +21,14 @@ import numpy as np
 import pandas as pd
 from matplotlib import font_manager
 from matplotlib.collections import LineCollection
+
+FORMAL_ROOT = Path(__file__).resolve().parent.parent
+if str(FORMAL_ROOT) not in sys.path:
+    sys.path.insert(0, str(FORMAL_ROOT))
+
+from common.strata_framework import load_framework  # noqa: E402
+
+FRAMEWORK = load_framework()
 
 try:
     from scipy.spatial import cKDTree
@@ -52,9 +61,14 @@ INTERVAL_COLORS = {
 }
 
 INTERVAL_LABELS = {
-    "T4->T6": "沙三段(T4-T6)",
-    "T6->T7": "沙四段(T6-T7)",
+    layer.interval_label(): f"{layer.name}({layer.top}-{layer.base})"
+    for layer in FRAMEWORK.layers
 }
+if set(INTERVAL_COLORS) != set(INTERVAL_LABELS):
+    raise RuntimeError(
+        f"INTERVAL_COLORS 与地层框架不一致: colors={sorted(INTERVAL_COLORS)} "
+        f"framework={sorted(INTERVAL_LABELS)}"
+    )
 
 SURFACE_LINE_STYLES = {
     "T4": ("#111827", "-"),
