@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -10,8 +11,15 @@ import pandas as pd
 
 
 CURRENT_DIR = Path(__file__).resolve().parent
+FORMAL_ROOT = CURRENT_DIR.parent
+if str(FORMAL_ROOT) not in sys.path:
+    sys.path.insert(0, str(FORMAL_ROOT))
+
+from common.strata_framework import load_framework  # noqa: E402
+
+
 DEFAULT_CONFIG = CURRENT_DIR / "configs/formal_unified_t4_t7_density_samples.json"
-ALLOWED_LAYERS = ["沙三段", "沙四段"]
+ALLOWED_LAYERS = list(load_framework().layer_names())
 ATTRIBUTE_COLUMNS = ["SeisAmp", "Coherence", "AntTrack", "CurvatureMax"]
 OUTPUT_COLUMNS = [
     "SourceKind", "SourceWellName", "TrackWellName",

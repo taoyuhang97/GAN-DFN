@@ -14,16 +14,21 @@ from scipy.spatial import cKDTree
 
 
 CURRENT_DIR = Path(__file__).resolve().parent
+FORMAL_ROOT = CURRENT_DIR.parent
 DEFAULT_CONFIG = CURRENT_DIR / "configs/formal_initial_dfn_3d_candidate_cheye1.json"
 SURFACE_TOOL_DIR = CURRENT_DIR.parent / "step1_surface_framework"
+if str(FORMAL_ROOT) not in sys.path:
+    sys.path.insert(0, str(FORMAL_ROOT))
 if str(SURFACE_TOOL_DIR) not in sys.path:
     sys.path.insert(0, str(SURFACE_TOOL_DIR))
 
 from surface_tools import load_surface_tables, validate_surface_order  # noqa: E402
+from common.strata_framework import load_framework  # noqa: E402
 
 
-ALLOWED_LAYERS = ["沙三段", "沙四段"]
-LAYER_CODE = {"沙三段": 3, "沙四段": 4}
+_FRAMEWORK = load_framework()
+ALLOWED_LAYERS = list(_FRAMEWORK.layer_names())
+LAYER_CODE = _FRAMEWORK.layer_code_map()
 
 
 def parse_args() -> argparse.Namespace:

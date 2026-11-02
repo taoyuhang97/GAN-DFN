@@ -33,9 +33,11 @@ from common.unified_dfn_vtk import (  # noqa: E402
     unified_vtk_summary,
     write_unified_dfn_vtk,
 )
+from common.strata_framework import load_framework  # noqa: E402
 
-ALLOWED_LAYERS = ["沙三段", "沙四段"]
-LAYER_CODE = {"沙三段": 3, "沙四段": 4}
+_FRAMEWORK = load_framework()
+ALLOWED_LAYERS = list(_FRAMEWORK.layer_names())
+LAYER_CODE = _FRAMEWORK.layer_code_map()
 CSV_ENCODINGS = ("utf-8-sig", "utf-8", "gb18030", "gbk")
 
 

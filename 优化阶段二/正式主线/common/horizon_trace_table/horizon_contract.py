@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -8,17 +8,28 @@ import numpy as np
 import pandas as pd
 from scipy.spatial import cKDTree
 
+try:  # 作为 common.horizon_trace_table 包导入时
+    from ..strata_framework import Layer, StrataFramework, load_framework, resolve_framework
+except ImportError:  # 作为顶层 horizon_trace_table 模块导入时（太古界走这条）
+    from strata_framework import Layer, StrataFramework, load_framework, resolve_framework
 
-REQUIRED_FIELDS = {
-    "TraceIdx",
-    "T4",
-    "T5",
-    "T6",
-    "T7",
-    "SurfaceOrderValid",
-    "ShasanPresent",
-    "ShasiPresent",
-}
+
+DEFAULT_FRAMEWORK = load_framework()
+
+
+def framework_required_fields(framework: StrataFramework | None = None) -> set[str]:
+    """契约表必须具备的列：TraceIdx + 有效标志 + 各层位面 + 各层存在标志。"""
+    fw = framework or DEFAULT_FRAMEWORK
+    return {
+        "TraceIdx",
+        "SurfaceOrderValid",
+        *fw.surface_columns(),
+        *fw.legacy_presence_columns(),
+    }
+
+
+# 向后兼容：历史代码直接引用 REQUIRED_FIELDS
+REQUIRED_FIELDS = framework_required_fields(DEFAULT_FRAMEWORK)
 
 
 @dataclass(frozen=True)
@@ -33,10 +44,23 @@ class HorizonTraceContract:
     shasan_present: np.ndarray
     shasi_present: np.ndarray
     correction_code: np.ndarray
+    framework_id: str = DEFAULT_FRAMEWORK.framework_id
+    # 框架原生视图：Surface.id -> 逐道时间；地层 code -> 逐道存在标志
+    surface_times: dict[str, np.ndarray] = field(default_factory=dict)
+    layer_present: dict[int, np.ndarray] = field(default_factory=dict)
 
     @property
     def trace_count(self) -> int:
         return int(len(self.trace_idx))
+
+    @property
+    def framework(self) -> StrataFramework:
+        return load_framework(self.framework_id)
+
+    def surface_time(self, surface_id: str) -> np.ndarray:
+        if surface_id in self.surface_times:
+            return self.surface_times[surface_id]
+        return np.asarray(getattr(self, surface_id.lower()), dtype=np.float32)
 
 
 def resolve_horizon_contract_path(config: dict[str, Any]) -> Path:
@@ -49,12 +73,18 @@ def resolve_horizon_contract_path(config: dict[str, Any]) -> Path:
     return path
 
 
-def load_horizon_table(path: Path) -> np.ndarray:
+def load_horizon_table(
+    path: Path,
+    framework: StrataFramework | None = None,
+) -> np.ndarray:
+    fw = framework or DEFAULT_FRAMEWORK
     table = np.load(path, mmap_mode="r")
     fields = set(table.dtype.names or ())
-    missing = sorted(REQUIRED_FIELDS - fields)
+    missing = sorted(framework_required_fields(fw) - fields)
     if missing:
-        raise ValueError(f"horizon contract table missing fields: {missing}")
+        raise ValueError(
+            f"horizon contract table missing fields for {fw.framework_id}: {missing}"
+        )
     if len(table) == 0:
         raise ValueError("horizon contract table is empty")
     trace_idx = np.asarray(table["TraceIdx"], dtype=np.int64)
@@ -65,8 +95,13 @@ def load_horizon_table(path: Path) -> np.ndarray:
     return table
 
 
-def load_contract_for_trace_indices(path: Path, trace_idx: np.ndarray) -> HorizonTraceContract:
-    table = load_horizon_table(path)
+def load_contract_for_trace_indices(
+    path: Path,
+    trace_idx: np.ndarray,
+    framework: StrataFramework | None = None,
+) -> HorizonTraceContract:
+    fw = framework or DEFAULT_FRAMEWORK
+    table = load_horizon_table(path, fw)
     indices = np.asarray(trace_idx, dtype=np.int64)
     if indices.ndim != 1 or len(indices) == 0:
         raise ValueError("source TraceIdx must be a non-empty one-dimensional array")
@@ -79,17 +114,46 @@ def load_contract_for_trace_indices(path: Path, trace_idx: np.ndarray) -> Horizo
         if "HorizonCorrectionCode" in (table.dtype.names or ())
         else np.zeros(len(indices), dtype=np.uint8)
     )
+    surface_times = {
+        surface.id: np.asarray(table[surface.column][indices], dtype=np.float32)
+        for surface in fw.surfaces
+    }
+    layer_present = {
+        layer.code: np.asarray(table[layer.presence_column][indices], dtype=bool)
+        for layer in fw.layers
+        if layer.presence_column
+    }
+    # 兼容字段：只有当框架确实声明了 T4..T7 时才有意义
+    def legacy(name: str) -> np.ndarray:
+        if name in surface_times:
+            return surface_times[name]
+        return np.full(len(indices), np.nan, dtype=np.float32)
+
+    shasan = layer_present.get(3)
+    shasi = layer_present.get(4)
+    if shasan is None and "Shasan" in fw.legacy_layer_aliases:
+        shasan = layer_present.get(fw.layer_by_name(fw.legacy_layer_aliases["Shasan"]).code)
+    if shasi is None and "Shasi" in fw.legacy_layer_aliases:
+        shasi = layer_present.get(fw.layer_by_name(fw.legacy_layer_aliases["Shasi"]).code)
+    if shasan is None:
+        shasan = np.asarray(table["ShasanPresent"][indices], dtype=bool) if "ShasanPresent" in (table.dtype.names or ()) else np.zeros(len(indices), dtype=bool)
+    if shasi is None:
+        shasi = np.asarray(table["ShasiPresent"][indices], dtype=bool) if "ShasiPresent" in (table.dtype.names or ()) else np.zeros(len(indices), dtype=bool)
+
     return HorizonTraceContract(
         table_path=path,
         trace_idx=indices.copy(),
-        t4=np.asarray(table["T4"][indices], dtype=np.float32),
-        t5=np.asarray(table["T5"][indices], dtype=np.float32),
-        t6=np.asarray(table["T6"][indices], dtype=np.float32),
-        t7=np.asarray(table["T7"][indices], dtype=np.float32),
+        t4=legacy("T4"),
+        t5=legacy("T5"),
+        t6=legacy("T6"),
+        t7=legacy("T7"),
         surface_order_valid=np.asarray(table["SurfaceOrderValid"][indices], dtype=bool),
-        shasan_present=np.asarray(table["ShasanPresent"][indices], dtype=bool),
-        shasi_present=np.asarray(table["ShasiPresent"][indices], dtype=bool),
+        shasan_present=np.asarray(shasan, dtype=bool),
+        shasi_present=np.asarray(shasi, dtype=bool),
         correction_code=correction,
+        framework_id=fw.framework_id,
+        surface_times=surface_times,
+        layer_present=layer_present,
     )
 
 
@@ -99,6 +163,7 @@ def load_contract_for_mapping(config: dict[str, Any], mapping: dict[str, np.ndar
     return load_contract_for_trace_indices(
         resolve_horizon_contract_path(config),
         np.asarray(mapping["source_trace_idx"], dtype=np.int64),
+        resolve_framework(config),
     )
 
 
@@ -128,8 +193,14 @@ def validate_window_contract(
     path = Path(str(configured[key])).resolve()
     if not path.exists():
         raise FileNotFoundError(f"horizon window contract not found: {path}")
+    fw = contract.framework
     with np.load(path) as payload:
-        required = {"TraceIdx", "samples", "T4", "T6", "T7", "ShasanPresent", "ShasiPresent"}
+        required = {
+            "TraceIdx",
+            "samples",
+            *fw.layer_surface_columns(),
+            *fw.legacy_presence_columns(),
+        }
         missing = sorted(required - set(payload.files))
         if missing:
             raise ValueError(f"horizon window contract missing fields: {missing}")
@@ -144,13 +215,28 @@ def validate_window_contract(
                 f"expected=({expected_samples[0]}, {expected_samples[-1]}, {len(expected_samples)}) "
                 f"actual=({samples[0]}, {samples[-1]}, {len(samples)})"
             )
-        for name, values in {"T4": contract.t4, "T6": contract.t6, "T7": contract.t7}.items():
-            if not np.allclose(np.asarray(payload[name], dtype=np.float32), values, atol=1.0e-5, rtol=0.0):
-                raise ValueError(f"horizon window {name} differs from table contract: {path}")
-        if not np.array_equal(np.asarray(payload["ShasanPresent"], dtype=bool), contract.shasan_present):
-            raise ValueError(f"horizon window ShasanPresent differs from table contract: {path}")
-        if not np.array_equal(np.asarray(payload["ShasiPresent"], dtype=bool), contract.shasi_present):
-            raise ValueError(f"horizon window ShasiPresent differs from table contract: {path}")
+        referenced = set(fw.layer_surface_columns())
+        for surface in fw.surfaces:
+            if surface.column not in referenced:
+                continue
+            if not np.allclose(
+                np.asarray(payload[surface.column], dtype=np.float32),
+                contract.surface_time(surface.id),
+                atol=1.0e-5,
+                rtol=0.0,
+            ):
+                raise ValueError(
+                    f"horizon window {surface.column} differs from table contract: {path}"
+                )
+        for layer in fw.layers:
+            column = layer.presence_column
+            if not column:
+                continue
+            if not np.array_equal(
+                np.asarray(payload[column], dtype=bool),
+                np.asarray(contract.layer_present[layer.code], dtype=bool),
+            ):
+                raise ValueError(f"horizon window {column} differs from table contract: {path}")
     return {
         "status": "pass",
         "path": str(path),
@@ -162,32 +248,54 @@ def validate_window_contract(
     }
 
 
+def resolve_layers(contract: HorizonTraceContract, layer: str | int | None) -> tuple[Layer, ...]:
+    """把层引用解析成地层列表。
+
+    支持：框架 LayerCode(int)、地层名、历史别名(Shasan/Shasi)、
+    以及 "T4-T7"/"main"/None 表示"全部地层"。
+    """
+    framework = contract.framework
+    if layer is None or str(layer) in {"T4-T7", "main", "all"}:
+        return tuple(framework.layers)
+    alias = framework.resolve_layer_alias(str(layer))
+    if alias is not None:
+        return (alias,)
+    return (framework.layer(layer),)
+
+
+def layer_window_mask(
+    contract: HorizonTraceContract,
+    samples: np.ndarray,
+    start: int,
+    stop: int,
+    layer: Layer,
+) -> np.ndarray:
+    """单个地层的层窗掩膜（框架驱动，不再按地层名写 if/else）。"""
+    axis = np.asarray(samples, dtype=np.float64)[None, :]
+    sl = slice(start, stop)
+    top = contract.surface_time(layer.top)[sl, None]
+    base = contract.surface_time(layer.base)[sl, None]
+    if layer.extension_ms > 0:
+        base = base + np.float64(layer.extension_ms)
+    present = contract.layer_present.get(layer.code)
+    if present is None:
+        present = contract.surface_order_valid
+    inside = axis <= base if layer.inclusive_base else axis < base
+    return np.asarray(present[sl, None], dtype=bool) & (axis >= top) & inside
+
+
 def trace_window_mask(
     contract: HorizonTraceContract,
     samples: np.ndarray,
     start: int,
     stop: int,
-    layer: str = "T4-T7",
+    layer: str | int | None = "T4-T7",
 ) -> np.ndarray:
-    axis = np.asarray(samples, dtype=np.float64)[None, :]
-    sl = slice(start, stop)
-    if layer == "Shasan":
-        return (
-            contract.shasan_present[sl, None]
-            & (axis >= contract.t4[sl, None])
-            & (axis < contract.t6[sl, None])
-        )
-    if layer == "Shasi":
-        return (
-            contract.shasi_present[sl, None]
-            & (axis >= contract.t6[sl, None])
-            & (axis <= contract.t7[sl, None])
-        )
-    if layer != "T4-T7":
-        raise ValueError(f"unsupported horizon layer: {layer}")
-    return trace_window_mask(contract, samples, start, stop, "Shasan") | trace_window_mask(
-        contract, samples, start, stop, "Shasi"
-    )
+    layers = resolve_layers(contract, layer)
+    mask = layer_window_mask(contract, samples, start, stop, layers[0])
+    for item in layers[1:]:
+        mask = mask | layer_window_mask(contract, samples, start, stop, item)
+    return mask
 
 
 def apply_window_inplace(
@@ -255,23 +363,38 @@ def surface_grids_from_contract(
         output[iy, ix] = values
         return output
 
-    any_layer_present = contract.shasan_present | contract.shasi_present
-    return {
-        "T4_TIME": grid(contract.t4),
-        "T5_TIME": grid(contract.t5),
-        "T6_TIME": grid(contract.t6),
-        "T7_TIME": grid(contract.t7),
-        "SurfaceOrderValid": grid(contract.surface_order_valid.astype(np.uint8), np.uint8),
-        "ShasanPresent": grid(contract.shasan_present.astype(np.uint8), np.uint8),
-        "ShasiPresent": grid(contract.shasi_present.astype(np.uint8), np.uint8),
-        "Check_All": grid(any_layer_present.astype(np.uint8), np.uint8).astype(bool),
-        "SourceTraceIdx": grid(contract.trace_idx.astype(np.int32), np.int32),
+    framework = contract.framework
+    output: dict[str, np.ndarray] = {
+        f"{surface.id}_TIME": grid(contract.surface_time(surface.id))
+        for surface in framework.surfaces
     }
+    output["SurfaceOrderValid"] = grid(
+        contract.surface_order_valid.astype(np.uint8), np.uint8
+    )
+    any_layer_present = np.zeros(contract.trace_count, dtype=bool)
+    for layer in framework.layers:
+        present = np.asarray(
+            contract.layer_present.get(layer.code, contract.surface_order_valid),
+            dtype=bool,
+        )
+        any_layer_present |= present
+        if layer.presence_column:
+            output[layer.presence_column] = grid(present.astype(np.uint8), np.uint8)
+    output["Check_All"] = grid(any_layer_present.astype(np.uint8), np.uint8).astype(bool)
+    output["SourceTraceIdx"] = grid(contract.trace_idx.astype(np.int32), np.int32)
+    return output
 
 
 class HorizonSpatialLookup:
-    def __init__(self, table_path: Path, trace_header_csv: Path, target_block: dict[str, Any] | None = None):
-        table = load_horizon_table(table_path)
+    def __init__(
+        self,
+        table_path: Path,
+        trace_header_csv: Path,
+        target_block: dict[str, Any] | None = None,
+        framework: StrataFramework | None = None,
+    ):
+        self.framework = framework or DEFAULT_FRAMEWORK
+        table = load_horizon_table(table_path, self.framework)
         frame = pd.read_csv(trace_header_csv, usecols=["TraceIdx", "X", "Y"], encoding="utf-8-sig")
         for column in ["TraceIdx", "X", "Y"]:
             frame[column] = pd.to_numeric(frame[column], errors="raise")
@@ -297,33 +420,61 @@ class HorizonSpatialLookup:
         distance, position = self.tree.query(np.asarray([[float(x), float(y)]], dtype=np.float64), k=1)
         trace_idx = int(self.trace_idx[int(np.asarray(position).reshape(-1)[0])])
         row = self.table[trace_idx]
-        return {
+        surface_times = {
+            surface.id: float(row[surface.column]) for surface in self.framework.surfaces
+        }
+        layer_present = {
+            layer.code: bool(row[layer.presence_column])
+            for layer in self.framework.layers
+            if layer.presence_column
+        }
+        payload = {
             "TraceIdx": trace_idx,
             "DistanceM": float(np.asarray(distance).reshape(-1)[0]),
-            "T4": float(row["T4"]),
-            "T5": float(row["T5"]),
-            "T6": float(row["T6"]),
-            "T7": float(row["T7"]),
             "SurfaceOrderValid": bool(row["SurfaceOrderValid"]),
-            "ShasanPresent": bool(row["ShasanPresent"]),
-            "ShasiPresent": bool(row["ShasiPresent"]),
+            "SurfaceTimes": surface_times,
+            "LayerPresent": layer_present,
             "HorizonCorrectionCode": int(row["HorizonCorrectionCode"])
             if "HorizonCorrectionCode" in (self.table.dtype.names or ())
             else 0,
         }
+        # 兼容字段：砂砾岩历史调用直接读 T4..T7 / ShasanPresent / ShasiPresent
+        for surface in self.framework.surfaces:
+            payload[surface.id] = surface_times[surface.id]
+        for layer in self.framework.layers:
+            if layer.presence_column:
+                payload[layer.presence_column] = layer_present[layer.code]
+        return payload
 
     def interval(self, x: float, y: float, time_ms: float) -> str | None:
         row = self.query(x, y)
         time = float(time_ms)
-        if row["ShasanPresent"] and row["T4"] <= time < row["T6"]:
-            return "T4->T6"
-        if row["ShasiPresent"] and row["T6"] <= time <= row["T7"]:
-            return "T6->T7"
+        for layer in self.framework.layers:
+            if not row["LayerPresent"].get(layer.code, False):
+                continue
+            top = row["SurfaceTimes"][layer.top]
+            base = row["SurfaceTimes"][layer.base]
+            if layer.extension_ms > 0:
+                base += layer.extension_ms
+            inside = top <= time <= base if layer.inclusive_base else top <= time < base
+            if inside:
+                return layer.interval_label()
         return None
 
     def layer_group(self, x: float, y: float, time_ms: float) -> str | None:
-        interval = self.interval(x, y, time_ms)
-        return {"T4->T6": "沙三段", "T6->T7": "沙四段"}.get(interval)
+        row = self.query(x, y)
+        time = float(time_ms)
+        for layer in self.framework.layers:
+            if not row["LayerPresent"].get(layer.code, False):
+                continue
+            top = row["SurfaceTimes"][layer.top]
+            base = row["SurfaceTimes"][layer.base]
+            if layer.extension_ms > 0:
+                base += layer.extension_ms
+            inside = top <= time <= base if layer.inclusive_base else top <= time < base
+            if inside:
+                return layer.name
+        return None
 
 
 def build_spatial_lookup(config: dict[str, Any]) -> HorizonSpatialLookup:
@@ -337,6 +488,7 @@ def build_spatial_lookup(config: dict[str, Any]) -> HorizonSpatialLookup:
         resolve_horizon_contract_path(config),
         path,
         dict(config.get("target_block") or {}) or None,
+        resolve_framework(config),
     )
 
 

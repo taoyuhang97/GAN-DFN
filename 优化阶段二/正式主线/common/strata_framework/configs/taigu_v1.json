@@ -1,0 +1,39 @@
+{
+  "framework_id": "taigu_v1",
+  "area": "太古界",
+  "metadata": {
+    "note": "太古界：3 个层位面（Top/Mid/Base）圈出上部复合层、太古界风化壳两个地层单元；风化壳底以下延伸 50 ms",
+    "legacy_alias_note": "历史 npy 用 T4/T5/T6/T7 字段名，其中 T4=Top、T5=T6=Mid、T7=Base；这里通过 legacy_column 兼容读取",
+    "canonical_presence_note": "新契约建议用 UpperPresent/CrustPresent；当前历史 npy 仍是 ShasanPresent/ShasiPresent"
+  },
+  "surfaces": [
+    {"id": "Top", "label": "上部复合层顶", "order": 1, "legacy_column": "T4", "source_file": "Grid_上部复合层T-a-1.dat"},
+    {"id": "Mid", "label": "太古界顶", "order": 2, "legacy_column": "T6", "source_file": "Grid_太古界顶Art_1.dat"},
+    {"id": "Base", "label": "风化壳底", "order": 3, "legacy_column": "T7", "source_file": "Grid_风化壳底Art_d1-1.dat"}
+  ],
+  "layers": [
+    {
+      "code": 1,
+      "name": "上部复合层",
+      "top": "Top",
+      "base": "Mid",
+      "color": "#f97316",
+      "display_order": 1,
+      "inclusive_base": false,
+      "extension_ms": 0.0,
+      "presence_column": "ShasanPresent"
+    },
+    {
+      "code": 2,
+      "name": "太古界风化壳",
+      "top": "Mid",
+      "base": "Base",
+      "color": "#22d3ee",
+      "display_order": 2,
+      "inclusive_base": true,
+      "extension_ms": 50.0,
+      "presence_column": "ShasiPresent"
+    }
+  ],
+  "legacy_layer_aliases": {"Shasan": "上部复合层", "Shasi": "太古界风化壳"}
+}
