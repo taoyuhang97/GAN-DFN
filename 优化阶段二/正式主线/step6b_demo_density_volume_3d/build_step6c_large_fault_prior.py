@@ -512,7 +512,9 @@ def local_layer_relative_position(
             if item.presence_column
             else True
         )
-        upper_ok = time_ms <= base if item.inclusive_base else time_ms < base
+        # 保持历史语义：Step6C 对所有层统一使用闭区间（与 trace_window_mask 的
+        # inclusive_base 不同）。否则 T6 且沙四不存在的体素会丢失。
+        upper_ok = time_ms <= base
         inside = present & (time_ms >= top) & upper_ok
         layer_code[inside] = ordinal
         relative[inside] = (time_ms[inside] - top[inside]) / np.maximum(

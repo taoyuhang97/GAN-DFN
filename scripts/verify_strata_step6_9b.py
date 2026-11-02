@@ -147,6 +147,15 @@ def verify_step6c() -> None:
     check(code[2] == 2, "T6 边界归沙四段（与旧逻辑覆盖顺序一致）")
     check(code[3] == 2, "T7 边界归沙四段")
 
+    # 回归：T6 处若沙四缺失，旧逻辑仍把该点归到沙三段（闭区间）
+    surfaces_no_crust = dict(surfaces)
+    surfaces_no_crust["ShasiPresent"] = np.array([[0]], dtype=np.uint8)
+    code2, relative2 = module.local_layer_relative_position(
+        yy[:1], xx[:1], np.array([20.0]), surfaces_no_crust
+    )
+    check(code2.tolist() == [1], f"T6 且沙四缺失 -> 沙三段（旧语义）{code2.tolist()}")
+    check(np.allclose(relative2, [1.0]), "T6 且沙四缺失 -> relative=1.0")
+
 
 def main() -> int:
     print("=" * 70)

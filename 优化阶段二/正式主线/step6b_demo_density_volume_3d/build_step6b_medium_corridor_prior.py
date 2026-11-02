@@ -283,26 +283,34 @@ def build_medium_components(
             if layer_like:
                 rejected_layer_like += 1
                 continue
-            local_time = float(samples[gtt])
-            relative_values: list[float] = []
+            local_time = np.asarray(samples[gtt], dtype=float)
+            top_time = np.full(local_time.shape, np.nan, dtype=float)
+            base_time = np.full(local_time.shape, np.nan, dtype=float)
+            assigned = np.zeros(local_time.shape, dtype=bool)
             for item in FRAMEWORK.layers:
-                if item.presence_column and surfaces[item.presence_column][gyy, gxx] <= 0:
-                    continue
-                top_time = float(
-                    surfaces[f"{FRAMEWORK.surface(item.top).column}_TIME"][gyy, gxx]
+                present = (
+                    surfaces[item.presence_column][gyy, gxx] > 0
+                    if item.presence_column
+                    else True
                 )
-                base_time = float(
-                    surfaces[f"{FRAMEWORK.surface(item.base).column}_TIME"][gyy, gxx]
+                layer_top = surfaces[
+                    f"{FRAMEWORK.surface(item.top).column}_TIME"
+                ][gyy, gxx]
+                layer_base = surfaces[
+                    f"{FRAMEWORK.surface(item.base).column}_TIME"
+                ][gyy, gxx]
+                # 保持历史语义：Step6B 相对位置对所有层用闭区间，且先匹配者优先
+                inside = (
+                    present
+                    & (local_time >= layer_top)
+                    & (local_time <= layer_base)
+                    & ~assigned
                 )
-                inside = local_time >= top_time and (
-                    local_time <= base_time if item.inclusive_base else local_time < base_time
-                )
-                if inside:
-                    relative_values.append(
-                        (local_time - top_time) / max(base_time - top_time, 1.0e-6)
-                    )
-                    break
-            relative = np.asarray(relative_values, dtype=float)
+                top_time[inside] = layer_top[inside]
+                base_time[inside] = layer_base[inside]
+                assigned |= inside
+            relative = (local_time - top_time) / np.maximum(base_time - top_time, 1.0e-6)
+            relative = relative[assigned]
             relative_std = float(np.std(relative)) if relative.size else float("nan")
             relative_span = float(np.max(relative) - np.min(relative)) if relative.size else float("nan")
             strat_following = bool(
@@ -316,7 +324,27 @@ def build_medium_components(
                 continue
             seed_fraction = float(np.mean((branch_values & 1) > 0))
             growth_fraction = float(np.mean((branch_values & 2) > 0))
-            dominant_layer = "沙三段" if int(is_shasan.sum()) >= int(is_shasi.sum()) else "沙四段"
+            layer_hits: dict[str, int] = {}
+            for item in FRAMEWORK.layers:
+                hit_present = (
+                    surfaces[item.presence_column][gyy, gxx] > 0
+                    if item.presence_column
+                    else True
+                )
+                hit_top = surfaces[f"{FRAMEWORK.surface(item.top).column}_TIME"][gyy, gxx]
+                hit_base = surfaces[f"{FRAMEWORK.surface(item.base).column}_TIME"][gyy, gxx]
+                layer_hits[item.name] = int(
+                    np.sum(
+                        hit_present
+                        & (local_time >= hit_top)
+                        & (local_time <= hit_base)
+                    )
+                )
+            # 与旧逻辑一致：命中数相同时取先声明的地层（沙三段）
+            dominant_layer = max(
+                FRAMEWORK.layers,
+                key=lambda item: (layer_hits[item.name], -item.code),
+            ).name
             component_id_grid[gyy, gxx, gtt] = next_id
             rows.append(
                 {
