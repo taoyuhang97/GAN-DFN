@@ -197,11 +197,13 @@ def main() -> int:
     horizon = np.load(args.horizon_table, mmap_mode="r")
     if len(header) != len(horizon):
         raise ValueError("trace header and horizon table lengths differ")
-    header["_T4"] = np.asarray(horizon["T4"], dtype=np.float64)
-    header["_T6"] = np.asarray(horizon["T6"], dtype=np.float64)
-    header["_T7"] = np.asarray(horizon["T7"], dtype=np.float64)
-    header["_thick3"] = np.clip(header["_T6"] - header["_T4"], 0.0, None)
-    header["_thick4"] = np.clip(header["_T7"] - header["_T6"], 0.0, None)
+    for surface in FRAMEWORK.surfaces:
+        header[f"_{surface.column}"] = np.asarray(horizon[surface.column], dtype=np.float64)
+    for layer in FRAMEWORK.layers:
+        top_column, base_column = FRAMEWORK.surface_pair(layer)
+        header[f"_thick_{layer.code}"] = np.clip(
+            header[f"_{base_column}"] - header[f"_{top_column}"], 0.0, None
+        )
 
     grid_m = float(args.grid_m)
     if args.x_min is not None:
@@ -218,11 +220,11 @@ def main() -> int:
     cell_trace_count = np.zeros((ny, nx), dtype=np.int64)
     np.add.at(cell_trace_count, (h_iy[valid_cell], h_ix[valid_cell]), 1)
     cell_thick = {layer: np.zeros((ny, nx), dtype=np.float64) for layer in LAYERS}
-    for layer, col in (("沙三段", "_thick3"), ("沙四段", "_thick4")):
-        values = header[col].to_numpy(dtype=np.float64)
+    for layer in FRAMEWORK.layers:
+        values = header[f"_thick_{layer.code}"].to_numpy(dtype=np.float64)
         total = np.zeros((ny, nx), dtype=np.float64)
         np.add.at(total, (h_iy[valid_cell], h_ix[valid_cell]), values[valid_cell])
-        cell_thick[layer] = total / np.maximum(cell_trace_count, 1)
+        cell_thick[layer.name] = total / np.maximum(cell_trace_count, 1)
 
     cell_area_m2 = cell_trace_count.astype(np.float64) * (12.5 * 12.5)
     p_ix = np.digitize(patches["CenterX"].to_numpy(dtype=np.float64), x_bins) - 1
@@ -271,7 +273,10 @@ def main() -> int:
         factor: {layer: sum(p33[factor][layer][s] for s in SCALES) for layer in LAYERS}
         for factor in SENSITIVITY_FACTORS
     }
-    p33_all = {factor: p33_total[factor]["沙三段"] + p33_total[factor]["沙四段"] for factor in SENSITIVITY_FACTORS}
+    p33_all = {
+        factor: sum(p33_total[factor][layer] for layer in LAYERS)
+        for factor in SENSITIVITY_FACTORS
+    }
 
     # Grid CSV.
     rows: list[dict[str, Any]] = []
@@ -411,10 +416,10 @@ def main() -> int:
         near = dist <= float(args.well_radius_m)
         lookup = HorizonSpatialLookup(args.horizon_table, args.trace_header)
         well_row = lookup.query(float(well["X"].mean()), float(well["Y"].mean()))
-        t4 = float(well_row["T4"])
-        t6 = float(well_row["T6"])
-        t7 = float(well_row["T7"])
-        for layer, (t0, t1) in (("沙三段", (t4, t6)), ("沙四段", (t6, t7))):
+        for layer in FRAMEWORK.layers:
+            top_column, base_column = FRAMEWORK.surface_pair(layer)
+            t0 = float(well_row[top_column])
+            t1 = float(well_row[base_column])
             span = max(t1 - t0, 1.0)
             in_layer = near & patches["CenterTime"].between(t0, t1)
             for scale in SCALES:
@@ -422,7 +427,7 @@ def main() -> int:
                 well_rows.append(
                     {
                         "Well": "车页1导眼",
-                        "Layer": layer,
+                        "Layer": layer.name,
                         "Scale": scale,
                         "PatchCountNear": count,
                         "LayerSpanMs": float(span),
@@ -433,7 +438,7 @@ def main() -> int:
             well_rows.append(
                 {
                     "Well": "车页1导眼",
-                    "Layer": layer,
+                        "Layer": layer.name,
                     "Scale": "合计",
                     "PatchCountNear": count_all,
                     "LayerSpanMs": float(span),
@@ -479,8 +484,10 @@ def main() -> int:
             yidx = np.searchsorted(y_bins, layer_df["CellYMin"].to_numpy())
             cal_maps[layer][yidx, xidx] = layer_df["P33_imaging_calibrated"].to_numpy(dtype=np.float64)
             thick_maps[layer][yidx, xidx] = layer_df["LayerThicknessMs"].to_numpy(dtype=np.float64)
-        h_sum = thick_maps["沙三段"] + thick_maps["沙四段"]
-        total_cal = (cal_maps["沙三段"] * thick_maps["沙三段"] + cal_maps["沙四段"] * thick_maps["沙四段"]) / np.maximum(h_sum, 1e-9)
+        h_sum = sum(thick_maps[layer] for layer in LAYERS)
+        total_cal = sum(
+            cal_maps[layer] * thick_maps[layer] for layer in LAYERS
+        ) / np.maximum(h_sum, 1e-9)
         cal_maps["total"] = total_cal
         combined = np.concatenate([cal_maps[layer][np.isfinite(cal_maps[layer]) & (cal_maps[layer] > 0)] for layer in (*LAYERS, "total")])
         unified_vmax = (

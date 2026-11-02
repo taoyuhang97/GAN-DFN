@@ -3,7 +3,11 @@
   "area": "砂砾岩",
   "metadata": {
     "note": "砂砾岩正式主线：4 个层位面（T4/T5/T6/T7）圈出沙三段、沙四段两个地层单元",
-    "coordinate": "X=Easting, Y=Northing, Z=TWT ms"
+    "coordinate": "X=Easting, Y=Northing, Z=TWT ms",
+    "step4_defaults": {
+      "stage1_threshold_cap": {"沙三段": 0.30, "沙四段": 0.25},
+      "adaptive_min_positive_ratio": {"沙三段": 0.20, "沙四段": 0.15}
+    }
   },
   "surfaces": [
     {"id": "T4", "label": "沙三段顶", "order": 1, "legacy_column": "T4"},

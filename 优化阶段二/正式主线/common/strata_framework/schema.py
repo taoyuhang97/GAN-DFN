@@ -138,6 +138,8 @@ class StrataFramework:
 
     def layer(self, layer: int | str) -> Layer:
         """按 int code 或 name 取地层，便于逐步替换旧调用。"""
+        if isinstance(layer, Layer):
+            return layer
         if isinstance(layer, bool):
             raise StrataFrameworkError(f"{self.framework_id}: bool is not a layer reference")
         if isinstance(layer, (int,)):

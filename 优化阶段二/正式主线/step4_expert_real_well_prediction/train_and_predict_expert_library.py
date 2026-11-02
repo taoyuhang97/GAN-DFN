@@ -40,7 +40,8 @@ STEP2_ROOT_DEFAULT = (
 STEP3_GROUPS_DEFAULT = (
     REPO_ROOT / "优化阶段二/正式主线/step3_imaging_supervision_samples/output/formal_rebuild/groups"
 )
-TARGET_STRATA = list(load_framework().layer_names())
+_FRAMEWORK = load_framework()
+TARGET_STRATA = list(_FRAMEWORK.layer_names())
 DEFAULT_HOLDOUT_WELL = "车页1导眼"
 DEFAULT_FEATURE_COLUMNS = [
     "AC",
@@ -851,14 +852,24 @@ def get_ensemble_top_k(config: dict[str, Any]) -> int:
 
 
 def threshold_caps(config: dict[str, Any]) -> dict[str, float]:
-    defaults = {"沙三段": 0.30, "沙四段": 0.25}
+    defaults = dict(
+        _FRAMEWORK.metadata.get("step4_defaults", {}).get("stage1_threshold_cap", {})
+    )
     user_caps = config.get("stage1_threshold_caps_by_strata") or {}
+    missing = sorted(set(TARGET_STRATA) - set(defaults))
+    if missing:
+        raise KeyError(f"strata framework missing step4 stage1_threshold_cap for {missing}")
     return {strata: float(user_caps.get(strata, defaults[strata])) for strata in TARGET_STRATA}
 
 
 def adaptive_min_positive_ratios(config: dict[str, Any]) -> dict[str, float]:
-    defaults = {"沙三段": 0.20, "沙四段": 0.15}
+    defaults = dict(
+        _FRAMEWORK.metadata.get("step4_defaults", {}).get("adaptive_min_positive_ratio", {})
+    )
     user_values = config.get("adaptive_min_positive_ratio_by_strata") or {}
+    missing = sorted(set(TARGET_STRATA) - set(defaults))
+    if missing:
+        raise KeyError(f"strata framework missing step4 adaptive_min_positive_ratio for {missing}")
     return {strata: float(user_values.get(strata, defaults[strata])) for strata in TARGET_STRATA}
 
 
@@ -958,12 +969,15 @@ def load_step2_interval(interval_csv: Path) -> pd.Series:
 def assign_step2_strata(main_df: pd.DataFrame, interval_row: pd.Series) -> pd.DataFrame:
     out = main_df.copy()
     depth = safe_numeric(out["DEPT"])
-    t4 = float(interval_row["T4_DEPT"])
-    t6 = float(interval_row["T6_DEPT"])
-    t7 = float(interval_row["T7_DEPT"])
     out["StrataName"] = pd.NA
-    out.loc[(depth >= t4) & (depth < t6), "StrataName"] = "沙三段"
-    out.loc[(depth >= t6) & (depth <= t7), "StrataName"] = "沙四段"
+    for item in _FRAMEWORK.layers:
+        top_column = f"{_FRAMEWORK.surface(item.top).column}_DEPT"
+        base_column = f"{_FRAMEWORK.surface(item.base).column}_DEPT"
+        top = float(interval_row[top_column])
+        base = float(interval_row[base_column])
+        upper = depth <= base if item.inclusive_base else depth < base
+        mask = (depth >= top) & upper
+        out.loc[mask, "StrataName"] = item.name
     return out
 
 

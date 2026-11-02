@@ -104,11 +104,26 @@ fw.layer("Shasi")    # == fw.layer("沙四段")
 - Step9b：`LAYERS / LAYER_SLUG / LAYER_KEYS` 由框架派生（保持 sha3/sha4 文件名）；
 - 验证脚本：`scripts/verify_strata_step6_9b.py`。
 
+第 3 阶段补充（本轮）：
+
+- Step9b：逐层厚度、P33 合计、P10 层窗、厚度加权标定总分全部改为遍历 `framework.layers`；
+- Step6 预测：层→`T4_TIME/T6_TIME` 映射、模型层集合校验、`density_cap` 兜底、
+  `Sha3/Sha4PredictionCount` 输出列均改为框架派生；
+- Step8：`update_layer_window_from_surfaces`、区间→地层、顶点裁剪的
+  `if layer == "沙四段"` 分支全部改为框架遍历；
+- Step4：`threshold_caps` / `adaptive_min_positive_ratios` 的按层默认值移入
+  框架配置 `metadata.step4_defaults`；`assign_step2_strata` 改为遍历框架层。
+
+以上改完后，`step9b` 只剩 `CALIBRATION_INTERVALS`（井上标定数据），
+`predict_step6` / `correct_dfn_with_well_controls` / `train_and_predict_expert_library`
+中已无地层名字面量。
+
 仍待处理（第 4 阶段）：
 
 - 太古界 `build_taigu_horizon_npy.py` 的 npy schema（改为 Top/Mid/Base）；
 - Step6C 中给原始/推断断层片指定默认地层的少量 `"沙三段"/"沙四段"` 字面量
   （属语义默认值，不是层窗定义）；
+- Step7C 中 8 处"原始/推断断层片默认归到哪一层"的字面量（同上，需业务确认）；
 - Step9 各文件的层段配色仍是各自调色板（只把键/标签改为框架驱动）；
 - Step2/Step3 中逐井手工层段表里的地层名（已加框架校验，数据本身保留）。
 

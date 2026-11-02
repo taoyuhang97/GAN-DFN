@@ -116,6 +116,20 @@ def verify_step4() -> None:
         module = load_module(FORMAL_ROOT / rel)
         check(list(module.TARGET_STRATA) == expected, f"{Path(rel).name}: TARGET_STRATA 来自框架")
 
+    expert = load_module(FORMAL_ROOT / modules[0])
+    check(expert.threshold_caps({}) == {"沙三段": 0.30, "沙四段": 0.25},
+          "threshold_caps 默认值与旧硬编码一致")
+    check(expert.adaptive_min_positive_ratios({}) == {"沙三段": 0.20, "沙四段": 0.15},
+          "adaptive_min_positive_ratios 默认值与旧硬编码一致")
+
+    interval = pd.Series({"T4_DEPT": 10.0, "T6_DEPT": 20.0, "T7_DEPT": 30.0})
+    main = pd.DataFrame({"DEPT": [10.0, 20.0, 30.0, 35.0]})
+    assigned = expert.assign_step2_strata(main, interval)["StrataName"].tolist()
+    check(assigned == ["沙三段", "沙四段", "沙四段", pd.NA] or
+          (assigned[0] == "沙三段" and assigned[1] == "沙四段" and assigned[2] == "沙四段"
+           and (pd.isna(assigned[3]))),
+          f"assign_step2_strata 边界与旧逻辑一致 {assigned}")
+
 
 def verify_step5a() -> None:
     print("\n[5] Step5A layer_bounds")

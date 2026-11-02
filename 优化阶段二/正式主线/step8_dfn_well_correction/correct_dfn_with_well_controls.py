@@ -455,16 +455,14 @@ def update_layer_window_from_surfaces(
     x = float(row["CenterX"])
     y = float(row["CenterY"])
     local = surface_lookup.query(x, y)
-    if layer == "沙三段":
-        top = float(local["T4"])
-        base = float(local["T6"])
-        present = bool(local["ShasanPresent"])
-    elif layer == "沙四段":
-        top = float(local["T6"])
-        base = float(local["T7"])
-        present = bool(local["ShasiPresent"])
-    else:
+    try:
+        layer_item = _FRAMEWORK.layer(layer)
+    except Exception:
         return {}
+    top_column, base_column = _FRAMEWORK.surface_pair(layer_item)
+    top = float(local[top_column])
+    base = float(local[base_column])
+    present = bool(local[layer_item.presence_column])
     valid_window = bool(present and np.isfinite(top) and np.isfinite(base) and base > top)
     center_time = float(row["CenterTime"])
     center_inside = bool(valid_window and np.isfinite(center_time) and top <= center_time <= base)
@@ -507,7 +505,7 @@ def enforce_final_center_horizon_contract(
                 continue
             rejected += 1
             continue
-        expected_layer = "沙三段" if interval == "T4->T6" else "沙四段"
+        expected_layer = _FRAMEWORK.layer_by_interval(interval).name
         if str(row["LayerGroup"]) != expected_layer:
             reassigned += 1
         row["LayerGroup"] = expected_layer
@@ -1307,10 +1305,17 @@ def materialize_and_clip_vertices_to_horizon_contract(
     trace_idx = lookup.trace_idx[np.asarray(positions, dtype=np.int64)]
     horizon_rows = lookup.table[trace_idx]
     vertex_layers = np.repeat(out["LayerGroup"].astype(str).to_numpy(), 4)
-    is_shasi = vertex_layers == "沙四段"
-    top = np.where(is_shasi, horizon_rows["T6"], horizon_rows["T4"]).astype(np.float64)
-    base = np.where(is_shasi, horizon_rows["T7"], horizon_rows["T6"]).astype(np.float64)
-    present = np.where(is_shasi, horizon_rows["ShasiPresent"], horizon_rows["ShasanPresent"]).astype(bool)
+    top = np.full(len(vertex_layers), np.nan, dtype=np.float64)
+    base = np.full(len(vertex_layers), np.nan, dtype=np.float64)
+    present = np.zeros(len(vertex_layers), dtype=bool)
+    for layer_item in _FRAMEWORK.layers:
+        layer_mask = vertex_layers == layer_item.name
+        if not layer_mask.any():
+            continue
+        top_column, base_column = _FRAMEWORK.surface_pair(layer_item)
+        top[layer_mask] = horizon_rows[top_column][layer_mask].astype(np.float64)
+        base[layer_mask] = horizon_rows[base_column][layer_mask].astype(np.float64)
+        present[layer_mask] = horizon_rows[layer_item.presence_column][layer_mask].astype(bool)
     valid = present & np.isfinite(top) & np.isfinite(base) & (base >= top)
     voxel_coverage = out.get("WindowValidationMode", pd.Series("", index=out.index)).astype(str).eq("voxel_coverage").to_numpy()
     voxel_coverage_vertices = voxel_coverage.repeat(4)
@@ -1330,14 +1335,11 @@ def materialize_and_clip_vertices_to_horizon_contract(
             fraction = 0.5 * (low + high)
             candidate_xy = center_xy + fraction * (vertex_xy - center_xy)
             local = lookup.query(float(candidate_xy[0]), float(candidate_xy[1]))
-            if patch_layer == "沙四段":
-                local_present = bool(local["ShasiPresent"])
-                local_top = float(local["T6"])
-                local_base = float(local["T7"])
-            else:
-                local_present = bool(local["ShasanPresent"])
-                local_top = float(local["T4"])
-                local_base = float(local["T6"])
+            patch_item = _FRAMEWORK.layer(patch_layer)
+            patch_top, patch_base = _FRAMEWORK.surface_pair(patch_item)
+            local_present = bool(local[patch_item.presence_column])
+            local_top = float(local[patch_top])
+            local_base = float(local[patch_base])
             local_valid = bool(local_present and np.isfinite(local_top) and np.isfinite(local_base) and local_base >= local_top)
             if local_valid:
                 low = fraction
@@ -1349,14 +1351,11 @@ def materialize_and_clip_vertices_to_horizon_contract(
             best = (center_xy, local)
         candidate_xy, local = best
         flat_vertices[flat_idx, :2] = candidate_xy
-        if patch_layer == "沙四段":
-            top[flat_idx] = float(local["T6"])
-            base[flat_idx] = float(local["T7"])
-            local_present = bool(local["ShasiPresent"])
-        else:
-            top[flat_idx] = float(local["T4"])
-            base[flat_idx] = float(local["T6"])
-            local_present = bool(local["ShasanPresent"])
+        patch_item = _FRAMEWORK.layer(patch_layer)
+        patch_top, patch_base = _FRAMEWORK.surface_pair(patch_item)
+        top[flat_idx] = float(local[patch_top])
+        base[flat_idx] = float(local[patch_base])
+        local_present = bool(local[patch_item.presence_column])
         valid[flat_idx] = bool(
             local_present
             and np.isfinite(top[flat_idx])

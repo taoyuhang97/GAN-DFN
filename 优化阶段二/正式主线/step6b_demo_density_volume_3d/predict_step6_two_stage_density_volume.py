@@ -245,10 +245,15 @@ def predict_block(
     output = np.full((len(grid_block), len(samples)), np.nan, dtype=np.float32)
     layer_counts: dict[str, int] = {}
     surface_valid = grid_block["SurfaceValid"].to_numpy(dtype=bool)
-    for layer, top_column, base_column in (
-        ("沙三段", "T4_TIME", "T6_TIME"),
-        ("沙四段", "T6_TIME", "T7_TIME"),
-    ):
+    layer_contracts = [
+        (
+            item.name,
+            f"{_FRAMEWORK.surface(item.top).column}_TIME",
+            f"{_FRAMEWORK.surface(item.base).column}_TIME",
+        )
+        for item in _FRAMEWORK.layers
+    ]
+    for layer, top_column, base_column in layer_contracts:
         features, row_idx, time_idx = build_layer_features(
             attributes=attributes,
             samples=samples,
@@ -333,7 +338,7 @@ def main() -> int:
     if tuple(artifact.get("feature_columns", ())) != EXPECTED_FEATURE_COLUMNS:
         raise ValueError(f"model feature contract mismatch: {artifact.get('feature_columns')}")
     if sorted(artifact.get("models", {})) != sorted(ALLOWED_LAYERS):
-        raise ValueError("model artifact does not contain both 沙三段 and 沙四段")
+        raise ValueError(f"model artifact layers {sorted(artifact.get('models', {}))} != {sorted(ALLOWED_LAYERS)}")
     if "CurvaturePos" in artifact.get("feature_columns", ()):
         raise ValueError("formal predictor must not use CurvaturePos")
 
@@ -343,7 +348,14 @@ def main() -> int:
     interval_ms = float(config.get("sample_interval_ms", 2.0))
     sample_axis = build_sample_axis(grid, interval_ms)
     block_x_lines = max(int(config.get("block_x_line_count", 2)), 1)
-    density_cap = float(config.get("density_cap", artifact.get("models", {}).get("沙三段", {}).get("density_cap", 10.0)))
+    density_cap = float(
+        config.get(
+            "density_cap",
+            artifact.get("models", {})
+            .get(_FRAMEWORK.layers[0].name, {})
+            .get("density_cap", 10.0),
+        )
+    )
     x_line_count = int(grid["IX"].max()) + 1
     block_rows: list[dict[str, Any]] = []
     density_stats = RunningStats()
@@ -406,23 +418,29 @@ def main() -> int:
                         output_handle.trace[output_cursor] = predicted[local_index]
                         output_cursor += 1
                     finite_count = int(np.isfinite(predicted).sum())
-                    block_rows.append(
+                    block_row = {
+                        "BlockIndex": block_index,
+                        "IXStart": ix_start,
+                        "IXStopExclusive": ix_stop,
+                        "TraceCount": int(len(block)),
+                        "SurfaceValidTraceCount": int(block["SurfaceValid"].sum()),
+                        "FinitePredictionCount": finite_count,
+                        "NaNCount": int(predicted.size - finite_count),
+                    }
+                    for layer_name in ALLOWED_LAYERS:
+                        layer_slug = _FRAMEWORK.layer(layer_name).slug or layer_name
+                        block_row[f"{layer_slug.capitalize()}PredictionCount"] = int(
+                            layer_counts[layer_name]
+                        )
+                    block_row.update(
                         {
-                            "BlockIndex": block_index,
-                            "IXStart": ix_start,
-                            "IXStopExclusive": ix_stop,
-                            "TraceCount": int(len(block)),
-                            "SurfaceValidTraceCount": int(block["SurfaceValid"].sum()),
-                            "FinitePredictionCount": finite_count,
-                            "NaNCount": int(predicted.size - finite_count),
-                            "Sha3PredictionCount": int(layer_counts["沙三段"]),
-                            "Sha4PredictionCount": int(layer_counts["沙四段"]),
                             "PredictionMin": float(np.nanmin(predicted)) if finite_count else np.nan,
                             "PredictionMax": float(np.nanmax(predicted)) if finite_count else np.nan,
                             "PredictionMean": float(np.nanmean(predicted)) if finite_count else np.nan,
                             "ElapsedSeconds": float(time.time() - block_started),
                         }
                     )
+                    block_rows.append(block_row)
                     print(
                         f"[step6-predict] block={block_index} ix={ix_start}:{ix_stop} "
                         f"traces={output_cursor}/{len(grid)} finite={finite_count} "
