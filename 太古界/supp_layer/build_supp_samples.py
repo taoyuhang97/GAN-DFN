@@ -143,7 +143,7 @@ def main() -> int:
         "DensityScaleFactor": 1.0,
         "ImagingWindowID": "埕北古斜405_supp_W01",
         "HasFractureDensity": merged["HasFractureDensity"],
-        "GT_POINT_FLAG": 0,
+        "GT_POINT_FLAG": merged["HasFractureDensity"],
         "RawPointCount": 0,
         "FracAzimuth": np.nan,
         "FracDip": np.nan,

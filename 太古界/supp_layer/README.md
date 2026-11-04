@@ -57,6 +57,7 @@ Y 4,239,250 – 4,244,250
 ├── build_supp_legacy_adapter.py      # 把新层映射成 T4/T6/T7 形状，供 6B/6C/6D 复用
 ├── build_supp_step7_inputs.py        # Step7 区块网格 / window_code / 四份配置
 ├── relabel_supp_dfn.py               # 把 7D 临时层标签改回"上部补充层"（LayerCode=3）
+├── build_supp_step8_inputs.py        # Step8 临时层标签成像组 + 配置
 ├── README.md
 └── output/                           # 生成物（已 gitignore）
     ├── taigu_supp_horizon_v1/
@@ -77,7 +78,7 @@ Y 4,239,250 – 4,244,250
         ├── step6b_supp/                        # 中尺度先验
         ├── step6c_supp/                        # 大尺度断层先验
         └── step6d_supp/                        # 多尺度打包
-    └── taigu_supp_step7_v1/
+    ├── taigu_supp_step7_v1/
         ├── supp_demo_grid_block.csv            # 401×401 区块网格（局部 IX/IY）
         ├── supp_window_code.npz                # 新层层窗（160801×494）
         ├── supp_7a_config.json ... supp_7d_config.json
@@ -85,6 +86,10 @@ Y 4,239,250 – 4,244,250
         ├── step7b_supp/                        # 中尺度 3,919 片
         ├── step7c_supp/                        # 大尺度 159 片
         └── step7d_supp/                        # 融合 47,139 片 + 修正层标签 CSV
+    └── taigu_supp_step8_v1/
+        ├── supp_8_config.json
+        ├── groups/                             # 临时改名为"上部复合层"的 405 成像组
+        └── step8_supp/                         # 井控校正 48,935 片 + 修正层标签 CSV
 ```
 
 ## 5. 运行
@@ -137,6 +142,8 @@ python3 太古界/step6d_multiscale_bundle/code/build_step6d_multiscale_bundle.p
 | **Step7C 大尺度** | 159 片；仅"双层代表"QC 未过（单层运行属预期） |
 | **Step7D 融合** | **status=pass，47,139 片**（small 43,061 / medium 3,919 / large 159），时间 2650–3600 ms |
 | 层标签修正 | 47,139 行全部改为 `上部补充层` / `LayerCode=3` |
+| **Step8 井控校正** | **status=pass**，1,829 个控制点，**48,935 片**（small 44,857 / medium 3,919 / large 159），时间 2650–3600 ms |
+| Step8 层标签修正 | 48,935 行全部改为 `上部补充层` / `LayerCode=3` |
 
 ## 7. 与原代码的接口
 
@@ -148,9 +155,8 @@ python3 太古界/step6d_multiscale_bundle/code/build_step6d_multiscale_bundle.p
 
 ## 8. 后续步骤（尚未实现）
 
-1. **Step8**：用 405 在新层内的成像点做井控校正；
-2. **拼接**：把新层 DFN（区块）与现有全域 DFN 做几何并集，交界处按 `Top − ε` / `Top` 切齐；
-3. **Step9 / Step9b**：新增"上部补充层"剖面与 P33 图，和现有两层并排对比。
+1. **拼接**：把新层 DFN（区块）与现有全域 DFN 做几何并集，交界处按 `Top − ε` / `Top` 切齐；
+2. **Step9 / Step9b**：新增"上部补充层"剖面与 P33 图，和现有两层并排对比。
 
 > Step6A 已完成：`predict_supp_density.py` 复用"上部复合层"两阶段模型，
 > 属性分数使用其 normalization contract；层窗取 `[TopV, Top)`，与上部复合层不重叠。
@@ -161,5 +167,9 @@ python3 太古界/step6d_multiscale_bundle/code/build_step6d_multiscale_bundle.p
 
 > Step7A–D 已完成：7A/7B/7C 复用原有脚本（新区块配置）；7D status=pass，
 > 融合 47,139 片。`relabel_supp_dfn.py` 已把层标签统一为"上部补充层"/LayerCode=3。
+
+> Step8 已完成：`build_supp_step8_inputs.py` 把 405 成像组临时改名为"上部复合层"
+> 以通过原脚本的层过滤；井控校正后 status=pass，1,829 个控制点、48,935 片，
+> 再用 `relabel_supp_dfn.py` 统一改回"上部补充层"/LayerCode=3。
 
 这些步骤同样只新增配置/脚本，不改原代码。
