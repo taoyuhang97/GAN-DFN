@@ -30,7 +30,11 @@ BASE_CONFIG = TAIGU / "step8_well_correction/configs/taigu_step8_attribute_multi
 INITIAL_CSV = SUPP / "taigu_supp_step7_v1/step7d_supp/fused_multiscale_dfn_patches.csv"
 INITIAL_VTK = SUPP / "taigu_supp_step7_v1/step7d_supp/fused_multiscale_dfn_raw_time.vtk"
 INITIAL_SUMMARY = SUPP / "taigu_supp_step7_v1/step7d_supp/fused_multiscale_summary.json"
-SUPP_GROUP = SUPP / "taigu_supp_samples_v1/supp_imaging_group.csv"
+# 用原始 Step3 成像组：它覆盖 MD 3676.55-3998.05（正是新层区间），
+# 且带真实 GT_POINT_FLAG / RawPointCount（317 条裂缝，301 行）。
+SUPP_GROUP = (
+    TAIGU / "step3_imaging_groups/output/taigu_step3_imaging_md1/groups/埕北古斜405_g001_上部复合层.csv"
+)
 LEGACY_CSV = SUPP / "taigu_supp_legacy_v1/supp_horizon_legacy_full.csv"
 OUTPUT = SUPP / "taigu_supp_step8_v1"
 

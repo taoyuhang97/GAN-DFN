@@ -142,8 +142,8 @@ python3 太古界/step6d_multiscale_bundle/code/build_step6d_multiscale_bundle.p
 | **Step7C 大尺度** | 159 片；仅"双层代表"QC 未过（单层运行属预期） |
 | **Step7D 融合** | **status=pass，47,139 片**（small 43,061 / medium 3,919 / large 159），时间 2650–3600 ms |
 | 层标签修正 | 47,139 行全部改为 `上部补充层` / `LayerCode=3` |
-| **Step8 井控校正** | **status=pass**，1,829 个控制点，**48,935 片**（small 44,857 / medium 3,919 / large 159），时间 2650–3600 ms |
-| Step8 层标签修正 | 48,935 行全部改为 `上部补充层` / `LayerCode=3` |
+| **Step8 井控校正** | **status=pass**，**301 个控制行（317 条真实裂缝）**，**47,407 片**（small 43,329 / medium 3,919 / large 159），仅修改 301 片，时间 2650–3600 ms |
+| Step8 层标签修正 | 47,407 行全部改为 `上部补充层` / `LayerCode=3` |
 
 ## 7. 与原代码的接口
 
@@ -168,8 +168,13 @@ python3 太古界/step6d_multiscale_bundle/code/build_step6d_multiscale_bundle.p
 > Step7A–D 已完成：7A/7B/7C 复用原有脚本（新区块配置）；7D status=pass，
 > 融合 47,139 片。`relabel_supp_dfn.py` 已把层标签统一为"上部补充层"/LayerCode=3。
 
-> Step8 已完成：`build_supp_step8_inputs.py` 把 405 成像组临时改名为"上部复合层"
-> 以通过原脚本的层过滤；井控校正后 status=pass，1,829 个控制点、48,935 片，
-> 再用 `relabel_supp_dfn.py` 统一改回"上部补充层"/LayerCode=3。
+> Step8 已完成：`build_supp_step8_inputs.py` 直接使用**原始 405 Step3 成像组**
+> （覆盖 MD 3676.55–3998.05，带真实 GT_POINT_FLAG/RawPointCount），只把层名临时
+> 改成"上部复合层"以通过原脚本层过滤。真实裂缝共 **317 条**（CCF 70 + DCF 196 +
+> ECF 51），分布在 **301 个采样行**；井控校正后 status=pass，47,407 片，仅修改
+> 301 片，再用 `relabel_supp_dfn.py` 统一改回"上部补充层"/LayerCode=3。
+>
+> 早期版本曾用"密度>0 的 1,829 个采样行"作代理控制，导致井周补片偏多
+> （48,935 片、修改 1,829 片）；该结果已被真实裂缝版覆盖。
 
 这些步骤同样只新增配置/脚本，不改原代码。
