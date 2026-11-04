@@ -53,16 +53,21 @@ Y 4,239,250 – 4,244,250
 ├── supp_framework.py                 # 运行时注册 taigu_supp_v1
 ├── build_supp_horizon.py             # 生成带 TopV 的逐道契约
 ├── build_supp_samples.py             # 405 成像监督组 + 常规测井样本
+├── predict_supp_density.py           # Step6A：区块内新层密度预测（复用上部复合层模型）
 ├── README.md
 └── output/                           # 生成物（已 gitignore）
     ├── taigu_supp_horizon_v1/
     │   ├── supp_horizon_contract.npy          # 全矿区 2,156,550 道
     │   ├── supp_horizon_contract_block.csv    # 区块 160,682 道
     │   └── supp_horizon_summary.json
-    └── taigu_supp_samples_v1/
+    ├── taigu_supp_samples_v1/
         ├── supp_imaging_group.csv             # Step3 组格式
         ├── supp_real_well_samples.csv         # 带 GR/RD/RS/Density 的井上样本
         └── supp_samples_summary.json
+    └── taigu_supp_density_v1/
+        ├── supp_density_block.sgy             # 159,140 道 × 493 样点 @2 ms
+        ├── supp_density_mapping.npz
+        └── supp_density_summary.json
 ```
 
 ## 5. 运行
@@ -75,6 +80,9 @@ python3 太古界/supp_layer/build_supp_horizon.py
 
 # 2) 405 成像组 + 井上样本
 python3 太古界/supp_layer/build_supp_samples.py
+
+# 3) Step6A：区块内新层密度体（复用上部复合层模型）
+python3 太古界/supp_layer/predict_supp_density.py
 ```
 
 两个脚本都可 `--help` 查看参数。
@@ -90,6 +98,8 @@ python3 太古界/supp_layer/build_supp_samples.py
 | 405 成像点余量 | 最小 49.3 ms / 中位 127.9 ms |
 | 405 井上样本 | 2,573 行，GR/RD/RS 全有效 |
 | 其中密度 > 0 | 1,829 行（71.1%），均值 0.98，最大 6.76 |
+| **Step6A 密度体** | 159,140 道 × 493 样点（2650–3634 ms @2 ms），耗时 203 s |
+| 405 成像点密度 | 2572/2572 有值，均值 0.892，最大 1.477 |
 
 ## 7. 与原代码的接口
 
@@ -101,11 +111,13 @@ python3 太古界/supp_layer/build_supp_samples.py
 
 ## 8. 后续步骤（尚未实现）
 
-1. **Step6A**：在 5×5 km 区块内，对 code=3 预测密度，复用"上部复合层"两阶段模型；
-2. **Step6B/C/D**：在区块内生成新层的中/大尺度先验与打包；
-3. **Step7A–D**：在区块内生成新层 DFN；
-4. **Step8**：用 405 在新层内的成像点做井控校正；
-5. **拼接**：把新层 DFN（区块）与现有全域 DFN 做几何并集，交界处按 `Top − ε` / `Top` 切齐；
-6. **Step9 / Step9b**：新增"上部补充层"剖面与 P33 图，和现有两层并排对比。
+1. **Step6B/C/D**：在区块内生成新层的中/大尺度先验与打包；
+2. **Step7A–D**：在区块内生成新层 DFN；
+3. **Step8**：用 405 在新层内的成像点做井控校正；
+4. **拼接**：把新层 DFN（区块）与现有全域 DFN 做几何并集，交界处按 `Top − ε` / `Top` 切齐；
+5. **Step9 / Step9b**：新增"上部补充层"剖面与 P33 图，和现有两层并排对比。
+
+> Step6A 已完成：`predict_supp_density.py` 复用"上部复合层"两阶段模型，
+> 属性分数使用其 normalization contract；层窗取 `[TopV, Top)`，与上部复合层不重叠。
 
 这些步骤同样只新增配置/脚本，不改原代码。
