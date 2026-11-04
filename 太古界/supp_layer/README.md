@@ -60,6 +60,7 @@ Y 4,239,250 – 4,244,250
 ├── build_supp_step8_inputs.py        # Step8 临时层标签成像组 + 配置
 ├── merge_supp_dfn.py                 # 新层 DFN 与现有全域 DFN 几何并集
 ├── plot_supp_layer_density.py        # Step9b：5×5 km 三层裂缝面积密度对比
+├── plot_supp_step9_split_sections.py # Step9 增补：成像真值 / DFN 预测拆成两张剖面
 ├── README.md
 └── output/                           # 生成物（已 gitignore）
     ├── taigu_supp_horizon_v1/
@@ -100,6 +101,9 @@ Y 4,239,250 – 4,244,250
     └── taigu_supp_step9b_v1/
         ├── layer_area_density_grid_300m.csv
         └── layer_area_density_compare.png
+    └── taigu_supp_step9_split_v1/
+        ├── 01_imaging_trajectory_and_fractures.png   # 仅井轨迹 + 真实裂缝
+        └── 02_dfn_predicted_only.png                 # 仅 DFN 预测
 ```
 
 ## 5. 运行
@@ -157,6 +161,7 @@ python3 太古界/step6d_multiscale_bundle/code/build_step6d_multiscale_bundle.p
 | **拼接（新层 ∪ 全域）** | **418,024 片**（原 370,617 + 新 47,407）；VTK **462,976 单元 / 1,724,789 点**；三层：上部复合层 253,723 / 太古界风化壳 116,894 / 上部补充层 47,407 |
 | **Step9 剖面** | 全量 20 图（2354–4232 ms，含新层纵轴范围）；另出 2 图快速版，临时把新层并入上部复合层以命中原配色表 |
 | **Step9b 密度对比** | 5×5 km 300 m 网格面积密度：上部复合层均值 1.045、太古界风化壳 0.511、上部补充层 **1.779**（patch 27,157 / 12,110 / 47,278） |
+| **Step9 拆分剖面** | 405 井段 ±200 m、2600–3060 ms：图1 仅井轨迹+301 行真实裂缝（317 条，按倾向/倾角画线）；图2 仅 DFN 预测（不含真实成像裂缝），按小/中/大尺度着色 |
 
 ## 7. 与原代码的接口
 
