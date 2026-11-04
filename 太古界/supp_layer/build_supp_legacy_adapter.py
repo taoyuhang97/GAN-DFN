@@ -52,7 +52,7 @@ def main() -> int:
 
     source = pd.read_csv(
         args.source_contract,
-        usecols=["TraceIdx", "SurfaceValid"],
+        usecols=["TraceIdx", "X", "Y", "SurfaceValid"],
         encoding="utf-8-sig",
         low_memory=False,
     ).sort_values("TraceIdx").reset_index(drop=True)
@@ -66,6 +66,8 @@ def main() -> int:
 
     legacy = pd.DataFrame({
         "TraceIdx": source["TraceIdx"].to_numpy(dtype=np.int64),
+        "X": source["X"].to_numpy(dtype=np.float64),
+        "Y": source["Y"].to_numpy(dtype=np.float64),
         "TopTimeMs": top_v,
         "MidTimeMs": top - 1.0,
         "BaseTimeMs": top,

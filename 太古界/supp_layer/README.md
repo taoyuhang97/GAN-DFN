@@ -55,6 +55,8 @@ Y 4,239,250 – 4,244,250
 ├── build_supp_samples.py             # 405 成像监督组 + 常规测井样本
 ├── predict_supp_density.py           # Step6A：区块内新层密度预测（复用上部复合层模型）
 ├── build_supp_legacy_adapter.py      # 把新层映射成 T4/T6/T7 形状，供 6B/6C/6D 复用
+├── build_supp_step7_inputs.py        # Step7 区块网格 / window_code / 四份配置
+├── relabel_supp_dfn.py               # 把 7D 临时层标签改回"上部补充层"（LayerCode=3）
 ├── README.md
 └── output/                           # 生成物（已 gitignore）
     ├── taigu_supp_horizon_v1/
@@ -69,12 +71,20 @@ Y 4,239,250 – 4,244,250
         ├── supp_density_block.sgy             # 159,140 道 × 493 样点 @2 ms
         ├── supp_density_mapping.npz
         └── supp_density_summary.json
-    └── taigu_supp_legacy_v1/
+    ├── taigu_supp_legacy_v1/
         ├── supp_horizon_legacy_full.csv/.npy  # T4=TopV, T6=Top-1ms, T7=Top
         ├── supp_6b_config.json / supp_6c_config.json / supp_6d_config.json
         ├── step6b_supp/                        # 中尺度先验
         ├── step6c_supp/                        # 大尺度断层先验
         └── step6d_supp/                        # 多尺度打包
+    └── taigu_supp_step7_v1/
+        ├── supp_demo_grid_block.csv            # 401×401 区块网格（局部 IX/IY）
+        ├── supp_window_code.npz                # 新层层窗（160801×494）
+        ├── supp_7a_config.json ... supp_7d_config.json
+        ├── step7a_supp/                        # 小尺度 43,061 片
+        ├── step7b_supp/                        # 中尺度 3,919 片
+        ├── step7c_supp/                        # 大尺度 159 片
+        └── step7d_supp/                        # 融合 47,139 片 + 修正层标签 CSV
 ```
 
 ## 5. 运行
@@ -122,6 +132,11 @@ python3 太古界/step6d_multiscale_bundle/code/build_step6d_multiscale_bundle.p
 | **Step6B 中尺度** | status=pass，889 个组件，候选体素 391,325，层内占比 28.1% |
 | **Step6C 大尺度** | status=pass，188 个推断组件，323 个原始断层片 |
 | **Step6D 打包** | status=pass，shape 160,801×494（2650–3636 ms）；small 2.65M / medium 644k / large 1.31M 候选体素 |
+| **Step7A 小尺度** | status=pass，43,061 片 | 75 s |
+| **Step7B 中尺度** | 3,919 片；仅"空间四象限覆盖"QC 未过（局部区块候选集中） |
+| **Step7C 大尺度** | 159 片；仅"双层代表"QC 未过（单层运行属预期） |
+| **Step7D 融合** | **status=pass，47,139 片**（small 43,061 / medium 3,919 / large 159），时间 2650–3600 ms |
+| 层标签修正 | 47,139 行全部改为 `上部补充层` / `LayerCode=3` |
 
 ## 7. 与原代码的接口
 
@@ -133,10 +148,9 @@ python3 太古界/step6d_multiscale_bundle/code/build_step6d_multiscale_bundle.p
 
 ## 8. 后续步骤（尚未实现）
 
-1. **Step7A–D**：在区块内生成新层 DFN；
-2. **Step8**：用 405 在新层内的成像点做井控校正；
-3. **拼接**：把新层 DFN（区块）与现有全域 DFN 做几何并集，交界处按 `Top − ε` / `Top` 切齐；
-4. **Step9 / Step9b**：新增"上部补充层"剖面与 P33 图，和现有两层并排对比。
+1. **Step8**：用 405 在新层内的成像点做井控校正；
+2. **拼接**：把新层 DFN（区块）与现有全域 DFN 做几何并集，交界处按 `Top − ε` / `Top` 切齐；
+3. **Step9 / Step9b**：新增"上部补充层"剖面与 P33 图，和现有两层并排对比。
 
 > Step6A 已完成：`predict_supp_density.py` 复用"上部复合层"两阶段模型，
 > 属性分数使用其 normalization contract；层窗取 `[TopV, Top)`，与上部复合层不重叠。
@@ -144,5 +158,8 @@ python3 太古界/step6d_multiscale_bundle/code/build_step6d_multiscale_bundle.p
 > Step6B/C/D 已完成：`build_supp_legacy_adapter.py` 把新层映射到 T4/T6/T7 槽位
 > （T4=TopV、T6=Top−1 ms、T7=Top），原有 6B/6C/6D 脚本无需修改即可运行；
 > 输出的 LayerGroup 仍是临时"沙三段"语义，Step7 之后会统一改回"上部补充层"。
+
+> Step7A–D 已完成：7A/7B/7C 复用原有脚本（新区块配置）；7D status=pass，
+> 融合 47,139 片。`relabel_supp_dfn.py` 已把层标签统一为"上部补充层"/LayerCode=3。
 
 这些步骤同样只新增配置/脚本，不改原代码。
