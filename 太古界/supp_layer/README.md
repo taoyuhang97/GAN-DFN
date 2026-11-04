@@ -58,6 +58,7 @@ Y 4,239,250 – 4,244,250
 ├── build_supp_step7_inputs.py        # Step7 区块网格 / window_code / 四份配置
 ├── relabel_supp_dfn.py               # 把 7D 临时层标签改回"上部补充层"（LayerCode=3）
 ├── build_supp_step8_inputs.py        # Step8 临时层标签成像组 + 配置
+├── merge_supp_dfn.py                 # 新层 DFN 与现有全域 DFN 几何并集
 ├── README.md
 └── output/                           # 生成物（已 gitignore）
     ├── taigu_supp_horizon_v1/
@@ -89,7 +90,11 @@ Y 4,239,250 – 4,244,250
     └── taigu_supp_step8_v1/
         ├── supp_8_config.json
         ├── groups/                             # 临时改名为"上部复合层"的 405 成像组
-        └── step8_supp/                         # 井控校正 48,935 片 + 修正层标签 CSV
+        └── step8_supp/                         # 井控校正 47,407 片 + 修正层标签 CSV
+    └── taigu_supp_merged_v1/
+        ├── merged_dfn_patches.csv              # 418,024 片（三层）
+        ├── merged_dfn_raw_time.vtk             # 462,976 单元
+        └── merged_dfn_summary.json
 ```
 
 ## 5. 运行
@@ -144,6 +149,7 @@ python3 太古界/step6d_multiscale_bundle/code/build_step6d_multiscale_bundle.p
 | 层标签修正 | 47,139 行全部改为 `上部补充层` / `LayerCode=3` |
 | **Step8 井控校正** | **status=pass**，**301 个控制行（317 条真实裂缝）**，**47,407 片**（small 43,329 / medium 3,919 / large 159），仅修改 301 片，时间 2650–3600 ms |
 | Step8 层标签修正 | 47,407 行全部改为 `上部补充层` / `LayerCode=3` |
+| **拼接（新层 ∪ 全域）** | **418,024 片**（原 370,617 + 新 47,407）；VTK **462,976 单元 / 1,724,789 点**；三层：上部复合层 253,723 / 太古界风化壳 116,894 / 上部补充层 47,407 |
 
 ## 7. 与原代码的接口
 
@@ -155,8 +161,7 @@ python3 太古界/step6d_multiscale_bundle/code/build_step6d_multiscale_bundle.p
 
 ## 8. 后续步骤（尚未实现）
 
-1. **拼接**：把新层 DFN（区块）与现有全域 DFN 做几何并集，交界处按 `Top − ε` / `Top` 切齐；
-2. **Step9 / Step9b**：新增"上部补充层"剖面与 P33 图，和现有两层并排对比。
+1. **Step9 / Step9b**：新增"上部补充层"剖面与 P33 图，和现有两层并排对比。
 
 > Step6A 已完成：`predict_supp_density.py` 复用"上部复合层"两阶段模型，
 > 属性分数使用其 normalization contract；层窗取 `[TopV, Top)`，与上部复合层不重叠。
@@ -176,5 +181,10 @@ python3 太古界/step6d_multiscale_bundle/code/build_step6d_multiscale_bundle.p
 >
 > 早期版本曾用"密度>0 的 1,829 个采样行"作代理控制，导致井周补片偏多
 > （48,935 片、修改 1,829 片）；该结果已被真实裂缝版覆盖。
+
+> 拼接已完成：新层 [TopV, Top) 与现有 [Top, Base+50] 时间区间不相交，
+> 直接几何并集。输出 `taigu_supp_merged_v1/merged_dfn_raw_time.vtk`
+> （462,976 单元）与 `merged_dfn_patches.csv`（418,024 行，三层标签齐全），
+> 可直接用于 Step9 剖面。
 
 这些步骤同样只新增配置/脚本，不改原代码。
