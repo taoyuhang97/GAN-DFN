@@ -87,16 +87,16 @@ def main() -> int:
     interval = float(config.get("sample_interval_ms", 2.0))
 
     block = pd.read_csv(args.block_csv, encoding="utf-8-sig")
-    block = block[block["SuppPresent"].astype(bool)].reset_index(drop=True)
     if block.empty:
-        raise RuntimeError("supplementary block contains no valid traces")
+        raise RuntimeError("supplementary block is empty")
     top_v = pd.to_numeric(block["TopVTimeMs"], errors="coerce").to_numpy(dtype=np.float64)
     top = pd.to_numeric(block["TopTimeMs"], errors="coerce").to_numpy(dtype=np.float64)
     x = pd.to_numeric(block["X"], errors="coerce").to_numpy(dtype=np.float64)
     y = pd.to_numeric(block["Y"], errors="coerce").to_numpy(dtype=np.float64)
-    ix = block["IX"].to_numpy(dtype=np.int32)
-    iy = block["IY"].to_numpy(dtype=np.int32)
+    ix = block["IXLocal"].to_numpy(dtype=np.int32) if "IXLocal" in block.columns else block["IX"].to_numpy(dtype=np.int32)
+    iy = block["IYLocal"].to_numpy(dtype=np.int32) if "IYLocal" in block.columns else block["IY"].to_numpy(dtype=np.int32)
     trace_idx = block["TraceIdx"].to_numpy(dtype=np.int64)
+    valid = block["SuppPresent"].astype(bool).to_numpy()
 
     axis_start = float(np.floor(np.nanmin(top_v) / interval) * interval)
     axis_stop = float(np.ceil(np.nanmax(top) / interval) * interval)
@@ -115,6 +115,8 @@ def main() -> int:
     np.savez_compressed(
         mapping_path,
         source_trace_idx=trace_idx,
+        trace_idx=trace_idx,
+        output_trace_index=np.arange(len(trace_idx), dtype=np.int64),
         x=x,
         y=y,
         ix=ix,
@@ -172,7 +174,7 @@ def main() -> int:
                 sample_axis,
                 lo,
                 hi,
-                np.ones(stop - start, dtype=bool),
+                valid[start:stop],
                 LAYER_CODE,
                 MODEL_LAYER,
                 normalization,

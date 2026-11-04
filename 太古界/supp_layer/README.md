@@ -54,6 +54,7 @@ Y 4,239,250 – 4,244,250
 ├── build_supp_horizon.py             # 生成带 TopV 的逐道契约
 ├── build_supp_samples.py             # 405 成像监督组 + 常规测井样本
 ├── predict_supp_density.py           # Step6A：区块内新层密度预测（复用上部复合层模型）
+├── build_supp_legacy_adapter.py      # 把新层映射成 T4/T6/T7 形状，供 6B/6C/6D 复用
 ├── README.md
 └── output/                           # 生成物（已 gitignore）
     ├── taigu_supp_horizon_v1/
@@ -64,10 +65,16 @@ Y 4,239,250 – 4,244,250
         ├── supp_imaging_group.csv             # Step3 组格式
         ├── supp_real_well_samples.csv         # 带 GR/RD/RS/Density 的井上样本
         └── supp_samples_summary.json
-    └── taigu_supp_density_v1/
+    ├── taigu_supp_density_v1/
         ├── supp_density_block.sgy             # 159,140 道 × 493 样点 @2 ms
         ├── supp_density_mapping.npz
         └── supp_density_summary.json
+    └── taigu_supp_legacy_v1/
+        ├── supp_horizon_legacy_full.csv/.npy  # T4=TopV, T6=Top-1ms, T7=Top
+        ├── supp_6b_config.json / supp_6c_config.json / supp_6d_config.json
+        ├── step6b_supp/                        # 中尺度先验
+        ├── step6c_supp/                        # 大尺度断层先验
+        └── step6d_supp/                        # 多尺度打包
 ```
 
 ## 5. 运行
@@ -83,6 +90,18 @@ python3 太古界/supp_layer/build_supp_samples.py
 
 # 3) Step6A：区块内新层密度体（复用上部复合层模型）
 python3 太古界/supp_layer/predict_supp_density.py
+
+# 4) 兼容适配 + Step6B/C/D（复用原有脚本，不改代码）
+python3 太古界/supp_layer/build_supp_legacy_adapter.py
+python3 太古界/step6b_medium_corridor/code/build_step6b_medium_corridor_prior.py \
+  --config 太古界/supp_layer/output/taigu_supp_legacy_v1/supp_6b_config.json \
+  --output-dir 太古界/supp_layer/output/taigu_supp_legacy_v1/step6b_supp
+python3 太古界/step6c_large_fault/code/build_step6c_large_fault_prior.py \
+  --config 太古界/supp_layer/output/taigu_supp_legacy_v1/supp_6c_config.json
+python3 太古界/step6a_density_volume/build_taigu_small_background.py \
+  --config 太古界/supp_layer/output/taigu_supp_legacy_v1/supp_6a_small_config.json
+python3 太古界/step6d_multiscale_bundle/code/build_step6d_multiscale_bundle.py \
+  --config 太古界/supp_layer/output/taigu_supp_legacy_v1/supp_6d_config.json
 ```
 
 两个脚本都可 `--help` 查看参数。
@@ -100,6 +119,9 @@ python3 太古界/supp_layer/predict_supp_density.py
 | 其中密度 > 0 | 1,829 行（71.1%），均值 0.98，最大 6.76 |
 | **Step6A 密度体** | 159,140 道 × 493 样点（2650–3634 ms @2 ms），耗时 203 s |
 | 405 成像点密度 | 2572/2572 有值，均值 0.892，最大 1.477 |
+| **Step6B 中尺度** | status=pass，889 个组件，候选体素 391,325，层内占比 28.1% |
+| **Step6C 大尺度** | status=pass，188 个推断组件，323 个原始断层片 |
+| **Step6D 打包** | status=pass，shape 160,801×494（2650–3636 ms）；small 2.65M / medium 644k / large 1.31M 候选体素 |
 
 ## 7. 与原代码的接口
 
@@ -111,13 +133,16 @@ python3 太古界/supp_layer/predict_supp_density.py
 
 ## 8. 后续步骤（尚未实现）
 
-1. **Step6B/C/D**：在区块内生成新层的中/大尺度先验与打包；
-2. **Step7A–D**：在区块内生成新层 DFN；
-3. **Step8**：用 405 在新层内的成像点做井控校正；
-4. **拼接**：把新层 DFN（区块）与现有全域 DFN 做几何并集，交界处按 `Top − ε` / `Top` 切齐；
-5. **Step9 / Step9b**：新增"上部补充层"剖面与 P33 图，和现有两层并排对比。
+1. **Step7A–D**：在区块内生成新层 DFN；
+2. **Step8**：用 405 在新层内的成像点做井控校正；
+3. **拼接**：把新层 DFN（区块）与现有全域 DFN 做几何并集，交界处按 `Top − ε` / `Top` 切齐；
+4. **Step9 / Step9b**：新增"上部补充层"剖面与 P33 图，和现有两层并排对比。
 
 > Step6A 已完成：`predict_supp_density.py` 复用"上部复合层"两阶段模型，
 > 属性分数使用其 normalization contract；层窗取 `[TopV, Top)`，与上部复合层不重叠。
+
+> Step6B/C/D 已完成：`build_supp_legacy_adapter.py` 把新层映射到 T4/T6/T7 槽位
+> （T4=TopV、T6=Top−1 ms、T7=Top），原有 6B/6C/6D 脚本无需修改即可运行；
+> 输出的 LayerGroup 仍是临时"沙三段"语义，Step7 之后会统一改回"上部补充层"。
 
 这些步骤同样只新增配置/脚本，不改原代码。

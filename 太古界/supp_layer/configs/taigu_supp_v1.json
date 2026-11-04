@@ -14,6 +14,9 @@
       "x_max": 668450.0,
       "y_min": 4239250.0,
       "y_max": 4244250.0,
+      "center_x": 665954.0,
+      "center_y": 4241759.0,
+      "half_cells": 200,
       "center_well": "埕北古斜405"
     },
     "model_reuse": {

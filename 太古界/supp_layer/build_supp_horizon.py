@@ -149,12 +149,24 @@ def main() -> int:
     np.save(npy_path, table)
     print(f"[supp-horizon] wrote {npy_path} ({len(table):,} traces)")
 
-    # 只把 5×5 km 区块写成 CSV（供后续脚本按块读取，避免再吃全量 CSV）
+    # 5×5 km 区块按 IX/IY 取完整的 401×401 矩形（6B 要求映射是完整矩形）。
+    from scipy.spatial import cKDTree
+
+    center_x = float(block.get("center_x", 665954.0))
+    center_y = float(block.get("center_y", 4241759.0))
+    xy_tree = cKDTree(source[["X", "Y"]].to_numpy(dtype=np.float64))
+    _, center_pos = xy_tree.query([center_x, center_y], k=1)
+    center_pos = int(np.asarray(center_pos).reshape(-1)[0])
+    center_ix = int(source.loc[center_pos, "IX"])
+    center_iy = int(source.loc[center_pos, "IY"])
+    half_cells = int(block.get("half_cells", 200))
+    ix_min = center_ix - half_cells
+    ix_max = center_ix + half_cells
+    iy_min = center_iy - half_cells
+    iy_max = center_iy + half_cells
     block_mask = (
-        (source["X"] >= float(block.get("x_min", 663450.0)))
-        & (source["X"] <= float(block.get("x_max", 668450.0)))
-        & (source["Y"] >= float(block.get("y_min", 4239250.0)))
-        & (source["Y"] <= float(block.get("y_max", 4244250.0)))
+        (source["IX"] >= ix_min) & (source["IX"] <= ix_max)
+        & (source["IY"] >= iy_min) & (source["IY"] <= iy_max)
     ).to_numpy()
     block_df = pd.DataFrame({
         "TraceIdx": source.loc[block_mask, "TraceIdx"].to_numpy(dtype=np.int64),
@@ -162,6 +174,8 @@ def main() -> int:
         "Y": source.loc[block_mask, "Y"].to_numpy(dtype=np.float64),
         "IX": source.loc[block_mask, "IX"].to_numpy(dtype=np.int64),
         "IY": source.loc[block_mask, "IY"].to_numpy(dtype=np.int64),
+        "IXLocal": (source.loc[block_mask, "IX"] - ix_min).to_numpy(dtype=np.int64),
+        "IYLocal": (source.loc[block_mask, "IY"] - iy_min).to_numpy(dtype=np.int64),
         "TopVTimeMs": top_v[block_mask],
         "TopTimeMs": top[block_mask],
         "MidTimeMs": mid[block_mask],
@@ -184,6 +198,15 @@ def main() -> int:
         "output_block_csv": str(block_csv),
         "virtual_top": {"formula": f"max(TopTimeMs - {offset:g}, {floor:g})", "offset_ms": offset, "floor_ms": floor},
         "block": block,
+        "block_grid": {
+            "center_ix": center_ix,
+            "center_iy": center_iy,
+            "ix_min": ix_min,
+            "ix_max": ix_max,
+            "iy_min": iy_min,
+            "iy_max": iy_max,
+            "expected_cells": int((ix_max - ix_min + 1) * (iy_max - iy_min + 1)),
+        },
         "counts": {
             "total_traces": int(len(source)),
             "surface_valid_traces": int(valid.sum()),
