@@ -1,0 +1,75 @@
+{
+  "framework_id": "taigu_supp_v1",
+  "area": "太古界·上部补充层（405 局部 5×5 km）",
+  "metadata": {
+    "note": "在太古界三个层位面之上增加虚拟顶 TopV，形成上部补充层，用来包住埕北古斜405的成像解释段",
+    "virtual_top": {
+      "formula": "TopV = max(TopTimeMs - 350, 2650)",
+      "offset_ms": 350.0,
+      "floor_ms": 2650.0,
+      "reason": "405 成像段 2746.8-2866.2 ms，沿井 Top 比成像时间高 125-301 ms；属性体 6B/6C 从 2624 ms 起，故下限取 2650"
+    },
+    "block": {
+      "x_min": 663450.0,
+      "x_max": 668450.0,
+      "y_min": 4239250.0,
+      "y_max": 4244250.0,
+      "center_well": "埕北古斜405"
+    },
+    "model_reuse": {
+      "上部补充层": "上部复合层",
+      "reason": "新层目前只有 405 一口成像井，先用上部复合层两阶段模型做代理预测"
+    }
+  },
+  "surfaces": [
+    {"id": "TopV", "label": "虚拟顶（上部补充层顶）", "order": 1, "legacy_column": "TopVTimeMs"},
+    {"id": "Top", "label": "上部复合层顶", "order": 2, "legacy_column": "TopTimeMs"},
+    {"id": "Mid", "label": "太古界顶", "order": 3, "legacy_column": "MidTimeMs"},
+    {"id": "Base", "label": "风化壳底", "order": 4, "legacy_column": "BaseTimeMs"}
+  ],
+  "layers": [
+    {
+      "code": 3,
+      "name": "上部补充层",
+      "top": "TopV",
+      "base": "Top",
+      "color": "#a855f7",
+      "display_order": 0,
+      "inclusive_base": false,
+      "extension_ms": 0.0,
+      "presence_column": "SuppPresent",
+      "time_class": "supp_topv_top",
+      "slug": "supp"
+    },
+    {
+      "code": 1,
+      "name": "上部复合层",
+      "top": "Top",
+      "base": "Mid",
+      "color": "#f97316",
+      "display_order": 1,
+      "inclusive_base": false,
+      "extension_ms": 0.0,
+      "presence_column": "UpperPresent",
+      "time_class": "upper_top_mid",
+      "slug": "upper"
+    },
+    {
+      "code": 2,
+      "name": "太古界风化壳",
+      "top": "Mid",
+      "base": "Base",
+      "color": "#22d3ee",
+      "display_order": 2,
+      "inclusive_base": true,
+      "extension_ms": 50.0,
+      "presence_column": "CrustPresent",
+      "time_class": "crust_mid_base",
+      "slug": "crust"
+    }
+  ],
+  "legacy_layer_aliases": {
+    "Shasan": "上部复合层",
+    "Shasi": "太古界风化壳"
+  }
+}
