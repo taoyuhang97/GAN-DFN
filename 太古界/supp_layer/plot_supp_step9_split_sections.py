@@ -104,7 +104,8 @@ def main() -> int:
     dfn = pd.read_csv(
         args.dfn_csv,
         usecols=["LayerGroup", "FractureScale", "CenterX", "CenterY", "CenterTime",
-                 "LengthM", "HeightTimeMs", "AzimuthDeg", "IsWellControlPatch"],
+                 "LengthM", "HeightTimeMs", "AzimuthDeg", "DipAzimuthDeg", "DipDeg",
+                 "IsWellControlPatch"],
         low_memory=False,
     )
     plane_x = float(real["X"].mean())
@@ -149,7 +150,8 @@ def main() -> int:
             center = sub["CenterY"].to_numpy(float)
         time = sub["CenterTime"].to_numpy(float)
         length = np.clip(pd.to_numeric(sub["LengthM"], errors="coerce").fillna(60.0).to_numpy(float), 10.0, 80.0)
-        height = np.clip(pd.to_numeric(sub["HeightTimeMs"], errors="coerce").fillna(20.0).to_numpy(float), 2.0, 30.0)
+        dip_azimuth = pd.to_numeric(sub["DipAzimuthDeg"], errors="coerce").to_numpy(float)
+        dip = pd.to_numeric(sub["DipDeg"], errors="coerce").to_numpy(float)
         for scale, color in colors.items():
             mask = sub["FractureScale"].astype(str).eq(scale).to_numpy()
             if not mask.any():
@@ -157,9 +159,11 @@ def main() -> int:
             c = center[mask]
             t = time[mask]
             half = length[mask] / 2.0
-            half_t = height[mask] / 2.0
+            alpha = apparent_dip(dip[mask], dip_azimuth[mask], plane)
+            dx = half * np.cos(alpha)
+            dt = half * np.sin(alpha) / TIME_SCALE_M_PER_MS
             for i in range(len(c)):
-                ax.plot([c[i] - half[i], c[i] + half[i]], [t[i] + half_t[i], t[i] - half_t[i]],
+                ax.plot([c[i] - dx[i], c[i] + dx[i]], [t[i] + dt[i], t[i] - dt[i]],
                         color=color, lw=0.6 if scale == "small" else 1.2, alpha=0.55, zorder=4)
             ax.plot([], [], color=color, lw=1.5 if scale != "small" else 0.9, label={"small": "小尺度", "medium": "中尺度", "large": "大尺度"}[scale])
         ax.set_xlabel("X(m)" if plane == "XZ" else "Y(m)")

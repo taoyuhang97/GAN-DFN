@@ -1,0 +1,118 @@
+{
+  "version": "taigu_supp_step9_scale_wiggle_v1",
+  "profile_well": "埕北古斜405",
+  "output_dir": "太古界/supp_layer/output/taigu_supp_step9_scale_wiggle_v1",
+  "target_block": {
+    "name": "taigu_quanqu1_full_area_plus_supp",
+    "x_min": 658887.0,
+    "x_max": 679500.0,
+    "y_min": 4231662.0,
+    "y_max": 4247987.0
+  },
+  "attribute_demo_grid_csv": "太古界/common/attribute_demo_grid/output/taigu_attribute_grid_quanqu1/attribute_demo_grid.csv",
+  "horizon_contract_csv": "太古界/common/horizon_contract/output/taigu_attribute_full_horizon_contract_v1/demo_horizon_contract.csv",
+  "obn_segy": "/data/shared/project-oil/wx数据/埕岛太古界/cd2023_obn_pstm_cub_all_grid125_1206_haorui.segy",
+  "obn_trace_header_csv": "太古界/common/trace_contract/output/obn_trace_header_v1/obn_trace_header_xy.csv",
+  "step2_segments_root": "太古界/step2_well_log_segments/output/taigu_step2_regular_md1",
+  "step8_patches_csv": "太古界/supp_layer/output/taigu_supp_merged_v1/merged_dfn_patches.csv",
+  "sample_cache": "太古界/step9_sections/output/taigu_step9_multibackground_v2_quanqu1/section_samples/overview/seisamp_section_samples.npz",
+  "time_range_ms": [
+    2380.0,
+    4442.0
+  ],
+  "section_sample_interval_ms": 2.0,
+  "dfn_projection_half_width_m": 50.0,
+  "time_scale_m_per_ms": 2.0,
+  "obn_max_nearest_distance_m": 25.0,
+  "progress_interval": 100,
+  "fault_vtk_paths": [
+    "太古界/step7c_large_fault_dfn/output/taigu_step7c_large_v3_attribute_v3_quanqu1/original_fault_units_demo_raw_time.vtk",
+    "太古界/supp_layer/output/taigu_supp_legacy_v1/step6c_supp/original_fault_units_demo_raw_time.vtk"
+  ],
+  "horizons": [
+    {
+      "field": "TopTimeMs",
+      "label": "上部复合层顶",
+      "color": "#f97316",
+      "linestyle": "-"
+    },
+    {
+      "field": "MidTimeMs",
+      "label": "太古界顶",
+      "color": "#a855f7",
+      "linestyle": "-"
+    },
+    {
+      "field": "BaseTimeMs",
+      "label": "风化壳底",
+      "color": "#ec4899",
+      "linestyle": [
+        0,
+        [
+          6,
+          2,
+          1,
+          2
+        ]
+      ]
+    }
+  ],
+  "scale_style": {
+    "small": {
+      "label": "小尺度裂缝",
+      "color": "#0891b2",
+      "line_width": 0.55,
+      "alpha": 0.46,
+      "legend_color": "#9ca3af",
+      "legend_line_width": 2.0
+    },
+    "medium": {
+      "label": "中尺度裂缝",
+      "color": "#d97706",
+      "line_width": 1.25,
+      "alpha": 0.72,
+      "legend_color": "#6b7280",
+      "legend_line_width": 2.6
+    },
+    "large": {
+      "label": "大尺度裂缝",
+      "color": "#dc2626",
+      "line_width": 2.15,
+      "alpha": 0.88,
+      "legend_color": "#374151",
+      "legend_line_width": 2.6
+    }
+  },
+  "fault_style": {
+    "label": "原始断层",
+    "halo_color": "#111827",
+    "color": "#ffe600",
+    "halo_width": 4.6,
+    "line_width": 2.3,
+    "alpha": 0.92
+  },
+  "well_style": {
+    "label": "埕北古斜405井轨迹",
+    "halo_color": "#5b4b00",
+    "color": "#ffea00",
+    "halo_width": 3.6,
+    "line_width": 2.2
+  },
+  "wiggle": {
+    "trace_spacing_m": 25.0,
+    "lateral_scale_fraction": 0.42,
+    "line_width": 0.35,
+    "positive_fill_alpha": 0.55,
+    "trace_color": "#111827",
+    "amplitude_percentile": 99.0
+  },
+  "figure": {
+    "width_in": 27.7275590551,
+    "height_in": 6.4966666667,
+    "dpi": 300,
+    "legend_width_in": 1.8,
+    "legend_fontsize": 7.5,
+    "suptitle_fontsize": 13.0,
+    "title_fontsize": 11.0
+  }
+}

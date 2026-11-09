@@ -1,0 +1,108 @@
+{
+  "version": "taigu_supp_step9_wiggle_split_v1",
+  "profile_well": "埕北古斜405",
+  "output_dir": "太古界/supp_layer/output/taigu_supp_step9_wiggle_split_v1",
+  "target_block": {
+    "name": "taigu_supp_5km",
+    "x_min": 663450.0,
+    "x_max": 668450.0,
+    "y_min": 4239250.0,
+    "y_max": 4244250.0
+  },
+  "attribute_demo_grid_csv": "太古界/common/attribute_demo_grid/output/taigu_attribute_grid_quanqu1/attribute_demo_grid.csv",
+  "horizon_contract_csv": "太古界/common/horizon_contract/output/taigu_attribute_full_horizon_contract_v1/demo_horizon_contract.csv",
+  "obn_segy": "/data/shared/project-oil/wx数据/埕岛太古界/cd2023_obn_pstm_cub_all_grid125_1206_haorui.segy",
+  "obn_trace_header_csv": "太古界/common/trace_contract/output/obn_trace_header_v1/obn_trace_header_xy.csv",
+  "step2_segments_root": "太古界/step2_well_log_segments/output/taigu_step2_regular_md1",
+  "step3_groups_root": "太古界/step3_imaging_groups/output/taigu_step3_imaging_md1/groups",
+  "step8_patches_csv": "太古界/supp_layer/output/taigu_supp_merged_v1/merged_dfn_patches.csv",
+  "sample_cache": "太古界/supp_layer/output/taigu_supp_step9_v1/sections/section_samples/local_200m/seisamp_section_samples.npz",
+  "local_axis_radius_m": 200.0,
+  "section_sample_interval_ms": 2.0,
+  "time_range_ms": [
+    2600.0,
+    3060.0
+  ],
+  "dfn_projection_half_width_m": 200.0,
+  "time_scale_m_per_ms": 2.0,
+  "segment_join": {
+    "tolerance_m": "auto",
+    "half_step_multiplier": 0.5,
+    "tolerance_floor_m": 0.02,
+    "tolerance_cap_m": 0.5
+  },
+  "horizons": [
+    {
+      "field": "TopTimeMs",
+      "label": "上部复合层顶",
+      "color": "#f97316",
+      "linestyle": "-"
+    },
+    {
+      "field": "MidTimeMs",
+      "label": "太古界顶",
+      "color": "#a855f7",
+      "linestyle": "-"
+    },
+    {
+      "field": "BaseTimeMs",
+      "label": "风化壳底",
+      "color": "#ec4899",
+      "linestyle": [
+        0,
+        [
+          6,
+          2,
+          1,
+          2
+        ]
+      ]
+    }
+  ],
+  "imaging": {
+    "color": "#ff2d55",
+    "halo_color": "#7f1d1d",
+    "line_length_m": 45.0,
+    "line_width": 1.15,
+    "halo_width": 2.4,
+    "point_size": 10.0
+  },
+  "dfn": {
+    "small": {
+      "label": "小尺度 DFN",
+      "color": "#0891b2",
+      "line_width": 0.55,
+      "alpha": 0.46
+    },
+    "medium": {
+      "label": "中尺度 DFN",
+      "color": "#d97706",
+      "line_width": 1.25,
+      "alpha": 0.72
+    },
+    "large": {
+      "label": "大尺度 DFN",
+      "color": "#dc2626",
+      "line_width": 2.15,
+      "alpha": 0.88
+    },
+    "display_length_range_m": [
+      20.0,
+      120.0
+    ]
+  },
+  "wiggle": {
+    "local_max_trace_count": 0,
+    "lateral_scale_fraction": 0.42,
+    "line_width": 0.32,
+    "positive_fill_alpha": 0.48,
+    "trace_color": "#111827",
+    "amplitude_percentile": 99.0
+  },
+  "figure": {
+    "width_in": 18.0,
+    "height_in": 8.4,
+    "dpi": 240,
+    "legend_fontsize": 9.0
+  }
+}

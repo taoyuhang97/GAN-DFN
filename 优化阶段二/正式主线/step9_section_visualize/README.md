@@ -156,6 +156,20 @@
 
 当前层位显示统一读取 `common/horizon_trace_table/output/formal_horizon_trace_table_v1/horizon_trace_table.npy`。XZ对每个X道坐标求解 `T=Horizon[TraceIdx(x,Ywell(T))]`，YZ对每个Y道坐标求解 `T=Horizon[TraceIdx(Xwell(T),y)]`；不再使用500/900个层位采样点，也不再从四个层位文件临时建立最近邻曲线。源表层序反转不会被强制排序，相关数量写入各输出summary。
 
+车页1导眼矿区分尺度 OBN 波形+变面积剖面的入口为：
+
+```bash
+/home/tyh/anaconda3/envs/gan-dfn/bin/python \
+  优化阶段二/正式主线/step9_section_visualize/build_cheye1_scale_wiggle_sections.py
+```
+
+该入口生成大尺度、中尺度、小尺度、大中尺度和大中小尺度 5 套组合，每套包含
+XZ/YZ 两图，输出到 `output/step9_section_presentation/mine_v1/scale_wiggle_t4_t7_v1/`。
+颜色表示裂缝尺度，不再表示地层；原始断层只在大尺度及含大尺度的组合中显示。
+砂砾岩与太古界的 3 套独立图例由仓库根目录
+`scripts/build_step9_standalone_legends.py` 统一生成；太古界图例按大、中、小尺度
+说明 DFN，砂砾岩仍按沙三段、沙四段说明地层裂缝。
+
 车页1导眼 `candidate_cheye1` 最终8图输出在 `output/candidate_cheye1/cheye1_dfn_coherence_sections`，只保留 PNG，不生成 SVG 或 combined 图：
 
 车页1导眼 `candidate_cheye1_3d` 最终8图输出在 `output/candidate_cheye1_3d/cheye1_dfn_coherence_sections`，命名和图片内容与 `candidate_cheye1` 版本一致，但 DFN 输入来自 Step7B/Step8 的三维密度路径。

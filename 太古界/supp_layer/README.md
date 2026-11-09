@@ -61,6 +61,10 @@ Y 4,239,250 – 4,244,250
 ├── merge_supp_dfn.py                 # 新层 DFN 与现有全域 DFN 几何并集
 ├── plot_supp_layer_density.py        # Step9b：5×5 km 三层裂缝面积密度对比
 ├── plot_supp_step9_split_sections.py # Step9 增补：成像真值 / DFN 预测拆成两张剖面
+├── plot_supp_step9_wiggle_split.py   # Step9 增补：地震波形+变面积底图上的成像 / DFN 拆分剖面
+├── plot_supp_step9_scale_wiggle.py   # Step9 增补：矿区尺度波形+变面积的分尺度 DFN 剖面
+├── configs/taigu_supp_step9_wiggle_split.json
+├── configs/taigu_supp_step9_scale_wiggle.json
 ├── README.md
 └── output/                           # 生成物（已 gitignore）
     ├── taigu_supp_horizon_v1/
@@ -104,6 +108,12 @@ Y 4,239,250 – 4,244,250
     └── taigu_supp_step9_split_v1/
         ├── 01_imaging_trajectory_and_fractures.png   # 仅井轨迹 + 真实裂缝
         └── 02_dfn_predicted_only.png                 # 仅 DFN 预测
+    └── taigu_supp_step9_wiggle_split_v1/
+        ├── 01_wiggle_area_imaging.png                # 地震底图 + 成像轨迹/真实裂缝
+        └── 02_wiggle_area_dfn.png                    # 地震底图 + 成像段井轨迹 + DFN
+    └── taigu_supp_step9_scale_wiggle_v1/
+        ├── 01_large_xz_t4_t7.png ... 10_all_scales_yz_t4_t7.png
+        └── legend_01_large.png ... legend_03_all_scales.svg
 ```
 
 ## 5. 运行
@@ -135,6 +145,28 @@ python3 太古界/step6d_multiscale_bundle/code/build_step6d_multiscale_bundle.p
 
 两个脚本都可 `--help` 查看参数。
 
+波形+变面积拆图可单独重跑（优先复用 Step9 的局部 OBN 采样缓存）：
+
+```bash
+python3 太古界/supp_layer/plot_supp_step9_wiggle_split.py \
+  --config 太古界/supp_layer/configs/taigu_supp_step9_wiggle_split.json
+```
+
+矿区分尺度波形剖面可单独重跑：
+
+```bash
+python3 太古界/supp_layer/plot_supp_step9_scale_wiggle.py \
+  --config 太古界/supp_layer/configs/taigu_supp_step9_scale_wiggle.json
+```
+
+砂砾岩和太古界的独立图例由同一脚本生成。太古界“裂缝尺度”分组直接复用
+`taigu_supp_step9_scale_wiggle.json` 中的 `scale_style`，列出大、中、小尺度
+裂缝及其图例线宽；不再按上部复合层、风化壳和补充层列“地层裂缝”：
+
+```bash
+python3 scripts/build_step9_standalone_legends.py
+```
+
 ## 6. 当前验证结果
 
 | 项 | 结果 |
@@ -162,6 +194,9 @@ python3 太古界/step6d_multiscale_bundle/code/build_step6d_multiscale_bundle.p
 | **Step9 剖面** | 全量 20 图（2354–4232 ms，含新层纵轴范围）；另出 2 图快速版，临时把新层并入上部复合层以命中原配色表 |
 | **Step9b 密度对比** | 5×5 km 300 m 网格面积密度：上部复合层均值 1.045、太古界风化壳 0.511、上部补充层 **1.779**（patch 27,157 / 12,110 / 47,278） |
 | **Step9 拆分剖面** | 405 井段 ±200 m、2600–3060 ms：图1 仅井轨迹+301 行真实裂缝（317 条，按倾向/倾角画线）；图2 仅 DFN 预测（不含真实成像裂缝），按小/中/大尺度着色 |
+| **Step9 波形+变面积拆分** | 同一窗口：波形+变面积底图；两张图统一使用原 Step9 的黄色轨迹“Step3成像井”图例标识；DFN 直接使用 `DipAzimuthDeg/DipDeg` 求剖面交线，不使用历史 VTK `V1..V4` 顶点；图例置于画布下方 |
+| **Step9 矿区分尺度波形** | `status=pass`，5 套组合共 10 图；颜色和线宽按大/中/小尺度统一，图为 XZ/YZ 剖面 |
+| **Step9 独立图例** | `status=pass`，3 套 PNG/SVG；太古界首列为“裂缝尺度”，按大/中/小尺度列出，旧三层裂缝标签已移除 |
 
 ## 7. 与原代码的接口
 
