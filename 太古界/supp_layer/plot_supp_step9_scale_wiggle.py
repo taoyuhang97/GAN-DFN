@@ -61,6 +61,7 @@ SCALE_SETS = (
 def parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="生成太古界扩充DFN矿区分尺度波形剖面")
     p.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
+    p.add_argument("--dfn-patch-csv", type=Path)
     p.add_argument("--output-dir", type=Path)
     return p
 
@@ -243,6 +244,7 @@ def build_scale_segments(
     frame: pd.DataFrame,
     plane: str,
     scales: tuple[str, ...],
+    config: dict[str, Any],
 ) -> dict[str, np.ndarray]:
     center_column = "CenterX" if plane == "XZ" else "CenterY"
     output: dict[str, list[list[list[float]]]] = {
@@ -262,12 +264,26 @@ def build_scale_segments(
         dh, dt = trace
         center_h = float(getattr(row, center_column))
         center_t = float(row.CenterTime)
-        output[scale].append(
+        line = np.asarray(
             [
                 [center_h - half * dh, center_t - half * dt],
                 [center_h + half * dh, center_t + half * dt],
-            ]
+            ],
+            dtype=float,
         )
+        min_dip = float(config.get("min_visible_apparent_dip_deg", 30.0))
+        horizontal = abs(float(line[1, 0] - line[0, 0]))
+        vertical_m = abs(float(line[1, 1] - line[0, 1])) * float(
+            config.get("time_scale_m_per_ms", 2.0)
+        )
+        visible_dip = (
+            float(np.degrees(np.arctan2(vertical_m, horizontal)))
+            if horizontal > 1.0e-12
+            else 90.0
+        )
+        if visible_dip + 1.0e-9 < min_dip:
+            continue
+        output[scale].append(line.tolist())
     return {
         scale: np.asarray(lines, dtype=np.float64)
         for scale, lines in output.items()
@@ -286,9 +302,20 @@ def load_fault_segments(
             raise FileNotFoundError(path)
         points, triangles = original.read_legacy_polydata(path)
         for projection in ("XZ", "YZ"):
-            result[projection].extend(
-                original.fault_section_segments(points, triangles, track, projection)
-            )
+            min_dip = float(config.get("min_visible_apparent_dip_deg", 30.0))
+            for line in original.fault_section_segments(points, triangles, track, projection):
+                array = np.asarray(line, dtype=float)
+                horizontal = abs(float(array[1, 0] - array[0, 0]))
+                vertical_m = abs(float(array[1, 1] - array[0, 1])) * float(
+                    config.get("time_scale_m_per_ms", 2.0)
+                )
+                visible_dip = (
+                    float(np.degrees(np.arctan2(vertical_m, horizontal)))
+                    if horizontal > 1.0e-12
+                    else 90.0
+                )
+                if visible_dip + 1.0e-9 >= min_dip:
+                    result[projection].append(line)
         print(
             f"[scale-wiggle-taigu] fault source={path.name} "
             f"triangles={len(triangles)}",
@@ -364,7 +391,7 @@ def render_one(
             Line2D(
                 [0],
                 [0],
-                color=style.get("legend_color", style["color"]),
+                color=style["color"],
                 linewidth=max(
                     float(style.get("legend_line_width", style["line_width"])),
                     0.8,
@@ -477,6 +504,8 @@ def render_one(
 def main() -> int:
     args = parser().parse_args()
     config = read_json(args.config.resolve())
+    if args.dfn_patch_csv:
+        config["step8_patches_csv"] = str(args.dfn_patch_csv.resolve())
     output_dir = (
         args.output_dir.resolve()
         if args.output_dir
@@ -544,6 +573,7 @@ def main() -> int:
                 selected_by_plane[projection],
                 projection,
                 scale_set.scales,
+                config,
             )
             qc, _ = render_one(
                 output_path,
@@ -606,6 +636,10 @@ def main() -> int:
         "output_dir": str(output_dir),
         "scope": "overview",
         "background": "OBN地震波形+正振幅变面积",
+        "visible_filter": {
+            "min_apparent_dip_deg": float(config.get("min_visible_apparent_dip_deg", 30.0)),
+            "rule": "all rendered DFN and original-fault segments below threshold are suppressed",
+        },
         "time_range_ms": [float(times[0]), float(times[-1])],
         "axis_trace_counts": {plane: int(len(axis)) for plane, axis in axes.items()},
         "dfn_source": {

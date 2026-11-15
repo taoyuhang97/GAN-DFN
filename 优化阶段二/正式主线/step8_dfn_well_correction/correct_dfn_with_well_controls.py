@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import importlib.util
 import json
 import sys
 from pathlib import Path
@@ -34,6 +35,15 @@ from common.unified_dfn_vtk import (  # noqa: E402
     write_unified_dfn_vtk,
 )
 from common.strata_framework import load_framework  # noqa: E402
+
+_large_control_path = FORMAL_ROOT.parents[1] / "common" / "large_fault_conventional_controls.py"
+_large_control_spec = importlib.util.spec_from_file_location(
+    "sand_step8_large_conventional_controls", _large_control_path
+)
+if _large_control_spec is None or _large_control_spec.loader is None:
+    raise ImportError(f"cannot load large conventional control helper: {_large_control_path}")
+large_conventional_controls = importlib.util.module_from_spec(_large_control_spec)
+_large_control_spec.loader.exec_module(large_conventional_controls)
 
 _FRAMEWORK = load_framework()
 ALLOWED_LAYERS = list(_FRAMEWORK.layer_names())
@@ -1279,6 +1289,7 @@ def materialize_and_clip_vertices_to_horizon_contract(
     lookup: HorizonSpatialLookup,
     use_dip_geometry: bool,
     geometry_time_scale_m_per_ms: float,
+    preserve_existing_vertices: bool = False,
 ) -> tuple[pd.DataFrame, dict[str, Any]]:
     out = patch_df.reset_index(drop=True).copy()
     vertex_cols = [f"V{vertex_idx}{axis}" for vertex_idx in range(1, 5) for axis in ("X", "Y", "Z")]
@@ -1288,16 +1299,35 @@ def materialize_and_clip_vertices_to_horizon_contract(
 
     all_vertices = np.empty((len(out), 4, 3), dtype=np.float64)
     for row_idx, row in out.iterrows():
-        all_vertices[row_idx] = np.asarray(
-            patch_vertices(
-                row,
-                display=False,
-                display_z_scale=1.0,
-                use_dip_geometry=use_dip_geometry,
-                geometry_time_scale_m_per_ms=geometry_time_scale_m_per_ms,
-            ),
+        correction_action = str(row.get("CorrectionAction", "unchanged_density_volume"))
+        existing = np.asarray(
+            [
+                [
+                    float(row[f"V{vertex_idx}X"]),
+                    float(row[f"V{vertex_idx}Y"]),
+                    float(row[f"V{vertex_idx}Z"]),
+                ]
+                for vertex_idx in range(1, 5)
+            ],
             dtype=np.float64,
         )
+        if (
+            preserve_existing_vertices
+            and np.isfinite(existing).all()
+            and correction_action not in {"add_well_control_patch", "adjust_to_well_control"}
+        ):
+            all_vertices[row_idx] = existing
+        else:
+            all_vertices[row_idx] = np.asarray(
+                patch_vertices(
+                    row,
+                    display=False,
+                    display_z_scale=1.0,
+                    use_dip_geometry=use_dip_geometry,
+                    geometry_time_scale_m_per_ms=geometry_time_scale_m_per_ms,
+                ),
+                dtype=np.float64,
+            )
 
     flat_vertices = all_vertices.reshape(-1, 3)
     original_vertices = flat_vertices.copy()
@@ -1366,6 +1396,20 @@ def materialize_and_clip_vertices_to_horizon_contract(
     clipped_z = np.where(valid, np.clip(original_z, top, base), original_z)
     flat_vertices[:, 2] = clipped_z
     all_vertices = flat_vertices.reshape(len(out), 4, 3)
+    if preserve_existing_vertices and "ParentPatchID" in out.columns:
+        parent_ids = out["ParentPatchID"].fillna("").astype(str)
+        for parent_id, group in out.groupby(parent_ids, sort=False):
+            if not parent_id or len(group) < 2 or "LargeFaultSegmentIndex" not in group.columns:
+                continue
+            positions = group.sort_values("LargeFaultSegmentIndex").index.to_numpy(dtype=int)
+            for left_pos, right_pos in zip(positions[:-1], positions[1:]):
+                shared = 0.5 * (
+                    all_vertices[left_pos, [1, 2], :]
+                    + all_vertices[right_pos, [0, 3], :]
+                )
+                all_vertices[left_pos, [1, 2], :] = shared
+                all_vertices[right_pos, [0, 3], :] = shared
+        flat_vertices = all_vertices.reshape(-1, 3)
     delta = np.abs(clipped_z - original_z).reshape(len(out), 4)
     xy_delta = np.linalg.norm(flat_vertices[:, :2] - original_vertices[:, :2], axis=1).reshape(len(out), 4)
 
@@ -1893,6 +1937,14 @@ def main() -> int:
         config=config,
         surface_lookup=surface_lookup,
     )
+    corrected_df, large_control_audit_df, large_control_summary = (
+        large_conventional_controls.apply_large_fault_conventional_support(
+            corrected_df,
+            control_df,
+            config,
+        )
+    )
+    config["_large_conventional_control_summary"] = large_control_summary
     corrected_df, region_audit_df = apply_imaging_well_region_correction(
         patch_df=corrected_df,
         control_df=control_df,
@@ -1929,11 +1981,17 @@ def main() -> int:
         lookup=surface_lookup,
         use_dip_geometry=use_dip_geometry,
         geometry_time_scale_m_per_ms=geometry_time_scale,
+        preserve_existing_vertices=bool(config.get("preserve_existing_vertices", False)),
     )
     final_horizon_qc["vertex_geometry"] = vertex_horizon_qc
     corrected_df.to_csv(paths["corrected_csv"], index=False, encoding="utf-8-sig")
     audit_df.to_csv(paths["audit_csv"], index=False, encoding="utf-8-sig")
     region_audit_df.to_csv(paths["region_audit_csv"], index=False, encoding="utf-8-sig")
+    large_control_audit_df.to_csv(
+        output_dir / "large_conventional_control_support.csv",
+        index=False,
+        encoding="utf-8-sig",
+    )
     predicted_vtk = output_dir / ".well_corrected_predicted_only_raw_time.vtk"
     write_legacy_vtk(
         predicted_vtk,
@@ -1976,6 +2034,9 @@ def main() -> int:
         after_dist=after_dist,
         track_dist=track_dist,
         density_mass=density_mass,
+    )
+    summary["large_conventional_control_support"] = dict(
+        config.get("_large_conventional_control_summary", {})
     )
     if debug_vtks:
         summary["debug_step_vtks"] = debug_vtks

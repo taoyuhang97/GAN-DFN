@@ -31,6 +31,15 @@ geometry_fingerprint = _vtk.geometry_fingerprint
 unified_vtk_summary = _vtk.unified_vtk_summary
 write_unified_dfn_vtk = _vtk.write_unified_dfn_vtk
 
+_large_control_path = REPO_ROOT / "common" / "large_fault_conventional_controls.py"
+_large_control_spec = importlib.util.spec_from_file_location(
+    "taigu_step8_large_conventional_controls", _large_control_path
+)
+if _large_control_spec is None or _large_control_spec.loader is None:
+    raise ImportError(f"cannot load large conventional control helper: {_large_control_path}")
+large_conventional_controls = importlib.util.module_from_spec(_large_control_spec)
+_large_control_spec.loader.exec_module(large_conventional_controls)
+
 ALLOWED_LAYERS = ["上部复合层", "太古界风化壳"]
 LAYER_CODE = {"上部复合层": 1, "太古界风化壳": 2}
 CSV_ENCODINGS = ("utf-8-sig", "utf-8", "gb18030", "gbk")
@@ -2495,6 +2504,14 @@ def main() -> int:
         config=config,
         surface_lookup=surface_lookup,
     )
+    corrected_df, large_control_audit_df, large_control_summary = (
+        large_conventional_controls.apply_large_fault_conventional_support(
+            corrected_df,
+            control_df,
+            config,
+        )
+    )
+    config["_large_conventional_control_summary"] = large_control_summary
     corrected_df, region_audit_df = apply_imaging_well_region_correction(
         patch_df=corrected_df,
         control_df=control_df,
@@ -2570,6 +2587,11 @@ def main() -> int:
     corrected_df.to_csv(paths["corrected_csv"], index=False, encoding="utf-8-sig")
     audit_df.to_csv(paths["audit_csv"], index=False, encoding="utf-8-sig")
     region_audit_df.to_csv(paths["region_audit_csv"], index=False, encoding="utf-8-sig")
+    large_control_audit_df.to_csv(
+        output_dir / "large_conventional_control_support.csv",
+        index=False,
+        encoding="utf-8-sig",
+    )
     predicted_vtk = output_dir / ".well_corrected_predicted_only_raw_time.vtk"
     write_legacy_vtk(
         predicted_vtk,
@@ -2612,6 +2634,9 @@ def main() -> int:
         after_dist=after_dist,
         track_dist=track_dist,
         density_mass=density_mass,
+    )
+    summary["large_conventional_control_support"] = dict(
+        config.get("_large_conventional_control_summary", {})
     )
     if debug_vtks:
         summary["debug_step_vtks"] = debug_vtks

@@ -170,6 +170,23 @@ XZ/YZ 两图，输出到 `output/step9_section_presentation/mine_v1/scale_wiggle
 `scripts/build_step9_standalone_legends.py` 统一生成；太古界图例按大、中、小尺度
 说明 DFN，砂砾岩仍按沙三段、沙四段说明地层裂缝。
 
+`vert1` 多尺度波形剖面可复用现有背景配置，并显式覆盖 Step8 的 CSV/VTK 和输出目录：
+
+```bash
+python3 优化阶段二/正式主线/step9_section_visualize/build_cheye1_scale_wiggle_sections.py \
+  --config 优化阶段二/正式主线/step9_section_visualize/configs/formal_mine_multiscale_flow_v1.json \
+  --dfn-patch-csv 优化阶段二/正式主线/output/formal_mine_multiscale_flow_v1_vert1/step8_well_correction/well_corrected_dfn_fracture_patches.csv \
+  --input-vtk 优化阶段二/正式主线/output/formal_mine_multiscale_flow_v1_vert1/step8_well_correction/well_corrected_dfn_raw_time.vtk \
+  --output-dir 优化阶段二/正式主线/output/step9_section_presentation/mine_v1/scale_wiggle_t4_t7_vert1
+```
+
+正式图会过滤视倾角低于 `30°` 的 DFN 和原始断层线段。砂砾岩 `vert1`
+验收产物位于 `output/step9_section_presentation/mine_v1/scale_wiggle_t4_t7_vert1/`。
+
+砂砾岩连续分块版 `seg1` 将 875 个推测大尺度父片拆成 2,065 个共享边界块，
+Step8 后最大边界缝隙为 `0 m`；10 张多尺度剖面位于
+`output/step9_section_presentation/mine_v1/scale_wiggle_t4_t7_seg1/`。
+
 车页1导眼 `candidate_cheye1` 最终8图输出在 `output/candidate_cheye1/cheye1_dfn_coherence_sections`，只保留 PNG，不生成 SVG 或 combined 图：
 
 车页1导眼 `candidate_cheye1_3d` 最终8图输出在 `output/candidate_cheye1_3d/cheye1_dfn_coherence_sections`，命名和图片内容与 `candidate_cheye1` 版本一致，但 DFN 输入来自 Step7B/Step8 的三维密度路径。

@@ -184,14 +184,14 @@ def sand_fracture_layers() -> list[dict[str, Any]]:
 
 
 def taigu_scale_layers(config: dict[str, Any]) -> list[dict[str, Any]]:
-    """Mirror the scale labels and legend strokes used by the Taigu sections."""
+    """Mirror the colored scale strokes used by the Taigu sections."""
     layers = []
     for scale in ("large", "medium", "small"):
         style = config["scale_style"][scale]
         layers.append(
             {
                 "label": style["label"],
-                "color": style.get("legend_color", style["color"]),
+                "color": style["color"],
                 "linewidth": max(
                     float(style.get("legend_line_width", style["line_width"])),
                     0.8,

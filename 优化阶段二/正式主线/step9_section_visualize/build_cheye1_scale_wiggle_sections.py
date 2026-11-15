@@ -22,6 +22,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 import matplotlib
+import numpy as np
 
 matplotlib.use("Agg")
 from matplotlib.collections import LineCollection
@@ -115,6 +116,8 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
     p.add_argument("--reference-summary", type=Path, default=DEFAULT_REFERENCE_SUMMARY)
     p.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
+    p.add_argument("--dfn-patch-csv", type=Path)
+    p.add_argument("--input-vtk", type=Path)
     return p
 
 
@@ -197,9 +200,23 @@ def add_scale_colored_dfn_segments(
     return count
 
 
+def segment_apparent_dip_deg(segment: Any, time_scale_m_per_ms: float) -> float:
+    horizontal = abs(float(segment.h2) - float(segment.h1))
+    vertical_m = abs(float(segment.z2) - float(segment.z1)) * float(time_scale_m_per_ms)
+    return (
+        float(np.degrees(np.arctan2(vertical_m, horizontal)))
+        if horizontal > 1.0e-12
+        else 90.0
+    )
+
+
 def main() -> int:
     args = parser().parse_args()
     config = read_json(args.config.resolve())
+    if args.dfn_patch_csv:
+        config["dfn_patch_csv"] = str(args.dfn_patch_csv.resolve())
+    if args.input_vtk:
+        config["input_vtk"] = str(args.input_vtk.resolve())
     reference = read_json(args.reference_summary.resolve())
     output_dir = args.output_dir.resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -263,6 +280,14 @@ def main() -> int:
     all_segments, scan = scan_vtk_intersections(
         scan_args, surfaces, overview.well_df
     )
+    min_visible_dip = float(config.get("min_visible_apparent_dip_deg", 30.0))
+    time_scale = float(config.get("time_scale_m_per_ms", 2.0))
+    all_segments_before_filter = len(all_segments)
+    all_segments = [
+        segment
+        for segment in all_segments
+        if segment_apparent_dip_deg(segment, time_scale) + 1.0e-9 >= min_visible_dip
+    ]
     display = {
         "display_x_min": float(overview.summary["display_x_min"]),
         "display_x_max": float(overview.summary["display_x_max"]),
@@ -272,6 +297,12 @@ def main() -> int:
     faults, fault_scan = scan_unified_original_fault_intersections(
         scan_args.input_vtk, overview.well_df, display
     )
+    faults_before_filter = len(faults)
+    faults = [
+        segment
+        for segment in faults
+        if segment_apparent_dip_deg(segment, time_scale) + 1.0e-9 >= min_visible_dip
+    ]
     segments_by_scale = {
         scale: [
             segment
@@ -383,8 +414,17 @@ def main() -> int:
             "is_step8_well_corrected": True,
             "patch_count": int(len(metadata)) if metadata is not None else 0,
             "scan": scan,
+            "visible_min_apparent_dip_deg": min_visible_dip,
+            "segments_before_filter": int(all_segments_before_filter),
+            "segments_after_filter": int(len(all_segments)),
+            "segments_suppressed": int(all_segments_before_filter - len(all_segments)),
         },
-        "fault_source": fault_scan,
+        "fault_source": {
+            **fault_scan,
+            "segments_before_filter": int(faults_before_filter),
+            "segments_after_filter": int(len(faults)),
+            "segments_suppressed": int(faults_before_filter - len(faults)),
+        },
         "scale_segments": {
             scale: {
                 "all": len(values),

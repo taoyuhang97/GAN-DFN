@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import importlib.util
 import json
 import shutil
 import sys
@@ -40,6 +41,27 @@ from common.unified_dfn_vtk import (  # noqa: E402
     unified_vtk_summary,
     write_unified_dfn_vtk,
 )
+
+SECTION_READABILITY_MODULE = REPO_ROOT / "common" / "section_readability.py"
+COMMON_DIR = REPO_ROOT / "common"
+if str(COMMON_DIR) not in sys.path:
+    sys.path.insert(0, str(COMMON_DIR))
+_section_spec = importlib.util.spec_from_file_location(
+    "sand_step7c_section_readability", SECTION_READABILITY_MODULE
+)
+if _section_spec is None or _section_spec.loader is None:
+    raise ImportError(f"cannot load section readability helper: {SECTION_READABILITY_MODULE}")
+section_readability = importlib.util.module_from_spec(_section_spec)
+_section_spec.loader.exec_module(section_readability)
+
+LARGE_FAULT_SEGMENTATION_MODULE = COMMON_DIR / "large_fault_segmentation.py"
+_segmentation_spec = importlib.util.spec_from_file_location(
+    "sand_step7c_large_fault_segmentation", LARGE_FAULT_SEGMENTATION_MODULE
+)
+if _segmentation_spec is None or _segmentation_spec.loader is None:
+    raise ImportError(f"cannot load large fault segmentation helper: {LARGE_FAULT_SEGMENTATION_MODULE}")
+large_fault_segmentation = importlib.util.module_from_spec(_segmentation_spec)
+_segmentation_spec.loader.exec_module(large_fault_segmentation)
 
 
 def parse_args() -> argparse.Namespace:
@@ -1475,10 +1497,22 @@ def main() -> int:
     original_mesh = original_mesh.triangulate()
     original_geometry_fingerprint = geometry_fingerprint(original_mesh)
     manifest_df = read_csv_flexible(paths["original_manifest_csv"])
+    readability_config = dict(config.get("section_readability", {}))
+    orientation_prior = section_readability.build_orientation_prior_index(
+        original_mesh,
+        time_scale_m_per_ms=float(
+            readability_config.get("prior_time_scale_m_per_ms", 2.0)
+        ),
+    )
 
     lowcoh_patches = build_inferred_surface_panels(config)
     if lowcoh_patches.empty:
         raise RuntimeError("no seismic-inferred local fault panels generated from Step6C")
+    lowcoh_patches, readability_summary = section_readability.apply_patch_readability(
+        lowcoh_patches,
+        orientation_prior,
+        config,
+    )
     upstream_inferred_df = read_csv_flexible(Path(config["large_component_summary_csv"]).resolve())
     upstream_inferred_ids = set(
         pd.to_numeric(
@@ -1499,6 +1533,12 @@ def main() -> int:
     lowcoh_patches = classified_patches[
         classified_patches["KeepInFormalDFN"].eq(1)
     ].copy().reset_index(drop=True)
+    lowcoh_patches, segmentation_summary = (
+        large_fault_segmentation.segment_large_fault_patches(
+            lowcoh_patches,
+            config,
+        )
+    )
     duplicate_patches.to_csv(paths["duplicate_csv"], index=False, encoding="utf-8-sig")
     write_patch_vtk(
         paths["duplicate_vtk"],
@@ -1518,6 +1558,19 @@ def main() -> int:
         len(upstream_inferred_ids & step7c_inferred_ids) / max(len(upstream_inferred_ids), 1)
     )
     lowcoh_patches.to_csv(paths["lowcoh_csv"], index=False, encoding="utf-8-sig")
+    readability_columns = [
+        column
+        for column in lowcoh_patches.columns
+        if column.startswith("SectionReadability")
+    ]
+    if readability_columns:
+        lowcoh_patches[
+            [column for column in ["PatchID", "SourceType", "LayerGroup", *readability_columns] if column in lowcoh_patches.columns]
+        ].to_csv(
+            output_dir / "section_readability_audit.csv",
+            index=False,
+            encoding="utf-8-sig",
+        )
     write_patch_vtk(paths["lowcoh_vtk"], lowcoh_patches, "step7c_large_inferred_fault_surfaces_raw_time")
     patch_df = lowcoh_patches.copy()
     patch_df.to_csv(paths["dfn_csv"], index=False, encoding="utf-8-sig")
@@ -1597,6 +1650,8 @@ def main() -> int:
         "formal_original_fault_patch_count": 0,
         "formal_original_fault_triangle_count": int(unified_summary["original_fault_cell_count"]),
         "inferred_fault_surface_patch_count": int(len(lowcoh_patches)),
+        "section_readability": readability_summary,
+        "large_fault_segmentation": segmentation_summary,
         "window_validation": window_validation,
         "inferred_known_fault_duplicate_patch_count": int(len(duplicate_patches)),
         "inferred_original_fault_classification": inferred_classification,

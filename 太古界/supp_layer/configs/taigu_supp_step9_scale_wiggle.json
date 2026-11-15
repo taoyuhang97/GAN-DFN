@@ -63,7 +63,6 @@
       "color": "#0891b2",
       "line_width": 0.55,
       "alpha": 0.46,
-      "legend_color": "#9ca3af",
       "legend_line_width": 2.0
     },
     "medium": {
@@ -71,7 +70,6 @@
       "color": "#d97706",
       "line_width": 1.25,
       "alpha": 0.72,
-      "legend_color": "#6b7280",
       "legend_line_width": 2.6
     },
     "large": {
@@ -79,7 +77,6 @@
       "color": "#dc2626",
       "line_width": 2.15,
       "alpha": 0.88,
-      "legend_color": "#374151",
       "legend_line_width": 2.6
     }
   },

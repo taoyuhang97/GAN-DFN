@@ -160,8 +160,9 @@ python3 太古界/supp_layer/plot_supp_step9_scale_wiggle.py \
 ```
 
 砂砾岩和太古界的独立图例由同一脚本生成。太古界“裂缝尺度”分组直接复用
-`taigu_supp_step9_scale_wiggle.json` 中的 `scale_style`，列出大、中、小尺度
-裂缝及其图例线宽；不再按上部复合层、风化壳和补充层列“地层裂缝”：
+`taigu_supp_step9_scale_wiggle.json` 中的 `scale_style`，用青、橙、红三种颜色
+分别表示小、中、大尺度裂缝，并保留线宽作为辅助编码；不再按上部复合层、
+风化壳和补充层列“地层裂缝”：
 
 ```bash
 python3 scripts/build_step9_standalone_legends.py
@@ -196,7 +197,7 @@ python3 scripts/build_step9_standalone_legends.py
 | **Step9 拆分剖面** | 405 井段 ±200 m、2600–3060 ms：图1 仅井轨迹+301 行真实裂缝（317 条，按倾向/倾角画线）；图2 仅 DFN 预测（不含真实成像裂缝），按小/中/大尺度着色 |
 | **Step9 波形+变面积拆分** | 同一窗口：波形+变面积底图；两张图统一使用原 Step9 的黄色轨迹“Step3成像井”图例标识；DFN 直接使用 `DipAzimuthDeg/DipDeg` 求剖面交线，不使用历史 VTK `V1..V4` 顶点；图例置于画布下方 |
 | **Step9 矿区分尺度波形** | `status=pass`，5 套组合共 10 图；颜色和线宽按大/中/小尺度统一，图为 XZ/YZ 剖面 |
-| **Step9 独立图例** | `status=pass`，3 套 PNG/SVG；太古界首列为“裂缝尺度”，按大/中/小尺度列出，旧三层裂缝标签已移除 |
+| **Step9 独立图例** | `status=pass`，3 套 PNG/SVG；太古界首列为“裂缝尺度”，用青、橙、红分别表示小、中、大尺度，旧三层裂缝标签和灰度图例均已移除 |
 
 ## 7. 与原代码的接口
 
@@ -240,5 +241,40 @@ python3 scripts/build_step9_standalone_legends.py
 >   确保新层几何可见；若要在图例里单独显示"上部补充层"，需要新增一个 Step9 配色脚本。
 > - Step9b 出三层 300 m 网格面积密度对比图（统一色标）：
 >   `taigu_supp_step9b_v1/layer_area_density_compare.png` + `layer_area_density_grid_300m.csv`。
+
+> `vert1` 近直立大尺度口径（2026-11-15）：
+> Step7C 对推测大尺度片施加真倾角 `>=65°`、目标约 `75°`、XZ/YZ 视倾角
+> `>=30°` 的约束；原始断层几何不变。Step8 使用 `500 m / 100 ms` 的
+> 常规测井点位软支持，仅调整置信度并输出
+> `large_conventional_control_support.csv`，不移动或旋转大尺度片。
+> 补充层合并与多尺度剖面的 `vert1` 产物分别为
+> `taigu_supp_merged_vert1/`、`taigu_supp_step9_scale_wiggle_vert1/`。
+
+```bash
+python3 太古界/supp_layer/merge_supp_dfn.py \
+  --full-csv 太古界/step8_well_correction/output/taigu_step8_attribute_multiscale_v1_quanqu1_vert1/well_corrected_dfn_fracture_patches.csv \
+  --full-vtk 太古界/step8_well_correction/output/taigu_step8_attribute_multiscale_v1_quanqu1_vert1/well_corrected_dfn_raw_time.vtk \
+  --output-dir 太古界/supp_layer/output/taigu_supp_merged_vert1
+
+python3 太古界/supp_layer/plot_supp_step9_scale_wiggle.py \
+  --config 太古界/supp_layer/configs/taigu_supp_step9_scale_wiggle.json \
+  --dfn-patch-csv 太古界/supp_layer/output/taigu_supp_merged_vert1/merged_dfn_patches.csv \
+  --output-dir 太古界/supp_layer/output/taigu_supp_step9_scale_wiggle_vert1
+```
+
+> `seg1` 连续分块口径（2026-11-15）：
+> 482 个推测大尺度父片沿走向分成 1,205 个相邻子块，每块共享横截面边界。
+> 目标块长约 200 m，相邻块最大倾向差 30°、最大倾角差 10°；
+> 最终真倾角仍均不低于 65°，Step8 后共享边界最大缝隙为 0 m。
+> 输出目录为 `taigu_supp_step9_scale_wiggle_seg1/`。
+
+```bash
+python3 太古界/step7c_large_fault_dfn/build_large_fault_dfn.py \
+  --config 太古界/step7c_large_fault_dfn/configs/taigu_step7c_large_v3_attribute_v3_quanqu1_seg1.json
+python3 太古界/step7d_multiscale_fused_dfn/build_multiscale_fused_dfn.py \
+  --config 太古界/step7d_multiscale_fused_dfn/configs/taigu_step7d_fused_v1_quanqu1_seg1.json
+python3 太古界/step8_well_correction/correct_taigu_multiscale_dfn_with_well_controls.py \
+  --config 太古界/step8_well_correction/configs/taigu_step8_attribute_multiscale_v1_quanqu1_seg1.json
+```
 
 这些步骤同样只新增配置/脚本，不改原代码。
