@@ -81,8 +81,8 @@ SCALE_SETS = (
     ScaleSet("all_scales", "大中小尺度", ("large", "medium", "small"), True, 9),
 )
 
-# 与当前太古界 taigu_supp_step9_scale_wiggle_v1 的尺度和图例口径一致：
-# 颜色表示尺度，不再用颜色表示地层；地层仍由 T4/T5/T6/T7 层位线表达。
+# 中、小尺度用颜色表示尺度；大尺度保留砂砾岩原层段配色，
+# 沙三 T4-T6 为橙色、沙四 T6-T7 为蓝色。
 SCALE_STYLES = {
     "small": {
         "label": "小尺度裂缝",
@@ -107,6 +107,19 @@ SCALE_STYLES = {
         "alpha": 0.88,
         "legend_color": "#374151",
         "legend_linewidth": 2.6,
+    },
+}
+
+LARGE_INTERVAL_STYLES = {
+    "T4->T6": {
+        "label": "沙三段裂缝（T4–T6）",
+        "color": "#ff7a00",
+        "linewidth": 2.15,
+    },
+    "T6->T7": {
+        "label": "沙四段裂缝（T6–T7）",
+        "color": "#00a6ff",
+        "linewidth": 2.15,
     },
 }
 
@@ -163,9 +176,44 @@ def add_scale_colored_dfn_segments(
     segments: list[Any],
     projection: str,
 ) -> int:
-    """Draw DFN segments with the same scale-based colors as Taigu."""
+    """Draw large faults by interval and smaller scales by scale."""
     count = 0
     for scale in ("small", "medium", "large"):
+        if scale == "large":
+            for interval in ("T4->T6", "T6->T7"):
+                lines = [
+                    [
+                        (float(segment.h1), float(segment.z1)),
+                        (float(segment.h2), float(segment.z2)),
+                    ]
+                    for segment in segments
+                    if segment.projection == projection
+                    and str(getattr(segment, "scale", "")).strip().lower() == "large"
+                    and str(getattr(segment, "interval", "")).strip() == interval
+                ]
+                if not lines:
+                    continue
+                style = LARGE_INTERVAL_STYLES[interval]
+                ax.add_collection(
+                    LineCollection(
+                        lines,
+                        colors=style["color"],
+                        linewidths=float(style["linewidth"]),
+                        alpha=0.88,
+                        zorder=13.2,
+                    )
+                )
+                ax.add_line(
+                    Line2D(
+                        [0],
+                        [0],
+                        color=style["color"],
+                        linewidth=float(style["linewidth"]),
+                        label=style["label"],
+                    )
+                )
+                count += len(lines)
+            continue
         lines = [
             [
                 (float(segment.h1), float(segment.z1)),
@@ -408,6 +456,14 @@ def main() -> int:
         "output_dir": str(output_dir),
         "scope": "overview",
         "background": "OBN地震波形+正振幅变面积",
+        "color_semantics": {
+            "large": {
+                "T4->T6": "sandstone_3_orange",
+                "T6->T7": "sandstone_4_blue",
+            },
+            "medium": "scale_color",
+            "small": "scale_color",
+        },
         "dfn_source": {
             "csv": str(infer_dfn_patch_csv(config)),
             "vtk": str(scan_args.input_vtk),
