@@ -26,7 +26,7 @@ REPO = Path(__file__).resolve().parents[2]
 TAIGU = REPO / "太古界"
 SUPP = TAIGU / "supp_layer/output"
 
-BASE_CONFIG = TAIGU / "step8_well_correction/configs/taigu_step8_attribute_multiscale_v1_quanqu1.json"
+BASE_CONFIG = TAIGU / "step8_well_correction/configs/taigu_step8_attribute_multiscale_v1_quanqu1_seg1.json"
 INITIAL_CSV = SUPP / "taigu_supp_step7_v1/step7d_supp/fused_multiscale_dfn_patches.csv"
 INITIAL_VTK = SUPP / "taigu_supp_step7_v1/step7d_supp/fused_multiscale_dfn_raw_time.vtk"
 INITIAL_SUMMARY = SUPP / "taigu_supp_step7_v1/step7d_supp/fused_multiscale_summary.json"
@@ -65,7 +65,7 @@ def main() -> int:
 
     config = json.loads(BASE_CONFIG.read_text(encoding="utf-8"))
     config.update({
-        "version": "taigu_supp_layer_v1_8",
+        "version": "taigu_supp_layer_density_balance_v1",
         "initial_dfn_csv": str(args.initial_csv.resolve()),
         "initial_dfn_vtk": str(args.initial_vtk.resolve()),
         "initial_dfn_summary_json": str(args.initial_summary.resolve()),

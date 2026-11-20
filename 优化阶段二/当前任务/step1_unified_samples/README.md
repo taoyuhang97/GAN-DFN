@@ -118,4 +118,13 @@ python 优化阶段二/当前任务/step1_unified_samples/build_unified_point_ta
 
 - `fractures.csv` 只有 `MD + 产状`，没有逐点裂缝密度，所以这里只能作为原始裂缝点监督挂接，不能直接生成真值密度。
 - `around_data.csv` 与 `final_log_with_fractures.csv` 采样步长不同，当前按 `TVD` 最近邻补值，并保留 `AroundMatchDistance` 供下游检查。
-- 当前默认 `fractures.csv` 的 `MD` 可直接按深度邻近映射到主表。若后续确认需要严格区分 `MD/TVD` 语义，应调整此处映射规则。
+- 当前默认 `fractures.csv` 的 `MD` 可直接按深度邻近映射到主表。
+  **2026-09-23 结论**：该做法在本表上数值成立，但依赖"主表 `TVD` 实际是 MD"这一隐含事实——
+  本表主表来自 `优化阶段一` 的 `*_around_data.csv`，其 `TVD` 列是早期脚本用
+  `tvd = row["DEPT"]`（LAS 测深）生成的，全表 `TVD == DEPT`，对斜井（如 `车151HF`）
+  与真实垂向深度相差可达约 786 m。成像裂缝成果的深度轴已确认为**测深 MD**
+  （`车151HF_裂缝参数_P10、P21、P33.las` 为 `TLFamily_MD = Measured Depth`、
+  `车页1导眼_fractures.csv` 列名即 `MD`），因此"按 MD 邻近挂接"本身是对的，
+  但**不能把本表的 `TVD` 列拿到空间/垂深/时深换算里当真实 TVD 用**。
+  正式主线（`优化阶段二/正式主线/step2_real_well_t4_t7_samples`）已改为按 `MD`
+  查井轨迹与时深（`depth_axis="MD"`），本脚手架如需对齐应走同一口径。

@@ -36,6 +36,17 @@ REPO = TAIGU.parent
 DEFAULT_CONFIG = HERE / "configs" / "taigu_supp_step9_wiggle_split.json"
 ORIGINAL_STEP9 = TAIGU / "step9_sections" / "build_taigu_multibackground_sections.py"
 PLANES = ("XZ", "YZ")
+TAIGU_LAYER_COLORS = {
+    "上部复合层": "#ff7a00",
+    "太古界风化壳": "#00a6ff",
+}
+TAIGU_LAYER_ORDER = ("上部复合层", "太古界风化壳")
+TAIGU_DISPLAY_LAYER_MAP = {
+    "上部复合层": "上部复合层",
+    "上部补充层": "上部复合层",
+    "太古界风化壳": "太古界风化壳",
+}
+TAIGU_SCALE_WIDTHS = {"small": 1.10, "medium": 2.20, "large": 3.20}
 
 os.environ.setdefault("MPLCONFIGDIR", str(HERE / "output" / ".matplotlib"))
 import matplotlib
@@ -299,6 +310,7 @@ def load_dfn(config: dict[str, Any], time_range: tuple[float, float]) -> pd.Data
         & dfn["DipAzimuthDeg"].notna()
         & dfn["DipDeg"].notna()
     ].copy()
+    dfn["LayerGroup"] = dfn["LayerGroup"].replace(TAIGU_DISPLAY_LAYER_MAP)
     return dfn.reset_index(drop=True)
 
 
@@ -335,12 +347,15 @@ def panel_line_segments(
     frame: pd.DataFrame,
     plane: str,
     length_range_m: tuple[float, float],
-) -> dict[str, np.ndarray]:
+    *,
+    plane_coords: np.ndarray | None = None,
+    mid_times: np.ndarray | None = None,
+) -> dict[tuple[str, str], np.ndarray]:
     center_column = "CenterX" if plane == "XZ" else "CenterY"
-    grouped: dict[str, list[list[list[float]]]] = {
-        "small": [],
-        "medium": [],
-        "large": [],
+    grouped: dict[tuple[str, str], list[list[list[float]]]] = {
+        (layer, scale): []
+        for layer in TAIGU_LAYER_ORDER
+        for scale in ("small", "medium", "large")
     }
     for row in frame.itertuples(index=False):
         trace = orientation.trace_on_section(
@@ -357,17 +372,86 @@ def panel_line_segments(
         center_t = float(row.CenterTime)
         dh, dt = trace
         scale = str(getattr(row, "FractureScale", "")).strip().lower()
-        if scale not in grouped:
+        if scale not in ("small", "medium", "large"):
             scale = "small"
-        grouped[scale].append(
+        line = np.asarray(
             [
                 [center_h - half * dh, center_t - half * dt],
                 [center_h + half * dh, center_t + half * dt],
-            ]
+            ],
+            dtype=float,
         )
+        subdivisions = [line]
+        if (
+            plane_coords is not None
+            and mid_times is not None
+            and len(plane_coords) == len(mid_times)
+            and len(plane_coords) >= 2
+        ):
+            params = np.linspace(0.0, 1.0, 17)
+            sampled_h = np.interp(params, [0.0, 1.0], line[:, 0])
+            sampled_t = np.interp(params, [0.0, 1.0], line[:, 1])
+            sampled_mid = np.interp(
+                sampled_h,
+                np.asarray(plane_coords, dtype=np.float64),
+                np.asarray(mid_times, dtype=np.float64),
+            )
+            delta = sampled_t - sampled_mid
+            split_params = [0.0, 1.0]
+            for index in np.flatnonzero(delta[:-1] * delta[1:] < 0.0):
+                left = float(delta[index])
+                right = float(delta[index + 1])
+                fraction = abs(left) / max(abs(left) + abs(right), 1.0e-12)
+                split_params.append(
+                    float(params[index] + fraction * (params[index + 1] - params[index]))
+                )
+            split_params = sorted(set(split_params))
+            subdivided = []
+            for start, stop in zip(split_params[:-1], split_params[1:]):
+                if stop - start <= 1.0e-9:
+                    continue
+                subdivided.append(
+                    np.asarray(
+                        [
+                            [
+                                np.interp(start, params, sampled_h),
+                                np.interp(start, params, sampled_t),
+                            ],
+                            [
+                                np.interp(stop, params, sampled_h),
+                                np.interp(stop, params, sampled_t),
+                            ],
+                        ],
+                        dtype=float,
+                    )
+                )
+            if subdivided:
+                subdivisions = subdivided
+        for segment in subdivisions:
+            segment_center_h = 0.5 * float(segment[0, 0] + segment[1, 0])
+            segment_center_t = 0.5 * float(segment[0, 1] + segment[1, 1])
+            if (
+                plane_coords is not None
+                and mid_times is not None
+                and len(plane_coords) == len(mid_times)
+                and len(plane_coords) >= 2
+            ):
+                local_mid = float(
+                    np.interp(
+                        segment_center_h,
+                        np.asarray(plane_coords, dtype=np.float64),
+                        np.asarray(mid_times, dtype=np.float64),
+                    )
+                )
+                layer = "太古界风化壳" if segment_center_t >= local_mid else "上部复合层"
+            else:
+                layer = str(getattr(row, "LayerGroup", "")).strip()
+            key = (layer, scale)
+            if key in grouped:
+                grouped[key].append(segment.tolist())
     return {
-        scale: np.asarray(segments, dtype=np.float64)
-        for scale, segments in grouped.items()
+        key: np.asarray(segments, dtype=np.float64)
+        for key, segments in grouped.items()
     }
 
 
@@ -726,9 +810,13 @@ def main() -> int:
         description="生成地震波形+变面积底图的成像/DFN拆分剖面"
     )
     parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
+    parser.add_argument("--dfn-csv", type=Path)
     parser.add_argument("--output-dir", type=Path)
+    parser.add_argument("--overlay-only", action="store_true")
     args = parser.parse_args()
     config = read_json(args.config.resolve())
+    if args.dfn_csv:
+        config["step8_patches_csv"] = str(args.dfn_csv.resolve())
     validate_config(config)
     output_dir = (
         args.output_dir.resolve()
@@ -866,41 +954,51 @@ def main() -> int:
         *common_horizon_handles,
     ]
     imaging_path = output_dir / "01_wiggle_area_imaging.png"
-    imaging_qc = build_figure(
-        imaging_path,
-        "埕北古斜405 成像测井段 ±200 m：地震背景 + 成像真值",
-        config,
-        times,
-        axes,
-        values,
-        curves,
-        draw_imaging,
-        imaging_handles,
-        [handle.get_label() for handle in imaging_handles],
-    )
-    print(f"[wiggle-split] 已生成 {imaging_path}", flush=True)
+    imaging_qc = None
+    if not args.overlay_only:
+        imaging_qc = build_figure(
+            imaging_path,
+            "埕北古斜405 成像测井段 ±200 m：地震背景 + 成像真值",
+            config,
+            times,
+            axes,
+            values,
+            curves,
+            draw_imaging,
+            imaging_handles,
+            [handle.get_label() for handle in imaging_handles],
+        )
+        print(f"[wiggle-split] 已生成 {imaging_path}", flush=True)
 
     def draw_dfn(ax, plane: str) -> dict[str, Any]:
         grouped = panel_line_segments(
             selected[plane],
             plane,
             dfn_length_range,
+            plane_coords=axes[plane],
+            mid_times=curves[plane]["MidTimeMs"],
         )
         drawn: dict[str, int] = {}
+        drawn_by_layer: dict[str, int] = {}
         for scale in ("small", "medium", "large"):
-            segments = grouped.get(scale, np.empty((0, 2, 2)))
-            style = dfn_cfg[scale]
-            if len(segments):
-                ax.add_collection(
-                    LineCollection(
-                        segments,
-                        colors=style["color"],
-                        linewidths=float(style["line_width"]),
-                        alpha=float(style["alpha"]),
-                        zorder=2.0 if scale == "small" else 2.2,
-                    )
+            drawn[scale] = 0
+            for layer in TAIGU_LAYER_ORDER:
+                segments = grouped.get(
+                    (layer, scale), np.empty((0, 2, 2))
                 )
-            drawn[scale] = int(len(segments))
+                if len(segments):
+                    ax.add_collection(
+                        LineCollection(
+                            segments,
+                            colors=TAIGU_LAYER_COLORS[layer],
+                            linewidths=TAIGU_SCALE_WIDTHS[scale],
+                            alpha=float(dfn_cfg[scale]["alpha"]),
+                            zorder=1.8 if scale == "small" else 2.0 if scale == "medium" else 2.2,
+                        )
+                    )
+                count = int(len(segments))
+                drawn[scale] += count
+                drawn_by_layer[layer] = drawn_by_layer.get(layer, 0) + count
         track_qc = draw_imaging_track(
             ax,
             plane,
@@ -911,43 +1009,90 @@ def main() -> int:
         )
         return {
             "dfn_line_counts_by_scale": drawn,
+            "dfn_line_counts_by_layer": drawn_by_layer,
             **track_qc,
         }
 
-    dfn_handles = [
+    layer_scale_handles = [
         Line2D(
             [0],
             [0],
-            color=dfn_cfg[scale]["color"],
-            linewidth=max(float(dfn_cfg[scale]["line_width"]), 0.8),
-            label=str(dfn_cfg[scale]["label"]),
+            color=TAIGU_LAYER_COLORS[layer],
+            linewidth=3.0,
+            label=layer,
+        )
+        for layer in TAIGU_LAYER_ORDER
+    ]
+    layer_scale_handles.extend(
+        Line2D(
+            [0],
+            [0],
+            color="#111827",
+            linewidth=TAIGU_SCALE_WIDTHS[scale],
+            label={
+                "small": "小尺度",
+                "medium": "中尺度",
+                "large": "大尺度",
+            }[scale],
         )
         for scale in ("small", "medium", "large")
-    ]
-    dfn_handles.append(
-        Line2D(
-            [0],
-            [0],
-            color=imaging_track_style["color"],
-            linewidth=imaging_track_style["line_width"],
-            label=imaging_track_style["label"],
-        )
     )
+    imaging_track_handle = Line2D(
+        [0],
+        [0],
+        color=imaging_track_style["color"],
+        linewidth=imaging_track_style["line_width"],
+        label=imaging_track_style["label"],
+    )
+    dfn_handles = [*layer_scale_handles, imaging_track_handle]
     dfn_handles.extend(common_horizon_handles)
     dfn_path = output_dir / "02_wiggle_area_dfn.png"
-    dfn_qc = build_figure(
-        dfn_path,
-        "埕北古斜405 成像测井段 ±200 m：地震背景 + DFN 预测",
-        config,
-        times,
-        axes,
-        values,
-        curves,
-        draw_dfn,
-        dfn_handles,
-        [handle.get_label() for handle in dfn_handles],
-    )
-    print(f"[wiggle-split] 已生成 {dfn_path}", flush=True)
+    dfn_qc = None
+    if not args.overlay_only:
+        dfn_qc = build_figure(
+            dfn_path,
+            "埕北古斜405 成像测井段 ±200 m：地震背景 + DFN 预测",
+            config,
+            times,
+            axes,
+            values,
+            curves,
+            draw_dfn,
+            dfn_handles,
+            [handle.get_label() for handle in dfn_handles],
+        )
+        print(f"[wiggle-split] 已生成 {dfn_path}", flush=True)
+
+    overlay_path = output_dir / "01_wiggle_area_dfn_multiscale_imaging_overlay.png"
+    overlay_qc = None
+    if args.overlay_only:
+        def draw_overlay(ax, plane: str) -> dict[str, Any]:
+            dfn_overlay_qc = draw_dfn(ax, plane)
+            imaging_overlay_qc = draw_imaging(ax, plane)
+            return {
+                **dfn_overlay_qc,
+                **imaging_overlay_qc,
+            }
+
+        overlay_handles = [
+            *layer_scale_handles,
+            imaging_track_handle,
+            imaging_handles[1],
+            *common_horizon_handles,
+        ]
+        overlay_qc = build_figure(
+            overlay_path,
+            "埕北古斜405 成像测井段 ±200 m：地震背景 + 多尺度DFN + 成像真值",
+            config,
+            times,
+            axes,
+            values,
+            curves,
+            draw_overlay,
+            overlay_handles,
+            [handle.get_label() for handle in overlay_handles],
+        )
+        print(f"[wiggle-split] 已生成 {overlay_path}", flush=True)
 
     stats = orientation_stats(imaging, selected)
     summary = {
@@ -973,15 +1118,28 @@ def main() -> int:
             "time_scale_m_per_ms": float(config.get("time_scale_m_per_ms", 2.0)),
             "dfn_geometry_policy": "CSV产状字段；不使用V1..V4顶点",
         },
+        "color_semantics": {
+            "color": {
+                layer: TAIGU_LAYER_COLORS[layer]
+                for layer in TAIGU_LAYER_ORDER
+            },
+            "linewidth": TAIGU_SCALE_WIDTHS,
+            "supp_layer_display_merged_into": "上部复合层",
+        },
         "figure_qc": {
-            "imaging": imaging_qc,
-            "dfn": dfn_qc,
+            **({"imaging": imaging_qc} if imaging_qc is not None else {}),
+            **({"dfn": dfn_qc} if dfn_qc is not None else {}),
+            **({"overlay": overlay_qc} if overlay_qc is not None else {}),
         },
         "orientation_comparison": stats,
-        "outputs": {
-            "imaging": str(imaging_path),
-            "dfn": str(dfn_path),
-        },
+        "outputs": (
+            {"overlay": str(overlay_path)}
+            if args.overlay_only
+            else {
+                "imaging": str(imaging_path),
+                "dfn": str(dfn_path),
+            }
+        ),
     }
     write_json(output_dir / "wiggle_split_summary.json", summary)
     print(

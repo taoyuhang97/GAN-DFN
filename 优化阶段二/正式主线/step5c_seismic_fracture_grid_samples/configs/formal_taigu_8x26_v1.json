@@ -1,0 +1,42 @@
+{
+  "region": "太古界",
+  "region_code": "taigu",
+  "source_wells": [
+    "埕北301",
+    "埕北303",
+    "埕北321",
+    "埕北38",
+    "埕北39",
+    "埕北古10",
+    "埕北古16",
+    "埕北古406"
+  ],
+  "wells_root": "/home/tyh/projects/petroleum/code/GAN-DFN/太古界/step5_virtual_wells/output/taigu_step5_attribute_v3_common_contract_md1/wells",
+  "output_root": "/home/tyh/projects/petroleum/code/GAN-DFN/太古界/output/taigu_seismic_fracture_grid_samples_v1",
+  "grid_type": "taigu_inline_xline",
+  "trace_header_csv": "/home/tyh/projects/petroleum/code/GAN-DFN/太古界/common/attribute_trace_contract/output/taigu_attribute_trace_header_v1/attribute_trace_header.csv",
+  "trace_count": 2156550,
+  "grid_origin_x_m": 658887.0,
+  "grid_origin_y_m": 4231661.0,
+  "grid_spacing_m": 12.5,
+  "expected_grid_nx": 1650,
+  "expected_grid_ny": 1307,
+  "coordinate_tolerance_m": 2.5,
+  "volume_paths": {
+    "AntTrack": "/data/shared/project-oil/wx数据/埕岛太古界/体数据/Chengdao-Taigujie-AntTracking.sgy",
+    "Coherence": "/data/shared/project-oil/wx数据/埕岛太古界/体数据/Chengdao-Taigujie-Eigenstructure Coherence.sgy",
+    "CurvatureMax": "/data/shared/project-oil/wx数据/埕岛太古界/体数据/Chengdao-Taigujie-Most Positive Curvature.sgy"
+  },
+  "time_origins_ms": {
+    "AntTrack": 1800.0,
+    "Coherence": 1800.0,
+    "CurvatureMax": 1800.0
+  },
+  "attribute_rules": {},
+  "real_relative_path": "real_well/real_well_samples.csv",
+  "virtual_relative_template": "virtual_wells/{virtual_well_name}/virtual_well_training_samples.csv",
+  "virtual_per_source": 25,
+  "expected_source_wells": 8,
+  "expected_sample_files": 208,
+  "density_aggregation": "point_confidence_weighted_mean"
+}

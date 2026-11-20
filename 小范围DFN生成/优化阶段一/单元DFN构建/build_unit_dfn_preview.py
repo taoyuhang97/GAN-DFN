@@ -398,7 +398,20 @@ def export_patch_vtk_files(
     config: VtkExportConfig,
 ) -> dict[str, object]:
     if patch_df.empty:
-        return {"patch_file_count": 0}
+        # Keep the per-unit output contract intact for valid empty units so
+        # downstream recovery/audit code can distinguish an empty DFN from a
+        # failed or incomplete export.
+        raw_path = output_dir / "unit_dfn_patches_raw_time.vtk"
+        display_path = output_dir / "unit_dfn_patches_display.vtk"
+        write_legacy_vtk_polygons(raw_path, "unit_dfn_patches_raw_time", np.empty((0, 3), dtype=float), [], {})
+        write_legacy_vtk_polygons(display_path, "unit_dfn_patches_display", np.empty((0, 3), dtype=float), [], {})
+        return {
+            "patch_file_count": 2,
+            "patch_raw_vtk": str(raw_path),
+            "patch_display_vtk": str(display_path),
+            "PatchMappings": {},
+        }
+
     cell_data, mappings = build_patch_vtk_cell_data(patch_df)
     raw_points: list[list[float]] = []
     display_points: list[list[float]] = []

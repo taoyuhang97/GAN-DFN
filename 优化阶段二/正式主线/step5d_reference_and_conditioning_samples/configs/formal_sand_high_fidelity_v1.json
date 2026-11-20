@@ -1,0 +1,14 @@
+{
+  "mode": "well-match",
+  "region": "砂砾岩",
+  "region_code": "sand",
+  "target_count": 200,
+  "group_prefix": "HF_SAND",
+  "input_patch_csv": "/home/tyh/projects/petroleum/code/GAN-DFN/优化阶段二/正式主线/output/formal_mine_multiscale_flow_v1/step8_well_correction/well_corrected_dfn_fracture_patches.csv",
+  "wells_root": "/home/tyh/projects/petroleum/code/GAN-DFN/优化阶段二/正式主线/step5b_unified_samples_t4_t7/output/formal_curvature_led_v2/wells",
+  "prior_sample_config": "/home/tyh/projects/petroleum/code/GAN-DFN/优化阶段二/正式主线/step5c_seismic_fracture_grid_samples/configs/formal_sand_16x26_v1.json",
+  "real_relative_path": "real_well/real_well_samples.csv",
+  "virtual_relative_template": "virtual_wells/{virtual_well_name}/virtual_well_training_samples.csv",
+  "virtual_per_source": 25,
+  "output_dir": "/home/tyh/projects/petroleum/code/GAN-DFN/优化阶段二/正式主线/output/high_fidelity_reference_models_sand_v1"
+}

@@ -13,7 +13,7 @@
   "random_seed": 20260717,
   "min_prior_score": 0.58,
   "min_component_voxels": 80,
-  "target_patch_count": 0,
+  "target_patch_count": 36000,
   "max_component_count": 0,
   "component_voxels_per_patch": 140.0,
   "min_patches_per_component": 2,

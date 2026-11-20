@@ -53,6 +53,14 @@ def amplitude_limit(sections: list[AttributeSection], quantile: float) -> float:
 
 
 def figure_size_inches(section: AttributeSection, geometry, panel: bool = False) -> tuple[float, float, int]:
+    figure_size_cm = geometry.config.get("figure_size_cm")
+    if figure_size_cm and len(figure_size_cm) == 2:
+        dpi = int(geometry.config.get("render_dpi", geometry.args.dpi))
+        return (
+            float(figure_size_cm[0]) / 2.54,
+            float(figure_size_cm[1]) / 2.54,
+            dpi,
+        )
     dpi = int(geometry.config.get("render_dpi", geometry.args.dpi))
     if panel:
         width_px = int(geometry.config.get("panel_width_px", 3000))
@@ -158,7 +166,9 @@ def plot_wiggle_variable_area(
     product_title: str | None = None,
 ) -> int:
     width, height, dpi = figure_size_inches(section, geometry, panel=panel)
-    if overlay_drawer is not None:
+    separate_legend = bool(geometry.config.get("separate_legend", False))
+    include_title = bool(geometry.config.get("include_title", True))
+    if overlay_drawer is not None and not separate_legend:
         legend_width_in = float(geometry.config.get("overlay_legend_width_in", 3.6))
         width += legend_width_in
     else:
@@ -195,18 +205,22 @@ def plot_wiggle_variable_area(
     ax.set_facecolor("white")
     if overlay_drawer is not None:
         overlay_drawer(ax, section.projection)
-        right = max(0.55, 1.0 - legend_width_in / width)
-        fig.subplots_adjust(left=0.06, right=right, bottom=0.10, top=0.88)
-        handles, labels = ax.get_legend_handles_labels()
-        legend_fontsize = float(geometry.config.get("overlay_legend_fontsize", 8.4))
-        fig.legend(handles, labels, loc="upper left", bbox_to_anchor=(right + 0.035, 0.88), fontsize=legend_fontsize, framealpha=0.92)
-        fig.suptitle(product_title or "车页1导眼：DFN与成像测井裂缝对比剖面", y=0.975, fontsize=13)
-        ax.set_title(
-            f"{scope_label or '剖面'} | 地震波形+变面积 | {section.projection} | "
-            f"T4-T7 | 道数={len(selected)}{title_suffix}",
-            fontsize=11,
-            pad=8,
-        )
+        if separate_legend:
+            fig.subplots_adjust(left=0.09, right=0.985, bottom=0.14, top=0.975)
+        else:
+            right = max(0.55, 1.0 - legend_width_in / width)
+            fig.subplots_adjust(left=0.06, right=right, bottom=0.10, top=0.88)
+            handles, labels = ax.get_legend_handles_labels()
+            legend_fontsize = float(geometry.config.get("overlay_legend_fontsize", 8.4))
+            fig.legend(handles, labels, loc="upper left", bbox_to_anchor=(right + 0.035, 0.88), fontsize=legend_fontsize, framealpha=0.92)
+        if include_title:
+            fig.suptitle(product_title or "车页1导眼：DFN与成像测井裂缝对比剖面", y=0.975, fontsize=13)
+            ax.set_title(
+                f"{scope_label or '剖面'} | 地震波形+变面积 | {section.projection} | "
+                f"T4-T7 | 道数={len(selected)}{title_suffix}",
+                fontsize=11,
+                pad=8,
+            )
     else:
         ax.set_title(
             f"{geometry.config['title_prefix']} | 地震波形+变面积 | {section.projection} | "

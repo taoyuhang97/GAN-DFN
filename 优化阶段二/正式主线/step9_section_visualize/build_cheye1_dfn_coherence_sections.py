@@ -49,6 +49,9 @@ from trace_horizon_section import build_trace_horizon_section_curves, resolve_ho
 FORMAL_ROOT = Path(__file__).resolve().parent.parent
 if str(FORMAL_ROOT) not in sys.path:
     sys.path.insert(0, str(FORMAL_ROOT))
+REPO_ROOT = FORMAL_ROOT.parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 from common.horizon_trace_table.horizon_contract import (  # noqa: E402
     HorizonSpatialLookup,
     build_spatial_lookup,
@@ -58,6 +61,7 @@ from common.unified_dfn_vtk import (  # noqa: E402
     extract_geometry_group,
     geometry_group_counts,
 )
+from 太古界.common.orientation_frame import convention as orientation  # noqa: E402
 
 
 WELL_NAME = "车页1导眼"
@@ -89,6 +93,18 @@ SCALE_LINE_STYLES = {
     "large": (2.8, "-"),
     "": (1.4, "-"),
 }
+LEGACY_SCALE_LINE_STYLES = {
+    "small": (1.5, "-"),
+    "medium": (2.5, "-"),
+    "large": (2.5, "-"),
+    "": (1.4, "-"),
+}
+LARGE_SECTION_SCALE_LINE_STYLES = {
+    "small": (1.1, "-"),
+    "medium": (2.2, "-"),
+    "large": (3.2, "-"),
+    "": (1.4, "-"),
+}
 # 大尺度是否加深色描边（轮廓）；预览脚本可切换对比"虚实线 vs 描边"
 SCALE_LARGE_HALO = True
 # 方案B：图例样本样式，尺度 -> (颜色, 线型, 线宽, 标签)
@@ -96,6 +112,16 @@ SCALE_LEGEND_STYLES = {
     "small": ("#9ca3af", (0, (1.2, 1.1)), 1.4, "小尺度裂缝（细虚线）"),
     "medium": ("#6b7280", "-", 2.4, "中尺度裂缝（粗实线）"),
     "large": ("#374151", "-", 3.0, "大尺度裂缝（粗实线+描边）"),
+}
+LEGACY_SCALE_LEGEND_STYLES = {
+    "small": ("#9ca3af", "-", 2.0, "小尺度裂缝"),
+    "medium": ("#6b7280", "-", 2.6, "中尺度裂缝"),
+    "large": ("#374151", "-", 2.6, "大尺度裂缝"),
+}
+LARGE_SECTION_SCALE_LEGEND_STYLES = {
+    "small": ("#111827", "-", 1.1, "小尺度"),
+    "medium": ("#111827", "-", 2.2, "中尺度"),
+    "large": ("#111827", "-", 3.2, "大尺度"),
 }
 DFN_WIDTH_MIN = 0.45
 DFN_WIDTH_MAX = 3.0
@@ -346,7 +372,10 @@ def make_summary(display: dict[str, float], time_min: float, time_max: float) ->
 
 
 def segment_lines(
-    segments: list[ProjectionSegment], projection: str
+    segments: list[ProjectionSegment],
+    projection: str,
+    *,
+    scale_line_styles: dict[str, tuple[float, str]] | None = None,
 ) -> tuple[list[tuple[tuple[float, float], tuple[float, float]]], list[str], list[float], list[str]]:
     """返回 (线段, 颜色, 线宽, 线型)；线宽/线型按尺度区分（方案B），颜色保留层段色。"""
     lines: list[tuple[tuple[float, float], tuple[float, float]]] = []
@@ -354,6 +383,7 @@ def segment_lines(
     widths: list[float] = []
     linestyles: list[str] = []
     selected = [segment for segment in segments if segment.projection == projection]
+    style_contract = scale_line_styles or SCALE_LINE_STYLES
     areas = np.asarray([max(float(segment.patch_area), 1.0) for segment in selected], dtype=float)
     if areas.size > 1 and np.isfinite(areas).all() and float(np.nanmax(areas)) > float(np.nanmin(areas)):
         lo = float(np.nanquantile(areas, 0.05))
@@ -368,7 +398,9 @@ def segment_lines(
             continue
         colors.append(DFN_INTERVAL_COLORS.get(segment.interval, "#ef4444"))
         patch_scale = str(getattr(segment, "scale", "")).strip().lower()
-        width, linestyle = SCALE_LINE_STYLES.get(patch_scale, SCALE_LINE_STYLES[""])
+        width, linestyle = style_contract.get(
+            patch_scale, style_contract[""]
+        )
         if hi > lo:
             area_norm = float(np.clip((max(float(segment.patch_area), 1.0) - lo) / (hi - lo), 0.0, 1.0))
             scale = DFN_SEGMENT_SCALE_MIN + (DFN_SEGMENT_SCALE_MAX - DFN_SEGMENT_SCALE_MIN) * (area_norm ** DFN_SEGMENT_SCALE_POWER)
@@ -1153,7 +1185,16 @@ def add_fault_trace_segments(
     return len(lines)
 
 
-def add_dfn_segments(ax, segments: list[ProjectionSegment], projection: str, *, overlay: bool) -> int:
+def add_dfn_segments(
+    ax,
+    segments: list[ProjectionSegment],
+    projection: str,
+    *,
+    overlay: bool,
+    legacy_style: bool = False,
+    large_section_style: bool = False,
+    add_scale_legend: bool = True,
+) -> int:
     intersection_segments = [
         segment
         for segment in segments
@@ -1164,8 +1205,22 @@ def add_dfn_segments(ax, segments: list[ProjectionSegment], projection: str, *, 
         for segment in segments
         if segment.projection == projection and getattr(segment, "display_mode", "intersection") == "small_projection"
     ]
-    intersection_lines, intersection_colors, intersection_widths, intersection_styles = segment_lines(intersection_segments, projection)
-    projected_lines, projected_colors, projected_widths, projected_styles = segment_lines(projected_segments, projection)
+    if large_section_style:
+        line_style_contract = LARGE_SECTION_SCALE_LINE_STYLES
+    elif legacy_style:
+        line_style_contract = LEGACY_SCALE_LINE_STYLES
+    else:
+        line_style_contract = SCALE_LINE_STYLES
+    intersection_lines, intersection_colors, intersection_widths, intersection_styles = segment_lines(
+        intersection_segments,
+        projection,
+        scale_line_styles=line_style_contract,
+    )
+    projected_lines, projected_colors, projected_widths, projected_styles = segment_lines(
+        projected_segments,
+        projection,
+        scale_line_styles=line_style_contract,
+    )
     if not intersection_lines and not projected_lines:
         ax.text(0.5, 0.5, "无T4-T7裂缝片段", transform=ax.transAxes, ha="center", va="center")
         return 0
@@ -1191,10 +1246,24 @@ def add_dfn_segments(ax, segments: list[ProjectionSegment], projection: str, *, 
         str(getattr(segment, "scale", "")).strip().lower()
         for segment in [*intersection_segments, *projected_segments]
     }
-    for scale_key in ("small", "medium", "large"):
-        if scale_key in present_scales:
-            color, style, width, label = SCALE_LEGEND_STYLES[scale_key]
-            ax.plot([], [], color=color, linestyle=style, linewidth=width, label=label)
+    if add_scale_legend:
+        for scale_key in ("small", "medium", "large"):
+            if scale_key in present_scales:
+                if large_section_style:
+                    styles = LARGE_SECTION_SCALE_LEGEND_STYLES
+                elif legacy_style:
+                    styles = LEGACY_SCALE_LEGEND_STYLES
+                else:
+                    styles = SCALE_LEGEND_STYLES
+                color, style, width, label = styles[scale_key]
+                ax.plot(
+                    [],
+                    [],
+                    color=color,
+                    linestyle=style,
+                    linewidth=width,
+                    label=label,
+                )
     return len(intersection_lines) + len(projected_lines)
 
 
@@ -1218,9 +1287,9 @@ def imaging_patch_vertices(row: pd.Series, length_m: float) -> np.ndarray | None
     time_value = pd.to_numeric(pd.Series([row.get("TIME")]), errors="coerce").iloc[0]
     if not np.isfinite([azimuth, dip, x, y, time_value]).all():
         return None
-    # Keep Step9 consistent with Step8: Frac_Azimuth is written to AzimuthDeg
-    # and used as the patch long-edge direction in VTK geometry.
-    theta = np.deg2rad(float(azimuth) % 180.0)
+    # Convert true dip azimuth to the historical XY long-edge angle used by
+    # the rectangular patch geometry: A = (180 - D) mod 180.
+    theta = np.deg2rad(float(180.0 - float(azimuth)) % 180.0)
     dip_rad = np.deg2rad(float(np.clip(dip, 1.0, 89.0)))
     strike = np.asarray([np.cos(theta), np.sin(theta)], dtype=float)
     dip_horizontal = np.asarray([-np.sin(theta), np.cos(theta)], dtype=float)
@@ -1244,14 +1313,32 @@ def build_imaging_fracture_patch_segments(fracture_df: pd.DataFrame) -> list[Pro
     for idx, row in fracture_df.iterrows():
         factor = float(factors.loc[idx])
         length = IMAGING_PATCH_LENGTH_MIN_M + (IMAGING_PATCH_LENGTH_MAX_M - IMAGING_PATCH_LENGTH_MIN_M) * factor
-        vertices = imaging_patch_vertices(row, length_m=length)
-        if vertices is None:
+        azimuth = pd.to_numeric(
+            pd.Series([row.get("Frac_Azimuth")]), errors="coerce"
+        ).iloc[0]
+        dip = pd.to_numeric(
+            pd.Series([row.get("Frac_Dip")]), errors="coerce"
+        ).iloc[0]
+        x = pd.to_numeric(
+            pd.Series([row.get("X")]), errors="coerce"
+        ).iloc[0]
+        y = pd.to_numeric(
+            pd.Series([row.get("Y")]), errors="coerce"
+        ).iloc[0]
+        time_value = pd.to_numeric(
+            pd.Series([row.get("TIME")]), errors="coerce"
+        ).iloc[0]
+        if not np.isfinite([azimuth, dip, x, y, time_value]).all():
             continue
-        area = polygon_area(vertices)
-        for projection, coords in [("XZ", vertices[:, [0, 2]]), ("YZ", vertices[:, [1, 2]])]:
-            line = representative_line_2d(coords)
-            if line is None:
+        half = 0.5 * length
+        for projection in ("XZ", "YZ"):
+            trace = orientation.trace_on_section(
+                float(azimuth), float(dip), projection
+            )
+            if trace is None:
                 continue
+            dh, dt = trace
+            center_h = float(x if projection == "XZ" else y)
             segments.append(
                 ProjectionSegment(
                     polygon_index=int(idx),
@@ -1261,11 +1348,11 @@ def build_imaging_fracture_patch_segments(fracture_df: pd.DataFrame) -> list[Pro
                     center_y=float(row["Y"]),
                     center_z=float(row["TIME"]),
                     surface_distance=0.0,
-                    patch_area=float(area),
-                    h1=float(line[0][0]),
-                    z1=float(line[0][1]),
-                    h2=float(line[1][0]),
-                    z2=float(line[1][1]),
+                    patch_area=float(length * length / IMAGING_PATCH_ASPECT_RATIO),
+                    h1=center_h - half * dh,
+                    z1=float(time_value) - half * dt,
+                    h2=center_h + half * dh,
+                    z2=float(time_value) + half * dt,
                 )
             )
     return segments

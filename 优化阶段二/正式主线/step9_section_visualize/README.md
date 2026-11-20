@@ -181,8 +181,11 @@ python3 优化阶段二/正式主线/step9_section_visualize/build_cheye1_scale_
   --output-dir 优化阶段二/正式主线/output/step9_section_presentation/mine_v1/scale_wiggle_t4_t7_vert1
 ```
 
-正式图会过滤视倾角低于 `30°` 的 DFN 和原始断层线段。砂砾岩 `vert1`
-验收产物位于 `output/step9_section_presentation/mine_v1/scale_wiggle_t4_t7_vert1/`。
+旧版砂砾岩正式图会过滤视倾角低于 `30°` 的 DFN 和原始断层线段，相关验收产物位于
+`output/step9_section_presentation/mine_v1/scale_wiggle_t4_t7_vert1/`。从 `v5` 起，
+砂砾岩多尺度剖面不再按视倾角过滤 DFN 或原始断层交线，所有剖面交线都会进入绘制、
+`intersections/dfn_intersections.csv` 和统计；太古界多尺度剖面仍保留 `30°` 可视过滤。
+`v5` 砂砾岩与太古界结果由 `scripts/run_layered_multiscale_profiles_v5.sh` 统一生成。
 
 砂砾岩连续分块版 `seg1` 将 875 个推测大尺度父片拆成 2,065 个共享边界块，
 Step8 后最大边界缝隙为 `0 m`；10 张多尺度剖面位于

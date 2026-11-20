@@ -40,6 +40,15 @@ if _large_control_spec is None or _large_control_spec.loader is None:
 large_conventional_controls = importlib.util.module_from_spec(_large_control_spec)
 _large_control_spec.loader.exec_module(large_conventional_controls)
 
+_match_density_path = REPO_ROOT / "common" / "step8_well_match_density.py"
+_match_density_spec = importlib.util.spec_from_file_location(
+    "taigu_step8_well_match_density", _match_density_path
+)
+if _match_density_spec is None or _match_density_spec.loader is None:
+    raise ImportError(f"cannot load Step8 match/density helper: {_match_density_path}")
+step8_match_density = importlib.util.module_from_spec(_match_density_spec)
+_match_density_spec.loader.exec_module(step8_match_density)
+
 ALLOWED_LAYERS = ["上部复合层", "太古界风化壳"]
 LAYER_CODE = {"上部复合层": 1, "太古界风化壳": 2}
 CSV_ENCODINGS = ("utf-8-sig", "utf-8", "gb18030", "gbk")
@@ -94,6 +103,7 @@ def build_spatial_lookup(config: dict[str, Any]) -> TaiguHorizonSpatialLookup:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Correct the Taigu multiscale DFN with real-well controls.")
     parser.add_argument("--config", default=str(DEFAULT_CONFIG), help="Path to JSON config.")
+    parser.add_argument("--output-dir", type=Path, help="Optional output override for calibration runs.")
     return parser.parse_args()
 
 
@@ -195,6 +205,10 @@ def output_paths(output_dir: Path) -> dict[str, Path]:
         "md_join_audit_csv": output_dir / "well_control_md_join_audit.csv",
         "md_join_unmatched_csv": output_dir / "well_control_md_join_unmatched.csv",
         "segment_coverage_csv": output_dir / "step2_segment_coverage_audit.csv",
+        "imaging_match_json": output_dir / "imaging_match_summary.json",
+        "imaging_match_selection_csv": output_dir / "imaging_match_selection_audit.csv",
+        "density_compensation_requests_csv": output_dir / "density_compensation_requests.csv",
+        "density_compensation_summary_csv": output_dir / "density_compensation_ring_summary.csv",
     }
 
 
@@ -230,6 +244,8 @@ def load_initial_dfn(path: Path) -> pd.DataFrame:
     out["WellControlMatchAfter"] = np.nan
     out["NearestTrajectoryDistance"] = np.nan
     out["IsWellControlPatch"] = 0
+    out["IsImagingMatchPatch"] = 0
+    out["IsDensityCompensationPatch"] = 0
     return out.reset_index(drop=True)
 
 
@@ -452,6 +468,7 @@ def load_step3_imaging_controls(
         "IsImagingGroundTruth",
         "Frac_Azimuth",
         "Frac_Dip",
+        "RawPointCount",
         "Step3GroupCSV",
         "temporary_neighbor_time_depth",
         "MD",
@@ -787,7 +804,11 @@ def enforce_final_center_horizon_contract(
                 flush=True,
             )
         row = source_row.copy()
-        modified = str(row.get("CorrectionAction", "")) in {"add_well_control_patch", "adjust_to_well_control"}
+        modified = str(row.get("CorrectionAction", "")) in {
+            "add_well_control_patch",
+            "adjust_to_well_control",
+            "add_density_compensation_patch",
+        }
         x = float(row["CenterX"])
         y = float(row["CenterY"])
         time = float(row["CenterTime"])
@@ -1262,6 +1283,7 @@ def offset_center_near_control(control: pd.Series, dip_azimuth_deg: float, dip_d
 def apply_geometry_from_control(row: pd.Series | dict[str, Any], template: pd.Series, control: pd.Series, config: dict[str, Any]) -> dict[str, Any]:
     out = dict(row)
     dip_azimuth, dip, orientation_source = control_orientation(template=template, control=control, config=config)
+    is_imaging_ground_truth = int(control.get("IsImagingGroundTruth", 0) or 0) == 1
     length = float(control["WellControlLengthM"]) if "WellControlLengthM" in control and pd.notna(control["WellControlLengthM"]) else float(template["LengthM"])
     height = float(control["WellControlHeightTimeMs"]) if "WellControlHeightTimeMs" in control and pd.notna(control["WellControlHeightTimeMs"]) else float(template["HeightTimeMs"])
     center = offset_center_near_control(control=control, dip_azimuth_deg=dip_azimuth, dip_deg=dip, length_m=length, height_time_ms=height, config=config)
@@ -1280,7 +1302,18 @@ def apply_geometry_from_control(row: pd.Series | dict[str, Any], template: pd.Se
     out["ControlY"] = float(control["Y"])
     out["ControlTime"] = float(control["TIME"])
     out["ControlSource"] = str(control.get("ControlSource", "step4_predicted"))
-    out["IsImagingGroundTruth"] = int(control.get("IsImagingGroundTruth", 0) or 0)
+    out["IsImagingGroundTruth"] = int(is_imaging_ground_truth)
+    out["IsImagingMatchPatch"] = int(
+        is_imaging_ground_truth
+        and int(control.get("ImagingMatchSelected", 0) or 0) == 1
+    )
+    out["IsDensityCompensationPatch"] = 0
+    out["ImagingMatchTargetAzimuthDeg"] = (
+        float(control.get("Frac_Azimuth", np.nan)) if is_imaging_ground_truth else np.nan
+    )
+    out["ImagingMatchTargetDipDeg"] = (
+        float(control.get("Frac_Dip", np.nan)) if is_imaging_ground_truth else np.nan
+    )
     control_score = float(control.get("DensityScore", 0.5))
     original_score = float(pd.to_numeric(pd.Series([out.get("FractureIntensityScore", 0.5)]), errors="coerce").fillna(0.5).iloc[0])
     corrected_score = max(original_score, control_score)
@@ -1539,6 +1572,106 @@ def apply_well_controls(
     return corrected.reset_index(drop=True), pd.DataFrame(audit_rows)
 
 
+def build_radial_density_compensation_patches(
+    initial_df: pd.DataFrame,
+    requests: pd.DataFrame,
+    config: dict[str, Any],
+    surface_lookup: TaiguHorizonSpatialLookup | None = None,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    if requests.empty:
+        return pd.DataFrame(), pd.DataFrame()
+    time_scale = float(config.get("time_scale_m_per_ms", 2.0))
+    length_multiplier = float(config.get("density_compensation_size_multiplier", 0.65))
+    height_multiplier = float(config.get("density_compensation_height_multiplier", 0.65))
+    confidence = float(config.get("density_compensation_confidence", 0.45))
+    target = dict(config.get("target_block") or {})
+    rows: list[dict[str, Any]] = []
+    audit_rows: list[dict[str, Any]] = []
+    for request_index, request in requests.reset_index(drop=True).iterrows():
+        template = nearest_template_patch(
+            initial_df=initial_df,
+            layer=str(request["LayerGroup"]),
+            x=float(request["X"]),
+            y=float(request["Y"]),
+            time_value=float(request["TIME"]),
+            time_scale=time_scale,
+            config=config,
+        )
+        if template is None:
+            continue
+        comp_id = f"density_comp_{request_index + 1:06d}"
+        pseudo_control = pd.Series(
+            {
+                "WellName": str(request["WellName"]),
+                "X": float(request["X"]),
+                "Y": float(request["Y"]),
+                "TIME": float(request["TIME"]),
+                "LayerGroup": str(request["LayerGroup"]),
+                "Density": float(template.get("SourceDensity", 0.5)),
+                "Frac_Azimuth": float(request["Frac_Azimuth"]),
+                "Frac_Dip": float(request["Frac_Dip"]),
+                "WellControlSampleID": comp_id,
+                "ControlSource": "density_compensation_radial",
+                "IsImagingGroundTruth": 1,
+                "ImagingMatchSelected": 0,
+                "WellControlLengthM": float(
+                    np.clip(float(template["LengthM"]) * length_multiplier, 20.0, 80.0)
+                ),
+                "WellControlHeightTimeMs": float(
+                    np.clip(float(template["HeightTimeMs"]) * height_multiplier, 3.0, 12.0)
+                ),
+                "WellControlDensityScore": 0.5,
+            }
+        )
+        row = build_added_patch(
+            template=template,
+            control=pseudo_control,
+            add_index=request_index + 1,
+            before_distance=np.nan,
+            track_distance=float(request["RadialDistanceM"]),
+            config=config,
+            surface_lookup=surface_lookup,
+        )
+        row["PatchID"] = f"density_comp_dfn_{request_index + 1:06d}"
+        row["SourceType"] = "density_compensation_well_ring"
+        row["CorrectionAction"] = "add_density_compensation_patch"
+        row["CorrectionReason"] = "radial_band_density_deficit"
+        row["ControlSource"] = "density_compensation_radial"
+        row["IsImagingGroundTruth"] = 0
+        row["IsImagingMatchPatch"] = 0
+        row["IsDensityCompensationPatch"] = 1
+        row["IsWellControlPatch"] = 0
+        row["NeedsWellCorrection"] = 0
+        row["Confidence"] = confidence
+        row["DensityCompensationWellName"] = str(request["WellName"])
+        row["DensityCompensationRing"] = str(request["RadialBandLabel"])
+        row["DensityCompensationRingMinM"] = float(request["RadialBandMinM"])
+        row["DensityCompensationRingMaxM"] = float(request["RadialBandMaxM"])
+        row["DensityCompensationRadialWeight"] = float(request["RadialWeight"])
+        row["DensityCompensationTargetDensity"] = float(request["TargetAreaDensity"])
+        row["DensityCompensationCurrentDensity"] = float(request["CurrentAreaDensity"])
+        row["DensityCompensationDeficit"] = float(request["DeficitAreaDensity"])
+        row["DensityCompensationReferencePointWeight"] = float(request["ReferencePointWeight"])
+        row["DipAzimuthDeg"] = float(request["Frac_Azimuth"]) % 360.0
+        row["AzimuthDeg"] = float((float(request["Frac_Azimuth"]) - 90.0) % 180.0)
+        row["DipDeg"] = float(request["Frac_Dip"])
+        row["OrientationSource"] = "radial_density_compensation_local_orientation"
+        if target:
+            row["CenterX"] = float(np.clip(row["CenterX"], float(target["x_min"]), float(target["x_max"])))
+            row["CenterY"] = float(np.clip(row["CenterY"], float(target["y_min"]), float(target["y_max"])))
+        row.update(update_layer_window_from_surfaces(row, surface_lookup))
+        rows.append(row)
+        audit_rows.append(
+            {
+                "PatchID": row["PatchID"],
+                **request.to_dict(),
+                "SourceType": row["SourceType"],
+                "CorrectionAction": row["CorrectionAction"],
+            }
+        )
+    return pd.DataFrame(rows), pd.DataFrame(audit_rows)
+
+
 def patch_vertices(
     row: pd.Series,
     display: bool,
@@ -1563,7 +1696,11 @@ def patch_vertices(
     if (
         preserve_vertices
         and not rebuild_all_vertices
-        and correction_action not in {"add_well_control_patch", "adjust_to_well_control"}
+        and correction_action not in {
+            "add_well_control_patch",
+            "adjust_to_well_control",
+            "add_density_compensation_patch",
+        }
     ):
         points = []
         for vertex_idx in range(1, 5):
@@ -1637,7 +1774,11 @@ def refresh_well_control_vertices(
     out = patch_df.copy()
     if "CorrectionAction" not in out.columns:
         return out
-    modified_mask = out["CorrectionAction"].astype(str).isin(["add_well_control_patch", "adjust_to_well_control"])
+    modified_mask = out["CorrectionAction"].astype(str).isin([
+        "add_well_control_patch",
+        "adjust_to_well_control",
+        "add_density_compensation_patch",
+    ])
     if not modified_mask.any():
         return out
     vertex_cols = [f"V{vertex_idx}{axis}" for vertex_idx in range(1, 5) for axis in ("X", "Y", "Z")]
@@ -1702,9 +1843,11 @@ def materialize_and_clip_vertices_to_horizon_contract(
     surface_valid = pd.to_numeric(horizon_rows["SurfaceValid"], errors="coerce").fillna(0).to_numpy(dtype=bool)
     present = surface_valid & np.isfinite(top) & np.isfinite(base) & (top < base)
     valid = present & np.isfinite(top) & np.isfinite(base) & (base >= top)
-    modified = out.get("CorrectionAction", pd.Series("", index=out.index)).astype(str).isin(
-        ["add_well_control_patch", "adjust_to_well_control"]
-    ).to_numpy()
+    modified = out.get("CorrectionAction", pd.Series("", index=out.index)).astype(str).isin([
+        "add_well_control_patch",
+        "adjust_to_well_control",
+        "add_density_compensation_patch",
+    ]).to_numpy()
     modified_vertices = modified.repeat(4)
 
     # A hard fault center remains fixed. If a corner reaches a local trace without a
@@ -2067,7 +2210,11 @@ def build_summary(
         ).fillna(0).eq(1).sum()
     )
     if {"CenterTime", "TimeWindowMin", "TimeWindowMax"}.issubset(corrected_df.columns):
-        modified_mask = corrected_df["CorrectionAction"].astype(str).isin(["adjust_to_well_control", "add_well_control_patch"])
+        modified_mask = corrected_df["CorrectionAction"].astype(str).isin([
+            "adjust_to_well_control",
+            "add_well_control_patch",
+            "add_density_compensation_patch",
+        ])
         layer_window_available = corrected_df[["CenterTime", "TimeWindowMin", "TimeWindowMax"]].notna().all(axis=1) & modified_mask
         layer_window_missing_count = int((~layer_window_available).sum())
         layer_window_checked_count = int(layer_window_available.sum())
@@ -2305,7 +2452,11 @@ def main() -> int:
     args = parse_args()
     config_path = Path(args.config).resolve()
     config = read_json(config_path)
-    output_dir = Path(config["output_dir"]).resolve()
+    output_dir = (
+        args.output_dir.resolve()
+        if args.output_dir
+        else Path(config["output_dir"]).resolve()
+    )
     paths = output_paths(output_dir)
     ensure_dir(output_dir)
     flow_start = time.time()
@@ -2490,9 +2641,18 @@ def main() -> int:
     control_df = control_df.iloc[eligible_positions].reset_index(drop=True)
     config["_outside_layer_control_count"] = int((~inside_mask).sum())
     config["_eligible_control_count"] = int(len(control_df))
+    control_df, imaging_match_selection_df, imaging_match_calibration = (
+        step8_match_density.calibrate_imaging_point_controls(
+            control_df,
+            config,
+        )
+    )
+    config["_imaging_match_calibration"] = imaging_match_calibration
     log(
         f"[Step8 3b/7] 层位窗口筛选：原始控制点 {len(input_qc)}，"
-        f"保留 {len(control_df)}，层外审计 {len(outside_layer_audit)}",
+        f"保留 {len(control_df)}，层外审计 {len(outside_layer_audit)}；"
+        f"成像原点 {imaging_match_calibration['original_imaging_point_count']}，"
+        f"匹配选择 {imaging_match_calibration['selected_match_point_count']}",
     )
     track_dist = nearest_track_distances(control_df, tracks, time_scale=time_scale)
     before_dist = nearest_patch_distances(initial_df, control_df, time_scale=time_scale)
@@ -2556,6 +2716,36 @@ def main() -> int:
         }
     )
     config["_imaging_well_region_summary"] = region_summary
+    selected_imaging_controls = control_df[
+        safe_numeric(
+            control_df.get("IsImagingGroundTruth", pd.Series(0, index=control_df.index))
+        ).fillna(0).astype(int).eq(1)
+        & safe_numeric(
+            control_df.get("ImagingMatchSelected", pd.Series(0, index=control_df.index))
+        ).fillna(0).astype(int).eq(1)
+    ].copy()
+    density_requests_df, density_ring_summary_df, density_compensation_summary = (
+        step8_match_density.build_radial_density_compensation_requests(
+            patches=corrected_df,
+            selected_imaging_controls=selected_imaging_controls,
+            tracks=tracks,
+            config=config,
+        )
+    )
+    density_patches_df, density_patch_audit_df = build_radial_density_compensation_patches(
+        initial_df=initial_df,
+        requests=density_requests_df,
+        config=config,
+        surface_lookup=surface_lookup,
+    )
+    if not density_patches_df.empty:
+        corrected_df = pd.concat(
+            [corrected_df, density_patches_df],
+            ignore_index=True,
+            sort=False,
+        )
+    density_compensation_summary["created_patch_count"] = int(len(density_patches_df))
+    config["_radial_density_compensation_summary"] = density_compensation_summary
     log("[Step8 5/7] 检查新增/移动小尺度片的太古界层位合同")
     corrected_df, final_horizon_qc = enforce_final_center_horizon_contract(corrected_df, surface_lookup)
     after_dist = nearest_patch_distances(corrected_df, control_df, time_scale=time_scale)
@@ -2587,6 +2777,21 @@ def main() -> int:
     corrected_df.to_csv(paths["corrected_csv"], index=False, encoding="utf-8-sig")
     audit_df.to_csv(paths["audit_csv"], index=False, encoding="utf-8-sig")
     region_audit_df.to_csv(paths["region_audit_csv"], index=False, encoding="utf-8-sig")
+    imaging_match_selection_df.to_csv(
+        paths["imaging_match_selection_csv"],
+        index=False,
+        encoding="utf-8-sig",
+    )
+    density_requests_df.to_csv(
+        paths["density_compensation_requests_csv"],
+        index=False,
+        encoding="utf-8-sig",
+    )
+    density_ring_summary_df.to_csv(
+        paths["density_compensation_summary_csv"],
+        index=False,
+        encoding="utf-8-sig",
+    )
     large_control_audit_df.to_csv(
         output_dir / "large_conventional_control_support.csv",
         index=False,
@@ -2634,6 +2839,39 @@ def main() -> int:
         after_dist=after_dist,
         track_dist=track_dist,
         density_mass=density_mass,
+    )
+    imaging_match_summary = step8_match_density.summarize_imaging_match_patches(
+        corrected_df=corrected_df,
+        active_controls=control_df,
+        calibration_summary=imaging_match_calibration,
+        config=config,
+    )
+    paths["imaging_match_json"].write_text(
+        json.dumps(imaging_match_summary, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    summary["imaging_match"] = imaging_match_summary
+    summary["radial_density_compensation"] = dict(
+        config.get("_radial_density_compensation_summary", {})
+    )
+    summary["radial_density_compensation"]["patch_audit"] = {
+        "created_patch_count": int(len(density_patch_audit_df)),
+        "by_band": {
+            str(key): int(value)
+            for key, value in density_patch_audit_df.get(
+                "RadialBandLabel", pd.Series(dtype=str)
+            ).value_counts().sort_index().items()
+        },
+    }
+    summary.setdefault("checks", {})["imaging_match_ratio_within_85_90"] = bool(
+        imaging_match_summary["geometry_match_ratio_within_required_interval"]
+    )
+    summary.setdefault("checks", {})["imaging_orientation_histogram_preserved"] = bool(
+        imaging_match_summary["orientation_histogram_overlap"]
+        >= imaging_match_summary["minimum_orientation_histogram_overlap"]
+    )
+    summary.setdefault("checks", {})["imaging_match_plane_tolerance"] = bool(
+        imaging_match_summary["geometry_match_ratio_within_required_interval"]
     )
     summary["large_conventional_control_support"] = dict(
         config.get("_large_conventional_control_summary", {})

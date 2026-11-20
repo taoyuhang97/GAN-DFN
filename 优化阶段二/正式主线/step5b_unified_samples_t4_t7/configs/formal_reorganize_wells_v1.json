@@ -1,0 +1,27 @@
+{
+  "step5a_index_csv": "/home/tyh/projects/petroleum/code/GAN-DFN/优化阶段二/正式主线/step5a_single_source_virtual_wells/output/formal_curvature_led_v2/virtual_well_index.csv",
+  "step5a_training_csv": "/home/tyh/projects/petroleum/code/GAN-DFN/优化阶段二/正式主线/step5a_single_source_virtual_wells/output/formal_curvature_led_v2/virtual_well_training_samples.csv",
+  "step5a_summary_csv": "/home/tyh/projects/petroleum/code/GAN-DFN/优化阶段二/正式主线/step5a_single_source_virtual_wells/output/formal_curvature_led_v2/virtual_well_training_summary.csv",
+  "step5a_audit_json": "/home/tyh/projects/petroleum/code/GAN-DFN/优化阶段二/正式主线/step5a_single_source_virtual_wells/output/formal_curvature_led_v2/virtual_well_build_audit.json",
+  "step5b_unified_csv": "/home/tyh/projects/petroleum/code/GAN-DFN/优化阶段二/正式主线/step5b_unified_samples_t4_t7/output/formal_curvature_led_v2/unified_t4_t7_density_samples.csv",
+  "step5b_summary_json": "/home/tyh/projects/petroleum/code/GAN-DFN/优化阶段二/正式主线/step5b_unified_samples_t4_t7/output/formal_curvature_led_v2/unified_t4_t7_density_samples_summary.json",
+  "output_dir": "/home/tyh/projects/petroleum/code/GAN-DFN/优化阶段二/正式主线/step5b_unified_samples_t4_t7/output/formal_curvature_led_v2/wells",
+  "chunk_size": 200000,
+  "imaging_wells": [
+    {
+      "well_name": "车页1导眼",
+      "fracture_points_csv": "/data/shared/project-oil/wx数据/砂砾岩/优化阶段一/研究内容一/成像测井/裂缝提取/车页1导眼_fractures.csv",
+      "group_csvs": [
+        "/home/tyh/projects/petroleum/code/GAN-DFN/优化阶段二/正式主线/step3_imaging_supervision_samples/output/formal_rebuild/groups/车页1导眼_沙三段.csv",
+        "/home/tyh/projects/petroleum/code/GAN-DFN/优化阶段二/正式主线/step3_imaging_supervision_samples/output/formal_rebuild/groups/车页1导眼_沙四段.csv"
+      ]
+    },
+    {
+      "well_name": "车151HF",
+      "fracture_points_csv": "/data/shared/project-oil/wx数据/砂砾岩/优化阶段一/研究内容一/成像测井/裂缝提取/车151HF_fractures.csv",
+      "group_csvs": [
+        "/home/tyh/projects/petroleum/code/GAN-DFN/优化阶段二/正式主线/step3_imaging_supervision_samples/output/formal_rebuild/groups/车151HF_沙三段.csv"
+      ]
+    }
+  ]
+}

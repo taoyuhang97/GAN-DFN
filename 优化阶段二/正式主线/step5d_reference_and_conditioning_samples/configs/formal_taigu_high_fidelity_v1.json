@@ -1,0 +1,14 @@
+{
+  "mode": "well-match",
+  "region": "太古界",
+  "region_code": "taigu",
+  "target_count": 40,
+  "group_prefix": "HF_TAIGU",
+  "input_patch_csv": "/home/tyh/projects/petroleum/code/GAN-DFN/太古界/step8_well_correction/output/taigu_step8_attribute_multiscale_v1_quanqu1/well_corrected_dfn_fracture_patches.csv",
+  "wells_root": "/home/tyh/projects/petroleum/code/GAN-DFN/太古界/step5_virtual_wells/output/taigu_step5_attribute_v3_common_contract_md1/wells",
+  "prior_sample_config": "/home/tyh/projects/petroleum/code/GAN-DFN/优化阶段二/正式主线/step5c_seismic_fracture_grid_samples/configs/formal_taigu_8x26_v1.json",
+  "real_relative_path": "real_well/real_well_samples.csv",
+  "virtual_relative_template": "virtual_wells/{virtual_well_name}/virtual_well_training_samples.csv",
+  "virtual_per_source": 25,
+  "output_dir": "/home/tyh/projects/petroleum/code/GAN-DFN/太古界/output/high_fidelity_reference_models_taigu_v1"
+}

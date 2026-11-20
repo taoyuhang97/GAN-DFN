@@ -56,6 +56,11 @@ DEFAULT_FAULT_PATCH_ROOT = REPO_ROOT / "小范围DFN生成/断层裂缝片生成
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Step6C large fault/fault-zone prior.")
     parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
+    parser.add_argument(
+        "--skip-large-prior-sgy",
+        action="store_true",
+        help="Skip large_fault_prior.sgy for component-count calibration runs.",
+    )
     parser.add_argument("--input-qc-dir", type=Path, default=DEFAULT_INPUT_QC_DIR)
     parser.add_argument("--fault-patch-root", type=Path, default=DEFAULT_FAULT_PATCH_ROOT)
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
@@ -1538,7 +1543,14 @@ def main() -> int:
     large_mask_flat = grid_to_flat(combined_mask_grid.astype(np.float32), mapping)
     inferred_id_flat = grid_to_flat(inferred_id_grid.astype(np.float32), mapping).astype(np.int32)
 
-    write_sgy_like(output_dir / "large_fault_prior.sgy", input_density_sgy, large_prior_flat, samples)
+    large_prior_sgy_write = {"status": "written"}
+    if args.skip_large_prior_sgy:
+        large_prior_sgy_write = {
+            "status": "skipped_by_cli",
+            "reason": "component-count calibration run",
+        }
+    else:
+        write_sgy_like(output_dir / "large_fault_prior.sgy", input_density_sgy, large_prior_flat, samples)
     inferred_df.to_csv(output_dir / "large_fault_component_summary.csv", index=False, encoding="utf-8-sig")
     inferred_vtk_summary = (
         write_component_vtk(
@@ -1588,6 +1600,7 @@ def main() -> int:
         "original_fault_horizon_mask_qc": original_fault_horizon_qc,
         "output_contract": {
             "large_prior_sgy": str(output_dir / "large_fault_prior.sgy"),
+            "large_prior_sgy_write": large_prior_sgy_write,
             "component_npz": str(output_dir / "large_fault_prior_components.npz"),
             "original_fault_surface_vtk": str(output_dir / "original_fault_units_demo_raw_time.vtk"),
             "original_fault_manifest_csv": str(output_dir / "original_fault_unit_manifest.csv"),
