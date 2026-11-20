@@ -65,6 +65,18 @@ from well_curved_section_common import (
     save_section_pair_npz,
     write_json,
 )
+_imaging_log_spec = importlib.util.spec_from_file_location(
+    "sand_step9_imaging_log_overlay",
+    REPO_ROOT / "common" / "step9_imaging_log_overlay.py",
+)
+if _imaging_log_spec is None or _imaging_log_spec.loader is None:
+    raise ImportError("cannot load imaging-log overlay helper")
+imaging_log_overlay = importlib.util.module_from_spec(_imaging_log_spec)
+_imaging_log_spec.loader.exec_module(imaging_log_overlay)
+add_imaging_log_track = imaging_log_overlay.add_imaging_log_track
+imaging_log_track_summary = imaging_log_overlay.imaging_log_track_summary
+load_imaging_log_track = imaging_log_overlay.load_imaging_log_track
+
 _layer_spec = importlib.util.spec_from_file_location(
     "sand_layered_section_profile",
     REPO_ROOT / "common" / "layered_section_profile.py",
@@ -158,6 +170,7 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("--section-time-mode", choices=["dfn_extent_plus_padding"])
     p.add_argument("--max-traces", type=int)
     p.add_argument("--layer-output-dir", type=Path)
+    p.add_argument("--imaging-log-csv", type=Path, action="append")
     return p
 
 
@@ -178,6 +191,7 @@ def set_display_bounds(
 def make_set_drawer(
     segments: list[Any],
     faults: list[Any],
+    imaging_log: pd.DataFrame,
     *,
     include_faults: bool,
 ) -> Callable[[Any, str], dict[str, int]]:
@@ -192,9 +206,15 @@ def make_set_drawer(
                 overview=True,
                 taigu_style=True,
             )
+        imaging_log_count = add_imaging_log_track(
+            ax,
+            imaging_log,
+            projection,
+        )
         return {
             "dfn_segment_count": int(dfn_count),
             "fault_segment_count": int(fault_count),
+            "imaging_log_segment_count": int(imaging_log_count),
             "imaging_patch_count": 0,
             "imaging_point_count": 0,
         }
@@ -614,6 +634,22 @@ def main() -> int:
             flush=True,
         )
 
+    imaging_log_paths = [
+        Path(value).expanduser().resolve()
+        for value in (
+            args.imaging_log_csv
+            or config.get("step3_imaging_group_csvs", [])
+        )
+    ]
+    if not imaging_log_paths:
+        raise ValueError("no imaging-log CSV configured for sandstone section")
+    imaging_log = load_imaging_log_track(
+        imaging_log_paths,
+        well_name=overview.well_name,
+        target_block=dict(config["overview_target_block"]),
+    )
+    imaging_log_summary = imaging_log_track_summary(imaging_log)
+
     layer_manifest: dict[str, Any] | None = None
     if args.layer_output_dir:
         layer_dir = args.layer_output_dir.resolve()
@@ -647,6 +683,7 @@ def main() -> int:
                     float(sections["XZ"].display_time_min),
                     float(sections["XZ"].display_time_max),
                 ],
+                "imaging_log": imaging_log_summary,
             },
         )
         intersection_manifest = layered_profile.write_intersection_layer(
@@ -666,9 +703,8 @@ def main() -> int:
                 "segments_after_filter": int(len(all_segments)),
             },
         )
-        base_drawer = lambda ax, projection: {
-            "dfn_segment_count": 0,
-            "fault_segment_count": int(
+        def base_drawer(ax, projection: str) -> dict[str, int]:
+            fault_count = int(
                 add_fault_trace_segments(
                     ax,
                     faults,
@@ -676,10 +712,20 @@ def main() -> int:
                     overview=True,
                     taigu_style=True,
                 )
-            ),
-            "imaging_patch_count": 0,
-            "imaging_point_count": 0,
-        }
+            )
+            imaging_log_count = add_imaging_log_track(
+                ax,
+                imaging_log,
+                projection,
+            )
+            return {
+                "dfn_segment_count": 0,
+                "fault_segment_count": fault_count,
+                "imaging_log_segment_count": int(imaging_log_count),
+                "imaging_patch_count": 0,
+                "imaging_point_count": 0,
+            }
+
         for projection in ("XZ", "YZ"):
             plot_wiggle_variable_area(
                 sections[projection],
@@ -709,6 +755,7 @@ def main() -> int:
         drawer = make_set_drawer(
             selected_segments,
             faults,
+            imaging_log,
             include_faults=scale_set.include_faults,
         )
         for offset, projection in enumerate(("XZ", "YZ")):
@@ -773,6 +820,10 @@ def main() -> int:
             and row["overlay"]["imaging_point_count"] == 0
             for row in images
         ),
+        "imaging_log_visible_in_all_images": all(
+            row["overlay"]["imaging_log_segment_count"] > 0
+            for row in images
+        ),
         "trace_counts_match_expected": {
             row["projection"]: row["wiggle_trace_count"] for row in images
         }
@@ -806,6 +857,7 @@ def main() -> int:
             "separate_legend": True,
         },
         "background": "OBN地震波形+正振幅变面积",
+        "imaging_log": imaging_log_summary,
         "color_semantics": {
             "color": {
                 "T4->T6": "sandstone_3_orange",

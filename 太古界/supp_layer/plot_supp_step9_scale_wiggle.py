@@ -24,6 +24,7 @@ import matplotlib
 
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+import matplotlib.patheffects as path_effects
 import numpy as np
 import pandas as pd
 from matplotlib.collections import LineCollection
@@ -34,6 +35,18 @@ TAIGU = HERE.parent
 REPO = TAIGU.parent
 if str(REPO) not in sys.path:
     sys.path.insert(0, str(REPO))
+_imaging_log_spec = importlib.util.spec_from_file_location(
+    "taigu_step9_imaging_log_overlay",
+    REPO / "common" / "step9_imaging_log_overlay.py",
+)
+if _imaging_log_spec is None or _imaging_log_spec.loader is None:
+    raise ImportError("cannot load imaging-log overlay helper")
+imaging_log_overlay = importlib.util.module_from_spec(_imaging_log_spec)
+_imaging_log_spec.loader.exec_module(imaging_log_overlay)
+IMAGING_LOG_STYLE = imaging_log_overlay.IMAGING_LOG_STYLE
+add_imaging_log_track = imaging_log_overlay.add_imaging_log_track
+imaging_log_track_summary = imaging_log_overlay.imaging_log_track_summary
+load_imaging_log_track = imaging_log_overlay.load_imaging_log_track
 DEFAULT_CONFIG = HERE / "configs" / "taigu_supp_step9_scale_wiggle.json"
 SPLIT_SCRIPT = HERE / "plot_supp_step9_wiggle_split.py"
 ORIGINAL_STEP9 = TAIGU / "step9_sections" / "build_taigu_multibackground_sections.py"
@@ -100,6 +113,7 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("--dfn-time-padding-ms", type=float)
     p.add_argument("--section-time-mode", choices=["dfn_extent_plus_padding"])
     p.add_argument("--layer-output-dir", type=Path)
+    p.add_argument("--imaging-log-csv", type=Path, action="append")
     return p
 
 
@@ -458,6 +472,8 @@ def render_one(
     track: pd.DataFrame,
     config: dict[str, Any],
     original,
+    *,
+    imaging_log: pd.DataFrame,
 ) -> tuple[dict[str, Any], list[Line2D]]:
     separate_legend = bool(config.get("separate_legend", False))
     include_title = bool(config.get("include_title", True))
@@ -600,6 +616,29 @@ def render_one(
         linewidth=float(well_style["line_width"]),
         label=well_style["label"],
     )
+    imaging_log_count = add_imaging_log_track(
+        ax,
+        imaging_log,
+        projection,
+        display_time_min=float(times[0]),
+        display_time_max=float(times[-1]),
+    )
+    imaging_log_handle = Line2D(
+        [0],
+        [0],
+        color=IMAGING_LOG_STYLE["color"],
+        linewidth=IMAGING_LOG_STYLE["line_width"],
+        label=IMAGING_LOG_STYLE["label"],
+    )
+    imaging_log_handle.set_path_effects(
+        [
+            path_effects.Stroke(
+                linewidth=IMAGING_LOG_STYLE["halo_width"],
+                foreground=IMAGING_LOG_STYLE["halo_color"],
+            ),
+            path_effects.Normal(),
+        ]
+    )
 
     ax.set_xlim(float(coords[0]), float(coords[-1]))
     ax.set_ylim(float(times[-1]), float(times[0]))
@@ -626,7 +665,10 @@ def render_one(
             fontsize=float(config["figure"].get("suptitle_fontsize", 13.0)),
             y=0.975,
         )
-    handles = [well_handle, *scale_handles]
+    handles = [well_handle]
+    if imaging_log_count:
+        handles.append(imaging_log_handle)
+    handles.extend(scale_handles)
     if fault_handle is not None:
         handles.append(fault_handle)
     if not separate_legend:
@@ -643,6 +685,7 @@ def render_one(
         "dfn_line_counts_by_scale": counts,
         "dfn_line_counts_by_layer": counts_by_layer,
         "fault_segment_count": int(fault_count),
+        "imaging_log_segment_count": int(imaging_log_count),
         "imaging_patch_count": 0,
         "imaging_point_count": 0,
     }, handles
@@ -705,6 +748,26 @@ def main() -> int:
                 "XZ": np.asarray(archive["xz_h"], dtype=np.float64),
                 "YZ": np.asarray(archive["yz_h"], dtype=np.float64),
             }
+    imaging_log_paths = [
+        Path(value).expanduser().resolve()
+        for value in (args.imaging_log_csv or [])
+    ]
+    if not imaging_log_paths:
+        well_segment_dir = (
+            resolve_path(config["step2_segments_root"])
+            / str(config["profile_well"])
+        )
+        imaging_log_paths = sorted(well_segment_dir.glob("*.csv"))
+    if not imaging_log_paths:
+        raise FileNotFoundError(
+            f"no imaging-log CSV found for {config['profile_well']}"
+        )
+    imaging_log = load_imaging_log_track(
+        imaging_log_paths,
+        require_in_imaging_interval=True,
+        target_block=dict(config["target_block"]),
+    )
+    imaging_log_summary = imaging_log_track_summary(imaging_log)
     if dfn_time_mode:
         dfn_top, dfn_bottom, section_extent_summary = section_window.dfn_time_extent_in_block(
             resolve_path(config["step8_patches_csv"]),
@@ -837,6 +900,7 @@ def main() -> int:
                 track,
                 config,
                 original,
+                imaging_log=imaging_log,
             )
         layer_manifest = {
             "directory": str(layer_dir),
@@ -873,6 +937,7 @@ def main() -> int:
                 track,
                 config,
                 original,
+                imaging_log=imaging_log,
             )
             images.append(
                 {
@@ -912,6 +977,10 @@ def main() -> int:
             and row["overlay"]["imaging_point_count"] == 0
             for row in images
         ),
+        "imaging_log_visible_in_all_images": all(
+            row["overlay"]["imaging_log_segment_count"] > 0
+            for row in images
+        ),
     }
     summary = {
         "status": "pass" if all(checks.values()) else "fail",
@@ -944,6 +1013,7 @@ def main() -> int:
             },
         },
         "background": "OBN地震波形+正振幅变面积",
+        "imaging_log": imaging_log_summary,
         "visible_filter": {
             "min_apparent_dip_deg": float(config.get("min_visible_apparent_dip_deg", 30.0)),
             "rule": "all rendered DFN and original-fault segments below threshold are suppressed",

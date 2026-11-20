@@ -4,6 +4,8 @@
 from __future__ import annotations
 
 import argparse
+import importlib.util
+import sys
 import tempfile
 from pathlib import Path
 
@@ -13,6 +15,19 @@ from matplotlib import font_manager, patheffects
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from matplotlib.lines import Line2D
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+_imaging_log_spec = importlib.util.spec_from_file_location(
+    "legend_step9_imaging_log_overlay",
+    REPO_ROOT / "common" / "step9_imaging_log_overlay.py",
+)
+if _imaging_log_spec is None or _imaging_log_spec.loader is None:
+    raise ImportError("cannot load imaging-log overlay helper")
+imaging_log_overlay = importlib.util.module_from_spec(_imaging_log_spec)
+_imaging_log_spec.loader.exec_module(imaging_log_overlay)
+IMAGING_LOG_STYLE = imaging_log_overlay.IMAGING_LOG_STYLE
 
 
 SCALE_STYLES = {
@@ -152,6 +167,13 @@ def section_legend_handles(
                 label=well_label,
                 halo_color="#5b4b00",
                 halo_width=3.6,
+            ),
+            outlined_handle(
+                color=IMAGING_LOG_STYLE["color"],
+                linewidth=IMAGING_LOG_STYLE["line_width"],
+                label=IMAGING_LOG_STYLE["label"],
+                halo_color=IMAGING_LOG_STYLE["halo_color"],
+                halo_width=IMAGING_LOG_STYLE["halo_width"],
             ),
             outlined_handle(
                 color="#ffe600",

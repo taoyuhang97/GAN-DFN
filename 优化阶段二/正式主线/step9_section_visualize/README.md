@@ -192,6 +192,9 @@ python3 优化阶段二/正式主线/step9_section_visualize/build_cheye1_scale_
 两区图例中的大尺度裂缝统一使用灰色线芯加黑色外描边，小、中尺度仍按线宽区分。
 大、中、小尺度三套单独剖面以及组合剖面均叠加原始断层；实际图中的大尺度 DFN
 同步使用黑色外描边，与图例保持一致。
+两区底图和全部多尺度剖面均沿实际井轨迹叠加紫色成像测井段；砂砾岩读取
+`step3_imaging_group_csvs`，太古界读取 Step2 中 `InImagingInterval=1` 的记录。
+两区及独立图例共用 `common/step9_imaging_log_overlay.py` 的同一颜色和线宽定义。
 
 砂砾岩连续分块版 `seg1` 将 875 个推测大尺度父片拆成 2,065 个共享边界块，
 Step8 后最大边界缝隙为 `0 m`；10 张多尺度剖面位于
