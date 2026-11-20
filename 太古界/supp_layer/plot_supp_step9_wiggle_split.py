@@ -53,12 +53,22 @@ import matplotlib
 
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+from matplotlib import patheffects
 from matplotlib.collections import LineCollection
 from matplotlib.lines import Line2D
 
 if str(TAIGU) not in sys.path:
     sys.path.insert(0, str(TAIGU))
 from common.orientation_frame import convention as orientation  # noqa: E402
+
+_imaging_compare_spec = importlib.util.spec_from_file_location(
+    "shared_step9_imaging_200m_compare",
+    REPO / "common" / "step9_imaging_200m_compare.py",
+)
+if _imaging_compare_spec is None or _imaging_compare_spec.loader is None:
+    raise ImportError("cannot load shared 200 m comparison contract")
+shared_compare = importlib.util.module_from_spec(_imaging_compare_spec)
+_imaging_compare_spec.loader.exec_module(shared_compare)
 
 
 def load_original_module():
@@ -295,6 +305,9 @@ def load_dfn(config: dict[str, Any], time_range: tuple[float, float]) -> pd.Data
         "HeightTimeMs",
         "DipAzimuthDeg",
         "DipDeg",
+        "IsDensityCompensationPatch",
+        "IsImagingMatchPatch",
+        "IsWellControlPatch",
     ]
     dfn = pd.read_csv(
         resolve_path(config["step8_patches_csv"]),
@@ -453,6 +466,97 @@ def panel_line_segments(
         key: np.asarray(segments, dtype=np.float64)
         for key, segments in grouped.items()
     }
+
+
+def panel_comparison_rows(
+    frame: pd.DataFrame,
+    plane: str,
+    plane_coords: np.ndarray,
+    mid_times: np.ndarray,
+) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    center_column = "CenterX" if plane == "XZ" else "CenterY"
+    for index, row in frame.iterrows():
+        trace = orientation.trace_on_section(
+            float(row["DipAzimuthDeg"]),
+            float(row["DipDeg"]),
+            plane,
+        )
+        if trace is None:
+            continue
+        length = float(np.clip(float(row["LengthM"]), 10.0, 500.0))
+        half = 0.5 * length
+        dh, dt = trace
+        center_h = float(row[center_column])
+        center_t = float(row["CenterTime"])
+        local_mid = float(
+            np.interp(center_h, plane_coords, mid_times)
+        )
+        layer = "太古界风化壳" if center_t >= local_mid else "上部复合层"
+        if int(row.get("IsDensityCompensationPatch", 0) or 0) == 1:
+            category = "density_compensation"
+        elif int(row.get("IsImagingMatchPatch", 0) or 0) == 1:
+            category = "imaging_match"
+        elif int(row.get("IsWellControlPatch", 0) or 0) == 1:
+            category = "well_control"
+        else:
+            category = "base_prediction"
+        h1, z1 = center_h - half * dh, center_t - half * dt
+        h2, z2 = center_h + half * dh, center_t + half * dt
+        line_length, apparent_dip, line_angle = shared_compare.line_metrics(
+            h1, z1, h2, z2
+        )
+        rows.append(
+            {
+                "region": "太古界",
+                "projection": plane,
+                "source": "step8_final_dfn",
+                "category": category,
+                "layer": layer,
+                "scale": str(row["FractureScale"]).strip().lower(),
+                "patch_id": int(index),
+                "h1": h1,
+                "z1": z1,
+                "h2": h2,
+                "z2": z2,
+                "line_length_m": line_length,
+                "apparent_dip_deg": apparent_dip,
+                "line_angle_deg": line_angle,
+            }
+        )
+    return rows
+
+
+def imaging_comparison_rows(
+    segments: list[np.ndarray],
+    plane: str,
+) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for index, line in enumerate(segments):
+        h1, z1 = (float(value) for value in line[0])
+        h2, z2 = (float(value) for value in line[1])
+        line_length, apparent_dip, line_angle = shared_compare.line_metrics(
+            h1, z1, h2, z2
+        )
+        rows.append(
+            {
+                "region": "太古界",
+                "projection": plane,
+                "source": "step3_imaging_truth",
+                "category": "imaging_truth",
+                "layer": "成像测井",
+                "scale": "imaging",
+                "patch_id": int(index),
+                "h1": h1,
+                "z1": z1,
+                "h2": h2,
+                "z2": z2,
+                "line_length_m": line_length,
+                "apparent_dip_deg": apparent_dip,
+                "line_angle_deg": line_angle,
+            }
+        )
+    return rows
 
 
 def imaging_line_segments(
@@ -824,7 +928,7 @@ def main() -> int:
         else resolve_path(config["output_dir"])
     )
     output_dir.mkdir(parents=True, exist_ok=True)
-    time_range = (
+    broad_time_range = (
         float(config["time_range_ms"][0]),
         float(config["time_range_ms"][1]),
     )
@@ -842,13 +946,22 @@ def main() -> int:
     }
     track = original_step9.load_track(config)
     axes = load_local_axes(config, track)
+    imaging = load_imaging(original_step9, config, broad_time_range)
+    time_range = shared_compare.tight_imaging_window(
+        imaging["TIME"],
+        padding_ms=20.0,
+        sample_interval_ms=float(config.get("section_sample_interval_ms", 2.0)),
+    )
+    config["time_range_ms"] = [float(time_range[0]), float(time_range[1])]
+    imaging = imaging[
+        imaging["TIME"].between(float(time_range[0]), float(time_range[1]))
+    ].reset_index(drop=True)
     times, values, sample_source = load_or_sample_wiggle(
         original_step9, config, track, axes
     )
     curves, horizon_source = load_or_compute_horizons(
         original_step9, config, track, axes, output_dir
     )
-    imaging = load_imaging(original_step9, config, time_range)
     dfn = load_dfn(config, time_range)
     selected = {
         plane: select_patches_for_plane(
@@ -866,8 +979,32 @@ def main() -> int:
         f"XZ={len(selected['XZ'])} YZ={len(selected['YZ'])}",
         flush=True,
     )
+    base_dir = output_dir / "base"
+    base_dir.mkdir(parents=True, exist_ok=True)
+    base_payload: dict[str, np.ndarray] = {
+        "times": times,
+        "well_x": track["X"].to_numpy(dtype=float),
+        "well_y": track["Y"].to_numpy(dtype=float),
+        "well_time": track["TIME"].to_numpy(dtype=float),
+    }
+    for plane in PLANES:
+        base_payload[f"{plane.lower()}_h"] = axes[plane]
+        base_payload[f"{plane.lower()}_values"] = values[plane]
+        for item in config["horizons"]:
+            base_payload[f"{plane.lower()}_{item['field']}"] = curves[plane][
+                item["field"]
+            ]
+    np.savez_compressed(base_dir / "base_section_data.npz", **base_payload)
 
     imaging_cfg = dict(config["imaging"])
+    imaging_cfg.update(
+        {
+            "color": shared_compare.IMAGING_COLOR,
+            "halo_color": shared_compare.IMAGING_HALO_COLOR,
+            "line_width": shared_compare.IMAGING_LINE_WIDTH,
+            "halo_width": shared_compare.IMAGING_HALO_WIDTH,
+        }
+    )
     dfn_cfg = dict(config["dfn"])
     dfn_length_range = tuple(dfn_cfg["display_length_range_m"])
     common_horizon_handles = [
@@ -881,6 +1018,30 @@ def main() -> int:
         )
         for item in config["horizons"]
     ]
+    base_image = base_dir / "base_imaging_window.png"
+    build_figure(
+        base_image,
+        "埕北古斜405 成像段 ±200 m：底板",
+        config,
+        times,
+        axes,
+        values,
+        curves,
+        lambda ax, plane: {},
+        common_horizon_handles,
+        [handle.get_label() for handle in common_horizon_handles],
+    )
+    write_json(
+        base_dir / "base_manifest.json",
+        {
+            "status": "pass",
+            "data": str(base_dir / "base_section_data.npz"),
+            "image": str(base_image),
+            "scope": "local_200m_imaging_window",
+            "time_window_ms": [float(time_range[0]), float(time_range[1])],
+            "imaging_time_padding_ms": 20.0,
+        },
+    )
 
     def draw_imaging(ax, plane: str) -> dict[str, Any]:
         segments = imaging_line_segments(
@@ -987,11 +1148,21 @@ def main() -> int:
                     (layer, scale), np.empty((0, 2, 2))
                 )
                 if len(segments):
+                    if scale == "large":
+                        ax.add_collection(
+                            LineCollection(
+                                segments,
+                                colors=shared_compare.DFN_LARGE_HALO_COLOR,
+                                linewidths=shared_compare.DFN_LARGE_HALO_WIDTH,
+                                alpha=0.82,
+                                zorder=2.1,
+                            )
+                        )
                     ax.add_collection(
                         LineCollection(
                             segments,
                             colors=TAIGU_LAYER_COLORS[layer],
-                            linewidths=TAIGU_SCALE_WIDTHS[scale],
+                            linewidths=shared_compare.DFN_SCALE_WIDTHS[scale],
                             alpha=float(dfn_cfg[scale]["alpha"]),
                             zorder=1.8 if scale == "small" else 2.0 if scale == "medium" else 2.2,
                         )
@@ -1023,20 +1194,29 @@ def main() -> int:
         )
         for layer in TAIGU_LAYER_ORDER
     ]
-    layer_scale_handles.extend(
-        Line2D(
+    for scale in ("small", "medium", "large"):
+        handle = Line2D(
             [0],
             [0],
-            color="#111827",
-            linewidth=TAIGU_SCALE_WIDTHS[scale],
+            color="#6b7280" if scale == "large" else "#111827",
+            linewidth=shared_compare.DFN_SCALE_WIDTHS[scale],
             label={
                 "small": "小尺度",
                 "medium": "中尺度",
                 "large": "大尺度",
             }[scale],
         )
-        for scale in ("small", "medium", "large")
-    )
+        if scale == "large":
+            handle.set_path_effects(
+                [
+                    patheffects.Stroke(
+                        linewidth=shared_compare.DFN_LARGE_HALO_WIDTH,
+                        foreground=shared_compare.DFN_LARGE_HALO_COLOR,
+                    ),
+                    patheffects.Normal(),
+                ]
+            )
+        layer_scale_handles.append(handle)
     imaging_track_handle = Line2D(
         [0],
         [0],
@@ -1063,40 +1243,100 @@ def main() -> int:
         )
         print(f"[wiggle-split] 已生成 {dfn_path}", flush=True)
 
-    overlay_path = output_dir / "01_wiggle_area_dfn_multiscale_imaging_overlay.png"
-    overlay_qc = None
-    if args.overlay_only:
-        def draw_overlay(ax, plane: str) -> dict[str, Any]:
-            dfn_overlay_qc = draw_dfn(ax, plane)
-            imaging_overlay_qc = draw_imaging(ax, plane)
-            return {
-                **dfn_overlay_qc,
-                **imaging_overlay_qc,
-            }
+    fusion_path = output_dir / "03_wiggle_area_dfn_imaging_fusion.png"
 
-        overlay_handles = [
-            *layer_scale_handles,
-            imaging_track_handle,
-            imaging_handles[1],
-            *common_horizon_handles,
-        ]
-        overlay_qc = build_figure(
-            overlay_path,
-            "埕北古斜405 成像测井段 ±200 m：地震背景 + 多尺度DFN + 成像真值",
-            config,
-            times,
-            axes,
-            values,
-            curves,
-            draw_overlay,
-            overlay_handles,
-            [handle.get_label() for handle in overlay_handles],
+    def draw_overlay(ax, plane: str) -> dict[str, Any]:
+        dfn_overlay_qc = draw_dfn(ax, plane)
+        imaging_overlay_qc = draw_imaging(ax, plane)
+        return {
+            **dfn_overlay_qc,
+            **imaging_overlay_qc,
+        }
+
+    overlay_handles = [
+        *layer_scale_handles,
+        imaging_track_handle,
+        imaging_handles[1],
+        *common_horizon_handles,
+    ]
+    overlay_qc = build_figure(
+        fusion_path,
+        "埕北古斜405 成像测井段 ±200 m：地震背景 + 多尺度DFN + 成像真值",
+        config,
+        times,
+        axes,
+        values,
+        curves,
+        draw_overlay,
+        overlay_handles,
+        [handle.get_label() for handle in overlay_handles],
+    )
+    print(f"[wiggle-split] 已生成 {fusion_path}", flush=True)
+
+    imaging_rows: list[dict[str, Any]] = []
+    dfn_rows: list[dict[str, Any]] = []
+    for plane in PLANES:
+        imaging_rows.extend(
+            imaging_comparison_rows(
+                imaging_line_segments(
+                    imaging,
+                    plane,
+                    float(imaging_cfg["line_length_m"]),
+                ),
+                plane,
+            )
         )
-        print(f"[wiggle-split] 已生成 {overlay_path}", flush=True)
-
-    stats = orientation_stats(imaging, selected)
+        dfn_rows.extend(
+            panel_comparison_rows(
+                selected[plane],
+                plane,
+                axes[plane],
+                curves[plane]["MidTimeMs"],
+            )
+        )
+    imaging_rows_df = pd.DataFrame(imaging_rows)
+    dfn_rows_df = pd.DataFrame(dfn_rows)
+    intersection_manifest = shared_compare.write_intersection_layer(
+        output_dir,
+        region="太古界",
+        imaging_rows=imaging_rows,
+        dfn_rows=dfn_rows,
+        metadata={
+            "dfn_geometry_source": "STEP8_CSV_DIP_AZIMUTH_TRACE",
+            "time_window_ms": [float(time_range[0]), float(time_range[1])],
+            "imaging_time_padding_ms": 20.0,
+            "half_width_m": float(
+                config.get("dfn_projection_half_width_m", 200.0)
+            ),
+        },
+    )
+    comparison_statistics = shared_compare.comparison_stats(
+        imaging_rows_df,
+        dfn_rows_df,
+        time_min=float(time_range[0]),
+        time_max=float(time_range[1]),
+    )
+    output_paths = (
+        {"fusion": str(fusion_path)}
+        if args.overlay_only
+        else {
+            "imaging": str(imaging_path),
+            "dfn": str(dfn_path),
+            "fusion": str(fusion_path),
+        }
+    )
+    checks = {
+        "base_image_exists": bool(base_image.exists()),
+        "all_output_images_exist": all(Path(path).exists() for path in output_paths.values()),
+        "imaging_intersections_nonempty": bool(imaging_rows),
+        "dfn_intersections_nonempty": bool(dfn_rows),
+        "imaging_time_window_padded_20ms": bool(
+            float(time_range[0]) <= float(imaging["TIME"].min()) - 20.0
+            and float(time_range[1]) >= float(imaging["TIME"].max()) + 20.0
+        ),
+    }
     summary = {
-        "status": "pass",
+        "status": "pass" if all(checks.values()) else "fail",
         "config": str(args.config.resolve()),
         "output_dir": str(output_dir),
         "profile_well": config["profile_well"],
@@ -1124,22 +1364,27 @@ def main() -> int:
                 for layer in TAIGU_LAYER_ORDER
             },
             "linewidth": TAIGU_SCALE_WIDTHS,
+            "large_scale_halo": {
+                "enabled": True,
+                "color": shared_compare.DFN_LARGE_HALO_COLOR,
+                "width": shared_compare.DFN_LARGE_HALO_WIDTH,
+            },
             "supp_layer_display_merged_into": "上部复合层",
         },
+        "base_layer": {
+            "directory": str(base_dir),
+            "data": str(base_dir / "base_section_data.npz"),
+            "image": str(base_image),
+        },
+        "intersection_layer": intersection_manifest,
         "figure_qc": {
             **({"imaging": imaging_qc} if imaging_qc is not None else {}),
             **({"dfn": dfn_qc} if dfn_qc is not None else {}),
             **({"overlay": overlay_qc} if overlay_qc is not None else {}),
         },
-        "orientation_comparison": stats,
-        "outputs": (
-            {"overlay": str(overlay_path)}
-            if args.overlay_only
-            else {
-                "imaging": str(imaging_path),
-                "dfn": str(dfn_path),
-            }
-        ),
+        "comparison_statistics": comparison_statistics,
+        "checks": checks,
+        "outputs": output_paths,
     }
     write_json(output_dir / "wiggle_split_summary.json", summary)
     print(
@@ -1150,7 +1395,7 @@ def main() -> int:
         f"{selected['XZ']['DipAzimuthDeg'].median():.1f}°",
         flush=True,
     )
-    return 0
+    return 0 if summary["status"] == "pass" else 1
 
 
 if __name__ == "__main__":

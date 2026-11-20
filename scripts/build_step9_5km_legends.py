@@ -111,6 +111,60 @@ def outlined_handle(
     return handle
 
 
+def section_legend_handles(
+    *,
+    layers: list[tuple[str, str]],
+    scales: tuple[str, ...],
+    well_label: str,
+) -> list[Line2D]:
+    """Build DFN, well and fault handles with the Taigu legend drawing contract."""
+
+    handles = [
+        Line2D([0], [0], color=color, linewidth=3.0, label=label)
+        for label, color in layers
+    ]
+    for scale in scales:
+        if scale == "large":
+            handles.append(
+                outlined_handle(
+                    color="#6b7280",
+                    linewidth=SCALE_STYLES[scale][1],
+                    label=SCALE_STYLES[scale][0],
+                    halo_color="#111827",
+                    halo_width=5.2,
+                )
+            )
+        else:
+            handles.append(
+                Line2D(
+                    [0],
+                    [0],
+                    color="#111827",
+                    linewidth=SCALE_STYLES[scale][1],
+                    label=SCALE_STYLES[scale][0],
+                )
+            )
+    handles.extend(
+        [
+            outlined_handle(
+                color="#ffea00",
+                linewidth=2.2,
+                label=well_label,
+                halo_color="#5b4b00",
+                halo_width=3.6,
+            ),
+            outlined_handle(
+                color="#ffe600",
+                linewidth=2.3,
+                label="原始断层",
+                halo_color="#111827",
+                halo_width=4.6,
+            ),
+        ]
+    )
+    return handles
+
+
 def write_legends(
     output_dir: Path,
     layers: list[tuple[str, str]],
@@ -125,53 +179,18 @@ def write_legends(
     plt.rcParams["font.family"] = "sans-serif"
     plt.rcParams["font.sans-serif"] = [*font_names, "DejaVu Sans"]
     plt.rcParams["axes.unicode_minus"] = False
+    well_labels = {
+        "sand": "车页1导眼井轨迹",
+        "taigu": "埕北古斜405井轨迹",
+    }
+    if region not in well_labels:
+        raise ValueError(f"unsupported region: {region}")
     for filename, scales in LEGEND_SETS:
-        handles = [
-            Line2D([0], [0], color=color, linewidth=3.0, label=label)
-            for label, color in layers
-        ]
-        handles.extend(
-            Line2D(
-                [0],
-                [0],
-                color="#111827",
-                linewidth=SCALE_STYLES[scale][1],
-                label=SCALE_STYLES[scale][0],
-            )
-            for scale in scales
+        handles = section_legend_handles(
+            layers=layers,
+            scales=scales,
+            well_label=well_labels[region],
         )
-        if region == "sand":
-            well_handle = outlined_handle(
-                color="#ffea00",
-                linewidth=2.2,
-                label="车页1导眼井轨迹",
-            )
-            fault_handle = outlined_handle(
-                color="#ffe600",
-                linewidth=2.5,
-                linestyle="--",
-                label="原始断层（黄色虚线+黑色描边）",
-                halo_color="#111827",
-                halo_width=5.2,
-            )
-        elif region == "taigu":
-            well_handle = outlined_handle(
-                color="#ffea00",
-                linewidth=2.2,
-                label="埕北古斜405井轨迹",
-                halo_color="#5b4b00",
-                halo_width=3.6,
-            )
-            fault_handle = outlined_handle(
-                color="#ffe600",
-                linewidth=2.3,
-                label="原始断层",
-                halo_color="#111827",
-                halo_width=4.6,
-            )
-        else:
-            raise ValueError(f"unsupported region: {region}")
-        handles.extend([well_handle, fault_handle])
         fig, ax = plt.subplots(figsize=(4.8, 4.2))
         ax.axis("off")
         fig.legend(

@@ -70,8 +70,8 @@ class ScaleSet:
 
 SCALE_SETS = (
     ScaleSet("large", "大尺度", ("large",), True, 1),
-    ScaleSet("medium", "中尺度", ("medium",), False, 3),
-    ScaleSet("small", "小尺度", ("small",), False, 5),
+    ScaleSet("medium", "中尺度", ("medium",), True, 3),
+    ScaleSet("small", "小尺度", ("small",), True, 5),
     ScaleSet("large_medium", "大尺度+中尺度", ("large", "medium"), True, 7),
     ScaleSet("all_scales", "大中小尺度", ("large", "medium", "small"), True, 9),
 )
@@ -496,6 +496,16 @@ def render_one(
             lines = dfn_by_layer_scale.get((layer, scale), np.empty((0, 2, 2)))
             if not len(lines):
                 continue
+            if scale == "large":
+                ax.add_collection(
+                    LineCollection(
+                        lines,
+                        colors="#111827",
+                        linewidths=5.2,
+                        alpha=0.82,
+                        zorder=2.5,
+                    )
+                )
             ax.add_collection(
                 LineCollection(
                     lines,
@@ -892,8 +902,8 @@ def main() -> int:
             for row in images
             if row["set"] in ("large", "large_medium", "all_scales")
         ),
-        "medium_small_only_have_no_faults": all(
-            row["overlay"]["fault_segment_count"] == 0
+        "medium_small_include_faults": all(
+            row["overlay"]["fault_segment_count"] > 0
             for row in images
             if row["set"] in ("medium", "small")
         ),
@@ -927,6 +937,11 @@ def main() -> int:
                 for layer in TAIGU_LAYER_ORDER
             },
             "linewidth": TAIGU_SCALE_WIDTHS,
+            "large_scale_halo": {
+                "enabled": True,
+                "color": "#111827",
+                "linewidth": 5.2,
+            },
         },
         "background": "OBN地震波形+正振幅变面积",
         "visible_filter": {

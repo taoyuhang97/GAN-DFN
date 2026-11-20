@@ -21,6 +21,7 @@ DFN图只叠加成像井段轨迹和三尺度DFN裂缝，不叠加真实裂缝�
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import sys
 from pathlib import Path
 from typing import Any, Callable
@@ -30,6 +31,7 @@ import numpy as np
 import pandas as pd
 
 matplotlib.use("Agg")
+from matplotlib import patheffects
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 if str(SCRIPT_DIR) not in sys.path:
@@ -69,6 +71,21 @@ from well_curved_section_common import (
     write_json,
 )
 
+_imaging_compare_spec = importlib.util.spec_from_file_location(
+    "sand_step9_imaging_200m_compare",
+    REPO_ROOT / "common" / "step9_imaging_200m_compare.py",
+)
+if _imaging_compare_spec is None or _imaging_compare_spec.loader is None:
+    raise ImportError("cannot load shared 200 m comparison contract")
+shared_compare = importlib.util.module_from_spec(_imaging_compare_spec)
+_imaging_compare_spec.loader.exec_module(shared_compare)
+DFN_LARGE_HALO_COLOR = shared_compare.DFN_LARGE_HALO_COLOR
+DFN_LARGE_HALO_WIDTH = shared_compare.DFN_LARGE_HALO_WIDTH
+comparison_stats = shared_compare.comparison_stats
+segment_rows = shared_compare.segment_rows
+tight_imaging_window = shared_compare.tight_imaging_window
+write_intersection_layer = shared_compare.write_intersection_layer
+
 
 DEFAULT_CONFIG = (
     SCRIPT_DIR / "configs" / "formal_mine_multiscale_flow_v1.json"
@@ -103,7 +120,7 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--dfn-geometry-source",
         choices=("vtk", "csv"),
-        default="vtk",
+        default="csv",
     )
     return p
 
@@ -195,6 +212,9 @@ def build_csv_orientation_context(
         "LayerGroup",
         "FractureScale",
         "NearestTrajectoryDistance",
+        "IsDensityCompensationPatch",
+        "IsImagingMatchPatch",
+        "IsWellControlPatch",
     ]
     available = pd.read_csv(patch_csv, nrows=0).columns
     columns = [column for column in columns if column in available]
@@ -250,7 +270,7 @@ def build_csv_orientation_context(
             center_t = float(row.CenterTime)
             segments.append(
                 ProjectionSegment(
-                    polygon_index=-1,
+                    polygon_index=int(getattr(row, "Index", -1)),
                     projection=projection,
                     interval=interval_by_layer.get(str(row.LayerGroup), ""),
                     center_x=float(row.CenterX),
@@ -267,6 +287,15 @@ def build_csv_orientation_context(
                     scale=str(row.FractureScale).strip().lower(),
                 )
             )
+            if int(getattr(row, "IsDensityCompensationPatch", 0) or 0) == 1:
+                category = "density_compensation"
+            elif int(getattr(row, "IsImagingMatchPatch", 0) or 0) == 1:
+                category = "imaging_match"
+            elif int(getattr(row, "IsWellControlPatch", 0) or 0) == 1:
+                category = "well_control"
+            else:
+                category = "base_prediction"
+            setattr(segments[-1], "source_category", category)
     group_paths = [
         Path(str(value)).resolve()
         for value in config.get("step3_imaging_group_csvs", [])
@@ -329,19 +358,8 @@ def make_dfn_drawer(
     context: SectionOverlayContext,
 ) -> Callable[[Any, str], dict[str, int]]:
     def draw(ax, projection: str) -> dict[str, int]:
-        layer_labels = {
-            "T4->T6": "沙三段（T4–T6）",
-            "T6->T7": "沙四段（T6–T7）",
-        }
-        for interval, color in DFN_INTERVAL_COLORS.items():
-            ax.plot(
-                [],
-                [],
-                color=color,
-                linewidth=3.2,
-                label=layer_labels.get(interval, interval),
-            )
         draw_imaging_segment_trajectory(ax, context.imaging_df, projection)
+        add_large_dfn_halo(ax, context.dfn_segments, projection)
         segment_count = add_dfn_segments(
             ax,
             context.dfn_segments,
@@ -350,18 +368,7 @@ def make_dfn_drawer(
             large_section_style=True,
             add_scale_legend=False,
         )
-        for scale_key in ("small", "medium", "large"):
-            color, linestyle, width, label = LARGE_SECTION_SCALE_LEGEND_STYLES[
-                scale_key
-            ]
-            ax.plot(
-                [],
-                [],
-                color=color,
-                linestyle=linestyle,
-                linewidth=width,
-                label=label,
-            )
+        add_dfn_legend_handles(ax)
         return {
             "dfn_segment_count": int(segment_count),
             "imaging_patch_count": 0,
@@ -376,13 +383,16 @@ def make_overlay_drawer(
     context: SectionOverlayContext,
 ) -> Callable[[Any, str], dict[str, int]]:
     def draw(ax, projection: str) -> dict[str, int]:
+        add_large_dfn_halo(ax, context.dfn_segments, projection)
         segment_count = add_dfn_segments(
             ax,
             context.dfn_segments,
             projection,
             overlay=True,
-            legacy_style=True,
+            large_section_style=True,
+            add_scale_legend=False,
         )
+        add_dfn_legend_handles(ax)
         draw_imaging_segment_trajectory(ax, context.imaging_df, projection)
         patch_count = add_imaging_fracture_patch_segments(
             ax, context.imaging_patch_segments, projection
@@ -398,6 +408,62 @@ def make_overlay_drawer(
         }
 
     return draw
+
+
+def add_dfn_legend_handles(ax) -> None:
+    layer_labels = {
+        "T4->T6": "沙三段（T4–T6）",
+        "T6->T7": "沙四段（T6–T7）",
+    }
+    for interval, color in DFN_INTERVAL_COLORS.items():
+        ax.plot(
+            [],
+            [],
+            color=color,
+            linewidth=3.2,
+            label=layer_labels.get(interval, interval),
+        )
+    for scale_key in ("small", "medium", "large"):
+        color, linestyle, width, label = LARGE_SECTION_SCALE_LEGEND_STYLES[
+            scale_key
+        ]
+        handle = ax.plot(
+            [],
+            [],
+            color=color,
+            linestyle=linestyle,
+            linewidth=width,
+            label=label,
+        )[0]
+        if scale_key == "large":
+            handle.set_path_effects(
+                [
+                    patheffects.Stroke(
+                        linewidth=DFN_LARGE_HALO_WIDTH,
+                        foreground=DFN_LARGE_HALO_COLOR,
+                    ),
+                    patheffects.Normal(),
+                ]
+            )
+
+
+def add_large_dfn_halo(ax, segments: list[ProjectionSegment], projection: str) -> None:
+    lines = [
+        [(float(segment.h1), float(segment.z1)), (float(segment.h2), float(segment.z2))]
+        for segment in segments
+        if segment.projection == projection
+        and str(getattr(segment, "scale", "")).strip().lower() == "large"
+    ]
+    if lines:
+        ax.add_collection(
+            LineCollection(
+                lines,
+                colors=DFN_LARGE_HALO_COLOR,
+                linewidths=DFN_LARGE_HALO_WIDTH,
+                alpha=0.82,
+                zorder=12.9,
+            )
+        )
 
 
 def orientation_comparison(
@@ -486,7 +552,7 @@ def render_projection(
         title_suffix = " | 仅DFN裂缝"
     elif kind == "overlay":
         filename = (
-            f"01_local200m_seisamp_wiggle_dfn_multiscale_imaging_overlay_"
+            f"03_local200m_fusion_df_and_imaging_"
             f"{projection.lower()}_t4_t7.png"
         )
         product_title = "车页1导眼：井周200 m多尺度DFN与真实成像裂缝"
@@ -534,6 +600,27 @@ def main() -> int:
     overview = prepare_geometry(overview_config)
     local = mb.local_geometry(overview, config)
 
+    imaging_group_paths = [
+        Path(str(value)).resolve()
+        for value in config.get("step3_imaging_group_csvs", [])
+    ]
+    imaging_window_df = load_step3_imaging_fracture_labels(
+        imaging_group_paths,
+        local.well_name,
+        dict(config.get("target_block") or {}),
+    )
+    time_min, time_max = tight_imaging_window(
+        imaging_window_df["TIME"],
+        padding_ms=20.0,
+        sample_interval_ms=float(
+            config.get("section_sample_interval_ms", 2.0)
+        ),
+    )
+    local.time_min = float(time_min)
+    local.time_max = float(time_max)
+    local.summary["display_time_min"] = float(time_min)
+    local.summary["display_time_max"] = float(time_max)
+    local.summary["imaging_time_padding_ms"] = 20.0
     local_geometry_summary = dict(local.summary)
 
     target = dict(config["presentation_targets"]["local_200m"])
@@ -549,11 +636,18 @@ def main() -> int:
     cache_valid = False
     if cache.exists():
         xz, yz, cache_info = mb.load_section_pair_npz(cache, "SeisAmp")
+        expected_times = np.arange(
+            float(time_min),
+            float(time_max) + 1.0e-9,
+            float(config.get("section_sample_interval_ms", 2.0)),
+        )
         cache_valid = (
             len(xz.h) == len(ppt_geometry.x_values)
             and len(yz.h) == len(ppt_geometry.y_values)
             and np.allclose(xz.h, ppt_geometry.x_values, atol=1.0e-6)
             and np.allclose(yz.h, ppt_geometry.y_values, atol=1.0e-6)
+            and len(xz.time) == len(expected_times)
+            and np.allclose(xz.time, expected_times, atol=1.0e-6)
         )
     if not cache_valid:
         xz, yz, cache_info = sample_volume_sections(
@@ -579,6 +673,43 @@ def main() -> int:
             local_geometry_summary,
         ),
     }
+    base_dir = output_dir / "base"
+    base_dir.mkdir(parents=True, exist_ok=True)
+    np.savez_compressed(
+        base_dir / "base_section_data.npz",
+        xz_h=sections["XZ"].h,
+        xz_time=sections["XZ"].time,
+        xz_values=sections["XZ"].values,
+        yz_h=sections["YZ"].h,
+        yz_time=sections["YZ"].time,
+        yz_values=sections["YZ"].values,
+        well_x=local.well_df["X"].to_numpy(dtype=float),
+        well_y=local.well_df["Y"].to_numpy(dtype=float),
+        well_time=local.well_df["TIME"].to_numpy(dtype=float),
+    )
+    base_limit = float(reference["display"]["seismic_symmetric_limit"])
+    base_images: dict[str, str] = {}
+    for projection in ("XZ", "YZ"):
+        base_path = base_dir / f"base_{projection.lower()}_imaging_window.png"
+        plot_wiggle_variable_area(
+            sections[projection],
+            ppt_geometry,
+            base_path,
+            base_limit,
+            scope_label="井周200 m成像段",
+        )
+        base_images[projection] = str(base_path)
+    write_json(
+        base_dir / "base_manifest.json",
+        {
+            "status": "pass",
+            "data": str(base_dir / "base_section_data.npz"),
+            "images": base_images,
+            "scope": "local_200m_imaging_window",
+            "time_window_ms": [float(time_min), float(time_max)],
+            "imaging_time_padding_ms": 20.0,
+        },
+    )
 
     if args.dfn_geometry_source == "csv":
         print("[split-sections] 使用 Step8 CSV 产状构建 local_200m DFN", flush=True)
@@ -588,14 +719,50 @@ def main() -> int:
     else:
         print("[split-sections] 扫描 local_200m DFN VTK", flush=True)
         context, overlay_source = build_local_context(config, ppt_geometry)
-    limit = float(reference["display"]["seismic_symmetric_limit"])
+    imaging_rows = segment_rows(
+        context.imaging_patch_segments,
+        region="砂砾岩",
+        source="step3_imaging_truth",
+        category="imaging_truth",
+    )
+    dfn_rows = segment_rows(
+        context.dfn_segments,
+        region="砂砾岩",
+        source="step8_final_dfn",
+        category="final_dfn",
+        layer_by_interval={
+            "T4->T6": "沙三段",
+            "T6->T7": "沙四段",
+        },
+    )
+    imaging_rows_df = pd.DataFrame(imaging_rows)
+    dfn_rows_df = pd.DataFrame(dfn_rows)
+    intersection_manifest = write_intersection_layer(
+        output_dir,
+        region="砂砾岩",
+        imaging_rows=imaging_rows,
+        dfn_rows=dfn_rows,
+        metadata={
+            "dfn_geometry_source": overlay_source["dfn_geometry_source"],
+            "time_window_ms": [float(time_min), float(time_max)],
+            "imaging_time_padding_ms": 20.0,
+            "half_width_m": float(config.get("local_dfn_half_width_m", 200.0)),
+        },
+    )
+    comparison_statistics = comparison_stats(
+        imaging_rows_df,
+        dfn_rows_df,
+        time_min=float(time_min),
+        time_max=float(time_max),
+    )
+    limit = base_limit
     drawers = {
         "imaging": make_real_drawer(context),
         "dfn": make_dfn_drawer(context),
         "overlay": make_overlay_drawer(context),
     }
     images: list[dict[str, Any]] = []
-    kinds = ("overlay",) if args.overlay_only else ("imaging", "dfn")
+    kinds = ("overlay",) if args.overlay_only else ("imaging", "dfn", "overlay")
     for kind in kinds:
         for projection in ("XZ", "YZ"):
             path, trace_count, overlay = render_projection(
@@ -626,6 +793,18 @@ def main() -> int:
     checks = {
         "expected_images_generated": all(Path(row["path"]).exists() for row in images)
         and len(images) == len(kinds) * 2,
+        "base_stage_complete": all(
+            Path(path).exists() for path in base_images.values()
+        )
+        and (base_dir / "base_section_data.npz").exists(),
+        "intersection_stage_complete": Path(
+            intersection_manifest["imaging_intersections"]
+        ).exists()
+        and Path(intersection_manifest["dfn_intersections"]).exists(),
+        "imaging_time_window_padded_20ms": bool(
+            float(time_min) <= float(imaging_window_df["TIME"].min()) - 20.0
+            and float(time_max) >= float(imaging_window_df["TIME"].max()) + 20.0
+        ),
         "local_trace_counts_positive": all(
             row["wiggle_trace_count"] > 0 for row in images
         ),
@@ -677,8 +856,13 @@ def main() -> int:
             "section_mode": "well_trajectory_curved_surface_t4_t7",
             "projections": ["XZ", "YZ"],
             "time_range_ms": [
-                float(local_geometry_summary["display_time_min"]),
-                float(local_geometry_summary["display_time_max"]),
+                float(time_min),
+                float(time_max),
+            ],
+            "time_window_policy": "imaging_extent_plus_20ms",
+            "imaging_raw_time_range_ms": [
+                float(imaging_window_df["TIME"].min()),
+                float(imaging_window_df["TIME"].max()),
             ],
             "presentation_target": target,
             "seismic_symmetric_limit": float(limit),
@@ -700,12 +884,14 @@ def main() -> int:
             "path": str(cache),
             **cache_info,
         },
+        "base_layer": {
+            "directory": str(base_dir),
+            "manifest": str(base_dir / "base_manifest.json"),
+        },
+        "intersection_layer": intersection_manifest,
         "overlay_source": overlay_source,
         "overlay_counts": counts,
-        "orientation_comparison": orientation_comparison(
-            context,
-            float(config.get("time_scale_m_per_ms", 2.0)),
-        ),
+        "comparison_statistics": comparison_statistics,
         "dfn_line_style_contract": {
             "source": "current_5km_10km_scale_wiggle",
             "plot_styles": {

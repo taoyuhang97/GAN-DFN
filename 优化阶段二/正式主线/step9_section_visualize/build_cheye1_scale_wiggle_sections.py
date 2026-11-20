@@ -9,7 +9,8 @@
   4. large_medium  原始断层 + 大尺度DFN + 中尺度DFN
   5. all_scales    原始断层 + 大/中/小尺度DFN
 
-DFN使用Step8井控校正后的CSV/VTK；不叠加Step3真实裂缝或Step4井点。
+DFN使用Step8井控校正后的CSV产状字段生成剖面轨迹；原始断层使用统一VTK。
+不叠加Step3真实裂缝或Step4井点。
 背景只使用矿区尺度地震波形+正振幅变面积。
 """
 
@@ -24,6 +25,7 @@ from typing import Any, Callable
 
 import matplotlib
 import numpy as np
+import pandas as pd
 
 matplotlib.use("Agg")
 from matplotlib.collections import LineCollection
@@ -47,13 +49,12 @@ section_window = importlib.util.module_from_spec(_window_spec)
 _window_spec.loader.exec_module(section_window)
 
 import build_cheye1_dfn_multibackground_sections as mb
+from build_all_area_section_visualization import ProjectionSegment
 from build_cheye1_dfn_coherence_sections import (
     add_fault_trace_segments,
     build_namespace,
     infer_dfn_patch_csv,
-    load_dfn_patch_metadata,
     scan_unified_original_fault_intersections,
-    scan_vtk_intersections,
 )
 from build_well_seismic_amplitude_sections import plot_wiggle_variable_area
 from well_curved_section_common import (
@@ -72,6 +73,7 @@ if _layer_spec is None or _layer_spec.loader is None:
     raise ImportError("cannot load layered section profile helper")
 layered_profile = importlib.util.module_from_spec(_layer_spec)
 _layer_spec.loader.exec_module(layered_profile)
+from 太古界.common.orientation_frame import convention as orientation
 
 
 DEFAULT_CONFIG = SCRIPT_DIR / "configs" / "formal_mine_multiscale_flow_v1.json"
@@ -103,8 +105,8 @@ class ScaleSet:
 
 SCALE_SETS = (
     ScaleSet("large", "大尺度", ("large",), True, 1),
-    ScaleSet("medium", "中尺度", ("medium",), False, 3),
-    ScaleSet("small", "小尺度", ("small",), False, 5),
+    ScaleSet("medium", "中尺度", ("medium",), True, 3),
+    ScaleSet("small", "小尺度", ("small",), True, 5),
     ScaleSet("large_medium", "大尺度+中尺度", ("large", "medium"), True, 7),
     ScaleSet("all_scales", "大中小尺度", ("large", "medium", "small"), True, 9),
 )
@@ -137,6 +139,10 @@ LARGE_INTERVAL_STYLES = {
         "label": "沙四段（T6–T7）",
         "color": "#00a6ff",
     },
+}
+INTERVAL_BY_LAYER = {
+    "沙三段": "T4->T6",
+    "沙四段": "T6->T7",
 }
 
 
@@ -180,7 +186,11 @@ def make_set_drawer(
         fault_count = 0
         if include_faults:
             fault_count = add_fault_trace_segments(
-                ax, faults, projection, overview=True
+                ax,
+                faults,
+                projection,
+                overview=True,
+                taigu_style=True,
             )
         return {
             "dfn_segment_count": int(dfn_count),
@@ -190,6 +200,144 @@ def make_set_drawer(
         }
 
     return draw
+
+
+def load_dfn_patch_frame(path: Path) -> pd.DataFrame:
+    columns = [
+        "CenterX",
+        "CenterY",
+        "CenterTime",
+        "LengthM",
+        "PatchAreaM2",
+        "DipAzimuthDeg",
+        "DipDeg",
+        "AzimuthDeg",
+        "LayerGroup",
+        "FractureScale",
+    ]
+    available = set(pd.read_csv(path, nrows=0).columns)
+    missing = sorted(set(columns) - available)
+    if missing:
+        raise ValueError(f"Step8 DFN CSV missing required columns: {missing}")
+    frame = pd.read_csv(path, usecols=columns, low_memory=False)
+    for column in columns:
+        if column not in {"LayerGroup", "FractureScale"}:
+            frame[column] = pd.to_numeric(frame[column], errors="coerce")
+    return frame.dropna(
+        subset=[
+            "CenterX",
+            "CenterY",
+            "CenterTime",
+            "LengthM",
+            "DipDeg",
+            "LayerGroup",
+            "FractureScale",
+        ]
+    ).reset_index(drop=True)
+
+
+def build_csv_intersections(
+    frame: pd.DataFrame,
+    track: pd.DataFrame,
+    sections: dict[str, AttributeSection],
+    *,
+    half_width_m: float,
+) -> tuple[list[ProjectionSegment], dict[str, Any]]:
+    """Build full fracture traces from Step8 CSV geometry like Taigu Step9."""
+
+    track = track.sort_values("TIME").drop_duplicates("TIME")
+    track_time = track["TIME"].to_numpy(dtype=float)
+    segments: list[ProjectionSegment] = []
+    selected_indices: set[int] = set()
+    projection_counts: dict[str, int] = {}
+    for projection in ("XZ", "YZ"):
+        section = sections[projection]
+        center_column = "CenterX" if projection == "XZ" else "CenterY"
+        perpendicular = "Y" if projection == "XZ" else "X"
+        coords = np.asarray(section.h, dtype=float)
+        track_perpendicular = track[perpendicular].to_numpy(dtype=float)
+        well_perpendicular = np.interp(
+            frame["CenterTime"].to_numpy(dtype=float),
+            track_time,
+            track_perpendicular,
+        )
+        selected = frame[
+            frame["CenterTime"].between(
+                float(section.display_time_min),
+                float(section.display_time_max),
+            )
+            & frame[center_column].between(float(coords[0]), float(coords[-1]))
+            & (
+                np.abs(
+                    frame[f"Center{perpendicular}"].to_numpy(dtype=float)
+                    - well_perpendicular
+                )
+                <= float(half_width_m)
+            )
+        ]
+        selected_indices.update(int(index) for index in selected.index)
+        projection_counts[projection] = 0
+        for index, row in selected.iterrows():
+            azimuth = float(row["DipAzimuthDeg"])
+            if not np.isfinite(azimuth):
+                legacy_angle = float(row["AzimuthDeg"])
+                if not np.isfinite(legacy_angle):
+                    continue
+                azimuth = orientation.dip_azimuth_from_strike(
+                    orientation.strike_from_xy_line_angle(legacy_angle)
+                )
+            dip = float(row["DipDeg"])
+            trace = orientation.trace_on_section(azimuth, dip, projection)
+            if trace is None:
+                continue
+            length = float(np.clip(float(row["LengthM"]), 10.0, 500.0))
+            half = 0.5 * length
+            dh, dt = trace
+            center_h = float(row[center_column])
+            center_t = float(row["CenterTime"])
+            surface_distance = abs(
+                float(row[f"Center{perpendicular}"])
+                - float(
+                    np.interp(
+                        center_t,
+                        track_time,
+                        track_perpendicular,
+                    )
+                )
+            )
+            patch_area = float(row["PatchAreaM2"])
+            if not np.isfinite(patch_area):
+                patch_area = 1.0
+            segment = ProjectionSegment(
+                polygon_index=int(index),
+                projection=projection,
+                interval=INTERVAL_BY_LAYER.get(
+                    str(row["LayerGroup"]).strip(),
+                    "",
+                ),
+                center_x=float(row["CenterX"]),
+                center_y=float(row["CenterY"]),
+                center_z=center_t,
+                surface_distance=surface_distance,
+                patch_area=patch_area,
+                h1=center_h - half * dh,
+                z1=center_t - half * dt,
+                h2=center_h + half * dh,
+                z2=center_t + half * dt,
+                scale=str(row["FractureScale"]).strip().lower(),
+            )
+            setattr(segment, "display_mode", "orientation_plane_trace")
+            segments.append(segment)
+            projection_counts[projection] += 1
+    return segments, {
+        "geometry_source": "STEP8_CSV_DIP_AZIMUTH_TRACE",
+        "patch_count": int(len(frame)),
+        "selected_patch_count": int(len(selected_indices)),
+        "selected_segment_count": int(len(segments)),
+        "selected_segment_count_xz": int(projection_counts["XZ"]),
+        "selected_segment_count_yz": int(projection_counts["YZ"]),
+        "half_width_m": float(half_width_m),
+    }
 
 
 def add_scale_colored_dfn_segments(
@@ -223,6 +371,16 @@ def add_scale_colored_dfn_segments(
                 for segment in scale_segments
             ]
             scale_style = SCALE_STYLES[scale]
+            if scale == "large":
+                ax.add_collection(
+                    LineCollection(
+                        lines,
+                        colors="#111827",
+                        linewidths=5.2,
+                        alpha=0.82,
+                        zorder=13.0,
+                    )
+                )
             ax.add_collection(
                 LineCollection(
                     lines,
@@ -419,15 +577,15 @@ def main() -> int:
     scan_args = build_namespace(
         config, float(config.get("dfn_half_width_m", 50.0))
     )
-    metadata = load_dfn_patch_metadata(infer_dfn_patch_csv(config))
-    scan_args.dfn_patch_metadata = metadata
+    dfn_patch_csv = infer_dfn_patch_csv(config)
+    dfn_patches = load_dfn_patch_frame(dfn_patch_csv)
     scan_args.well_trajectory_csv = overview.well_path
     scan_args.selected_well_name = overview.well_name
-    from common.horizon_trace_table.horizon_contract import build_spatial_lookup
-
-    surfaces = build_spatial_lookup(config)
-    all_segments, scan = scan_vtk_intersections(
-        scan_args, surfaces, overview.well_df
+    all_segments, scan = build_csv_intersections(
+        dfn_patches,
+        overview.well_df,
+        sections,
+        half_width_m=float(config.get("dfn_half_width_m", 50.0)),
     )
     all_segments_before_filter = len(all_segments)
     display = {
@@ -502,7 +660,7 @@ def main() -> int:
                 },
             ),
             metadata={
-                "source": "Step8_VTK_polygon_plane_intersection",
+                "source": "Step8_CSV_dip_azimuth_trace",
                 "visible_filter_enabled": False,
                 "segments_before_filter": int(all_segments_before_filter),
                 "segments_after_filter": int(len(all_segments)),
@@ -516,6 +674,7 @@ def main() -> int:
                     faults,
                     projection,
                     overview=True,
+                    taigu_style=True,
                 )
             ),
             "imaging_patch_count": 0,
@@ -604,8 +763,8 @@ def main() -> int:
             for row in images
             if row["set"] in ("large", "large_medium", "all_scales")
         ),
-        "medium_small_only_have_no_faults": all(
-            row["overlay"]["fault_segment_count"] == 0
+        "medium_small_include_faults": all(
+            row["overlay"]["fault_segment_count"] > 0
             for row in images
             if row["set"] in ("medium", "small")
         ),
@@ -657,12 +816,18 @@ def main() -> int:
                 "medium": 2.20,
                 "large": 3.20,
             },
+            "large_scale_halo": {
+                "enabled": True,
+                "color": "#111827",
+                "linewidth": 5.20,
+            },
         },
         "dfn_source": {
-            "csv": str(infer_dfn_patch_csv(config)),
+            "csv": str(dfn_patch_csv),
             "vtk": str(scan_args.input_vtk),
             "is_step8_well_corrected": True,
-            "patch_count": int(len(metadata)) if metadata is not None else 0,
+            "patch_count": int(len(dfn_patches)),
+            "geometry_policy": "STEP8_CSV DipAzimuthDeg/DipDeg with LengthM",
             "scan": scan,
             "visible_filter_enabled": False,
             "segments_before_filter": int(all_segments_before_filter),

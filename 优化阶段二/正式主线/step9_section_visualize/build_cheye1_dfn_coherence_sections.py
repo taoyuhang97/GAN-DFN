@@ -1168,6 +1168,7 @@ def add_fault_trace_segments(
     projection: str,
     *,
     overview: bool = False,
+    taigu_style: bool = False,
 ) -> int:
     lines = [
         [(segment.h1, segment.z1), (segment.h2, segment.z2)]
@@ -1176,11 +1177,38 @@ def add_fault_trace_segments(
     ]
     if not lines:
         return 0
-    halo_width = FAULT_TRACE_OVERVIEW_HALO_WIDTH if overview else FAULT_TRACE_HALO_WIDTH
-    line_width = FAULT_TRACE_OVERVIEW_WIDTH if overview else FAULT_TRACE_WIDTH
-    line_style = (0, (5, 3)) if overview else "-"
-    ax.add_collection(LineCollection(lines, colors=FAULT_TRACE_HALO, linewidths=halo_width, alpha=0.70 if overview else 0.86, zorder=9, linestyles=line_style))
-    ax.add_collection(LineCollection(lines, colors=FAULT_TRACE_COLOR, linewidths=line_width, alpha=0.78 if overview else 0.96, zorder=10, linestyles=line_style))
+    if taigu_style:
+        halo_width = 4.6
+        line_width = 2.3
+        halo_alpha = 0.62
+        line_alpha = 0.92
+        line_style = "-"
+    else:
+        halo_width = FAULT_TRACE_OVERVIEW_HALO_WIDTH if overview else FAULT_TRACE_HALO_WIDTH
+        line_width = FAULT_TRACE_OVERVIEW_WIDTH if overview else FAULT_TRACE_WIDTH
+        halo_alpha = 0.70 if overview else 0.86
+        line_alpha = 0.78 if overview else 0.96
+        line_style = (0, (5, 3)) if overview else "-"
+    ax.add_collection(
+        LineCollection(
+            lines,
+            colors=FAULT_TRACE_HALO,
+            linewidths=halo_width,
+            alpha=halo_alpha,
+            zorder=9,
+            linestyles=line_style,
+        )
+    )
+    ax.add_collection(
+        LineCollection(
+            lines,
+            colors=FAULT_TRACE_COLOR,
+            linewidths=line_width,
+            alpha=line_alpha,
+            zorder=10,
+            linestyles=line_style,
+        )
+    )
     ax.plot([], [], color=FAULT_TRACE_COLOR, linewidth=line_width, linestyle=line_style, label="原始断层")
     return len(lines)
 
