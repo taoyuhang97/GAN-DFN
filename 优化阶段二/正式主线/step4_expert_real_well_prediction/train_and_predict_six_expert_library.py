@@ -40,7 +40,7 @@ PAIR_TYPES = ("LLD_LLS", "RD_RS", "RILD_RILM")
 DIRECT_PAIR_TYPES = ("LLD_LLS", "RD_RS")
 MERGE_PAIR_PRIORITY = ("RD_RS", "LLD_LLS", "RILD_RILM")
 
-FEATURE_COLUMNS = [
+BASE_FEATURE_COLUMNS = [
     "GRRobustZ",
     "RDeepRobustZ",
     "RReferenceRobustZ",
@@ -65,11 +65,40 @@ FEATURE_COLUMNS = [
 ]
 for _prefix in ("GR", "RDeep", "RReference"):
     for _window in (0.5, 1.0, 3.0, 5.0):
-        FEATURE_COLUMNS.append(f"{_prefix}Residual{str(_window).replace('.', 'p')}MZ")
+        BASE_FEATURE_COLUMNS.append(f"{_prefix}Residual{str(_window).replace('.', 'p')}MZ")
     for _window in (1.0, 3.0, 5.0):
-        FEATURE_COLUMNS.append(f"{_prefix}MAD{int(_window)}MZ")
+        BASE_FEATURE_COLUMNS.append(f"{_prefix}MAD{int(_window)}MZ")
 for _window in (1.0, 3.0, 5.0):
-    FEATURE_COLUMNS.append(f"ContrastResidual{int(_window)}MZ")
+    BASE_FEATURE_COLUMNS.append(f"ContrastResidual{int(_window)}MZ")
+
+MULTILOG_FEATURE_COLUMNS = list(BASE_FEATURE_COLUMNS)
+for _prefix in ("AC", "CNL", "DEN"):
+    MULTILOG_FEATURE_COLUMNS.extend(
+        [
+            f"{_prefix}RobustZ",
+            f"{_prefix}Rank",
+            f"{_prefix}GradientZ",
+        ]
+    )
+    for _window in (0.5, 1.0, 3.0, 5.0):
+        MULTILOG_FEATURE_COLUMNS.append(
+            f"{_prefix}Residual{str(_window).replace('.', 'p')}MZ"
+        )
+    for _window in (1.0, 3.0, 5.0):
+        MULTILOG_FEATURE_COLUMNS.append(f"{_prefix}MAD{int(_window)}MZ")
+MULTILOG_FEATURE_COLUMNS.extend(
+    [
+        "AC_CNL_Separation",
+        "AC_DEN_Separation",
+        "CNL_DEN_Separation",
+        "GRxACResidual",
+        "GRxCNLResidual",
+        "GRxDensityResidual",
+    ]
+)
+
+FEATURE_COLUMNS = list(BASE_FEATURE_COLUMNS)
+REQUIRE_MULTILOG_CURVES = False
 
 OUTPUT_COLUMNS = [
     "SampleID",
@@ -103,6 +132,84 @@ MERGED_OUTPUT_COLUMNS = OUTPUT_COLUMNS + [
     "SelectionPriority",
     "MergeRule",
 ]
+PREDICTION_MAIN_COLUMNS = [
+    "SampleID",
+    "WellName",
+    "X",
+    "Y",
+    "TIME",
+    "TVD",
+    "DEPT",
+    "StrataName",
+    "InputPairType",
+    "ReferenceType",
+    "ExpertID",
+    "ModelID",
+    "PredFractureProb",
+    "PredConditionalDensity",
+    "PredDensity",
+    "PredHasFracture",
+    "Stage1Threshold",
+    "Density",
+    "HasFracture",
+    "PredictionValid",
+]
+PREDICTION_PROVENANCE_COLUMNS = [
+    "SampleID",
+    "WellName",
+    "DEPT",
+    "InputPairType",
+    "SourceSampleID",
+    "SupportSegmentID",
+    "SegmentStartDEPT",
+    "SegmentEndDEPT",
+    "AvailableExpertCount",
+    "AvailablePairTypes",
+    "SelectionPriority",
+    "MergeRule",
+]
+POINT_MAIN_COLUMNS = [
+    "SampleID",
+    "WellName",
+    "X",
+    "Y",
+    "TIME",
+    "TVD",
+    "DEPT",
+    "StrataName",
+    "InputPairType",
+    "ExpertID",
+    "ModelID",
+    "Density",
+    "HasFracture",
+    "PredFractureProb",
+    "PointOrdinalInSegment",
+]
+POINT_PROVENANCE_COLUMNS = [
+    "SampleID",
+    "WellName",
+    "DEPT",
+    "InputPairType",
+    "SourceSampleID",
+    "SupportSegmentID",
+    "SegmentStartDEPT",
+    "SegmentEndDEPT",
+    "PointOrdinalInSegment",
+]
+TRAINING_SOURCE_COLUMNS = [
+    "SourceGroupFile",
+    "SourceGRCurve",
+    "SourceDeepCurve",
+    "SourceReferenceCurve",
+]
+TRAINING_SOURCE_AUDIT_COLUMNS = [
+    "SampleID",
+    "WellName",
+    "PairType",
+    "StrataName",
+    "DEPT",
+    *TRAINING_SOURCE_COLUMNS,
+]
 
 
 def parse_args() -> argparse.Namespace:
@@ -112,6 +219,22 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--replace-existing-output", action="store_true")
     parser.add_argument("--train-only", action="store_true")
     return parser.parse_args()
+
+
+def write_main_and_provenance(
+    frame: pd.DataFrame,
+    main_path: Path,
+    provenance_path: Path,
+    main_columns: list[str],
+    provenance_columns: list[str],
+) -> None:
+    """Write the lean row table and the traceability table separately."""
+    main_path.parent.mkdir(parents=True, exist_ok=True)
+    provenance_path.parent.mkdir(parents=True, exist_ok=True)
+    main = frame[[column for column in main_columns if column in frame.columns]].copy()
+    provenance = frame[[column for column in provenance_columns if column in frame.columns]].copy()
+    main.to_csv(main_path, index=False, encoding="utf-8-sig")
+    provenance.to_csv(provenance_path, index=False, encoding="utf-8-sig")
 
 
 def read_json(path: Path) -> dict[str, Any]:
@@ -232,6 +355,11 @@ def engineer_features(frame: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
             "RDeep": out["RDeepSignedLog"],
             "RReference": out["RReferenceSignedLog"],
         }
+        if REQUIRE_MULTILOG_CURVES:
+            for curve in ("AC", "CNL", "DEN"):
+                out[f"{curve}RobustZ"] = robust_z(numeric(out[curve]))
+                out[f"{curve}Rank"] = numeric(out[curve]).rank(method="average", pct=True)
+                transformed[curve] = numeric(out[curve])
         for prefix, values in transformed.items():
             out[f"{prefix}GradientZ"] = robust_z(depth_gradient(values, out["DEPT"]))
             for window_m in (0.5, 1.0, 3.0, 5.0):
@@ -257,9 +385,19 @@ def engineer_features(frame: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
         out["GRxDeepResidual"] = out["GRRobustZ"] * out["RDeepResidual1p0MZ"]
         out["GRxReferenceResidual"] = out["GRRobustZ"] * out["RReferenceResidual1p0MZ"]
         out["GRxNormalizedContrast"] = out["GRRobustZ"] * out["NormalizedContrast"]
+        if REQUIRE_MULTILOG_CURVES:
+            out["AC_CNL_Separation"] = out["ACRobustZ"] - out["CNLRobustZ"]
+            out["AC_DEN_Separation"] = out["ACRobustZ"] - out["DENRobustZ"]
+            out["CNL_DEN_Separation"] = out["CNLRobustZ"] - out["DENRobustZ"]
+            out["GRxACResidual"] = out["GRRobustZ"] * out["ACResidual1p0MZ"]
+            out["GRxCNLResidual"] = out["GRRobustZ"] * out["CNLResidual1p0MZ"]
+            out["GRxDensityResidual"] = out["GRRobustZ"] * out["DENResidual1p0MZ"]
         out["DeepNonPositiveFlag"] = numeric(out["RDeep"]).le(0.0).astype(int)
         out["ReferenceNonPositiveFlag"] = numeric(out["RReference"]).le(0.0).astype(int)
-        out["ModelInputEligible"] = out[["GR", "RDeep", "RReference"]].notna().all(axis=1)
+        required_curves = ["GR", "RDeep", "RReference"]
+        if REQUIRE_MULTILOG_CURVES:
+            required_curves.extend(["AC", "CNL", "DEN"])
+        out["ModelInputEligible"] = out[required_curves].notna().all(axis=1)
 
         for column in ("GR", "RDeep", "RReference", "RDeepSignedLog", "RReferenceSignedLog", "Contrast"):
             center, scale = robust_center_scale(out[column])
@@ -333,7 +471,10 @@ def load_training_table(config: dict[str, Any]) -> tuple[pd.DataFrame, pd.DataFr
         if not paths:
             raise RuntimeError(f"no Step3 groups for {well_name}")
         base = pd.concat([pd.read_csv(path).assign(WellName=well_name, SourceGroupFile=str(path)) for path in paths])
-        enrichment_file = v2.find_training_enrichment(config, well_name)
+        if bool(config.get("use_multilog_conventional_curves", False)):
+            enrichment_file = find_multilog_enrichment(config, well_name)
+        else:
+            enrichment_file = v2.find_training_enrichment(config, well_name)
         selected = v2.select_pair_rows(base, pd.read_csv(enrichment_file), pair_type)
         featured, feature_stats = engineer_features(selected)
         usable = (
@@ -513,6 +654,18 @@ def metric_row(part: pd.DataFrame, threshold: float) -> dict[str, Any]:
 
 def direct_expert_key(strata_name: str, pair_type: str) -> tuple[str, str]:
     return str(strata_name), str(pair_type)
+
+
+def multilog_enrichment_path(root: Path, well_name: str) -> Path:
+    return root / well_name / f"{well_name}_t4_t7_real_well_conventional_curves.csv"
+
+
+def find_multilog_enrichment(config: dict[str, Any], well_name: str) -> Path:
+    for key in ("step2_output_root", "step2_outer_output_root"):
+        path = multilog_enrichment_path(Path(config[key]), well_name)
+        if path.exists():
+            return path
+    raise FileNotFoundError(f"missing multilog conventional curves for {well_name}")
 
 
 def train_direct_experts(
@@ -1021,8 +1174,10 @@ def predict_all_wells(
     summary = pd.read_csv(root / "real_well_t4_t7_summary.csv")
     prediction_root = staging / "predictions"
     per_well_root = prediction_root / "real_well_predictions"
+    provenance_root = staging / "provenance"
     prediction_root.mkdir(parents=True, exist_ok=True)
     per_well_root.mkdir(parents=True, exist_ok=True)
+    provenance_root.mkdir(parents=True, exist_ok=True)
     expert_parts = []
     merged_parts = []
     coverage_rows = []
@@ -1036,7 +1191,11 @@ def predict_all_wells(
         main = pd.read_csv(Path(str(row["MainCsv"])))
         interval = pd.read_csv(Path(str(row["IntervalCsv"]))).iloc[0]
         main = v2.assign_step2_strata(main, interval)
-        enrichment_file = v2.enrichment_path(root, well_name)
+        enrichment_file = (
+            multilog_enrichment_path(root, well_name)
+            if bool(config.get("use_multilog_conventional_curves", False))
+            else v2.enrichment_path(root, well_name)
+        )
         if not enrichment_file.exists():
             coverage_rows.append({"WellName": well_name, "Status": "missing_enrichment", "TotalRows": int(len(main))})
             continue
@@ -1060,15 +1219,19 @@ def predict_all_wells(
                 ].copy()
                 if pair_prediction.empty:
                     continue
-                pair_prediction[OUTPUT_COLUMNS].to_csv(
+                write_main_and_provenance(
+                    pair_prediction[OUTPUT_COLUMNS],
                     well_output_dir / f"{well_name}_{pair_type}_expert_prediction.csv",
-                    index=False,
-                    encoding="utf-8-sig",
+                    provenance_root / "per_well" / well_name / f"{well_name}_{pair_type}_expert_provenance.csv",
+                    PREDICTION_MAIN_COLUMNS,
+                    PREDICTION_PROVENANCE_COLUMNS,
                 )
-            merged.to_csv(
+            write_main_and_provenance(
+                merged,
                 well_output_dir / f"{well_name}_merged_density_prediction.csv",
-                index=False,
-                encoding="utf-8-sig",
+                provenance_root / "per_well" / well_name / f"{well_name}_merged_density_provenance.csv",
+                PREDICTION_MAIN_COLUMNS,
+                PREDICTION_PROVENANCE_COLUMNS,
             )
             expert_parts.append(expert_predictions[OUTPUT_COLUMNS])
             merged_parts.append(merged)
@@ -1110,20 +1273,26 @@ def predict_all_wells(
     points = refine_points(merged_predictions, point_count_scales(training))
     coverage = pd.DataFrame(coverage_rows)
     unsupported = pd.concat(unsupported_parts, ignore_index=True) if unsupported_parts else pd.DataFrame()
-    expert_predictions.to_csv(
+    write_main_and_provenance(
+        expert_predictions,
         prediction_root / "all_wells_t4_t7_expert_detail_prediction.csv",
-        index=False,
-        encoding="utf-8-sig",
+        provenance_root / "all_wells_t4_t7_expert_detail_provenance.csv",
+        PREDICTION_MAIN_COLUMNS,
+        PREDICTION_PROVENANCE_COLUMNS,
     )
-    merged_predictions.to_csv(
+    write_main_and_provenance(
+        merged_predictions,
         prediction_root / "all_wells_t4_t7_merged_density_prediction.csv",
-        index=False,
-        encoding="utf-8-sig",
+        provenance_root / "all_wells_t4_t7_merged_density_provenance.csv",
+        PREDICTION_MAIN_COLUMNS,
+        PREDICTION_PROVENANCE_COLUMNS,
     )
-    points.to_csv(
+    write_main_and_provenance(
+        points,
         prediction_root / "all_wells_t4_t7_merged_fracture_points.csv",
-        index=False,
-        encoding="utf-8-sig",
+        provenance_root / "all_wells_t4_t7_merged_fracture_points_provenance.csv",
+        POINT_MAIN_COLUMNS,
+        POINT_PROVENANCE_COLUMNS,
     )
     qc_root = staging / "qc"
     qc_root.mkdir(parents=True, exist_ok=True)
@@ -1234,6 +1403,38 @@ def validate_delivery(
             errors.append(f"{well_name}:per_well_file_set_mismatch")
 
     expected_experts = {f"{strata}_{pair}" for strata in TARGET_STRATA for pair in PAIR_TYPES}
+    prediction_main_files = [
+        staging / "predictions" / "all_wells_t4_t7_expert_detail_prediction.csv",
+        staging / "predictions" / "all_wells_t4_t7_merged_density_prediction.csv",
+        staging / "predictions" / "all_wells_t4_t7_merged_fracture_points.csv",
+    ]
+    forbidden_main_columns = {
+        "SourceSampleID",
+        "SourceGroupFile",
+        "SourceGRCurve",
+        "SourceDeepCurve",
+        "SourceReferenceCurve",
+        "SupportSegmentID",
+        "SegmentStartDEPT",
+        "SegmentEndDEPT",
+        "AvailablePairTypes",
+        "SelectionPriority",
+        "MergeRule",
+    }
+    prediction_main_columns_clean = all(
+        not (forbidden_main_columns & set(pd.read_csv(path, nrows=0).columns))
+        for path in prediction_main_files
+    )
+    training_columns = set(pd.read_csv(staging / "training_feature_table.csv", nrows=0).columns)
+    training_main_clean = not (set(TRAINING_SOURCE_COLUMNS) & training_columns)
+    provenance_files_exist = all(
+        path.exists()
+        for path in [
+            staging / "provenance" / "training_source_audit.csv",
+            staging / "provenance" / "all_wells_t4_t7_merged_density_provenance.csv",
+            staging / "provenance" / "all_wells_t4_t7_merged_fracture_points_provenance.csv",
+        ]
+    )
     checks = {
         "six_experts_registered": set(registry["ExpertID"].astype(str)) == expected_experts,
         "registry_has_no_status_columns": not any("status" in str(column).lower() for column in registry.columns),
@@ -1278,6 +1479,9 @@ def validate_delivery(
             "status" in str(column).lower()
             for column in list(expert_predictions.columns) + list(merged_predictions.columns)
         ),
+        "main_tables_have_no_repeated_source_fields": prediction_main_columns_clean,
+        "training_main_has_no_source_fields": training_main_clean,
+        "provenance_tables_exist": provenance_files_exist,
         "isolated_v3_output": output_dir.name not in {
             "formal_gr_resistivity_strata_library_v2",
             "formal_gr_resistivity_lateral_v1",
@@ -1302,11 +1506,15 @@ def validate_delivery(
     }
     write_json(staging / "step4_six_expert_acceptance_summary.json", summary)
     manifest = {
-        "version": "formal_six_expert_library_v3",
+        "version": str(config.get("version", "formal_six_expert_library_v3")),
         "prediction_table": "predictions/all_wells_t4_t7_merged_density_prediction.csv",
         "fracture_point_table": "predictions/all_wells_t4_t7_merged_fracture_points.csv",
         "expert_detail_table": "predictions/all_wells_t4_t7_expert_detail_prediction.csv",
         "per_well_prediction_root": "predictions/real_well_predictions",
+        "training_source_audit": "provenance/training_source_audit.csv",
+        "expert_detail_provenance": "provenance/all_wells_t4_t7_expert_detail_provenance.csv",
+        "merged_density_provenance": "provenance/all_wells_t4_t7_merged_density_provenance.csv",
+        "fracture_point_provenance": "provenance/all_wells_t4_t7_merged_fracture_points_provenance.csv",
         "model_registry": "model_library/six_expert_registry.csv",
         "prediction_unique_key": ["WellName", "DEPT"],
         "prediction_valid_column": "PredictionValid",
@@ -1348,10 +1556,23 @@ def run(config: dict[str, Any], output_dir: Path, replace_existing: bool, train_
     try:
         model_dir = staging / "model_library"
         validation_dir = staging / "validation"
+        provenance_dir = staging / "provenance"
         model_dir.mkdir(parents=True, exist_ok=True)
         validation_dir.mkdir(parents=True, exist_ok=True)
+        provenance_dir.mkdir(parents=True, exist_ok=True)
         training, training_manifest, normalization = load_training_table(config)
-        training.to_csv(staging / "training_feature_table.csv", index=False, encoding="utf-8-sig")
+        training_source = training[
+            [column for column in TRAINING_SOURCE_AUDIT_COLUMNS if column in training.columns]
+        ].copy()
+        training_main = training.drop(
+            columns=[column for column in TRAINING_SOURCE_COLUMNS if column in training.columns]
+        )
+        training_main.to_csv(staging / "training_feature_table.csv", index=False, encoding="utf-8-sig")
+        training_source.to_csv(
+            staging / "provenance" / "training_source_audit.csv",
+            index=False,
+            encoding="utf-8-sig",
+        )
         training_manifest.to_csv(staging / "training_input_manifest.csv", index=False, encoding="utf-8-sig")
         normalization.to_csv(staging / "training_normalization_stats.csv", index=False, encoding="utf-8-sig")
         print(f"[Step4-v3] direct training rows={len(training)}", flush=True)
@@ -1408,8 +1629,13 @@ def run(config: dict[str, Any], output_dir: Path, replace_existing: bool, train_
 
 
 def main() -> int:
+    global FEATURE_COLUMNS, REQUIRE_MULTILOG_CURVES
     args = parse_args()
     config = read_json(args.config)
+    REQUIRE_MULTILOG_CURVES = bool(config.get("use_multilog_conventional_curves", False))
+    FEATURE_COLUMNS = list(
+        MULTILOG_FEATURE_COLUMNS if REQUIRE_MULTILOG_CURVES else BASE_FEATURE_COLUMNS
+    )
     output_dir = args.output_dir or Path(config["output_dir"])
     summary = run(config, output_dir, args.replace_existing_output, args.train_only)
     print(json.dumps(json_ready(summary), ensure_ascii=False, indent=2))

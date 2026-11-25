@@ -100,9 +100,29 @@ def dfn_time_extent_in_block(
         raise RuntimeError("no DFN patches fall inside the requested section window")
 
     available_z = [column for column in VERTEX_Z_COLUMNS if column in frame.columns]
+    extent_source = "CenterTime +/- HeightTimeMs/2"
     if available_z:
-        z_values = frame[available_z].to_numpy(dtype=float).reshape(-1)
-        z_values = z_values[np.isfinite(z_values)]
+        vertices = frame[available_z].to_numpy(dtype=float)
+        vertex_finite = np.isfinite(vertices)
+        z_values = vertices[vertex_finite]
+        rows_without_vertices = ~vertex_finite.any(axis=1)
+        if rows_without_vertices.any():
+            fallback = frame.loc[rows_without_vertices]
+            center = fallback["CenterTime"].to_numpy(dtype=float)
+            if "HeightTimeMs" in fallback.columns:
+                half_height = 0.5 * pd.to_numeric(
+                    fallback["HeightTimeMs"], errors="coerce"
+                ).fillna(0.0).to_numpy(dtype=float)
+                fallback_z = np.concatenate([center - half_height, center + half_height])
+            else:
+                fallback_z = center
+            z_values = np.concatenate([z_values, fallback_z])
+            extent_source = (
+                "DFN vertex Z plus CenterTime +/- HeightTimeMs/2 "
+                "for rows without vertices"
+            )
+        else:
+            extent_source = "DFN vertex Z"
     else:
         if "HeightTimeMs" not in frame.columns:
             z_values = frame["CenterTime"].to_numpy(dtype=float)
@@ -143,7 +163,7 @@ def dfn_time_extent_in_block(
         "sample_interval_ms": interval,
         "aligned_top_ms": aligned_top,
         "aligned_bottom_ms": aligned_bottom,
-        "extent_source": "DFN vertex Z" if available_z else "CenterTime +/- HeightTimeMs/2",
+        "extent_source": extent_source,
         "original_faults_included": False,
     }
     return aligned_top, aligned_bottom, summary

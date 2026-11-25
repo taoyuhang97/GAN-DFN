@@ -1,0 +1,50 @@
+{
+  "framework_id": "taigu_base_supp_v1",
+  "area": "太古界·基底以下补充层（上部补充层 5×5 km 试点区）",
+  "metadata": {
+    "note": "在太古界风化壳底以下追加 300 ms 低置信度延伸窗；最深处截到属性体 4800 ms。",
+    "pilot_block": {
+      "x_min": 663450.0,
+      "x_max": 668450.0,
+      "y_min": 4239250.0,
+      "y_max": 4244250.0,
+      "center_x": 665954.0,
+      "center_y": 4241759.0,
+      "source": "taigu_supp_v1 上部补充层试点区"
+    },
+    "model_reuse": {
+      "基底以下补充层": "太古界风化壳",
+      "reason": "试点区基底以下没有目标层真实裂缝训练标签，复用风化壳两阶段模型仅作低置信度代理预测。"
+    }
+  },
+  "surfaces": [
+    {
+      "id": "Base",
+      "label": "风化壳底",
+      "order": 1,
+      "legacy_column": "TopTimeMs"
+    },
+    {
+      "id": "BottomV",
+      "label": "基底以下 300 ms 虚拟底",
+      "order": 2,
+      "legacy_column": "BaseTimeMs"
+    }
+  ],
+  "layers": [
+    {
+      "code": 4,
+      "name": "基底以下补充层",
+      "top": "Base",
+      "base": "BottomV",
+      "color": "#22c55e",
+      "display_order": 3,
+      "inclusive_base": false,
+      "extension_ms": 0.0,
+      "presence_column": "BaseSuppPresent",
+      "time_class": "base_below_300",
+      "slug": "base_supp"
+    }
+  ],
+  "legacy_layer_aliases": {}
+}

@@ -224,10 +224,33 @@ def load_multiwell_orientation_points(
     parts: list[pd.DataFrame] = []
     audits: list[pd.DataFrame] = []
     allowed = {layer: set(wells) for layer, wells in allowed_wells.items()}
+    membership_path = Path(groups_root).parent / "group_segment_membership.csv"
+    membership = (
+        pd.read_csv(membership_path, encoding="utf-8-sig")
+        if membership_path.exists()
+        else pd.DataFrame()
+    )
     for group_file in sorted(Path(groups_root).glob("*.csv")):
         group = pd.read_csv(group_file, encoding="utf-8-sig")
         required = {"WellName", "StrataName", "GT_POINT_FLAG", "FracAzimuth", "FracDip", "MD", "InputSegmentPath"}
-        if group.empty or not required.issubset(group.columns):
+        if group.empty:
+            continue
+        if "InputSegmentPath" not in group.columns:
+            membership_columns = [
+                column
+                for column in ("GroupID", "GroupRowID", "LogSegmentPath")
+                if column in membership.columns
+            ]
+            if len(membership_columns) == 3:
+                group = group.merge(
+                    membership[membership_columns].rename(
+                        columns={"LogSegmentPath": "InputSegmentPath"}
+                    ),
+                    on=["GroupID", "GroupRowID"],
+                    how="left",
+                    validate="one_to_one",
+                )
+        if not required.issubset(group.columns):
             continue
         points = group[group["GT_POINT_FLAG"].fillna(0).astype(int).eq(1)].copy()
         # 2026-09-22 统一口径：甲方 FracAzimuth 是**真倾向方位**（0–360，自北顺时针），
@@ -558,6 +581,12 @@ def load_imaging_density_profile(config: dict[str, Any], well: str) -> pd.DataFr
     group_files = sorted(Path(config["step3_groups_root"]).glob(f"{well}_*.csv"))
     parts = []
     audits = []
+    membership_path = Path(config["step3_groups_root"]).parent / "group_segment_membership.csv"
+    membership = (
+        pd.read_csv(membership_path, encoding="utf-8-sig")
+        if membership_path.exists()
+        else pd.DataFrame()
+    )
     samples_root = Path(config["step2_segments_root"])
     join_config = dict(config.get("segment_join", {}))
     tolerance_setting = join_config.get("tolerance_m", config.get("md_merge_tolerance"))
@@ -571,6 +600,25 @@ def load_imaging_density_profile(config: dict[str, Any], well: str) -> pd.DataFr
         if group.empty or not {"WellName", "MD"}.issubset(group.columns):
             continue
         group = group.copy()
+        if "InputSegmentPath" not in group.columns:
+            membership_columns = [
+                column
+                for column in ("GroupID", "GroupRowID", "LogSegmentPath")
+                if column in membership.columns
+            ]
+            if len(membership_columns) != 3:
+                raise RuntimeError(
+                    "group_segment_membership.csv is missing required columns: "
+                    "GroupID, GroupRowID, LogSegmentPath"
+                )
+            group = group.merge(
+                membership[membership_columns].rename(
+                    columns={"LogSegmentPath": "InputSegmentPath"}
+                ),
+                on=["GroupID", "GroupRowID"],
+                how="left",
+                validate="one_to_one",
+            )
         group["MD"] = pd.to_numeric(group["MD"], errors="coerce")
         matched, audit = attach_geometry_per_segment(
             group,

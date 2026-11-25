@@ -1,5 +1,37 @@
 # Step4 常规测井裂缝预测当前正式文档
 
+## 新增井外推（2026-11-25）
+
+新增井 `车152`、`车斜155` 使用独立入口
+`predict_new_wells_from_las.py`，配置为
+`configs/formal_new_well_inference_20261125.json`。流程加载现有
+`formal_multilog_expert_library_v2`，不重新训练模型；井斜按最小曲率法积分，
+时深按最近且完整覆盖来源井的 `TVD/TIME` 关系借用。
+
+运行和字段说明见 `NEW_WELL_INFERENCE_20261125.md`。
+
+## 多曲线精简主表版本（2026-11-23）
+
+当前多曲线实验入口为
+`train_and_predict_six_expert_library.py --config configs/formal_multilog_expert_library_v2.json`，
+输出 `output/formal_multilog_expert_library_v2`。
+
+模型基础属性为 `GR + AC + CNL + DEN + RDeep + RReference`。三组电阻率仍按
+`LLD_LLS`、`RD_RS`、`RILD_RILM` 分别训练；`RDeep/RReference` 分别取当前曲线对的
+深探测曲线和第二条曲线。
+
+主表只保存定位、深度、地层、预测结果等逐行数据。来源曲线名、来源组文件、
+来源样本 ID、支撑段和合并规则放入 `provenance/`：
+
+```text
+training_source_audit.csv
+all_wells_t4_t7_expert_detail_provenance.csv
+all_wells_t4_t7_merged_density_provenance.csv
+all_wells_t4_t7_merged_fracture_points_provenance.csv
+```
+
+来源字段不进入模型，也不再在预测主表每一行重复保存。
+
 更新时间：2026-07-28
 
 状态：**本文件是 Step4 唯一有效的设计、结果和使用说明。**

@@ -4,12 +4,14 @@ import argparse
 import hashlib
 import importlib.util
 import json
+import math
 import sys
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 import pandas as pd
+import segyio
 from scipy.spatial import cKDTree
 
 
@@ -69,7 +71,16 @@ def parse_args() -> argparse.Namespace:
 
 
 def read_json(path: Path) -> dict[str, Any]:
-    return json.loads(path.read_text(encoding="utf-8"))
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    parent_name = payload.pop("_extends", None)
+    if not parent_name:
+        return payload
+    parent_path = (path.parent / str(parent_name)).resolve()
+    if not parent_path.exists():
+        raise FileNotFoundError(f"Step8 config parent does not exist: {parent_path}")
+    parent = read_json(parent_path)
+    parent.update(payload)
+    return parent
 
 
 def ensure_dir(path: Path) -> None:
@@ -115,6 +126,8 @@ def output_paths(output_dir: Path) -> dict[str, Path]:
         "imaging_match_selection_csv": output_dir / "imaging_match_selection_audit.csv",
         "density_compensation_requests_csv": output_dir / "density_compensation_requests.csv",
         "density_compensation_summary_csv": output_dir / "density_compensation_ring_summary.csv",
+        "seismic_guided_audit_csv": output_dir / "seismic_guided_densification_audit.csv",
+        "seismic_guided_summary_json": output_dir / "seismic_guided_densification_summary.json",
     }
 
 
@@ -677,6 +690,580 @@ def nearest_template_patch(
     return initial_df.loc[int(layer_idx[int(pos[0])])]
 
 
+SEISMIC_ATTRIBUTE_COLUMNS = {
+    "AntTrack": "SeismicAntTrack",
+    "Coherence": "SeismicCoherence",
+    "CurvatureMax": "SeismicCurvatureMax",
+}
+
+
+def _nearest_axis_index(axis: np.ndarray, values: np.ndarray) -> np.ndarray:
+    right = np.searchsorted(axis, values, side="left")
+    right = np.clip(right, 1, len(axis) - 1)
+    left = right - 1
+    choose_left = np.abs(values - axis[left]) <= np.abs(axis[right] - values)
+    return np.where(choose_left, left, right).astype(np.int64)
+
+
+class SandstoneSeismicAttributeSampler:
+    """Sample the three sandstone attribute volumes on their native 12.5 m grid."""
+
+    def __init__(self, mapping_path: Path, volume_paths: dict[str, Path], rules: dict[str, dict[str, float]]):
+        with np.load(mapping_path, allow_pickle=False) as packed:
+            ix = packed["ix"].astype(np.int64)
+            iy = packed["iy"].astype(np.int64)
+            x = packed["x"].astype(float)
+            y = packed["y"].astype(float)
+            source_trace_idx = packed["source_trace_idx"].astype(np.int64)
+        self.nx = int(ix.max()) + 1
+        self.ny = int(iy.max()) + 1
+        self.x_axis = np.full(self.nx, np.nan, dtype=float)
+        self.y_axis = np.full(self.ny, np.nan, dtype=float)
+        self.x_axis[ix] = x
+        self.y_axis[iy] = y
+        if not np.isfinite(self.x_axis).all() or not np.isfinite(self.y_axis).all():
+            raise ValueError("sand seismic trace mapping does not cover a complete X/Y lattice")
+        if not np.all(np.diff(self.x_axis) > 0.0) or not np.all(np.diff(self.y_axis) > 0.0):
+            raise ValueError("sand seismic trace mapping axes must be strictly increasing")
+        self.trace_by_ij = np.full((self.ny, self.nx), -1, dtype=np.int64)
+        self.trace_by_ij[iy, ix] = source_trace_idx
+        if np.any(self.trace_by_ij < 0):
+            raise ValueError("sand seismic trace mapping contains missing lattice nodes")
+        self.handles: dict[str, Any] = {}
+        self.samples: dict[str, np.ndarray] = {}
+        self.rules = dict(rules)
+        for name, path in volume_paths.items():
+            handle = segyio.open(str(Path(path).resolve()), "r", ignore_geometry=True)
+            handle.mmap()
+            self.handles[name] = handle
+            self.samples[name] = np.asarray(handle.samples, dtype=float)
+        self.trace_cache: dict[tuple[str, int], np.ndarray] = {}
+
+    def close(self) -> None:
+        for handle in self.handles.values():
+            handle.close()
+        self.handles.clear()
+        self.trace_cache.clear()
+
+    def _trace(self, name: str, trace_index: int) -> np.ndarray:
+        key = (name, int(trace_index))
+        value = self.trace_cache.get(key)
+        if value is None:
+            value = np.asarray(self.handles[name].trace[int(trace_index)], dtype=float)
+            self.trace_cache[key] = value
+        return value
+
+    def sample_points(self, points: pd.DataFrame) -> pd.DataFrame:
+        x = safe_numeric(points["X"]).to_numpy(dtype=float)
+        y = safe_numeric(points["Y"]).to_numpy(dtype=float)
+        time_value = safe_numeric(points["TIME"]).to_numpy(dtype=float)
+        valid_xy = np.isfinite(x) & np.isfinite(y)
+        ix = np.zeros(len(points), dtype=np.int64)
+        iy = np.zeros(len(points), dtype=np.int64)
+        ix[valid_xy] = _nearest_axis_index(self.x_axis, x[valid_xy])
+        iy[valid_xy] = _nearest_axis_index(self.y_axis, y[valid_xy])
+        trace_ids = np.full(len(points), -1, dtype=np.int64)
+        trace_ids[valid_xy] = self.trace_by_ij[iy[valid_xy], ix[valid_xy]]
+        output: dict[str, np.ndarray] = {}
+        for name, column in SEISMIC_ATTRIBUTE_COLUMNS.items():
+            values = np.full(len(points), np.nan, dtype=float)
+            samples = self.samples[name]
+            time_index = np.searchsorted(samples, time_value, side="left")
+            in_time = np.isfinite(time_value) & (time_value >= samples[0]) & (time_value <= samples[-1])
+            time_index = np.clip(time_index, 0, len(samples) - 1)
+            for row_index in np.flatnonzero(valid_xy & in_time & (trace_ids >= 0)):
+                trace = self._trace(name, int(trace_ids[row_index]))
+                candidate_index = int(time_index[row_index])
+                if candidate_index + 1 < len(samples):
+                    if samples[candidate_index + 1] - time_value[row_index] < time_value[row_index] - samples[candidate_index]:
+                        candidate_index += 1
+                values[row_index] = float(trace[candidate_index])
+            values[~np.isfinite(values) | (values <= -1.0e5)] = np.nan
+            rule = self.rules.get(name) or {}
+            if rule:
+                values[
+                    (values < float(rule.get("min", -np.inf)))
+                    | (values > float(rule.get("max", np.inf)))
+                ] = np.nan
+            output[column] = values
+        return pd.DataFrame(output, index=points.index)
+
+
+def _robust_normalization_scale(values: np.ndarray, floor: float) -> float:
+    finite = np.asarray(values, dtype=float)
+    finite = finite[np.isfinite(finite)]
+    if finite.size == 0:
+        return max(float(floor), 1.0e-9)
+    median = float(np.median(finite))
+    mad = float(np.median(np.abs(finite - median)))
+    return max(1.4826 * mad, float(floor), 1.0e-9)
+
+
+def build_seismic_guided_density_patches(
+    patch_df: pd.DataFrame,
+    initial_df: pd.DataFrame,
+    control_df: pd.DataFrame,
+    config: dict[str, Any],
+    surface_lookup: HorizonSpatialLookup | None,
+) -> tuple[pd.DataFrame, pd.DataFrame, dict[str, Any]]:
+    """Add steep 3D patches selected by seismic-signature similarity.
+
+    The candidate centers are distributed through three radial bands and are
+    displaced in TWT along the local dip direction. They are never copies at
+    the control point's original horizontal time slice.
+    """
+
+    spec = dict(config.get("seismic_guided_densification") or {})
+    enabled = bool(spec.get("enabled", False))
+    if not enabled:
+        return pd.DataFrame(), pd.DataFrame(), {
+            "enabled": False,
+            "status": "disabled",
+            "created_patch_count": 0,
+        }
+    well_names = {str(value) for value in spec.get("control_well_names", [])}
+    controls = control_df[control_df["WellName"].astype(str).isin(well_names)].copy()
+    if controls.empty:
+        return pd.DataFrame(), pd.DataFrame(), {
+            "enabled": True,
+            "status": "no_matching_control_wells",
+            "control_well_names": sorted(well_names),
+            "created_patch_count": 0,
+        }
+
+    time_scale = float(config.get("time_scale_m_per_ms", 2.0))
+    bands = [
+        (float(row[0]), float(row[1]))
+        for row in spec.get(
+            "radial_bands_m",
+            [[0.0, 50.0], [50.0, 100.0], [100.0, 200.0]],
+        )
+    ]
+    scale_cycle = [
+        str(value).strip().lower()
+        for value in spec.get("scale_cycle", ["small", "medium", "small"])
+    ]
+    allowed_scales = {
+        str(value).strip().lower()
+        for value in spec.get("template_scales", ["small", "medium"])
+    }
+    time_offsets = [
+        float(value)
+        for value in spec.get("center_time_offsets_ms", [-8.0, -5.0, 5.0, 8.0])
+    ]
+    min_time_offset = abs(float(spec.get("minimum_abs_time_offset_ms", 3.0)))
+    min_separation = float(spec.get("minimum_3d_separation_m", 12.0))
+    min_dip = float(spec.get("minimum_template_dip_deg", 35.0))
+    template_xy_radius = float(spec.get("template_xy_radius_m", 350.0))
+    template_time_radius = float(spec.get("template_time_radius_ms", 40.0))
+    template_limit = int(spec.get("max_local_templates_per_scale", 20))
+    minimum_radius = float(spec.get("minimum_radius_m", 10.0))
+    minimum_similarity = float(spec.get("minimum_similarity", 0.0))
+    size_multiplier = float(spec.get("patch_size_multiplier", 0.9))
+    height_multiplier = float(spec.get("patch_height_multiplier", 0.9))
+    max_total = int(spec.get("max_total_patches", 300))
+    attribute_weights = {
+        str(key): float(value)
+        for key, value in spec.get(
+            "attribute_weights",
+            {"AntTrack": 0.4, "Coherence": 0.4, "CurvatureMax": 0.2},
+        ).items()
+    }
+    attribute_floors = {
+        str(key): float(value)
+        for key, value in spec.get(
+            "attribute_normalization_floor",
+            {"AntTrack": 0.2, "Coherence": 10.0, "CurvatureMax": 0.01},
+        ).items()
+    }
+    volume_paths = {
+        str(name): Path(str(path)).resolve()
+        for name, path in dict(spec["volume_paths"]).items()
+    }
+    for name, path in volume_paths.items():
+        if not path.exists():
+            raise FileNotFoundError(f"seismic_guided_densification.volume_paths[{name}] does not exist: {path}")
+    mapping_path = Path(str(spec["trace_mapping_npz"])).resolve()
+    if not mapping_path.exists():
+        raise FileNotFoundError(f"seismic-guided trace mapping does not exist: {mapping_path}")
+
+    sampler = SandstoneSeismicAttributeSampler(
+        mapping_path=mapping_path,
+        volume_paths=volume_paths,
+        rules=dict(spec.get("attribute_rules", {})),
+    )
+    patch_rows: list[dict[str, Any]] = []
+    audit_rows: list[dict[str, Any]] = []
+    serial = 0
+    try:
+        for (well_name, layer), well_controls in controls.sort_values(["WellName", "LayerGroup", "TIME"]).groupby(
+            ["WellName", "LayerGroup"],
+            dropna=False,
+        ):
+            layer_pool = initial_df[
+                initial_df["LayerGroup"].astype(str).eq(str(layer))
+                & initial_df["FractureScale"].astype(str).str.lower().isin(allowed_scales)
+                & safe_numeric(initial_df["DipDeg"]).ge(min_dip)
+            ].copy()
+            if layer_pool.empty:
+                continue
+            occupied = patch_df[patch_df["LayerGroup"].astype(str).eq(str(layer))].copy()
+            occupied_coords = np.column_stack(
+                [
+                    safe_numeric(occupied["CenterX"]).to_numpy(dtype=float),
+                    safe_numeric(occupied["CenterY"]).to_numpy(dtype=float),
+                    safe_numeric(occupied["CenterTime"]).to_numpy(dtype=float) * time_scale,
+                ]
+            )
+            occupied_coords = occupied_coords[np.isfinite(occupied_coords).all(axis=1)]
+            occupied_tree = cKDTree(occupied_coords)
+            for _, event in well_controls.sort_values("TIME").iterrows():
+                event_attrs = sampler.sample_points(
+                    pd.DataFrame(
+                        [{"X": event["X"], "Y": event["Y"], "TIME": event["TIME"]}]
+                    )
+                ).iloc[0]
+                for band_index, (ring_min, ring_max) in enumerate(bands):
+                    if len(patch_rows) >= max_total:
+                        break
+                    scale = scale_cycle[band_index % len(scale_cycle)]
+                    if scale not in allowed_scales:
+                        continue
+                    local = layer_pool[
+                        layer_pool["FractureScale"].astype(str).str.lower().eq(scale)
+                    ].copy()
+                    if local.empty:
+                        continue
+                    local = local[
+                        safe_numeric(local["CenterX"]).sub(float(event["X"])).abs().le(template_xy_radius)
+                        & safe_numeric(local["CenterY"]).sub(float(event["Y"])).abs().le(template_xy_radius)
+                        & safe_numeric(local["CenterTime"]).sub(float(event["TIME"])).abs().le(template_time_radius)
+                    ].copy()
+                    if local.empty:
+                        local = layer_pool[
+                            layer_pool["FractureScale"].astype(str).str.lower().eq(scale)
+                        ].copy()
+                        local["_distance"] = np.hypot(
+                            safe_numeric(local["CenterX"]).sub(float(event["X"])),
+                            safe_numeric(local["CenterY"]).sub(float(event["Y"])),
+                        ) + np.abs(safe_numeric(local["CenterTime"]).sub(float(event["TIME"]))) * time_scale
+                        local = local.nsmallest(min(template_limit, len(local)), "_distance")
+                    else:
+                        local["_distance"] = np.hypot(
+                            safe_numeric(local["CenterX"]).sub(float(event["X"])),
+                            safe_numeric(local["CenterY"]).sub(float(event["Y"])),
+                        ) + np.abs(safe_numeric(local["CenterTime"]).sub(float(event["TIME"]))) * time_scale
+                        local = local.nsmallest(min(template_limit, len(local)), "_distance")
+
+                    local_dip = float(np.nanmedian(safe_numeric(local["DipDeg"])))
+                    if not np.isfinite(local_dip) or local_dip < min_dip:
+                        continue
+                    azimuth_column = (
+                        "DipAzimuthDeg"
+                        if "DipAzimuthDeg" in local.columns and safe_numeric(local["DipAzimuthDeg"]).notna().any()
+                        else "AzimuthDeg"
+                    )
+                    local_azimuth = float(np.nanmedian(safe_numeric(local[azimuth_column])))
+                    if not np.isfinite(local_azimuth):
+                        local_azimuth = 0.0
+                    if azimuth_column == "AzimuthDeg":
+                        local_azimuth += 90.0
+                    dip_direction = np.asarray(
+                        [
+                            -np.sin(np.deg2rad(local_azimuth)),
+                            np.cos(np.deg2rad(local_azimuth)),
+                        ],
+                        dtype=float,
+                    )
+                    strike_direction = np.asarray(
+                        [-dip_direction[1], dip_direction[0]],
+                        dtype=float,
+                    )
+                    effective_min = max(ring_min, minimum_radius if band_index == 0 else ring_min)
+                    radius = 0.5 * (effective_min + ring_max)
+                    candidate_records: list[dict[str, Any]] = []
+                    for time_offset in time_offsets:
+                        if abs(time_offset) < min_time_offset:
+                            continue
+                        dip_shift = time_offset * time_scale / max(np.tan(np.deg2rad(local_dip)), 1.0e-6)
+                        if abs(dip_shift) >= radius:
+                            continue
+                        strike_shift = math.sqrt(max(radius * radius - dip_shift * dip_shift, 0.0))
+                        for strike_sign in (-1.0, 1.0):
+                            xy_offset = dip_shift * dip_direction + strike_sign * strike_shift * strike_direction
+                            template = local.iloc[
+                                min(
+                                    int(
+                                        2 * band_index
+                                        + (0 if strike_sign < 0 else 1)
+                                        + int(round(abs(time_offset)))
+                                    ),
+                                    len(local) - 1,
+                                )
+                            ]
+                            candidate_records.append(
+                                {
+                                    "WellName": str(well_name),
+                                    "LayerGroup": str(layer),
+                                    "WellControlSampleID": str(event["WellControlSampleID"]),
+                                    "RadialBandLabel": f"{ring_min:.0f}-{ring_max:.0f}m",
+                                    "RadialBandMinM": float(ring_min),
+                                    "RadialBandMaxM": float(ring_max),
+                                    "RadialDistanceM": float(radius),
+                                    "RequestedScale": scale,
+                                    "X": float(event["X"]) + float(xy_offset[0]),
+                                    "Y": float(event["Y"]) + float(xy_offset[1]),
+                                    "TIME": float(event["TIME"]) + float(time_offset),
+                                    "TimeOffsetFromControlMs": float(time_offset),
+                                    "TemplatePatchID": str(template["PatchID"]),
+                                    "_template": template,
+                                }
+                            )
+                    if not candidate_records:
+                        continue
+                    candidate_df = pd.DataFrame(candidate_records)
+                    candidate_attrs = sampler.sample_points(
+                        candidate_df[["X", "Y", "TIME"]]
+                    )
+                    attribute_columns = list(SEISMIC_ATTRIBUTE_COLUMNS.values())
+                    all_attribute_values = candidate_attrs.copy()
+                    all_attribute_values.loc[len(all_attribute_values)] = [
+                        event_attrs.get(column, np.nan)
+                        for column in attribute_columns
+                    ]
+                    distance_sq = np.zeros(len(candidate_df), dtype=float)
+                    total_weight = 0.0
+                    for attribute_name, column in SEISMIC_ATTRIBUTE_COLUMNS.items():
+                        values = safe_numeric(all_attribute_values[column]).to_numpy(dtype=float)
+                        normalized_scale = _robust_normalization_scale(
+                            values,
+                            attribute_floors.get(attribute_name, 1.0),
+                        )
+                        reference_value = values[-1]
+                        if not np.isfinite(reference_value):
+                            reference_value = float(np.nanmedian(values[:-1])) if np.isfinite(values[:-1]).any() else 0.0
+                        weight = attribute_weights.get(attribute_name, 1.0)
+                        distance_sq += weight * np.square(
+                            (values[:-1] - reference_value) / normalized_scale
+                        )
+                        total_weight += weight
+                    candidate_df["SeismicAttributeDistance"] = np.sqrt(
+                        distance_sq / max(total_weight, 1.0e-9)
+                    )
+                    candidate_df["SeismicSimilarity"] = np.exp(
+                        -0.5 * candidate_df["SeismicAttributeDistance"].to_numpy(dtype=float)
+                    )
+                    for column in attribute_columns:
+                        candidate_df[column] = candidate_attrs[column].to_numpy(dtype=float)
+                    candidate_df["RejectionReason"] = ""
+                    candidate_df.loc[
+                        candidate_attrs.isna().any(axis=1),
+                        "RejectionReason",
+                    ] = "missing_seismic_attribute"
+                    candidate_df.loc[
+                        candidate_df["SeismicSimilarity"] < minimum_similarity,
+                        "RejectionReason",
+                    ] = "below_minimum_similarity"
+                    candidate_coords = np.column_stack(
+                        [
+                            candidate_df["X"].to_numpy(dtype=float),
+                            candidate_df["Y"].to_numpy(dtype=float),
+                            candidate_df["TIME"].to_numpy(dtype=float) * time_scale,
+                        ]
+                    )
+                    nearest_distances, _ = occupied_tree.query(
+                        candidate_coords,
+                        k=1,
+                    )
+                    candidate_df["NearestExisting3DDistanceM"] = np.asarray(
+                        nearest_distances,
+                        dtype=float,
+                    )
+                    candidate_df.loc[
+                        candidate_df["NearestExisting3DDistanceM"] < min_separation,
+                        "RejectionReason",
+                    ] = "too_close_to_existing_patch"
+
+                    eligible = candidate_df[candidate_df["RejectionReason"].eq("")].copy()
+                    if eligible.empty:
+                        for _, rejected in candidate_df.iterrows():
+                            audit_rows.append(
+                                {
+                                    key: value
+                                    for key, value in rejected.items()
+                                    if key != "_template"
+                                }
+                                | {"Selected": 0}
+                            )
+                        continue
+                    selected = eligible.sort_values(
+                        ["SeismicSimilarity", "NearestExisting3DDistanceM"],
+                        ascending=[False, False],
+                    ).iloc[0]
+                    template = selected["_template"]
+                    serial += 1
+                    row = dict(template)
+                    row["PatchID"] = f"seismic_guided_dfn_{serial:06d}"
+                    row["OriginalPatchID"] = str(template["PatchID"])
+                    row["ParentPatchID"] = str(template["PatchID"])
+                    row["OriginalCenterX"] = float(template["CenterX"])
+                    row["OriginalCenterY"] = float(template["CenterY"])
+                    row["OriginalCenterTime"] = float(template["CenterTime"])
+                    row["CenterX"] = float(selected["X"])
+                    row["CenterY"] = float(selected["Y"])
+                    row["CenterTime"] = float(selected["TIME"])
+                    row["LengthM"] = float(template["LengthM"]) * size_multiplier
+                    row["HeightTimeMs"] = float(template["HeightTimeMs"]) * height_multiplier
+                    row["SourceDensity"] = float(template.get("SourceDensity", 0.5)) * (
+                        0.65 + 0.35 * float(selected["SeismicSimilarity"])
+                    )
+                    row["CorrectionAction"] = "add_density_compensation_patch"
+                    row["CorrectionReason"] = "seismic_similarity_guided_3d_density"
+                    row["SourceType"] = "seismic_guided_conventional_density"
+                    row["GenerationStage"] = "step8_seismic_guided_density"
+                    row["ControlSource"] = "seismic_guided_conventional_prediction"
+                    row["ControlX"] = float(event["X"])
+                    row["ControlY"] = float(event["Y"])
+                    row["ControlTime"] = float(event["TIME"])
+                    row["WellControlSampleID"] = f"seismic_{event['WellControlSampleID']}_{serial:06d}"
+                    row["WellControlWellName"] = str(well_name)
+                    row["IsWellControlPatch"] = 0
+                    row["IsImagingGroundTruth"] = 0
+                    row["IsImagingMatchPatch"] = 0
+                    row["IsDensityCompensationPatch"] = 1
+                    row["NeedsWellCorrection"] = 0
+                    row["Confidence"] = min(float(template.get("Confidence", 0.5)), 0.65)
+                    row["DensityCompensationWellName"] = str(well_name)
+                    row["DensityCompensationRing"] = str(selected["RadialBandLabel"])
+                    row["DensityCompensationRingMinM"] = float(selected["RadialBandMinM"])
+                    row["DensityCompensationRingMaxM"] = float(selected["RadialBandMaxM"])
+                    row["DensityCompensationRadialWeight"] = 1.0
+                    row["DensityCompensationTargetDensity"] = np.nan
+                    row["DensityCompensationCurrentDensity"] = np.nan
+                    row["DensityCompensationDeficit"] = np.nan
+                    row["DensityCompensationReferencePointWeight"] = np.nan
+                    row["NearestTrajectoryDistance"] = float(selected["NearestExisting3DDistanceM"])
+                    row["SeismicGuidedDensity"] = 1
+                    row["SeismicSimilarity"] = float(selected["SeismicSimilarity"])
+                    row["SeismicAttributeDistance"] = float(selected["SeismicAttributeDistance"])
+                    row["SeismicAntTrack"] = float(selected["SeismicAntTrack"])
+                    row["SeismicCoherence"] = float(selected["SeismicCoherence"])
+                    row["SeismicCurvatureMax"] = float(selected["SeismicCurvatureMax"])
+                    row["SeismicReferenceControlID"] = str(event["WellControlSampleID"])
+                    row["SeismicCandidateBand"] = str(selected["RadialBandLabel"])
+                    row["SeismicTemplatePatchID"] = str(selected["TemplatePatchID"])
+                    row["TimeOffsetFromControlMs"] = float(selected["TimeOffsetFromControlMs"])
+                    row["Minimum3DSeparationM"] = float(selected["NearestExisting3DDistanceM"])
+                    row.update(update_layer_window_from_surfaces(row, surface_lookup))
+                    if int(row.get("HorizonCenterInside", 0)) != 1:
+                        selected["RejectionReason"] = "outside_local_layer_window"
+                    else:
+                        patch_rows.append(row)
+                        occupied_tree = cKDTree(
+                            np.vstack(
+                                [
+                                    occupied_coords,
+                                    np.asarray(
+                                        [[row["CenterX"], row["CenterY"], row["CenterTime"] * time_scale]],
+                                        dtype=float,
+                                    ),
+                                ]
+                            )
+                        )
+                        occupied_coords = np.vstack(
+                            [
+                                occupied_coords,
+                                np.asarray(
+                                    [[row["CenterX"], row["CenterY"], row["CenterTime"] * time_scale]],
+                                    dtype=float,
+                                ),
+                            ]
+                        )
+                    for _, candidate in candidate_df.iterrows():
+                        is_selected = str(candidate["TemplatePatchID"]) == str(selected["TemplatePatchID"]) and (
+                            float(candidate["X"]) == float(selected["X"])
+                            and float(candidate["Y"]) == float(selected["Y"])
+                            and float(candidate["TIME"]) == float(selected["TIME"])
+                        )
+                        audit_rows.append(
+                            {
+                                key: value
+                                for key, value in candidate.items()
+                                if key != "_template"
+                            }
+                            | {
+                                "Selected": int(is_selected),
+                                "SelectionReason": (
+                                    str(selected["RejectionReason"])
+                                    if is_selected and selected["RejectionReason"]
+                                    else "selected_highest_seismic_similarity"
+                                    if is_selected
+                                    else candidate["RejectionReason"]
+                                    or "not_highest_similarity_in_band"
+                                ),
+                            }
+                        )
+    finally:
+        sampler.close()
+
+    patch_output = pd.DataFrame(patch_rows)
+    audit_output = pd.DataFrame(audit_rows)
+    selected_audit = audit_output[audit_output.get("Selected", pd.Series(dtype=int)).eq(1)]
+    identical_center_count = int(
+        patch_output.duplicated(["CenterX", "CenterY", "CenterTime"]).sum()
+        if not patch_output.empty
+        else 0
+    )
+    summary = {
+        "enabled": True,
+        "status": "applied" if not patch_output.empty else "no_selected_candidates",
+        "control_well_names": sorted(well_names),
+        "control_event_count": int(len(controls)),
+        "candidate_count": int(len(audit_output)),
+        "created_patch_count": int(len(patch_output)),
+        "created_patch_count_by_well": {
+            str(key): int(value)
+            for key, value in patch_output.get("DensityCompensationWellName", pd.Series(dtype=str)).value_counts().items()
+        },
+        "created_patch_count_by_layer": {
+            str(key): int(value)
+            for key, value in patch_output.get("LayerGroup", pd.Series(dtype=str)).value_counts().items()
+        },
+        "created_patch_count_by_scale": {
+            str(key): int(value)
+            for key, value in patch_output.get("FractureScale", pd.Series(dtype=str)).value_counts().items()
+        },
+        "created_patch_count_by_band": {
+            str(key): int(value)
+            for key, value in patch_output.get("SeismicCandidateBand", pd.Series(dtype=str)).value_counts().sort_index().items()
+        },
+        "seismic_similarity_min": float(selected_audit["SeismicSimilarity"].min()) if not selected_audit.empty else None,
+        "seismic_similarity_median": float(selected_audit["SeismicSimilarity"].median()) if not selected_audit.empty else None,
+        "seismic_similarity_max": float(selected_audit["SeismicSimilarity"].max()) if not selected_audit.empty else None,
+        "minimum_abs_center_time_offset_ms": float(selected_audit["TimeOffsetFromControlMs"].abs().min()) if not selected_audit.empty else None,
+        "minimum_selected_3d_separation_m": float(selected_audit["NearestExisting3DDistanceM"].min()) if not selected_audit.empty else None,
+        "identical_center_count": identical_center_count,
+        "horizontal_like_patch_count": int(
+            (
+                safe_numeric(patch_output.get("DipDeg", pd.Series(dtype=float))).lt(min_dip)
+                & safe_numeric(patch_output.get("TimeWindowMax", pd.Series(dtype=float))).notna()
+            ).sum()
+        ),
+        "parameter_summary": {
+            "radial_bands_m": [list(item) for item in bands],
+            "scale_cycle": scale_cycle,
+            "minimum_template_dip_deg": min_dip,
+            "minimum_abs_time_offset_ms": min_time_offset,
+            "minimum_3d_separation_m": min_separation,
+            "time_scale_m_per_ms": time_scale,
+            "attribute_weights": attribute_weights,
+            "trace_mapping_npz": str(mapping_path),
+            "volume_paths": {key: str(value) for key, value in volume_paths.items()},
+        },
+    }
+    return patch_output, audit_output, summary
+
+
 def correction_columns() -> list[str]:
     return [
         "OriginalPatchID",
@@ -919,6 +1506,15 @@ def force_well_control_small_scale(row: dict[str, Any], control: pd.Series, conf
 
 
 def offset_center_near_control(control: pd.Series, azimuth_deg: float, dip_deg: float, length_m: float, height_time_ms: float, config: dict[str, Any]) -> dict[str, float]:
+    if int(pd.to_numeric(pd.Series([control.get("ForceWellControlCenter", 0)]), errors="coerce").fillna(0).iloc[0]) == 1:
+        return {
+            "CenterX": float(control["X"]),
+            "CenterY": float(control["Y"]),
+            "CenterTime": float(control["TIME"]),
+            "CenterOffsetM": 0.0,
+            "CenterOffsetTimeMs": 0.0,
+            "ControlInsidePatchEnvelope": 1,
+        }
     if not bool(config.get("enable_well_control_center_offset", True)):
         return {
             "CenterX": float(control["X"]),
@@ -2031,10 +2627,26 @@ def main() -> int:
     initial_csv = Path(config["initial_dfn_csv"]).resolve()
     initial_vtk = Path(config["initial_dfn_vtk"]).resolve()
     fracture_csv = Path(config["fracture_points_csv"]).resolve()
+    additional_fracture_csvs = [
+        Path(str(value)).resolve()
+        for value in config.get("additional_fracture_points_csvs", [])
+    ]
     samples_root = Path(config["real_well_samples_root"]).resolve()
+    additional_samples_roots = [
+        Path(str(value)).resolve()
+        for value in config.get("additional_real_well_samples_roots", [])
+    ]
     initial_summary_json = Path(config.get("initial_dfn_summary_json", "")).resolve()
     surface_dir = Path(config["surface_dir"]).resolve() if config.get("surface_dir") else None
-    for label, path in [("initial_dfn_csv", initial_csv), ("initial_dfn_vtk", initial_vtk), ("fracture_points_csv", fracture_csv), ("real_well_samples_root", samples_root)]:
+    required_paths = [
+        ("initial_dfn_csv", initial_csv),
+        ("initial_dfn_vtk", initial_vtk),
+        ("fracture_points_csv", fracture_csv),
+        ("real_well_samples_root", samples_root),
+        *[(f"additional_fracture_points_csvs[{index}]", path) for index, path in enumerate(additional_fracture_csvs)],
+        *[(f"additional_real_well_samples_roots[{index}]", path) for index, path in enumerate(additional_samples_roots)],
+    ]
+    for label, path in required_paths:
         if not path.exists():
             raise FileNotFoundError(f"{label} does not exist: {path}")
     if surface_dir is not None and not surface_dir.exists():
@@ -2050,8 +2662,25 @@ def main() -> int:
     initial_df = load_initial_dfn(initial_csv)
     step4_control_df = load_control_points(fracture_csv, dict(config["target_block"]))
     raw_step4_count = int(len(step4_control_df))
+    additional_control_count = 0
+    for path in additional_fracture_csvs:
+        additional = load_control_points(path, dict(config["target_block"]))
+        additional["ControlSource"] = "new_conventional_prediction"
+        additional["IsNewConventionalControl"] = 1
+        additional["ForceWellControlCenter"] = 1
+        additional_control_count += int(len(additional))
+        step4_control_df = pd.concat([step4_control_df, additional], ignore_index=True, sort=False)
+    if "IsNewConventionalControl" in step4_control_df.columns:
+        step4_control_df["IsNewConventionalControl"] = (
+            safe_numeric(step4_control_df["IsNewConventionalControl"]).fillna(0).astype(int)
+        )
+    if "ForceWellControlCenter" in step4_control_df.columns:
+        step4_control_df["ForceWellControlCenter"] = (
+            safe_numeric(step4_control_df["ForceWellControlCenter"]).fillna(0).astype(int)
+        )
     step4_control_df = aggregate_step4_controls_to_events(step4_control_df, config=config)
     config["_raw_step4_control_count"] = raw_step4_count
+    config["_additional_control_point_count"] = additional_control_count
     config["_aggregated_step4_control_count"] = int(len(step4_control_df))
     step3_group_paths = [Path(str(value)).resolve() for value in config.get("step3_imaging_group_csvs", [])]
     for path in step3_group_paths:
@@ -2084,7 +2713,15 @@ def main() -> int:
         )
     )
     config["_imaging_match_calibration"] = imaging_match_calibration
-    tracks = load_real_well_tracks(samples_root, set(control_df["WellName"].astype(str).unique()))
+    track_roots = [samples_root, *additional_samples_roots]
+    tracks: dict[str, pd.DataFrame] = {}
+    for root in track_roots:
+        tracks.update(
+            load_real_well_tracks(
+                root,
+                set(control_df["WellName"].astype(str).unique()),
+            )
+        )
     time_scale = float(config.get("time_scale_m_per_ms", 2.0))
     surface_lookup = build_spatial_lookup(config)
     track_dist = nearest_track_distances(control_df, tracks, time_scale=time_scale)
@@ -2124,6 +2761,22 @@ def main() -> int:
             (region_audit_df["CorrectedSourceDensity"] - region_audit_df["OriginalSourceDensity"]).mean()
         ) if not region_audit_df.empty else 0.0,
     }
+    seismic_patches_df, seismic_audit_df, seismic_guided_summary = (
+        build_seismic_guided_density_patches(
+            patch_df=corrected_df,
+            initial_df=initial_df,
+            control_df=control_df,
+            config=config,
+            surface_lookup=surface_lookup,
+        )
+    )
+    if not seismic_patches_df.empty:
+        corrected_df = pd.concat(
+            [corrected_df, seismic_patches_df],
+            ignore_index=True,
+            sort=False,
+        )
+    config["_seismic_guided_densification_summary"] = seismic_guided_summary
     selected_imaging_controls = control_df[
         safe_numeric(
             control_df.get("IsImagingGroundTruth", pd.Series(0, index=control_df.index))
@@ -2190,6 +2843,15 @@ def main() -> int:
         paths["density_compensation_summary_csv"],
         index=False,
         encoding="utf-8-sig",
+    )
+    seismic_audit_df.to_csv(
+        paths["seismic_guided_audit_csv"],
+        index=False,
+        encoding="utf-8-sig",
+    )
+    paths["seismic_guided_summary_json"].write_text(
+        json.dumps(seismic_guided_summary, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
     )
     large_control_audit_df.to_csv(
         output_dir / "large_conventional_control_support.csv",
@@ -2262,6 +2924,15 @@ def main() -> int:
             ).value_counts().sort_index().items()
         },
     }
+    summary["seismic_guided_densification"] = dict(
+        config.get("_seismic_guided_densification_summary", {})
+    )
+    summary.setdefault("checks", {})["seismic_guided_density_has_no_duplicate_centers"] = bool(
+        summary["seismic_guided_densification"].get("identical_center_count", 0) == 0
+    )
+    summary.setdefault("checks", {})["seismic_guided_density_is_steep"] = bool(
+        summary["seismic_guided_densification"].get("horizontal_like_patch_count", 0) == 0
+    )
     summary.setdefault("checks", {})["imaging_match_ratio_within_85_90"] = bool(
         imaging_match_summary["geometry_match_ratio_within_required_interval"]
     )

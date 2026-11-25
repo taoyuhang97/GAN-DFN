@@ -34,8 +34,16 @@ from scipy.spatial import cKDTree
 
 
 INVALID = (-999.25, -9999.0, -99999.0, 9999.0, 99999.0)
-CURVES = ("GR", "RD", "RS")
-GR_PRIORITY = ("GR", "GR1", "GRSL")
+DEFAULT_CURVES = ("GR", "RD", "RS")
+CURVE_ALIASES = {
+    "GR": ("GR", "GR1", "GRSL"),
+    "AC": ("AC", "AC1", "DT", "DTC", "DT24"),
+    "CNL": ("CNL", "CNL3", "2CNL", "1CNL", "CN", "NPHI", "CNCF"),
+    "DEN": ("DEN", "DEN3", "3ZDEN", "2ZDEN", "1ZDEN", "RHOB", "ZDEN"),
+    "RD": ("RD", "RD1", "RD3", "1RD", "0RD"),
+    "RS": ("RS", "RS1", "RS3", "1RS", "0RS"),
+}
+CURVES = DEFAULT_CURVES
 DECISION_DATE = "2026-08-12"
 STRATA_UPPER = "上部复合层"
 STRATA_LOWER = "太古界风化壳"
@@ -47,7 +55,7 @@ WINDOW_COLUMNS = [
     "InImagingInterval", "InHorizonLayer", "UseCase",
     "LayerGroupByHorizon", "LayerGroupByImaging", "ImagingMDMin", "ImagingMDMax",
 ]
-SEGMENT_COLUMNS = ["MD", "TVD", "X", "Y", "TIME", "StrataName", "GR", "RD", "RS"] + WINDOW_COLUMNS
+SEGMENT_COLUMNS = ["MD", "TVD", "X", "Y", "TIME", "StrataName", *CURVES] + WINDOW_COLUMNS
 
 
 def fill_window_defaults(log: pd.DataFrame) -> pd.DataFrame:
@@ -104,13 +112,14 @@ def read_las_required(path: Path) -> tuple[pd.DataFrame, dict[str, str | None], 
         raise ValueError(f"invalid LAS sections: {path}")
 
     md_col = next((c for c in columns if c in ("DEPT", "DEPTH")), None)
-    gr_col = next((c for c in GR_PRIORITY if c in columns), None)
-    rd_col = "RD" if "RD" in columns else None
-    rs_col = "RS" if "RS" in columns else None
+    selected = {
+        curve: next((name for name in CURVE_ALIASES[curve] if name in columns), None)
+        for curve in CURVES
+    }
     if md_col is None:
         raise ValueError(f"LAS has no depth column: {path}")
 
-    wanted = {"MD": md_col, "GR": gr_col, "RD": rd_col, "RS": rs_col}
+    wanted = {"MD": md_col, **selected}
     indices = {name: columns.index(col) for name, col in wanted.items() if col is not None}
     max_index = max(indices.values()) if indices else -1
 
@@ -136,7 +145,7 @@ def read_las_required(path: Path) -> tuple[pd.DataFrame, dict[str, str | None], 
         out[c] = clean(out[c])
     out = out.dropna(subset=["MD"]).sort_values("MD").drop_duplicates("MD", keep="last").reset_index(drop=True)
     out = out.dropna(subset=list(CURVES)).reset_index(drop=True)
-    meta = {"GRSourceCurve": gr_col, "RDSourceCurve": rd_col, "RSSourceCurve": rs_col}
+    meta = {f"{curve}SourceCurve": source for curve, source in selected.items()}
     return out, meta, raw_rows
 
 
@@ -548,18 +557,20 @@ def make_segment(well: str, source_kind: str, seg_seq: int, source_path: Path, l
         "SourceKind": source_kind,
         "SourcePath": str(source_path),
         "LogDate": log_date_from_name(source_path.name),
-        "GRSourceCurve": meta.get("GRSourceCurve") or "",
-        "RDSourceCurve": meta.get("RDSourceCurve") or "",
-        "RSSourceCurve": meta.get("RSSourceCurve") or "",
+        **{
+            f"{curve}SourceCurve": meta.get(f"{curve}SourceCurve") or ""
+            for curve in CURVES
+        },
         "WindowID": window_id_str,
         "MDMin": float(log.MD.min()),
         "MDMax": float(log.MD.max()),
         "TVDMin": float(log.TVD.min()),
         "TVDMax": float(log.TVD.max()),
         "Rows": complete_rows,
-        "GRCompleteRows": complete_rows,
-        "RDCompleteRows": complete_rows,
-        "RSCompleteRows": complete_rows,
+        **{
+            f"{curve}CompleteRows": complete_rows
+            for curve in CURVES
+        },
         "RawRowsRead": int(raw_rows),
         "CompleteRatio": float(complete_rows / raw_rows) if raw_rows else np.nan,
         "TIMEValidRows": int(log.TIME.notna().sum()),
@@ -640,8 +651,17 @@ def process_well_segments(well: str, source_kind: str, candidates: list[tuple[Pa
 
 
 def main() -> int:
+    global CURVES, SEGMENT_COLUMNS
     ns = parse_args()
     cfg = json.loads(ns.config.read_text(encoding="utf-8"))
+    requested_curves = tuple(str(value).upper() for value in cfg.get("model_curves", DEFAULT_CURVES))
+    unknown = [curve for curve in requested_curves if curve not in CURVE_ALIASES]
+    if unknown or not requested_curves:
+        raise ValueError(f"unsupported model_curves: {unknown}")
+    CURVES = requested_curves
+    SEGMENT_COLUMNS = [
+        "MD", "TVD", "X", "Y", "TIME", "StrataName", *CURVES, *WINDOW_COLUMNS
+    ]
     out_dir = ns.output_dir or Path(cfg["output_dir"])
     if not out_dir.is_absolute():
         out_dir = Path(__file__).resolve().parents[2] / out_dir
@@ -753,9 +773,9 @@ def main() -> int:
             if not matched:
                 reason = "missing_regular_las"
             elif not parsed:
-                reason = "missing_gr_rd_rs_curves"
+                reason = "missing_model_curves"
             elif not complete:
-                reason = "no_complete_gr_rd_rs_coverage"
+                reason = "no_complete_model_curve_coverage"
             else:
                 reason = "no_target_interval"
             add_rejected(well, "regular", reason,
@@ -865,9 +885,9 @@ def main() -> int:
             if not matched:
                 reason = "missing_imaging_las"
             elif not parsed:
-                reason = "missing_gr_rd_rs_curves"
+                reason = "missing_model_curves"
             elif not complete:
-                reason = "no_complete_gr_rd_rs_coverage"
+                reason = "no_complete_model_curve_coverage"
             else:
                 reason = "no_target_interval"
             add_rejected(well, "imaging", reason,
@@ -926,7 +946,8 @@ def main() -> int:
 
     rejected_counts = {str(k): int(v) for k, v in rejected_df.Reason.value_counts().items()} if not rejected_df.empty else {}
     summary = {
-        "version": "taigu_step2_regular_v3",
+        "version": str(cfg.get("version", "taigu_step2_regular_v3")),
+        "model_curves": list(CURVES),
         "decision_date": DECISION_DATE,
         "wells_configured": int(len(well_df)),
         "wells_eligible": int(well_df.Step2Status.eq("eligible").sum()) if not well_df.empty else 0,

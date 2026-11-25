@@ -1,0 +1,51 @@
+{
+  "framework_id": "taigu_base_supp_pilot600_v2",
+  "area": "太古界·基底以下 600 ms 小范围验证区",
+  "metadata": {
+    "note": "原 405 井周 5×5 km 验证区；风化壳底以下拓展 600 ms，最深处截到 4800 ms。",
+    "pilot_block": {
+      "x_min": 663450.0,
+      "x_max": 668450.0,
+      "y_min": 4239250.0,
+      "y_max": 4244250.0,
+      "center_x": 665954.0,
+      "center_y": 4241759.0,
+      "half_cells": 200,
+      "source": "taigu_supp_pilot_ext300_v2 同一井周验证区"
+    },
+    "model_reuse": {
+      "基底以下补充层": "太古界风化壳",
+      "reason": "基底以下没有目标层真实裂缝训练标签，复用风化壳两阶段模型做低置信度代理。"
+    }
+  },
+  "surfaces": [
+    {
+      "id": "Base",
+      "label": "风化壳底",
+      "order": 1,
+      "legacy_column": "TopTimeMs"
+    },
+    {
+      "id": "BottomV",
+      "label": "基底以下 600 ms 虚拟底",
+      "order": 2,
+      "legacy_column": "BaseTimeMs"
+    }
+  ],
+  "layers": [
+    {
+      "code": 4,
+      "name": "基底以下补充层",
+      "top": "Base",
+      "base": "BottomV",
+      "color": "#22c55e",
+      "display_order": 3,
+      "inclusive_base": false,
+      "extension_ms": 600.0,
+      "presence_column": "BaseSuppPresent",
+      "time_class": "base_below_600",
+      "slug": "base_supp"
+    }
+  ],
+  "legacy_layer_aliases": {}
+}

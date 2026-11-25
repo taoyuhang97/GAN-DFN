@@ -1,0 +1,41 @@
+{
+  "version": "formal_new_well_inference_20261125",
+  "model_root": "/home/tyh/projects/petroleum/code/GAN-DFN/优化阶段二/正式主线/step4_expert_real_well_prediction/output/formal_multilog_expert_library_v2",
+  "training_feature_table": "/home/tyh/projects/petroleum/code/GAN-DFN/优化阶段二/正式主线/step4_expert_real_well_prediction/output/formal_multilog_expert_library_v2/training_feature_table.csv",
+  "existing_wells_root": "/home/tyh/projects/petroleum/code/GAN-DFN/优化阶段二/正式主线/step2_real_well_t4_t7_samples/output/formal_all_wells",
+  "time_depth_dir": "/data/shared/project-oil/wx数据/砂砾岩/时深",
+  "layer_dir": "/data/shared/project-oil/wx数据/砂砾岩/层位",
+  "trace_header_csv": "/home/tyh/projects/petroleum/code/GAN-DFN/数据精简/trace_header_xy.csv",
+  "output_dir": "/home/tyh/projects/petroleum/code/GAN-DFN/优化阶段二/正式主线/step4_expert_real_well_prediction/output/formal_new_well_inference_20261125",
+  "time_depth_borrow": {
+    "strategy": "nearest_full_md_tvd_coverage",
+    "time_mapping_axis": "TVD",
+    "require_source_md_range_covers_target": true,
+    "require_source_tvd_range_covers_target": true
+  },
+  "max_support_gap_m": 0.5,
+  "wells": [
+    {
+      "well_name": "车152",
+      "source_las": "/data/shared/project-oil/wx数据/砂砾岩/车镇--新井/c152.las",
+      "deviation_path": "/data/shared/project-oil/wx数据/砂砾岩/车镇--新井/c152_dev_all.txt",
+      "deviation_format": "whitespace",
+      "input_pair_type": "LLD_LLS",
+      "wellhead_x": 575760.42,
+      "wellhead_y": 4202380.17,
+      "wellhead_kb_m": 10.67,
+      "coordinate_note": "docx 纵(X)=4202380.17 是 Northing；横(Y)=20575760.42 去掉 20000000 带号后为 Easting"
+    },
+    {
+      "well_name": "车斜155",
+      "source_las": "/data/shared/project-oil/wx数据/砂砾岩/车镇--新井/chexie155_cur1.las",
+      "deviation_path": "/data/shared/project-oil/wx数据/砂砾岩/车镇--新井/车斜155井井斜数据.csv",
+      "deviation_format": "csv_cn",
+      "input_pair_type": "RD_RS",
+      "wellhead_x": 575039.57,
+      "wellhead_y": 4204709.89,
+      "wellhead_kb_m": 10.5,
+      "coordinate_note": "docx 纵(X)=4204709.89 是 Northing；横(Y)=20575039.57 去掉 20000000 带号后为 Easting"
+    }
+  ]
+}

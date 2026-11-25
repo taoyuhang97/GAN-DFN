@@ -28,12 +28,21 @@ if _imaging_log_spec is None or _imaging_log_spec.loader is None:
 imaging_log_overlay = importlib.util.module_from_spec(_imaging_log_spec)
 _imaging_log_spec.loader.exec_module(imaging_log_overlay)
 IMAGING_LOG_STYLE = imaging_log_overlay.IMAGING_LOG_STYLE
+IMAGING_LOG_STYLE.update(
+    {
+        "color": "#00BCD4",
+        "halo_color": "#00BCD4",
+        "line_width": 2.5,
+        "halo_width": 2.5,
+        "label": "成像测井段",
+    }
+)
 
 
 SCALE_STYLES = {
-    "small": ("小尺度", 1.10),
-    "medium": ("中尺度", 2.20),
-    "large": ("大尺度", 3.20),
+    "small": ("小尺度裂缝", "#43A047", 1.0),
+    "medium": ("中尺度裂缝", "#FF9800", 1.5),
+    "large": ("大尺度裂缝", "#AD1457", 2.0),
 }
 SAND_LAYERS = [
     ("沙三段（T4–T6）", "#ff7a00"),
@@ -134,39 +143,16 @@ def section_legend_handles(
 ) -> list[Line2D]:
     """Build DFN, well and fault handles with the Taigu legend drawing contract."""
 
-    handles = [
-        Line2D([0], [0], color=color, linewidth=3.0, label=label)
-        for label, color in layers
-    ]
+    handles: list[Line2D] = []
     for scale in scales:
-        if scale == "large":
-            handles.append(
-                outlined_handle(
-                    color="#6b7280",
-                    linewidth=SCALE_STYLES[scale][1],
-                    label=SCALE_STYLES[scale][0],
-                    halo_color="#111827",
-                    halo_width=5.2,
-                )
-            )
-        else:
-            handles.append(
-                Line2D(
-                    [0],
-                    [0],
-                    color="#111827",
-                    linewidth=SCALE_STYLES[scale][1],
-                    label=SCALE_STYLES[scale][0],
-                )
-            )
+        label, color, width = SCALE_STYLES[scale]
+        handles.append(Line2D([0], [0], color=color, linewidth=width, label=label))
     handles.extend(
         [
             outlined_handle(
-                color="#ffea00",
-                linewidth=2.2,
+                color="#1A237E",
+                linewidth=2.5,
                 label=well_label,
-                halo_color="#5b4b00",
-                halo_width=3.6,
             ),
             outlined_handle(
                 color=IMAGING_LOG_STYLE["color"],
@@ -176,11 +162,9 @@ def section_legend_handles(
                 halo_width=IMAGING_LOG_STYLE["halo_width"],
             ),
             outlined_handle(
-                color="#ffe600",
-                linewidth=2.3,
+                color="#B22222",
+                linewidth=2.5,
                 label="原始断层",
-                halo_color="#111827",
-                halo_width=4.6,
             ),
         ]
     )

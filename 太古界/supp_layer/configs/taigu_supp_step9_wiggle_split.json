@@ -16,6 +16,7 @@
   "step2_segments_root": "太古界/step2_well_log_segments/output/taigu_step2_regular_md1",
   "step3_groups_root": "太古界/step3_imaging_groups/output/taigu_step3_imaging_md1/groups",
   "step8_patches_csv": "太古界/supp_layer/output/taigu_supp_merged_v1/merged_dfn_patches.csv",
+  "imaging_match_selection_audit_csv": "太古界/supp_layer/output/taigu_supp_step8_density_balance_v1/step8_supp/imaging_match_selection_audit.csv",
   "sample_cache": "太古界/supp_layer/output/taigu_supp_step9_v1/sections/section_samples/local_200m/seisamp_section_samples.npz",
   "local_axis_radius_m": 200.0,
   "section_sample_interval_ms": 2.0,
@@ -25,6 +26,34 @@
   ],
   "dfn_projection_half_width_m": 200.0,
   "time_scale_m_per_ms": 2.0,
+  "large_fracture_anchor_conditioning": {
+    "enabled": true,
+    "move_fraction": 0.45,
+    "anchor_radius_m": 250.0,
+    "max_cluster_offset_m": 300.0,
+    "halo_distance_power": 0.75,
+    "longitudinal_jitter_fraction": 0.01,
+    "anchor_lateral_ranges_m": [
+      300.0,
+      300.0
+    ],
+    "sparse_band_half_width_m": 20.0,
+    "sparse_band_density_ratio": 0.9,
+    "sparse_band_quota_multiplier": 1.4,
+    "horizontal_balance_band_ms": [
+      2790.0,
+      2820.0
+    ],
+    "horizontal_balance_flank_ranges_ms": [
+      [2760.0, 2790.0],
+      [2820.0, 2850.0]
+    ],
+    "horizontal_balance_ratio": 1.0,
+    "well_clearance_m": 10.0,
+    "orientation_sigma_deg": 22.0,
+    "neighbor_max_orientation_weight": 0.30,
+    "random_seed": 405
+  },
   "segment_join": {
     "tolerance_m": "auto",
     "half_step_multiplier": 0.5,
@@ -85,11 +114,7 @@
       "color": "#dc2626",
       "line_width": 2.15,
       "alpha": 0.88
-    },
-    "display_length_range_m": [
-      20.0,
-      120.0
-    ]
+    }
   },
   "wiggle": {
     "local_max_trace_count": 0,

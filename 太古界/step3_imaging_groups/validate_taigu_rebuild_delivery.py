@@ -55,10 +55,33 @@ def main() -> int:
     group_checks: list[dict[str, object]] = []
 
     manifest = read_csv(output / "sample_group_manifest.csv")
+    group_sources = (
+        read_csv(output / "group_source_manifest.csv")
+        if (output / "group_source_manifest.csv").exists()
+        else pd.DataFrame()
+    )
+    group_membership = (
+        read_csv(output / "group_segment_membership.csv")
+        if (output / "group_segment_membership.csv").exists()
+        else pd.DataFrame()
+    )
     point_qc = read_csv(output / "point_mapping_qc.csv")
     wells_without = read_csv(output / "wells_without_groups.csv") if (output / "wells_without_groups.csv").exists() else pd.DataFrame()
     rejected = read_csv(step2_root / "taigu_step2_rejected_wells.csv") if (step2_root / "taigu_step2_rejected_wells.csv").exists() else pd.DataFrame()
     rejected_reason = {str(r.WellName): str(r.Reason) for _, r in rejected.iterrows()} if not rejected.empty else {}
+    manifest_group_ids = set(manifest.GroupID.astype(str)) if not manifest.empty else set()
+    source_group_ids = set(group_sources.GroupID.astype(str)) if not group_sources.empty else set()
+    group_source_manifest_ok = manifest_group_ids == source_group_ids
+    if not group_source_manifest_ok:
+        errors.append("group_source_manifest_does_not_cover_manifest_groups")
+    membership_keys_ok = (
+        not group_membership.empty
+        and {"GroupID", "GroupRowID", "LogSegmentPath"}.issubset(group_membership.columns)
+        and not group_membership.duplicated(["GroupID", "GroupRowID"]).any()
+        and set(group_membership.GroupID.astype(str)) == manifest_group_ids
+    )
+    if not membership_keys_ok:
+        errors.append("group_segment_membership_is_missing_or_incomplete")
 
     # 1) + 2) per-group checks
     expected_columns = list(LABEL_COLUMNS)
@@ -130,8 +153,10 @@ def main() -> int:
 
     status = "pass" if not errors else "fail"
     summary = {
-        "version": "taigu_step3_imaging_v3_delivery_validation",
+        "version": f"{cfg.get('version', 'taigu_step3_imaging_v3')}_delivery_validation",
         "status": status,
+        "group_source_manifest_ok": group_source_manifest_ok,
+        "group_membership_keys_ok": membership_keys_ok,
         "group_checks": group_checks,
         "well_checks": well_checks,
         "point_checks": point_checks,

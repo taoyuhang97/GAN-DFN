@@ -593,7 +593,14 @@ def main() -> int:
         "all_layers_have_positive_density_rows": all(
             summary["positive_rows"] > 0 for summary in layer_summaries.values()
         ),
-        "crust_validation_is_3_fold_loo": layer_summaries["太古界风化壳"]["validation_fold_count"] == 3,
+        "all_layers_use_available_source_well_loo": all(
+            layer_summaries[layer]["validation_fold_count"]
+            == min(
+                int(config["layers"][layer]["validation_group_folds"]),
+                int(layer_summaries[layer]["source_well_count"]),
+            )
+            for layer in ("上部复合层", "太古界风化壳")
+        ),
     }
     status = "pass" if all(checks.values()) else "fail"
     artifact = {

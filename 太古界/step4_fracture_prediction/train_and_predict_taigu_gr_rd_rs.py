@@ -30,7 +30,7 @@ from xgboost import XGBClassifier, XGBRegressor
 STRATA_UPPER = "上部复合层"
 STRATA_LOWER = "太古界风化壳"
 TARGET_STRATA = (STRATA_UPPER, STRATA_LOWER)
-FEATURE_COLUMNS = [
+BASE_FEATURE_COLUMNS = [
     "GR", "RDeep", "RReference",
     "GRRobustZ", "RDeepRobustZ", "RReferenceRobustZ",
     "GRRank", "RDeepRank", "RReferenceRank",
@@ -47,6 +47,95 @@ FEATURE_COLUMNS = [
     "DeepNonPositiveFlag", "ReferenceNonPositiveFlag",
 ]
 
+MULTILOG_FEATURE_COLUMNS = list(BASE_FEATURE_COLUMNS)
+for _prefix in ("AC", "CNL", "DEN"):
+    MULTILOG_FEATURE_COLUMNS.extend(
+        [f"{_prefix}RobustZ", f"{_prefix}Rank", f"{_prefix}GradientZ"]
+    )
+    for _window in (0.5, 1.0, 3.0, 5.0):
+        MULTILOG_FEATURE_COLUMNS.append(
+            f"{_prefix}Residual{str(_window).replace('.', 'p')}MZ"
+        )
+    for _window in (1.0, 3.0, 5.0):
+        MULTILOG_FEATURE_COLUMNS.append(f"{_prefix}MAD{int(_window)}MZ")
+MULTILOG_FEATURE_COLUMNS.extend(
+    [
+        "AC_CNL_Separation",
+        "AC_DEN_Separation",
+        "CNL_DEN_Separation",
+        "GRxACResidual",
+        "GRxCNLResidual",
+        "GRxDensityResidual",
+    ]
+)
+
+FEATURE_COLUMNS = list(BASE_FEATURE_COLUMNS)
+REQUIRE_MULTILOG_CURVES = False
+
+TAIGU_MERGED_MAIN_COLUMNS = [
+    "WellName",
+    "TVD",
+    "MD",
+    "X",
+    "Y",
+    "TIME",
+    "StrataName",
+    "PredFractureProb",
+    "PredConditionalDensity",
+    "PredDensity",
+    "GR",
+    "AC",
+    "CNL",
+    "DEN",
+    "RD",
+    "RS",
+    "PredictionValid",
+    "Stage1Threshold",
+    "ExpertID",
+    "PredHasFracture",
+    "InImagingInterval",
+    "InHorizonLayer",
+    "UseCase",
+]
+TAIGU_MERGED_PROVENANCE_COLUMNS = [
+    "WellName",
+    "TVD",
+    "SupportSegmentID",
+    "SegmentStartTVD",
+    "SegmentEndTVD",
+    "SourceCount",
+    "SourceSegmentIDs",
+    "SelectedSegmentID",
+    "MergeRule",
+]
+TAIGU_POINT_MAIN_COLUMNS = [
+    "WellName",
+    "TVD",
+    "MD",
+    "X",
+    "Y",
+    "TIME",
+    "StrataName",
+    "PredDensity",
+    "PredFractureProb",
+    "PointOrdinalInSegment",
+    "IntervalID",
+    "DensityBin",
+    "ThicknessBin",
+    "RuleSource",
+]
+TAIGU_POINT_PROVENANCE_COLUMNS = [
+    "WellName",
+    "TVD",
+    "SupportSegmentID",
+    "PointOrdinalInSegment",
+    "IntervalID",
+    "IntervalStartTVD",
+    "IntervalEndTVD",
+    "SourceCount",
+    "SourceSegmentIDs",
+]
+
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Train and predict TaiGuJie GR/RD/RS fracture experts (v1)")
@@ -54,6 +143,24 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--output-dir", type=Path, default=None)
     p.add_argument("--replace-existing-output", action="store_true")
     return p.parse_args()
+
+
+def write_main_and_provenance(
+    frame: pd.DataFrame,
+    main_path: Path,
+    provenance_path: Path,
+    main_columns: list[str],
+    provenance_columns: list[str],
+) -> None:
+    """Write lean data separately from repeated source/merge traceability."""
+    main_path.parent.mkdir(parents=True, exist_ok=True)
+    provenance_path.parent.mkdir(parents=True, exist_ok=True)
+    frame[[column for column in main_columns if column in frame.columns]].to_csv(
+        main_path, index=False, encoding="utf-8-sig"
+    )
+    frame[[column for column in provenance_columns if column in frame.columns]].to_csv(
+        provenance_path, index=False, encoding="utf-8-sig"
+    )
 
 
 def numeric(values: pd.Series) -> pd.Series:
@@ -131,6 +238,9 @@ def engineer_batch_window_features(segment: pd.DataFrame) -> pd.DataFrame:
         "RDeep": deep_signed,
         "RReference": reference_signed,
     }
+    if REQUIRE_MULTILOG_CURVES:
+        for curve in ("AC", "CNL", "DEN"):
+            transformed[curve] = numeric(out[curve])
     for prefix, values in transformed.items():
         out[f"{prefix}Gradient"] = depth_gradient(values, depth)
         for window_m in (0.5, 1.0, 3.0, 5.0):
@@ -150,7 +260,10 @@ def cross_segment_window_columns(max_window_m: float) -> list[str]:
     深度梯度只用相邻行，等价于最小窗口，因此一并纳入。
     """
     columns: list[str] = []
-    for prefix in ("GR", "RDeep", "RReference"):
+    prefixes = ("GR", "RDeep", "RReference")
+    if REQUIRE_MULTILOG_CURVES:
+        prefixes = (*prefixes, "AC", "CNL", "DEN")
+    for prefix in prefixes:
         columns.append(f"{prefix}Gradient")
         for window_m in (0.5, 1.0, 3.0, 5.0):
             if window_m <= max_window_m + 1.0e-9:
@@ -179,8 +292,15 @@ def add_scaled_features(out: pd.DataFrame) -> pd.DataFrame:
     out["GRRank"] = numeric(out["GR"]).rank(method="average", pct=True)
     out["RDeepRank"] = numeric(out["RDeep"]).rank(method="average", pct=True)
     out["RReferenceRank"] = numeric(out["RReference"]).rank(method="average", pct=True)
+    if REQUIRE_MULTILOG_CURVES:
+        for curve in ("AC", "CNL", "DEN"):
+            out[f"{curve}RobustZ"] = robust_z(numeric(out[curve]))
+            out[f"{curve}Rank"] = numeric(out[curve]).rank(method="average", pct=True)
 
-    for prefix in ("GR", "RDeep", "RReference"):
+    prefixes = ["GR", "RDeep", "RReference"]
+    if REQUIRE_MULTILOG_CURVES:
+        prefixes.extend(["AC", "CNL", "DEN"])
+    for prefix in prefixes:
         out[f"{prefix}GradientZ"] = robust_z(out[f"{prefix}Gradient"])
         for window_m in (0.5, 1.0, 3.0, 5.0):
             suffix = str(window_m).replace(".", "p")
@@ -197,9 +317,19 @@ def add_scaled_features(out: pd.DataFrame) -> pd.DataFrame:
     out["GRxDeepResidual"] = out["GRRobustZ"] * out["RDeepResidual1p0MZ"]
     out["GRxReferenceResidual"] = out["GRRobustZ"] * out["RReferenceResidual1p0MZ"]
     out["GRxNormalizedContrast"] = out["GRRobustZ"] * out["NormalizedContrast"]
+    if REQUIRE_MULTILOG_CURVES:
+        out["AC_CNL_Separation"] = out["ACRobustZ"] - out["CNLRobustZ"]
+        out["AC_DEN_Separation"] = out["ACRobustZ"] - out["DENRobustZ"]
+        out["CNL_DEN_Separation"] = out["CNLRobustZ"] - out["DENRobustZ"]
+        out["GRxACResidual"] = out["GRRobustZ"] * out["ACResidual1p0MZ"]
+        out["GRxCNLResidual"] = out["GRRobustZ"] * out["CNLResidual1p0MZ"]
+        out["GRxDensityResidual"] = out["GRRobustZ"] * out["DENResidual1p0MZ"]
     out["DeepNonPositiveFlag"] = numeric(out["RDeep"]).le(0.0).astype(int)
     out["ReferenceNonPositiveFlag"] = numeric(out["RReference"]).le(0.0).astype(int)
-    out["ModelInputEligible"] = out[["GR", "RDeep", "RReference"]].notna().all(axis=1)
+    required = ["GR", "RDeep", "RReference"]
+    if REQUIRE_MULTILOG_CURVES:
+        required.extend(["AC", "CNL", "DEN"])
+    out["ModelInputEligible"] = out[required].notna().all(axis=1)
     return out
 
 
@@ -453,7 +583,22 @@ def load_training_table(config: dict[str, Any]) -> pd.DataFrame:
         group = pd.read_csv(g.GroupPath, encoding="utf-8-sig")
         frames.append(group)
     labels = pd.concat(frames, ignore_index=True)
-    labels["SegmentID"] = labels["InputSegmentPath"].apply(lambda p: str(Path(p).stem))
+    if "InputSegmentPath" in labels.columns:
+        labels["SegmentID"] = labels["InputSegmentPath"].apply(lambda p: str(Path(p).stem))
+        labels = labels.drop(columns=["InputSegmentPath"])
+    else:
+        membership = pd.read_csv(step3_root / "group_segment_membership.csv", encoding="utf-8-sig")
+        membership = membership.rename(columns={"LogSegmentPath": "InputSegmentPath"})
+        labels = labels.merge(
+            membership,
+            on=["GroupID", "GroupRowID"],
+            how="left",
+            validate="one_to_one",
+        )
+        if labels.InputSegmentPath.isna().any():
+            raise RuntimeError("Step3 group rows have no log-segment membership")
+        labels["SegmentID"] = labels["InputSegmentPath"].apply(lambda p: str(Path(p).stem))
+        labels = labels.drop(columns=["InputSegmentPath"])
     seg_frames = []
     for _, seg in manifest.iterrows():
         df = pd.read_csv(seg.OutputFilePath, encoding="utf-8-sig")
@@ -461,8 +606,11 @@ def load_training_table(config: dict[str, Any]) -> pd.DataFrame:
         df["SegmentID"] = str(seg.SegmentID)
         seg_frames.append(df)
     segments = pd.concat(seg_frames, ignore_index=True)
+    curve_columns = ["GR", "RD", "RS"]
+    if bool(config.get("use_multilog_conventional_curves", False)):
+        curve_columns = ["GR", "AC", "CNL", "DEN", "RD", "RS"]
     training = labels.merge(
-        segments[["WellName", "TVD", "SegmentID", "GR", "RD", "RS"]],
+        segments[["WellName", "TVD", "SegmentID", *curve_columns]],
         on=["WellName", "TVD", "SegmentID"], how="left", validate="one_to_one",
     )
     training = training[training.StrataName.isin(TARGET_STRATA)].copy()
@@ -681,7 +829,8 @@ def _select_within_clusters(rows: pd.DataFrame, gap_break_m: float,
     selected["SegmentEndTVD"] = selected["SupportSegmentID"].map(bounds["max"])
     columns = [
         "WellName", "TVD", "MD", "X", "Y", "TIME", "StrataName",
-        "PredFractureProb", "PredConditionalDensity", "PredDensity", "GR", "RD", "RS",
+        "PredFractureProb", "PredConditionalDensity", "PredDensity",
+        "GR", "AC", "CNL", "DEN", "RD", "RS",
         "SourceCount", "SourceSegmentIDs", "SelectedSegmentID",
         "PredictionValid", "Stage1Threshold", "ExpertID", "PredHasFracture",
         "SupportSegmentID", "SegmentStartTVD", "SegmentEndTVD", "MergeRule",
@@ -744,27 +893,33 @@ def merge_well_predictions(rows: pd.DataFrame, tolerance_m: float, gap_break_m: 
         return _select_within_clusters(rows, gap_break_m, select_priority or [
             "segment_rows_desc", "log_date_desc", "segment_id_asc",
         ])
-    agg = rows.groupby("ClusterID").agg(
-        WellName=("WellName", "first"),
-        TVD=("TVD", "mean"),
-        MD=("MD", "mean"),
-        X=("X", "mean"),
-        Y=("Y", "mean"),
-        TIME=("TIME", "mean"),
-        StrataName=("StrataName", "first"),
-        PredFractureProb=("PredFractureProb", "mean"),
-        PredConditionalDensity=("PredConditionalDensity", "mean"),
-        PredDensity=("PredDensity", "mean"),
-        GR=("GR", "mean"), RD=("RD", "mean"), RS=("RS", "mean"),
-        SourceCount=("SegmentID", "nunique"),
-        SourceSegmentIDs=("SegmentID", lambda s: ";".join(sorted(set(s)))),
-        PredictionValid=("PredictionValid", "first"),
-        Stage1Threshold=("Stage1Threshold", "first"),
-        ExpertID=("ExpertID", "first"),
+    agg_spec: dict[str, tuple[str, Any]] = {
+        "WellName": ("WellName", "first"),
+        "TVD": ("TVD", "mean"),
+        "MD": ("MD", "mean"),
+        "X": ("X", "mean"),
+        "Y": ("Y", "mean"),
+        "TIME": ("TIME", "mean"),
+        "StrataName": ("StrataName", "first"),
+        "PredFractureProb": ("PredFractureProb", "mean"),
+        "PredConditionalDensity": ("PredConditionalDensity", "mean"),
+        "PredDensity": ("PredDensity", "mean"),
+        "GR": ("GR", "mean"),
+        "RD": ("RD", "mean"),
+        "RS": ("RS", "mean"),
+        "SourceCount": ("SegmentID", "nunique"),
+        "SourceSegmentIDs": ("SegmentID", lambda s: ";".join(sorted(set(s)))),
+        "PredictionValid": ("PredictionValid", "first"),
+        "Stage1Threshold": ("Stage1Threshold", "first"),
+        "ExpertID": ("ExpertID", "first"),
         # v5：把取样窗口标记透传到井级预测表，供 Step5 只取目标地层内（InHorizonLayer=1）
-        InImagingInterval=("InImagingInterval", "max"),
-        InHorizonLayer=("InHorizonLayer", "max"),
-    ).reset_index(drop=True)
+        "InImagingInterval": ("InImagingInterval", "max"),
+        "InHorizonLayer": ("InHorizonLayer", "max"),
+    }
+    for curve in ("AC", "CNL", "DEN"):
+        if curve in rows.columns:
+            agg_spec[curve] = (curve, "mean")
+    agg = rows.groupby("ClusterID").agg(**agg_spec).reset_index(drop=True)
     if {"InImagingInterval", "InHorizonLayer"}.issubset(agg.columns):
         agg["UseCase"] = np.where(
             agg["InImagingInterval"].eq(1) & agg["InHorizonLayer"].eq(1), "both",
@@ -1064,7 +1219,9 @@ def predict_all_wells(config: dict[str, Any], experts: dict[str, dict[str, Any]]
         step2_root = Path(__file__).resolve().parents[2] / step2_root
     manifest = pd.read_csv(step2_root / "taigu_step2_segment_manifest.csv", encoding="utf-8-sig")
     per_well_root = prediction_root / "real_well_predictions"
+    provenance_root = prediction_root.parent / "provenance"
     per_well_root.mkdir(parents=True, exist_ok=True)
+    provenance_root.mkdir(parents=True, exist_ok=True)
     detail_parts = []
     merged_parts = []
     coverage_rows = []
@@ -1094,7 +1251,13 @@ def predict_all_wells(config: dict[str, Any], experts: dict[str, dict[str, Any]]
             merged_parts.append(merged)
             well_dir = per_well_root / well
             well_dir.mkdir(parents=True, exist_ok=True)
-            merged.to_csv(well_dir / f"{well}_merged_density_prediction.csv", index=False, encoding="utf-8-sig")
+            write_main_and_provenance(
+                merged,
+                well_dir / f"{well}_merged_density_prediction.csv",
+                provenance_root / "per_well" / f"{well}_merged_density_provenance.csv",
+                TAIGU_MERGED_MAIN_COLUMNS,
+                TAIGU_MERGED_PROVENANCE_COLUMNS,
+            )
             detail.to_csv(well_dir / f"{well}_source_detail_predictions.csv", index=False, encoding="utf-8-sig")
             coverage_rows.append({
                 "WellName": well, "Status": "ok", "Rows": int(len(merged)),
@@ -1104,7 +1267,13 @@ def predict_all_wells(config: dict[str, Any], experts: dict[str, dict[str, Any]]
     detail_all = pd.concat(detail_parts, ignore_index=True) if detail_parts else pd.DataFrame()
     merged_all = pd.concat(merged_parts, ignore_index=True) if merged_parts else pd.DataFrame()
     detail_all.to_csv(prediction_root / "all_wells_source_detail_predictions.csv", index=False, encoding="utf-8-sig")
-    merged_all.to_csv(prediction_root / "all_wells_merged_density_prediction.csv", index=False, encoding="utf-8-sig")
+    write_main_and_provenance(
+        merged_all,
+        prediction_root / "all_wells_merged_density_prediction.csv",
+        provenance_root / "all_wells_merged_density_provenance.csv",
+        TAIGU_MERGED_MAIN_COLUMNS,
+        TAIGU_MERGED_PROVENANCE_COLUMNS,
+    )
     coverage = pd.DataFrame(coverage_rows)
     return detail_all, merged_all, coverage_rows, coverage
 
@@ -1157,8 +1326,13 @@ def overlap_diagnostics(detail: pd.DataFrame) -> pd.DataFrame:
 
 
 def main() -> int:
+    global FEATURE_COLUMNS, REQUIRE_MULTILOG_CURVES
     ns = parse_args()
     cfg = json.loads(ns.config.read_text(encoding="utf-8"))
+    REQUIRE_MULTILOG_CURVES = bool(cfg.get("use_multilog_conventional_curves", False))
+    FEATURE_COLUMNS = list(
+        MULTILOG_FEATURE_COLUMNS if REQUIRE_MULTILOG_CURVES else BASE_FEATURE_COLUMNS
+    )
     out_dir = ns.output_dir or Path(cfg["output_dir"])
     if not out_dir.is_absolute():
         out_dir = Path(__file__).resolve().parents[2] / out_dir
@@ -1229,7 +1403,15 @@ def main() -> int:
     scales = point_count_scales(training, [str(w) for w in cfg["point_wells"]])
     refine = refine_points(merged_all, cfg, training)
     points = refine["points"]
-    points.to_csv(prediction_dir / "all_wells_merged_fracture_points.csv", index=False, encoding="utf-8-sig")
+    provenance_dir = out_dir / "provenance"
+    provenance_dir.mkdir(parents=True, exist_ok=True)
+    write_main_and_provenance(
+        points,
+        prediction_dir / "all_wells_merged_fracture_points.csv",
+        provenance_dir / "all_wells_merged_fracture_points_provenance.csv",
+        TAIGU_POINT_MAIN_COLUMNS,
+        TAIGU_POINT_PROVENANCE_COLUMNS,
+    )
     refine["intervals"].to_csv(prediction_dir / "all_wells_refine_intervals.csv", index=False, encoding="utf-8-sig")
     refine["interval_audit"].to_csv(qc_dir / "refine_interval_audit.csv", index=False, encoding="utf-8-sig")
     (model_dir / "refine_rule_library.json").write_text(
@@ -1262,9 +1444,40 @@ def main() -> int:
         bad = merged_all[~np.isfinite(merged_all[["PredFractureProb", "PredDensity"]].to_numpy(dtype=float)).all(axis=1)]
         if len(bad):
             errors.append("merged table has non-finite predictions")
+    forbidden_main_columns = {
+        "SupportSegmentID",
+        "SegmentStartTVD",
+        "SegmentEndTVD",
+        "SourceCount",
+        "SourceSegmentIDs",
+        "SelectedSegmentID",
+        "MergeRule",
+        "IntervalStartTVD",
+        "IntervalEndTVD",
+    }
+    main_prediction_files = [
+        prediction_dir / "all_wells_merged_density_prediction.csv",
+        prediction_dir / "all_wells_merged_fracture_points.csv",
+    ]
+    main_tables_have_no_source_fields = all(
+        not (forbidden_main_columns & set(pd.read_csv(path, nrows=0).columns))
+        for path in main_prediction_files
+    )
+    if not main_tables_have_no_source_fields:
+        errors.append("main prediction table contains repeated source/provenance fields")
+    provenance_files_exist = all(
+        path.exists()
+        for path in [
+            provenance_dir / "all_wells_merged_density_provenance.csv",
+            provenance_dir / "all_wells_merged_fracture_points_provenance.csv",
+        ]
+    )
+    if not provenance_files_exist:
+        errors.append("prediction provenance tables are missing")
     status = "pass" if not errors else "fail"
+    version = str(cfg.get("version", "taigu_step4_gr_rd_rs_v1"))
     summary = {
-        "version": "taigu_step4_gr_rd_rs_v1",
+        "version": version,
         "status": status,
         "training_wells": sorted(training.WellName.unique().astype(str)),
         "training_rows": int(len(training)),
@@ -1282,14 +1495,19 @@ def main() -> int:
         "refine_floors": refine["floors"],
         "refine_interval_count": int(len(refine["intervals"])),
         "refine_rule_count": int(len(refine["library"])),
+        "feature_contract": cfg.get("feature_contract"),
+        "main_tables_have_no_source_fields": main_tables_have_no_source_fields,
+        "provenance_files_exist": provenance_files_exist,
         "errors": errors,
     }
     (out_dir / "taigu_step4_acceptance_summary.json").write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
     manifest = {
-        "version": "taigu_step4_gr_rd_rs_v1",
+        "version": version,
         "all_wells_merged_prediction_table": str(prediction_dir / "all_wells_merged_density_prediction.csv"),
         "all_wells_source_detail_table": str(prediction_dir / "all_wells_source_detail_predictions.csv"),
         "all_wells_fracture_points_table": str(prediction_dir / "all_wells_merged_fracture_points.csv"),
+        "merged_density_provenance": str(provenance_dir / "all_wells_merged_density_provenance.csv"),
+        "fracture_point_provenance": str(provenance_dir / "all_wells_merged_fracture_points_provenance.csv"),
         "all_wells_refine_intervals_table": str(prediction_dir / "all_wells_refine_intervals.csv"),
         "refine_rule_library": str(model_dir / "refine_rule_library.json"),
         "refine_interval_audit": str(qc_dir / "refine_interval_audit.csv"),

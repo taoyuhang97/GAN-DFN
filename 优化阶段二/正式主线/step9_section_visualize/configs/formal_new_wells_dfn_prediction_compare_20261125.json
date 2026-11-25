@@ -1,0 +1,64 @@
+{
+  "version": "formal_new_wells_dfn_prediction_compare_20261125",
+  "prediction_points_csv": "/home/tyh/projects/petroleum/code/GAN-DFN/优化阶段二/正式主线/step4_expert_real_well_prediction/output/formal_new_well_inference_20261125/predictions/all_new_wells_fracture_points.csv",
+  "real_well_samples_root": "/home/tyh/projects/petroleum/code/GAN-DFN/优化阶段二/正式主线/step4_expert_real_well_prediction/output/formal_new_well_inference_20261125/step2_like",
+  "trace_header_csv": "/home/tyh/projects/petroleum/code/GAN-DFN/数据精简/trace_header_xy.csv",
+  "surface_dir": "/data/shared/project-oil/wx数据/砂砾岩/层位",
+  "seismic_volume": "/data/shared/project-oil/wx数据/砂砾岩/psdm_final_time.sgy",
+  "horizon_trace_table_path": "/home/tyh/projects/petroleum/code/GAN-DFN/优化阶段二/正式主线/common/horizon_trace_table/output/formal_horizon_trace_table_v2_mine/horizon_trace_table.npy",
+  "horizon_contract_table": "/home/tyh/projects/petroleum/code/GAN-DFN/优化阶段二/正式主线/common/horizon_trace_table/output/formal_horizon_trace_table_v2_mine/horizon_trace_table.npy",
+  "target_block": {
+    "x_min": 556150,
+    "x_max": 581650,
+    "y_min": 4193975,
+    "y_max": 4212275
+  },
+  "local_axis_radius_m": 200.0,
+  "dfn_half_width_m": 200.0,
+  "match_tolerance_m": 1.0,
+  "orientation_neighbor_count": 24,
+  "orientation_max_distance_m": 300.0,
+  "orientation_distance_scale_m": 80.0,
+  "orientation_time_scale_m_per_ms": 2.0,
+  "prediction_segment_half_length_m": 12.5,
+  "time_padding_ms": 20.0,
+  "axis_sample_count": 0,
+  "horizon_curve_iteration_count": 12,
+  "figure_width": 18.0,
+  "figure_height": 8.5,
+  "dpi": 260,
+  "output_dir": "/home/tyh/projects/petroleum/code/GAN-DFN/优化阶段二/正式主线/step9_section_visualize/output/new_well_dfn_prediction_sections_20261125",
+  "colors": {
+    "small": "#2E7D32",
+    "medium": "#F57C00",
+    "large": "#AD1457",
+    "original_fault": "#5D4037",
+    "prediction": "#D50000",
+    "well": "#111111",
+    "match": "#00ACC1"
+  },
+  "wells": [
+    {
+      "well_name": "车152",
+      "trajectory_csv": "/home/tyh/projects/petroleum/code/GAN-DFN/优化阶段二/正式主线/step4_expert_real_well_prediction/output/formal_new_well_inference_20261125/step2_like/车152/车152_t4_t7_real_well_main.csv"
+    },
+    {
+      "well_name": "车斜155",
+      "trajectory_csv": "/home/tyh/projects/petroleum/code/GAN-DFN/优化阶段二/正式主线/step4_expert_real_well_prediction/output/formal_new_well_inference_20261125/step2_like/车斜155/车斜155_t4_t7_real_well_main.csv"
+    }
+  ],
+  "dfn_versions": [
+    {
+      "name": "step7d_before_well_control",
+      "label": "Step7D 井控前",
+      "input_vtk": "/home/tyh/projects/petroleum/code/GAN-DFN/优化阶段二/正式主线/output/formal_mine_multiscale_flow_v1_seg1/step7d_fused_medium_count36000_v1/fused_multiscale_dfn_raw_time.vtk",
+      "dfn_patch_csv": "/home/tyh/projects/petroleum/code/GAN-DFN/优化阶段二/正式主线/output/formal_mine_multiscale_flow_v1_seg1/step7d_fused_medium_count36000_v1/fused_multiscale_dfn_patches.csv"
+    },
+    {
+      "name": "step8_after_well_control",
+      "label": "Step8 新增井+地震引导加密",
+      "input_vtk": "/home/tyh/projects/petroleum/code/GAN-DFN/优化阶段二/正式主线/output/formal_mine_multiscale_flow_v1_seg1/step8_new_wells_seismic_guided_v1/well_corrected_dfn_raw_time.vtk",
+      "dfn_patch_csv": "/home/tyh/projects/petroleum/code/GAN-DFN/优化阶段二/正式主线/output/formal_mine_multiscale_flow_v1_seg1/step8_new_wells_seismic_guided_v1/well_corrected_dfn_fracture_patches.csv"
+    }
+  ]
+}

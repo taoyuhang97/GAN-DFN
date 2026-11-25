@@ -152,6 +152,70 @@ python3 太古界/supp_layer/plot_supp_step9_wiggle_split.py \
   --config 太古界/supp_layer/configs/taigu_supp_step9_wiggle_split.json
 ```
 
+右上大裂缝周边的定向小裂缝加密由独立后处理完成，不重新移动已条件化的
+井周裂缝。当前 `v2` 以 `staged_v4` 的局部条件化交线为输入，对
+`SourceIndex=371350` 大裂缝周边新增 256 条小尺度裂缝扰动副本：
+
+```bash
+python3 太古界/supp_layer/enrich_supp_small_patches_near_large.py \
+  --input-csv 太古界/supp_layer/output/taigu_supp_step9_imaging_dfn_200m_staged_v4/local_conditioned_dfn_patches.csv \
+  --output-csv 太古界/supp_layer/output/taigu_supp_step9_imaging_dfn_200m_staged_v4_style_v2_upper_right_enriched/upper_right_large_enriched_source_patches.csv \
+  --summary-json 太古界/supp_layer/output/taigu_supp_step9_imaging_dfn_200m_staged_v4_style_v2_upper_right_enriched/upper_right_large_enrichment_summary.json \
+  --anchor-source-index 371350 \
+  --added-count 256
+```
+
+随后将 `upper_right_large_enriched_source_patches.csv` 作为
+`plot_supp_step9_wiggle_split.py --dfn-csv` 的输入，并关闭二次大裂缝锚定
+条件化。该加密只增加小尺度副本，不改动成像锁定裂缝、井控裂缝、中尺度
+和大尺度裂缝。
+
+若上半成像段的井上裂缝仍明显密于相交大裂缝周边，可继续以 `v2`
+加密结果为输入，并限定 `2746–2808 ms` 做第二级局部加密：
+
+```bash
+python3 太古界/supp_layer/enrich_supp_small_patches_near_large.py \
+  --input-csv 太古界/supp_layer/output/taigu_supp_step9_imaging_dfn_200m_staged_v4_style_v2_upper_right_enriched/upper_right_large_enriched_source_patches.csv \
+  --output-csv 太古界/supp_layer/output/taigu_supp_step9_imaging_dfn_200m_staged_v4_style_v3_upper_segment_enriched/upper_segment_large_enriched_source_patches.csv \
+  --summary-json 太古界/supp_layer/output/taigu_supp_step9_imaging_dfn_200m_staged_v4_style_v3_upper_segment_enriched/upper_segment_large_enrichment_summary.json \
+  --anchor-source-index 371350 \
+  --added-count 180 \
+  --enrichment-stage upper_imaging_segment_large_fracture_enrichment_v3 \
+  --time-min-ms 2746 --time-max-ms 2808 \
+  --lateral-sigma-m 22 --max-lateral-offset-m 45 \
+  --longitudinal-sigma-m 5 --max-longitudinal-offset-m 10 \
+  --azimuth-sigma-deg 2 --dip-sigma-deg 2 --seed 406
+```
+
+`v4` 进一步平滑右上方大裂缝沿纵深方向的小裂缝密度。该步骤保持裂缝总数、
+倾角、倾向和到大裂缝的水平偏移不变，仅重排沿 TIME 方向的位置：
+
+```bash
+python3 太古界/supp_layer/smooth_small_patches_along_large.py \
+  --input-csv 太古界/supp_layer/output/taigu_supp_step9_imaging_dfn_200m_staged_v4_style_v3_upper_segment_enriched/upper_segment_large_enriched_source_patches.csv \
+  --output-csv 太古界/supp_layer/output/taigu_supp_step9_imaging_dfn_200m_staged_v4_style_v4_wake_smoothed/wake_smoothed_source_patches.csv \
+  --summary-json 太古界/supp_layer/output/taigu_supp_step9_imaging_dfn_200m_staged_v4_style_v4_wake_smoothed/wake_smoothing_summary.json \
+  --anchor-source-index 371350 \
+  --time-min-ms 2744 --time-max-ms 2862 \
+  --smoothing-strength 0.85 --bin-width-ms 10 --seed 20261122
+```
+
+若上半成像段仍表现为“井上密、大裂缝周围稀”，可继续把对应小裂缝的水平
+横向偏移压缩到 55%。该步骤保持 TIME 和产状不变，并逐条检查井轨迹，
+恢复任何会新增井交点的小裂缝位置：
+
+```bash
+python3 太古界/supp_layer/concentrate_small_patches_near_large.py \
+  --input-csv 太古界/supp_layer/output/taigu_supp_step9_imaging_dfn_200m_staged_v4_style_v4_wake_smoothed/wake_smoothed_source_patches.csv \
+  --output-csv 太古界/supp_layer/output/taigu_supp_step9_imaging_dfn_200m_staged_v4_style_v5_upper_wake_concentrated/upper_wake_concentrated_source_patches.csv \
+  --summary-json 太古界/supp_layer/output/taigu_supp_step9_imaging_dfn_200m_staged_v4_style_v5_upper_wake_concentrated/upper_wake_concentration_summary.json \
+  --anchor-source-index 371350 \
+  --time-min-ms 2744 --time-max-ms 2812 \
+  --lateral-scale-factor 0.55 \
+  --well-track-dir 太古界/step2_well_log_segments/output/taigu_step2_regular_md1 \
+  --well-name 埕北古斜405
+```
+
 矿区分尺度波形剖面可单独重跑：
 
 ```bash
@@ -198,6 +262,10 @@ python3 scripts/build_step9_standalone_legends.py
 | **Step9 波形+变面积拆分** | 同一窗口：波形+变面积底图；两张图统一使用原 Step9 的黄色轨迹“Step3成像井”图例标识；DFN 直接使用 `DipAzimuthDeg/DipDeg` 求剖面交线，不使用历史 VTK `V1..V4` 顶点；图例置于画布下方 |
 | **Step9 矿区分尺度波形** | `status=pass`，5 套组合共 10 图；颜色和线宽按大/中/小尺度统一，图为 XZ/YZ 剖面 |
 | **Step9 独立图例** | `status=pass`，3 套 PNG/SVG；太古界首列为“裂缝尺度”，用青、橙、红分别表示小、中、大尺度，旧三层裂缝标签和灰度图例均已移除 |
+| **Step9 右上大裂缝定向加密 v2** | `status=pass`；`SourceIndex=371350` 周边小裂缝 818→1074，三维源数据新增 256 条；XZ 选入交线 2398→2645，中/大尺度数量不变 |
+| **Step9 上半成像段定向加密 v3** | `status=pass`；`2746–2808 ms` 内大裂缝横向 30 m 小裂缝 126→178、45 m 内 167→237；XZ 选入交线 2645→2824，中/大尺度数量不变 |
+| **Step9 右上大裂缝密度平滑 v4** | `status=pass`；`2744–2862 ms` 小裂缝总数保持 1048 条；10 ms 分箱数量波动系数 0.269→0.089 |
+| **Step9 上半段大裂缝周边集中 v5** | `status=pass`；`2744–2812 ms` 内 30 m 横向带 161→239、45 m 带 214→310；未新增井交点，总裂缝数不变 |
 
 ## 7. 与原代码的接口
 

@@ -1,5 +1,22 @@
 # Step 3 Imaging Supervision Samples
 
+## 多曲线精简主表（2026-11-23）
+
+当前入口为 `configs/taigu_step3_imaging_multilog_v2.json`，输出
+`output/taigu_step3_imaging_multilog_v2`。组表不再重复保存 LAS 路径、密度源路径和
+点位源路径；这些信息分别存放在：
+
+```text
+group_source_manifest.csv
+group_segment_membership.csv
+source_manifest.csv
+density_source_merge_audit.csv
+imaging_window_registry.csv
+```
+
+`group_segment_membership.csv` 使用 `GroupID + GroupRowID` 回连所属测井段。
+组表本身只保留标签、产状点和取样窗口相关数据。
+
 # Step 3 Imaging Supervision Samples
 
 > 本目录同时保留砂砾岩正式主线的 README 与脚本。**太古界实际入口是

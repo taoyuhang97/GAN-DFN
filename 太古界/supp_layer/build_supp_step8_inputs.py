@@ -45,7 +45,18 @@ def main() -> int:
     parser.add_argument("--initial-vtk", type=Path, default=INITIAL_VTK)
     parser.add_argument("--initial-summary", type=Path, default=INITIAL_SUMMARY)
     parser.add_argument("--supp-group", type=Path, default=SUPP_GROUP)
+    parser.add_argument("--membership-csv", type=Path, default=None)
     parser.add_argument("--legacy-csv", type=Path, default=LEGACY_CSV)
+    parser.add_argument(
+        "--original-fault-manifest",
+        type=Path,
+        default=(
+            SUPP
+            / "taigu_supp_legacy_v1"
+            / "step6c_supp"
+            / "original_fault_unit_manifest.csv"
+        ),
+    )
     parser.add_argument("--output-dir", type=Path, default=OUTPUT)
     args = parser.parse_args()
 
@@ -54,6 +65,23 @@ def main() -> int:
     groups_dir.mkdir(parents=True, exist_ok=True)
 
     group = pd.read_csv(args.supp_group, encoding="utf-8-sig")
+    membership_path = (
+        args.membership_csv.resolve()
+        if args.membership_csv is not None
+        else args.supp_group.resolve().parent.parent / "group_segment_membership.csv"
+    )
+    if "InputSegmentPath" not in group.columns and membership_path.exists():
+        membership = pd.read_csv(membership_path, encoding="utf-8-sig")
+        required_membership = {"GroupID", "GroupRowID", "LogSegmentPath"}
+        if required_membership.issubset(membership.columns):
+            group = group.merge(
+                membership[
+                    ["GroupID", "GroupRowID", "LogSegmentPath"]
+                ].rename(columns={"LogSegmentPath": "InputSegmentPath"}),
+                on=["GroupID", "GroupRowID"],
+                how="left",
+                validate="one_to_one",
+            )
     for column in ("StrataName", "LayerGroupByHorizon", "LayerGroupByImaging"):
         if column in group.columns:
             group[column] = "上部复合层"
@@ -70,7 +98,7 @@ def main() -> int:
         "initial_dfn_vtk": str(args.initial_vtk.resolve()),
         "initial_dfn_summary_json": str(args.initial_summary.resolve()),
         "original_fault_manifest_csv": str(
-            SUPP / "taigu_supp_legacy_v1/step6c_supp/original_fault_unit_manifest.csv"
+            args.original_fault_manifest.resolve()
         ),
         "step3_groups_root": str(groups_dir),
         "horizon_contract_table": str(args.legacy_csv.resolve()),

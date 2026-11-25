@@ -2,6 +2,16 @@
 
 # Step4 常规测井裂缝预测当前正式文档
 
+## 太古界多曲线精简主表（2026-11-23）
+
+当前多曲线入口为 `configs/taigu_step4_multilog_v2.json`，输出
+`output/taigu_step4_multilog_v2`。输入为 Step2 `taigu_step2_multilog_v1` 和
+Step3 `taigu_step3_imaging_multilog_v2`。
+
+模型使用 `GR/AC/CNL/DEN/RD/RS`，并加入声波-中子、声波-密度、中子-密度分离量及
+三条曲线与 GR 的交互特征。合并曲线主表只保留曲线和预测结果；来源段、合并规则、
+支撑段范围放在 `provenance/` 下，不进入模型，也不在主表逐行重复。
+
 > **太古界实际入口**：`train_and_predict_taigu_gr_rd_rs.py`（配置
 > `configs/taigu_step4_gr_rd_rs_v1.json`，输出
 > `output/taigu_step4_gr_rd_rs_v1`）。它训练两个地层专家

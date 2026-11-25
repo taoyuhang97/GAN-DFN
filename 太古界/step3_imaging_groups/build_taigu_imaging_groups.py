@@ -46,10 +46,10 @@ import pandas as pd
 
 INVALID = (-999.25, -9999.0, -99999.0, 9999.0, 99999.0)
 LABEL_COLUMNS = [
-    "GroupID", "WellName", "InputSegmentPath", "MD", "TVD", "StrataName",
+    "GroupID", "GroupRowID", "WellName", "MD", "TVD", "StrataName",
     "Density", "DensityRaw", "DensityScaleFactor", "ImagingWindowID",
     "HasFractureDensity", "GT_POINT_FLAG", "RawPointCount", "FracAzimuth", "FracDip",
-    "DensityKind", "FractureScope", "DensitySourcePaths", "PointSourcePaths",
+    "DensityKind", "FractureScope",
     "DensitySupportStatus", "SupervisionStatus", "SupervisionTier",
     # v5：Step2 的取样窗口标记（成像段管标签、层位段管预测）
     "InImagingInterval", "InHorizonLayer", "UseCase",
@@ -187,6 +187,8 @@ def runs_of(depth: np.ndarray, gap_break_m: float | None = None) -> list[tuple[f
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Build TaiGuJie Step3 imaging supervision groups (v3)")
     p.add_argument("--config", type=Path, default=Path(__file__).with_name("configs") / "taigu_step3_imaging_groups.json")
+    p.add_argument("--step2-output-dir", type=Path)
+    p.add_argument("--output-dir", type=Path)
     p.add_argument("--replace-output", action="store_true")
     return p.parse_args()
 
@@ -432,8 +434,8 @@ def split_groups(labels: pd.DataFrame) -> list[pd.DataFrame]:
 def main() -> int:
     ns = parse_args()
     cfg = json.loads(ns.config.read_text(encoding="utf-8"))
-    step2_root = Path(cfg["step2_output_dir"])
-    output = Path(cfg["output_dir"])
+    step2_root = Path(ns.step2_output_dir or cfg["step2_output_dir"])
+    output = Path(ns.output_dir or cfg["output_dir"])
     if not step2_root.is_absolute():
         step2_root = Path(__file__).resolve().parents[2] / step2_root
     if not output.is_absolute():
@@ -455,6 +457,8 @@ def main() -> int:
     density_source_rows: list[dict[str, object]] = []
     calibration_rows: list[dict[str, object]] = []
     window_rows: list[dict[str, object]] = []
+    group_source_rows: list[dict[str, object]] = []
+    group_membership_rows: list[dict[str, object]] = []
     out_of_coverage_rows: list[dict[str, object]] = []
     unmapped_rows: list[dict[str, object]] = []
     wells_without_groups: list[dict[str, object]] = []
@@ -638,16 +642,31 @@ def main() -> int:
 
         for coverage_index, group in enumerate(split_groups(labels), start=1):
             group_id = f"{well}_g{coverage_index:03d}_{group.StrataName.iloc[0]}"
+            group = group.copy()
+            input_segment_paths = "|".join(
+                sorted(group.InputSegmentPath.dropna().astype(str).unique())
+            )
             group["GroupID"] = group_id
+            group["GroupRowID"] = np.arange(1, len(group) + 1, dtype=int)
             group["HasFractureDensity"] = group["Density"].gt(0.0).astype(int)
             group["DensityKind"] = well_cfg["density_kind"]
             group["FractureScope"] = well_cfg["fracture_scope"]
-            group["DensitySourcePaths"] = density_paths
-            group["PointSourcePaths"] = point_paths
             group["SupervisionStatus"] = well_cfg["supervision_status"]
             group["SupervisionTier"] = supervision_tier
             group_window_id = str(group.ImagingWindowID.iloc[0])
             group_scale = float(window_scale.get(group_window_id, density_scale))
+            group_source_rows.append({
+                "GroupID": group_id,
+                "WellName": well,
+                "LogSegmentPaths": input_segment_paths,
+                "DensitySourcePaths": density_paths,
+                "PointSourcePaths": point_paths,
+            })
+            group_membership_rows.extend(
+                group[["GroupID", "GroupRowID", "MD", "InputSegmentPath"]]
+                .rename(columns={"InputSegmentPath": "LogSegmentPath"})
+                .to_dict("records")
+            )
             group = group[LABEL_COLUMNS]
             group_path = groups_dir / f"{group_id}.csv"
             group.to_csv(group_path, index=False, encoding="utf-8-sig")
@@ -662,7 +681,8 @@ def main() -> int:
                 "DensityMedian": float(group.Density.median()),
                 "DensityMax": float(group.Density.max()),
                 "DensityPositiveRatio": float(group.HasFractureDensity.mean()),
-                "GTPointRows": int(group.GT_POINT_FLAG.sum()), "InputSegmentPaths": "|".join(sorted(group.InputSegmentPath.dropna().unique().astype(str))),
+                "GTPointRows": int(group.GT_POINT_FLAG.sum()),
+                "InputSegmentPaths": input_segment_paths,
                 "CoLocatedPointCount": int(max(0, int(group.RawPointCount.sum()) - int(group.GT_POINT_FLAG.sum()))),
                 "GroupPath": str(group_path), "DensityKind": well_cfg["density_kind"], "FractureScope": well_cfg["fracture_scope"],
                 "SupervisionStatus": well_cfg["supervision_status"],
@@ -712,6 +732,12 @@ def main() -> int:
                  "Reason", "NearestGridMD", "DistanceToGridM"],
     )
     group_df.to_csv(output / "sample_group_manifest.csv", index=False, encoding="utf-8-sig")
+    pd.DataFrame(group_source_rows).to_csv(
+        output / "group_source_manifest.csv", index=False, encoding="utf-8-sig"
+    )
+    pd.DataFrame(group_membership_rows).to_csv(
+        output / "group_segment_membership.csv", index=False, encoding="utf-8-sig"
+    )
     source_df.to_csv(output / "source_manifest.csv", index=False, encoding="utf-8-sig")
     point_qc.to_csv(output / "point_mapping_qc.csv", index=False, encoding="utf-8-sig")
     density_source_df.to_csv(output / "density_source_merge_audit.csv", index=False, encoding="utf-8-sig")
@@ -764,7 +790,7 @@ def main() -> int:
             })
 
     summary = {
-        "version": "taigu_step3_imaging_v4",
+        "version": str(cfg.get("version", "taigu_step3_imaging_v4")),
         "group_count": int(len(group_df)),
         "well_count": int(group_df.WellName.nunique()) if not group_df.empty else 0,
         "group_rows": int(group_df.Rows.sum()) if not group_df.empty else 0,

@@ -47,6 +47,16 @@ IMAGING_LOG_STYLE = imaging_log_overlay.IMAGING_LOG_STYLE
 add_imaging_log_track = imaging_log_overlay.add_imaging_log_track
 imaging_log_track_summary = imaging_log_overlay.imaging_log_track_summary
 load_imaging_log_track = imaging_log_overlay.load_imaging_log_track
+IMAGING_LOG_STYLE.update(
+    {
+        "color": "#00BCD4",
+        "halo_color": "#00BCD4",
+        "line_width": 2.5,
+        "halo_width": 2.5,
+        "label": "成像测井段",
+        "zorder": 5.2,
+    }
+)
 DEFAULT_CONFIG = HERE / "configs" / "taigu_supp_step9_scale_wiggle.json"
 SPLIT_SCRIPT = HERE / "plot_supp_step9_wiggle_split.py"
 ORIGINAL_STEP9 = TAIGU / "step9_sections" / "build_taigu_multibackground_sections.py"
@@ -99,8 +109,14 @@ TAIGU_DISPLAY_LAYER_MAP = {
     "上部复合层": "上部复合层",
     "上部补充层": "上部复合层",
     "太古界风化壳": "太古界风化壳",
+    "基底以下补充层": "太古界风化壳",
 }
-TAIGU_SCALE_WIDTHS = {"small": 1.10, "medium": 2.20, "large": 3.20}
+TAIGU_SCALE_COLORS = {
+    "small": "#43A047",
+    "medium": "#FF9800",
+    "large": "#AD1457",
+}
+TAIGU_SCALE_WIDTHS = {"small": 1.0, "medium": 1.5, "large": 2.0}
 TAIGU_SCALE_ALPHA = {"small": 0.72, "medium": 0.92, "large": 0.98}
 
 
@@ -245,13 +261,25 @@ def load_dfn(config: dict[str, Any]) -> pd.DataFrame:
         "DipAzimuthDeg",
         "DipDeg",
     ]
+    available = set(pd.read_csv(
+        resolve_path(config["step8_patches_csv"]),
+        nrows=0,
+    ).columns)
+    usecols = list(columns)
+    if "Local200Replacement" in available:
+        usecols.append("Local200Replacement")
     frame = pd.read_csv(
         resolve_path(config["step8_patches_csv"]),
-        usecols=columns,
+        usecols=usecols,
         low_memory=False,
     )
     for column in columns[2:]:
         frame[column] = pd.to_numeric(frame[column], errors="coerce")
+    if "Local200Replacement" not in frame.columns:
+        frame["Local200Replacement"] = 0
+    frame["Local200Replacement"] = (
+        pd.to_numeric(frame["Local200Replacement"], errors="coerce").fillna(0)
+    )
     frame = frame.dropna(
         subset=[
             "CenterX",
@@ -280,14 +308,19 @@ def select_for_plane(
     well_perp = np.interp(
         frame["CenterTime"].to_numpy(np.float64), track_time, track_perp
     )
-    mask = (
-        frame[center_column].between(float(coords[0]), float(coords[-1]))
-        & (
+    local_replacement = frame["Local200Replacement"].fillna(0).eq(1).to_numpy()
+    mask = frame[center_column].between(
+        float(coords[0]),
+        float(coords[-1]),
+    ) & (
+        (
             np.abs(
-                frame[f"Center{perpendicular}"].to_numpy(np.float64) - well_perp
+                frame[f"Center{perpendicular}"].to_numpy(np.float64)
+                - well_perp
             )
             <= float(half_width_m)
         )
+        | local_replacement
     )
     return frame[mask].copy()
 
@@ -499,7 +532,6 @@ def render_one(
     background = plot_wiggle(ax, values, coords, times, config, original)
     horizon_handles = add_horizons(ax, coords, curves, config)
 
-    formation_handles: list[Line2D] = []
     counts: dict[str, int] = {
         scale: 0 for scale in scale_set.scales
     }
@@ -512,20 +544,10 @@ def render_one(
             lines = dfn_by_layer_scale.get((layer, scale), np.empty((0, 2, 2)))
             if not len(lines):
                 continue
-            if scale == "large":
-                ax.add_collection(
-                    LineCollection(
-                        lines,
-                        colors="#111827",
-                        linewidths=5.2,
-                        alpha=0.82,
-                        zorder=2.5,
-                    )
-                )
             ax.add_collection(
                 LineCollection(
                     lines,
-                    colors=TAIGU_LAYER_COLORS[layer],
+                    colors=TAIGU_SCALE_COLORS[scale],
                     linewidths=TAIGU_SCALE_WIDTHS[scale],
                     alpha=TAIGU_SCALE_ALPHA[scale],
                     zorder=2.2 if scale == "small" else 2.4 if scale == "medium" else 2.6,
@@ -535,27 +557,17 @@ def render_one(
             layer_count += int(len(lines))
         if layer_count:
             counts_by_layer[layer] = layer_count
-            formation_handles.append(
-                Line2D(
-                    [0],
-                    [0],
-                    color=TAIGU_LAYER_COLORS[layer],
-                    linewidth=3.0,
-                    label=layer,
-                )
-            )
     scale_handles = [
         Line2D(
             [0],
             [0],
-            color="#111827",
+            color=TAIGU_SCALE_COLORS[scale],
             linewidth=TAIGU_SCALE_WIDTHS[scale],
             label=config["scale_style"][scale]["label"],
         )
         for scale in ("small", "medium", "large")
         if scale in scale_set.scales and counts.get(scale, 0) > 0
     ]
-    scale_handles = [*formation_handles, *scale_handles]
 
     fault_count = 0
     fault_handle = None
@@ -564,17 +576,8 @@ def render_one(
         ax.add_collection(
             LineCollection(
                 fault_segments,
-                colors=style["halo_color"],
-                linewidths=float(style["halo_width"]),
-                alpha=0.62,
-                zorder=2.8,
-            )
-        )
-        ax.add_collection(
-            LineCollection(
-                fault_segments,
-                colors=style["color"],
-                linewidths=float(style["line_width"]),
+                colors="#B22222",
+                linewidths=2.5,
                 alpha=float(style["alpha"]),
                 zorder=2.9,
             )
@@ -583,8 +586,8 @@ def render_one(
         fault_handle = Line2D(
             [0],
             [0],
-            color=style["color"],
-            linewidth=float(style["line_width"]),
+            color="#B22222",
+            linewidth=2.5,
             label=style["label"],
         )
 
@@ -597,23 +600,15 @@ def render_one(
     ax.plot(
         well_h[real_track],
         times[real_track],
-        color=well_style["halo_color"],
-        linewidth=float(well_style["halo_width"]),
-        alpha=0.92,
+        color="#1A237E",
+        linewidth=2.5,
         zorder=3.2,
-    )
-    ax.plot(
-        well_h[real_track],
-        times[real_track],
-        color=well_style["color"],
-        linewidth=float(well_style["line_width"]),
-        zorder=3.3,
     )
     well_handle = Line2D(
         [0],
         [0],
-        color=well_style["color"],
-        linewidth=float(well_style["line_width"]),
+        color="#1A237E",
+        linewidth=2.5,
         label=well_style["label"],
     )
     imaging_log_count = add_imaging_log_track(
@@ -783,7 +778,10 @@ def main() -> int:
         config["sample_cache"] = str(
             output_dir
             / "section_samples"
-            / f"obn_{section_window_tag}_dfn_pad{float(config.get('dfn_time_padding_ms', 20.0)):g}ms.npz"
+            / (
+                f"obn_{section_window_tag}_dfn_{dfn_top:g}_{dfn_bottom:g}"
+                f"_pad{float(config.get('dfn_time_padding_ms', 20.0)):g}ms.npz"
+            )
         )
     times, values, sample_source = split.load_or_sample_wiggle(
         original, config, track, axes
@@ -812,6 +810,15 @@ def main() -> int:
         for plane in ("XZ", "YZ")
     }
     faults = load_fault_segments(config, track, original)
+    fault_v_cleanup: dict[str, Any] = {}
+    for projection in ("XZ", "YZ"):
+        cleaned, cleanup = layered_profile.suppress_v_short_edges(
+            faults[projection],
+            max_short_length_m=25.0,
+            min_turn_angle_deg=20.0,
+        )
+        faults[projection] = cleaned
+        fault_v_cleanup[projection] = cleanup
 
     layer_manifest: dict[str, Any] | None = None
     if args.layer_output_dir:
@@ -1001,16 +1008,17 @@ def main() -> int:
             "separate_legend": True,
         },
         "color_semantics": {
-            "color": {
-                layer: TAIGU_LAYER_COLORS[layer]
-                for layer in TAIGU_LAYER_ORDER
-            },
+            "color": TAIGU_SCALE_COLORS,
             "linewidth": TAIGU_SCALE_WIDTHS,
             "large_scale_halo": {
-                "enabled": True,
-                "color": "#111827",
-                "linewidth": 5.2,
+                "enabled": False,
             },
+            "fault_color": "#B22222",
+            "fault_linewidth": 2.5,
+            "well_color": "#1A237E",
+            "well_linewidth": 2.5,
+            "imaging_log_color": "#00BCD4",
+            "imaging_log_linewidth": 2.5,
         },
         "background": "OBN地震波形+正振幅变面积",
         "imaging_log": imaging_log_summary,
@@ -1029,7 +1037,11 @@ def main() -> int:
             },
             "is_step8_well_corrected": True,
             "is_expanded_with_supp_layer": True,
-            "supp_layer_display_merged_into": "上部复合层",
+            "supp_layer_display_merged_into": {
+                layer: display
+                for layer, display in TAIGU_DISPLAY_LAYER_MAP.items()
+                if layer != display
+            },
             "geometry_policy": "CSV DipAzimuthDeg/DipDeg; no V1..V4",
         },
         "layer_data": layer_manifest,
@@ -1039,6 +1051,7 @@ def main() -> int:
         "fault_segment_counts": {
             plane: int(len(lines)) for plane, lines in faults.items()
         },
+        "fault_v_short_edge_cleanup": fault_v_cleanup,
         "sample_source": sample_source,
         "horizon_source": horizon_source,
         "images": images,

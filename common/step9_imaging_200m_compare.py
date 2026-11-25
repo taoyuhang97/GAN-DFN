@@ -13,9 +13,26 @@ import pandas as pd
 
 PLANES = ("XZ", "YZ")
 TIME_SCALE_M_PER_MS = 2.0
-DFN_SCALE_WIDTHS = {"small": 1.10, "medium": 2.20, "large": 3.20}
+DFN_SCALE_COLORS = {
+    "small": "#43A047",
+    "medium": "#FF9800",
+    "large": "#AD1457",
+}
+DFN_SCALE_WIDTHS = {"small": 1.0, "medium": 1.5, "large": 2.0}
 DFN_LARGE_HALO_COLOR = "#111827"
 DFN_LARGE_HALO_WIDTH = 5.20
+DFN_GEOMETRY_LENGTH_RANGE_M = (10.0, 500.0)
+CONVENTIONAL_TRACK_COLOR = "#1A237E"
+CONVENTIONAL_TRACK_HALO_COLOR = "#1A237E"
+CONVENTIONAL_TRACK_LINE_WIDTH = 2.50
+CONVENTIONAL_TRACK_HALO_WIDTH = 2.50
+CONVENTIONAL_TRACK_ALPHA = 0.96
+CONVENTIONAL_TRACK_ZORDER = 3.00
+IMAGING_LOG_COLOR = "#00BCD4"
+IMAGING_LOG_HALO_COLOR = "#00BCD4"
+IMAGING_LOG_LINE_WIDTH = 2.50
+IMAGING_LOG_HALO_WIDTH = 2.50
+IMAGING_LOG_ZORDER = 3.20
 IMAGING_COLOR = "#ff2bd6"
 IMAGING_HALO_COLOR = "#3b0764"
 IMAGING_LINE_WIDTH = 2.20
@@ -40,6 +57,136 @@ INTERSECTION_COLUMNS = [
     "apparent_dip_deg",
     "line_angle_deg",
 ]
+
+
+def _track_rows(frame: pd.DataFrame, projection: str) -> pd.DataFrame:
+    horizontal = "X" if projection == "XZ" else "Y"
+    work = frame.copy()
+    for column in (horizontal, "TIME"):
+        if column not in work:
+            raise ValueError(f"well track missing {column!r} column")
+        work[column] = pd.to_numeric(work[column], errors="coerce")
+    return (
+        work.dropna(subset=[horizontal, "TIME"])
+        .sort_values("TIME")
+        .drop_duplicates("TIME")
+        .reset_index(drop=True)
+    )
+
+
+def imaging_interval_rows(
+    conventional_track: pd.DataFrame,
+    imaging_track: pd.DataFrame | None = None,
+) -> pd.DataFrame:
+    """Return the imaging-log coverage rows used for the purple interval."""
+
+    source = conventional_track if imaging_track is None else imaging_track
+    if imaging_track is None:
+        if "InImagingInterval" not in source.columns:
+            raise ValueError(
+                "conventional track has no InImagingInterval and no separate "
+                "imaging track was provided"
+            )
+        source = source[
+            pd.to_numeric(
+                source["InImagingInterval"], errors="coerce"
+            ).fillna(0).astype(int).eq(1)
+        ]
+    work = source.copy()
+    work["TIME"] = pd.to_numeric(work["TIME"], errors="coerce")
+    return work.dropna(subset=["X", "Y", "TIME"]).reset_index(drop=True)
+
+
+def draw_well_context(
+    ax,
+    projection: str,
+    conventional_track: pd.DataFrame,
+    imaging_track: pd.DataFrame | None = None,
+) -> dict[str, Any]:
+    """Draw conventional track, purple imaging interval, then leave fractures above."""
+
+    horizontal = "X" if projection == "XZ" else "Y"
+    conventional = _track_rows(conventional_track, projection)
+    if len(conventional) < 2:
+        raise RuntimeError(f"{projection} conventional track has fewer than 2 rows")
+    ax.plot(
+        conventional[horizontal],
+        conventional["TIME"],
+        color=CONVENTIONAL_TRACK_HALO_COLOR,
+        linewidth=CONVENTIONAL_TRACK_HALO_WIDTH,
+        alpha=0.92,
+        solid_capstyle="round",
+        zorder=CONVENTIONAL_TRACK_ZORDER,
+    )
+    ax.plot(
+        conventional[horizontal],
+        conventional["TIME"],
+        color=CONVENTIONAL_TRACK_COLOR,
+        linewidth=CONVENTIONAL_TRACK_LINE_WIDTH,
+        alpha=CONVENTIONAL_TRACK_ALPHA,
+        solid_capstyle="round",
+        zorder=CONVENTIONAL_TRACK_ZORDER + 0.1,
+        label="常规测井轨迹",
+    )
+
+    imaging = imaging_interval_rows(conventional_track, imaging_track)
+    imaging = _track_rows(imaging, projection)
+    if len(imaging) < 2:
+        raise RuntimeError(f"{projection} imaging track has fewer than 2 rows")
+    group_column = next(
+        (
+            column
+            for column in ("Step3GroupCSV", "ImagingLogGroup")
+            if column in imaging.columns
+        ),
+        None,
+    )
+    groups = (
+        imaging.groupby(group_column, sort=False)
+        if group_column is not None
+        else [(None, imaging)]
+    )
+    labelled = False
+    for _, group in groups:
+        group = group.sort_values("TIME")
+        if len(group) < 2:
+            continue
+        ax.plot(
+            group[horizontal],
+            group["TIME"],
+            color=IMAGING_LOG_HALO_COLOR,
+            linewidth=IMAGING_LOG_HALO_WIDTH,
+            alpha=0.92,
+            solid_capstyle="round",
+            zorder=IMAGING_LOG_ZORDER,
+        )
+        ax.plot(
+            group[horizontal],
+            group["TIME"],
+            color=IMAGING_LOG_COLOR,
+            linewidth=IMAGING_LOG_LINE_WIDTH,
+            alpha=0.98,
+            solid_capstyle="round",
+            zorder=IMAGING_LOG_ZORDER + 0.1,
+            label="成像测井段" if not labelled else "_nolegend_",
+        )
+        labelled = True
+    return {
+        "conventional_track_samples": int(len(conventional)),
+        "conventional_track_time_range_ms": [
+            float(conventional["TIME"].min()),
+            float(conventional["TIME"].max()),
+        ],
+        "imaging_track_samples": int(len(imaging)),
+        "imaging_track_time_range_ms": [
+            float(imaging["TIME"].min()),
+            float(imaging["TIME"].max()),
+        ],
+        "track_zorders": {
+            "conventional": CONVENTIONAL_TRACK_ZORDER,
+            "imaging_log": IMAGING_LOG_ZORDER + 0.1,
+        },
+    }
 
 
 def tight_imaging_window(

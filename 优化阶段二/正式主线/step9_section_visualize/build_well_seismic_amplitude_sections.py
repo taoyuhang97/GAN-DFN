@@ -79,13 +79,22 @@ def save_figure(fig, output_path: Path, dpi: int, write_svg: bool) -> None:
         fig.savefig(output_path.with_suffix(".svg"))
 
 
-def apply_axes(ax, section: AttributeSection, geometry, *, show_legend: bool = True) -> None:
+def apply_axes(
+    ax,
+    section: AttributeSection,
+    geometry,
+    *,
+    show_legend: bool = True,
+    draw_well: bool = True,
+) -> None:
     draw_surface_curves(ax, geometry.surface_curves, section.projection)
     if section.projection == "XZ":
-        draw_well_trajectory(ax, geometry.well_df["X"], geometry.well_df["TIME"], label=f"{geometry.well_name}井轨迹")
+        if draw_well:
+            draw_well_trajectory(ax, geometry.well_df["X"], geometry.well_df["TIME"], label=f"{geometry.well_name}井轨迹")
         ax.set_xlabel("X / m")
     else:
-        draw_well_trajectory(ax, geometry.well_df["Y"], geometry.well_df["TIME"], label=f"{geometry.well_name}井轨迹")
+        if draw_well:
+            draw_well_trajectory(ax, geometry.well_df["Y"], geometry.well_df["TIME"], label=f"{geometry.well_name}井轨迹")
         ax.set_xlabel("Y / m")
     ax.set_xlim(float(section.h[0]), float(section.h[-1]))
     tmin = float(getattr(section, "display_time_min", geometry.summary["display_time_min"]))
@@ -164,6 +173,7 @@ def plot_wiggle_variable_area(
     overlay_drawer: Callable[[Any, str], dict[str, int]] | None = None,
     scope_label: str | None = None,
     product_title: str | None = None,
+    draw_well: bool = True,
 ) -> int:
     width, height, dpi = figure_size_inches(section, geometry, panel=panel)
     separate_legend = bool(geometry.config.get("separate_legend", False))
@@ -201,7 +211,13 @@ def plot_wiggle_variable_area(
             linewidth=0.0,
             zorder=1,
         )
-    apply_axes(ax, section, geometry, show_legend=overlay_drawer is None)
+    apply_axes(
+        ax,
+        section,
+        geometry,
+        show_legend=overlay_drawer is None,
+        draw_well=draw_well,
+    )
     ax.set_facecolor("white")
     if overlay_drawer is not None:
         overlay_drawer(ax, section.projection)

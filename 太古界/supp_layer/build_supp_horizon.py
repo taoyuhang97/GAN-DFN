@@ -93,6 +93,9 @@ def main() -> int:
     offset = float(virtual.get("offset_ms", 350.0))
     floor = float(virtual.get("floor_ms", 2650.0))
     block = dict(framework.metadata.get("block") or {})
+    min_well_coverage = float(
+        framework.metadata.get("min_well_coverage_fraction", 0.999)
+    )
 
     print(f"[supp-horizon] framework={framework.framework_id}")
     print(f"[supp-horizon] TopV = max(Top - {offset:.0f}, {floor:.0f})")
@@ -246,6 +249,7 @@ def main() -> int:
             "nearest_trace_distance_max_m": float(distance.max()),
             "inside_supp_layer": int(inside.sum()),
             "inside_fraction": float(inside.mean()) if imaging.any() else 0.0,
+            "minimum_required_fraction": float(min_well_coverage),
             "virtual_top_range_ms": [float(top_v[idx[imaging]].min()), float(top_v[idx[imaging]].max())],
             "top_range_ms": [float(top[idx[imaging]].min()), float(top[idx[imaging]].max())],
             "margin_ms_min": float(margin.min()) if margin.size else None,
@@ -261,7 +265,12 @@ def main() -> int:
     summary_path = output_dir / "supp_horizon_summary.json"
     summary_path.write_text(json.dumps(summary, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     print(f"[supp-horizon] wrote {summary_path}")
-    return 0 if summary.get("well_check", {}).get("inside_fraction", 1.0) >= 0.999 else 1
+    return (
+        0
+        if summary.get("well_check", {}).get("inside_fraction", 1.0)
+        >= min_well_coverage
+        else 1
+    )
 
 
 if __name__ == "__main__":

@@ -76,6 +76,24 @@ _imaging_log_spec.loader.exec_module(imaging_log_overlay)
 add_imaging_log_track = imaging_log_overlay.add_imaging_log_track
 imaging_log_track_summary = imaging_log_overlay.imaging_log_track_summary
 load_imaging_log_track = imaging_log_overlay.load_imaging_log_track
+imaging_log_overlay.IMAGING_LOG_STYLE.update(
+    {
+        "color": "#00BCD4",
+        "halo_color": "#00BCD4",
+        "line_width": 2.5,
+        "halo_width": 2.5,
+        "label": "成像测井段",
+        "zorder": 5.2,
+    }
+)
+_layer_profile_spec = importlib.util.spec_from_file_location(
+    "sand_step9_layered_section_profile",
+    REPO_ROOT / "common" / "layered_section_profile.py",
+)
+if _layer_profile_spec is None or _layer_profile_spec.loader is None:
+    raise ImportError("cannot load layered section profile helper")
+layered_profile = importlib.util.module_from_spec(_layer_profile_spec)
+_layer_profile_spec.loader.exec_module(layered_profile)
 
 _layer_spec = importlib.util.spec_from_file_location(
     "sand_layered_section_profile",
@@ -123,24 +141,30 @@ SCALE_SETS = (
     ScaleSet("all_scales", "大中小尺度", ("large", "medium", "small"), True, 9),
 )
 
-# Color encodes formation; width encodes fracture scale.
 SCALE_STYLES = {
     "small": {
         "label": "小尺度裂缝",
-        "linewidth": 1.10,
-        "alpha": 0.72,
+        "color": "#43A047",
+        "linewidth": 1.0,
+        "alpha": 0.85,
     },
     "medium": {
         "label": "中尺度裂缝",
-        "linewidth": 2.20,
-        "alpha": 0.92,
+        "color": "#FF9800",
+        "linewidth": 1.5,
+        "alpha": 0.90,
     },
     "large": {
         "label": "大尺度裂缝",
-        "linewidth": 3.20,
-        "alpha": 0.98,
+        "color": "#AD1457",
+        "linewidth": 2.0,
+        "alpha": 0.95,
     },
 }
+FAULT_TRACE_COLOR_OVERRIDE = "#B22222"
+FAULT_TRACE_WIDTH_OVERRIDE = 2.5
+WELL_TRACK_COLOR = "#1A237E"
+WELL_TRACK_WIDTH = 2.5
 
 LARGE_INTERVAL_STYLES = {
     "T4->T6": {
@@ -192,6 +216,7 @@ def make_set_drawer(
     segments: list[Any],
     faults: list[Any],
     imaging_log: pd.DataFrame,
+    track: pd.DataFrame,
     *,
     include_faults: bool,
 ) -> Callable[[Any, str], dict[str, int]]:
@@ -205,7 +230,19 @@ def make_set_drawer(
                 projection,
                 overview=True,
                 taigu_style=True,
+                color_override=FAULT_TRACE_COLOR_OVERRIDE,
+                line_width_override=FAULT_TRACE_WIDTH_OVERRIDE,
+                halo_width_override=0.0,
             )
+        h_column = "X" if projection == "XZ" else "Y"
+        ax.plot(
+            track[h_column],
+            track["TIME"],
+            color=WELL_TRACK_COLOR,
+            linewidth=WELL_TRACK_WIDTH,
+            zorder=3.3,
+            label="车页1导眼井轨迹",
+        )
         imaging_log_count = add_imaging_log_track(
             ax,
             imaging_log,
@@ -239,10 +276,18 @@ def load_dfn_patch_frame(path: Path) -> pd.DataFrame:
     missing = sorted(set(columns) - available)
     if missing:
         raise ValueError(f"Step8 DFN CSV missing required columns: {missing}")
-    frame = pd.read_csv(path, usecols=columns, low_memory=False)
+    usecols = list(columns)
+    if "Local200Replacement" in available:
+        usecols.append("Local200Replacement")
+    frame = pd.read_csv(path, usecols=usecols, low_memory=False)
     for column in columns:
         if column not in {"LayerGroup", "FractureScale"}:
             frame[column] = pd.to_numeric(frame[column], errors="coerce")
+    if "Local200Replacement" not in frame.columns:
+        frame["Local200Replacement"] = 0
+    frame["Local200Replacement"] = (
+        pd.to_numeric(frame["Local200Replacement"], errors="coerce").fillna(0)
+    )
     return frame.dropna(
         subset=[
             "CenterX",
@@ -281,6 +326,7 @@ def build_csv_intersections(
             track_time,
             track_perpendicular,
         )
+        local_replacement = frame["Local200Replacement"].eq(1)
         selected = frame[
             frame["CenterTime"].between(
                 float(section.display_time_min),
@@ -288,11 +334,14 @@ def build_csv_intersections(
             )
             & frame[center_column].between(float(coords[0]), float(coords[-1]))
             & (
-                np.abs(
-                    frame[f"Center{perpendicular}"].to_numpy(dtype=float)
-                    - well_perpendicular
+                (
+                    np.abs(
+                        frame[f"Center{perpendicular}"].to_numpy(dtype=float)
+                        - well_perpendicular
+                    )
+                    <= float(half_width_m)
                 )
-                <= float(half_width_m)
+                | local_replacement
             )
         ]
         selected_indices.update(int(index) for index in selected.index)
@@ -365,71 +414,38 @@ def add_scale_colored_dfn_segments(
     segments: list[Any],
     projection: str,
 ) -> int:
-    """Draw formation colors with scale-specific line widths."""
+    """Draw fracture colors by scale."""
     count = 0
     present_scales: set[str] = set()
-    present_intervals: set[str] = set()
     visible_segments = [segment for segment in segments if segment.projection == projection]
-    for layer_interval, layer_style in LARGE_INTERVAL_STYLES.items():
-        interval_segments = [
-            segment for segment in visible_segments
-            if str(getattr(segment, "interval", "")).strip() == layer_interval
+    for scale in ("small", "medium", "large"):
+        scale_segments = [
+            segment
+            for segment in visible_segments
+            if str(getattr(segment, "scale", "")).strip().lower() == scale
         ]
-        if not interval_segments:
+        if not scale_segments:
             continue
-        present_intervals.add(layer_interval)
-        for scale in ("small", "medium", "large"):
-            scale_segments = [
-                segment for segment in interval_segments
-                if str(getattr(segment, "scale", "")).strip().lower() == scale
-            ]
-            if not scale_segments:
-                continue
-            present_scales.add(scale)
-            lines = [
-                [(float(segment.h1), float(segment.z1)), (float(segment.h2), float(segment.z2))]
-                for segment in scale_segments
-            ]
-            scale_style = SCALE_STYLES[scale]
-            if scale == "large":
-                ax.add_collection(
-                    LineCollection(
-                        lines,
-                        colors="#111827",
-                        linewidths=5.2,
-                        alpha=0.82,
-                        zorder=13.0,
-                    )
-                )
-            ax.add_collection(
-                LineCollection(
-                    lines,
-                    colors=layer_style["color"],
-                    linewidths=float(scale_style["linewidth"]),
-                    alpha=float(scale_style["alpha"]),
-                    zorder=13.2,
-                )
+        present_scales.add(scale)
+        lines = [
+            [(float(segment.h1), float(segment.z1)), (float(segment.h2), float(segment.z2))]
+            for segment in scale_segments
+        ]
+        style = SCALE_STYLES[scale]
+        ax.add_collection(
+            LineCollection(
+                lines,
+                colors=style["color"],
+                linewidths=float(style["linewidth"]),
+                alpha=float(style["alpha"]),
+                zorder=13.2,
             )
-            count += len(lines)
-
-    for interval in ("T4->T6", "T6->T7"):
-        if interval in present_intervals:
-            style = LARGE_INTERVAL_STYLES[interval]
-            ax.add_line(
-                Line2D([0], [0], color=style["color"], linewidth=3.2, label=style["label"])
-            )
+        )
+        count += len(lines)
     for scale in ("small", "medium", "large"):
         if scale in present_scales:
             style = SCALE_STYLES[scale]
-            ax.add_line(
-                Line2D(
-                    [0],
-                    [0],
-                    color="#111827",
-                    linewidth=float(style["linewidth"]),
-                    label=style["label"],
-                )
-            )
+            ax.add_line(Line2D([0], [0], color=style["color"], linewidth=float(style["linewidth"]), label=style["label"]))
     return count
 
 
@@ -618,6 +634,31 @@ def main() -> int:
         scan_args.input_vtk, overview.well_df, display
     )
     faults_before_filter = len(faults)
+    fault_v_cleanup: dict[str, dict[str, int]] = {}
+    cleaned_faults: list[ProjectionSegment] = []
+    for projection in ("XZ", "YZ"):
+        local_segments = [
+            segment for segment in faults if segment.projection == projection
+        ]
+        _, cleanup = layered_profile.suppress_v_short_edges(
+            [
+                [
+                    [float(segment.h1), float(segment.z1)],
+                    [float(segment.h2), float(segment.z2)],
+                ]
+                for segment in local_segments
+            ],
+            max_short_length_m=25.0,
+            min_turn_angle_deg=20.0,
+        )
+        removed = set(int(value) for value in cleanup["removed_indices"])
+        cleaned_faults.extend(
+            segment
+            for index, segment in enumerate(local_segments)
+            if index not in removed
+        )
+        fault_v_cleanup[projection] = cleanup
+    faults = cleaned_faults
     segments_by_scale = {
         scale: [
             segment
@@ -711,7 +752,18 @@ def main() -> int:
                     projection,
                     overview=True,
                     taigu_style=True,
+                    color_override=FAULT_TRACE_COLOR_OVERRIDE,
+                    line_width_override=FAULT_TRACE_WIDTH_OVERRIDE,
+                    halo_width_override=0.0,
                 )
+            )
+            h_column = "X" if projection == "XZ" else "Y"
+            ax.plot(
+                overview.well_df[h_column],
+                overview.well_df["TIME"],
+                color=WELL_TRACK_COLOR,
+                linewidth=WELL_TRACK_WIDTH,
+                zorder=3.3,
             )
             imaging_log_count = add_imaging_log_track(
                 ax,
@@ -737,6 +789,7 @@ def main() -> int:
                 overlay_drawer=base_drawer,
                 scope_label=str(config.get("section_scope_label", "矿区尺度")),
                 product_title="车页1导眼：变面积剖面底图",
+                draw_well=False,
             )
         layer_manifest = {
             "directory": str(layer_dir),
@@ -756,6 +809,7 @@ def main() -> int:
             selected_segments,
             faults,
             imaging_log,
+            overview.well_df,
             include_faults=scale_set.include_faults,
         )
         for offset, projection in enumerate(("XZ", "YZ")):
@@ -778,6 +832,7 @@ def main() -> int:
                 overlay_drawer=capture,
                 scope_label=str(config.get("section_scope_label", "矿区尺度")),
                 product_title=f"车页1导眼：{scale_set.label}DFN",
+                draw_well=False,
             )
             images.append(
                 {
@@ -860,19 +915,24 @@ def main() -> int:
         "imaging_log": imaging_log_summary,
         "color_semantics": {
             "color": {
-                "T4->T6": "sandstone_3_orange",
-                "T6->T7": "sandstone_4_blue",
+                "small": "#43A047",
+                "medium": "#FF9800",
+                "large": "#AD1457",
             },
             "linewidth": {
-                "small": 1.10,
-                "medium": 2.20,
-                "large": 3.20,
+                "small": 1.0,
+                "medium": 1.5,
+                "large": 2.0,
             },
             "large_scale_halo": {
-                "enabled": True,
-                "color": "#111827",
-                "linewidth": 5.20,
+                "enabled": False,
             },
+            "fault_color": "#B22222",
+            "fault_linewidth": 2.5,
+            "well_color": "#1A237E",
+            "well_linewidth": 2.5,
+            "imaging_log_color": "#00BCD4",
+            "imaging_log_linewidth": 2.5,
         },
         "dfn_source": {
             "csv": str(dfn_patch_csv),
@@ -892,6 +952,7 @@ def main() -> int:
             "segments_before_filter": int(faults_before_filter),
             "segments_after_filter": int(len(faults)),
             "segments_suppressed": int(faults_before_filter - len(faults)),
+            "v_short_edge_cleanup": fault_v_cleanup,
         },
         "scale_segments": {
             scale: {

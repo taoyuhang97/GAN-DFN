@@ -164,3 +164,94 @@ def projection_segment_rows(
             }
         )
     return rows
+
+
+def suppress_v_short_edges(
+    segments: list[list[list[float]]],
+    *,
+    max_short_length_m: float = 25.0,
+    min_turn_angle_deg: float = 20.0,
+) -> tuple[list[list[list[float]]], dict[str, int]]:
+    """Remove short fault edges that form sharp V-like turns at shared nodes."""
+
+    import math
+    from collections import defaultdict
+
+    if not segments:
+        return segments, {
+            "input_count": 0,
+            "output_count": 0,
+            "removed_count": 0,
+        }
+    endpoint_nodes: dict[tuple[float, float], int] = {}
+    node_sequences: list[tuple[int, int]] = []
+    for line in segments:
+        array = np.asarray(line, dtype=float)
+        nodes = []
+        for h_value, time_value in array:
+            key = (round(float(h_value), 2), round(float(time_value), 2))
+            if key not in endpoint_nodes:
+                endpoint_nodes[key] = len(endpoint_nodes)
+            nodes.append(endpoint_nodes[key])
+        node_sequences.append((nodes[0], nodes[1]))
+
+    incident: dict[int, list[int]] = defaultdict(list)
+    for index, (first, second) in enumerate(node_sequences):
+        incident[first].append(index)
+        incident[second].append(index)
+
+    display_line = []
+    axial_angle = []
+    for line in segments:
+        array = np.asarray(line, dtype=float)
+        first = np.asarray([array[0, 0], 2.0 * array[0, 1]])
+        second = np.asarray([array[1, 0], 2.0 * array[1, 1]])
+        display_line.append((first, second))
+        axial_angle.append(
+            math.degrees(
+                math.atan2(
+                    float(second[1] - first[1]),
+                    float(second[0] - first[0]),
+                )
+            )
+            % 180.0
+        )
+    lengths = [
+        float(np.linalg.norm(second - first))
+        for first, second in display_line
+    ]
+
+    remove: set[int] = set()
+    for incident_indices in incident.values():
+        if len(incident_indices) < 2:
+            continue
+        for short_index in incident_indices:
+            if lengths[short_index] > float(max_short_length_m):
+                continue
+            for neighbor_index in incident_indices:
+                if neighbor_index == short_index:
+                    continue
+                angle = abs(
+                    (
+                        axial_angle[short_index]
+                        - axial_angle[neighbor_index]
+                        + 90.0
+                    )
+                    % 180.0
+                    - 90.0
+                )
+                if angle >= float(min_turn_angle_deg):
+                    remove.add(short_index)
+                    break
+
+    kept = [
+        line for index, line in enumerate(segments) if index not in remove
+    ]
+    return kept, {
+        "input_count": int(len(segments)),
+        "output_count": int(len(kept)),
+        "removed_count": int(len(remove)),
+        "removed_indices": sorted(int(value) for value in remove),
+        "max_short_length_m": float(max_short_length_m),
+        "min_turn_angle_deg": float(min_turn_angle_deg),
+    }

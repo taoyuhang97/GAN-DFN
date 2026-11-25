@@ -59,10 +59,17 @@ LOG_ALIAS_MAP = {
     "TVD": "TVD",
     "TIME": "TIME",
     "AC": "AC",
+    "AC1": "AC",
+    "DT": "AC",
+    "DTC": "AC",
+    "DT24": "AC",
+    "HAC": "AC",
     "CAL": "CAL",
     "CALI": "CAL",
     "CNL": "CNL",
     "NPHI": "CNL",
+    "CN": "CNL",
+    "CNCF": "CNL",
     "DEN": "DEN",
     "RHOB": "DEN",
     "GR": "GR",
@@ -151,12 +158,20 @@ def read_las_ascii_block(file_path: Path) -> pd.DataFrame:
         if in_columns_section:
             if line.startswith("~") or lower.startswith("~parameter"):
                 break
-            if "." in line:
-                name = line.split(".")[0].strip()
+            if line and not line.startswith("#"):
+                name = re.split(r"[\s.]", line, maxsplit=1)[0].strip()
                 if name:
                     columns.append(name)
 
-    start_idx = next(i for i, line in enumerate(lines) if line.strip().lower().startswith("~ascii"))
+    start_idx = next(
+        i
+        for i, line in enumerate(lines)
+        if (
+            line.strip().lower() == "~a"
+            or line.strip().lower().startswith("~a ")
+            or line.strip().lower().startswith("~ascii")
+        )
+    )
     data: list[list[float]] = []
     for line in lines[start_idx + 1 :]:
         stripped = line.strip()

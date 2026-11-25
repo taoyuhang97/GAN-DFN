@@ -1169,6 +1169,10 @@ def add_fault_trace_segments(
     *,
     overview: bool = False,
     taigu_style: bool = False,
+    color_override: str | None = None,
+    line_width_override: float | None = None,
+    halo_color_override: str | None = None,
+    halo_width_override: float | None = None,
 ) -> int:
     lines = [
         [(segment.h1, segment.z1), (segment.h2, segment.z2)]
@@ -1189,27 +1193,36 @@ def add_fault_trace_segments(
         halo_alpha = 0.70 if overview else 0.86
         line_alpha = 0.78 if overview else 0.96
         line_style = (0, (5, 3)) if overview else "-"
-    ax.add_collection(
-        LineCollection(
-            lines,
-            colors=FAULT_TRACE_HALO,
-            linewidths=halo_width,
-            alpha=halo_alpha,
-            zorder=9,
-            linestyles=line_style,
-        )
+    line_color = color_override or FAULT_TRACE_COLOR
+    line_width = (
+        float(line_width_override)
+        if line_width_override is not None
+        else line_width
     )
+    if halo_width_override is not None:
+        halo_width = float(halo_width_override)
+    if halo_width > 0:
+        ax.add_collection(
+            LineCollection(
+                lines,
+                colors=halo_color_override or FAULT_TRACE_HALO,
+                linewidths=halo_width,
+                alpha=halo_alpha,
+                zorder=9,
+                linestyles=line_style,
+            )
+        )
     ax.add_collection(
         LineCollection(
             lines,
-            colors=FAULT_TRACE_COLOR,
+            colors=line_color,
             linewidths=line_width,
             alpha=line_alpha,
             zorder=10,
             linestyles=line_style,
         )
     )
-    ax.plot([], [], color=FAULT_TRACE_COLOR, linewidth=line_width, linestyle=line_style, label="原始断层")
+    ax.plot([], [], color=line_color, linewidth=line_width, linestyle=line_style, label="原始断层")
     return len(lines)
 
 
@@ -1222,6 +1235,10 @@ def add_dfn_segments(
     legacy_style: bool = False,
     large_section_style: bool = False,
     add_scale_legend: bool = True,
+    scale_line_styles: dict[str, tuple[float, Any]] | None = None,
+    scale_color_overrides: dict[str, str] | None = None,
+    scale_halo_enabled: bool = True,
+    zorder_base: float | None = None,
 ) -> int:
     intersection_segments = [
         segment
@@ -1233,7 +1250,9 @@ def add_dfn_segments(
         for segment in segments
         if segment.projection == projection and getattr(segment, "display_mode", "intersection") == "small_projection"
     ]
-    if large_section_style:
+    if scale_line_styles is not None:
+        line_style_contract = scale_line_styles
+    elif large_section_style:
         line_style_contract = LARGE_SECTION_SCALE_LINE_STYLES
     elif legacy_style:
         line_style_contract = LEGACY_SCALE_LINE_STYLES
@@ -1249,15 +1268,35 @@ def add_dfn_segments(
         projection,
         scale_line_styles=line_style_contract,
     )
+    if scale_color_overrides:
+        intersection_colors = [
+            scale_color_overrides.get(
+                str(getattr(segment, "scale", "")).strip().lower(),
+                color,
+            )
+            for segment, color in zip(intersection_segments, intersection_colors)
+        ]
+        projected_colors = [
+            scale_color_overrides.get(
+                str(getattr(segment, "scale", "")).strip().lower(),
+                color,
+            )
+            for segment, color in zip(projected_segments, projected_colors)
+        ]
     if not intersection_lines and not projected_lines:
         ax.text(0.5, 0.5, "无T4-T7裂缝片段", transform=ax.transAxes, ha="center", va="center")
         return 0
     if projected_lines:
         # 投影小尺度与正常小尺度统一显示：层段色、按尺度线宽、正常透明度，不再单独图例
-        ax.add_collection(LineCollection(projected_lines, colors=projected_colors, linewidths=projected_widths, alpha=0.92, zorder=12.8 if overlay else 1.8, linestyles=projected_styles))
+        projected_zorder = (
+            float(zorder_base) + 0.1
+            if zorder_base is not None
+            else 12.8 if overlay else 1.8
+        )
+        ax.add_collection(LineCollection(projected_lines, colors=projected_colors, linewidths=projected_widths, alpha=0.92, zorder=projected_zorder, linestyles=projected_styles))
     if not intersection_lines:
         return len(projected_lines)
-    if overlay and SCALE_LARGE_HALO:
+    if overlay and scale_halo_enabled and SCALE_LARGE_HALO:
         # 描边（轮廓）只用于大尺度，突出主断裂；中/小尺度无描边
         large_flags = [
             str(getattr(segment, "scale", "")).strip().lower() == "large"
@@ -1267,8 +1306,18 @@ def add_dfn_segments(
         halo_widths = [width + 1.8 for width, flag in zip(intersection_widths, large_flags) if flag]
         halo_styles = [style for style, flag in zip(intersection_styles, large_flags) if flag]
         if halo_lines:
-            ax.add_collection(LineCollection(halo_lines, colors=DFN_HALO_COLOR, linewidths=halo_widths, alpha=0.78, zorder=13.0, linestyles=halo_styles))
-    ax.add_collection(LineCollection(intersection_lines, colors=intersection_colors, linewidths=intersection_widths, alpha=0.92, zorder=13.2 if overlay else 2, linestyles=intersection_styles))
+            halo_zorder = (
+                float(zorder_base) - 0.1
+                if zorder_base is not None
+                else 13.0
+            )
+            ax.add_collection(LineCollection(halo_lines, colors=DFN_HALO_COLOR, linewidths=halo_widths, alpha=0.78, zorder=halo_zorder, linestyles=halo_styles))
+    main_zorder = (
+        float(zorder_base)
+        if zorder_base is not None
+        else 13.2 if overlay else 2
+    )
+    ax.add_collection(LineCollection(intersection_lines, colors=intersection_colors, linewidths=intersection_widths, alpha=0.92, zorder=main_zorder, linestyles=intersection_styles))
     # 方案B：按实际出现的尺度添加图例项（颜色用中性灰，避免与层段色混淆）
     present_scales = {
         str(getattr(segment, "scale", "")).strip().lower()

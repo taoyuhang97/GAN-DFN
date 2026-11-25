@@ -1,0 +1,79 @@
+{
+  "framework_id": "taigu_supp_pilot_ext300_v2",
+  "area": "太古界·上边界以上 300 ms 小范围验证区",
+  "metadata": {
+    "note": "原 405 井周 5×5 km 验证区；上边界以上拓展 300 ms，最高截到属性体 1800 ms。",
+    "virtual_top": {
+      "formula": "TopV = max(TopTimeMs - 300, 1800)",
+      "offset_ms": 300.0,
+      "floor_ms": 1800.0,
+      "reason": "全矿区属性体上界为 1800 ms；小范围验证使用 405 井周 5×5 km。"
+    },
+    "block": {
+      "x_min": 663450.0,
+      "x_max": 668450.0,
+      "y_min": 4239250.0,
+      "y_max": 4244250.0,
+      "center_x": 665954.0,
+      "center_y": 4241759.0,
+      "half_cells": 200,
+      "center_well": "埕北古斜405"
+    },
+    "model_reuse": {
+      "上部补充层": "上部复合层",
+      "reason": "上边界以上没有独立裂缝标签，继续使用上部复合层代理模型。"
+    },
+    "min_well_coverage_fraction": 0.99
+  },
+  "surfaces": [
+    {"id": "TopV", "label": "虚拟顶（上部补充层顶）", "order": 1, "legacy_column": "TopVTimeMs"},
+    {"id": "Top", "label": "上部复合层顶", "order": 2, "legacy_column": "TopTimeMs"},
+    {"id": "Mid", "label": "太古界顶", "order": 3, "legacy_column": "MidTimeMs"},
+    {"id": "Base", "label": "风化壳底", "order": 4, "legacy_column": "BaseTimeMs"}
+  ],
+  "layers": [
+    {
+      "code": 3,
+      "name": "上部补充层",
+      "top": "TopV",
+      "base": "Top",
+      "color": "#a855f7",
+      "display_order": 0,
+      "inclusive_base": false,
+      "extension_ms": 0.0,
+      "presence_column": "SuppPresent",
+      "time_class": "supp_topv_top",
+      "slug": "supp"
+    },
+    {
+      "code": 1,
+      "name": "上部复合层",
+      "top": "Top",
+      "base": "Mid",
+      "color": "#f97316",
+      "display_order": 1,
+      "inclusive_base": false,
+      "extension_ms": 0.0,
+      "presence_column": "UpperPresent",
+      "time_class": "upper_top_mid",
+      "slug": "upper"
+    },
+    {
+      "code": 2,
+      "name": "太古界风化壳",
+      "top": "Mid",
+      "base": "Base",
+      "color": "#22d3ee",
+      "display_order": 2,
+      "inclusive_base": true,
+      "extension_ms": 50.0,
+      "presence_column": "CrustPresent",
+      "time_class": "crust_mid_base",
+      "slug": "crust"
+    }
+  ],
+  "legacy_layer_aliases": {
+    "Shasan": "上部复合层",
+    "Shasi": "太古界风化壳"
+  }
+}

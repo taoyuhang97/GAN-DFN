@@ -831,6 +831,12 @@ def main() -> int:
         # --- strong supervision: all usable imaging wells, per-segment join ---
         strong_records: list[dict[str, Any]] = []
         strong_well_list = [] if args.no_strong_supervision else config["strong_supervision_wells"]
+        group_membership_path = Path(config["step3_groups_root"]).parent / "group_segment_membership.csv"
+        group_membership = (
+            pd.read_csv(group_membership_path, encoding="utf-8-sig")
+            if group_membership_path.exists()
+            else pd.DataFrame()
+        )
         for well in strong_well_list:
             group_files = sorted(Path(config["step3_groups_root"]).glob(f"{well}_*.csv"))
             if not group_files:
@@ -840,8 +846,31 @@ def main() -> int:
                 if group.empty or not {"WellName", "MD"}.issubset(group.columns):
                     continue
                 group = group.copy()
+                if "InputSegmentPath" not in group.columns:
+                    if group_membership.empty:
+                        raise RuntimeError("group_segment_membership.csv is required for Step3 groups")
+                    membership_columns = [
+                        column
+                        for column in ("GroupID", "GroupRowID", "LogSegmentPath")
+                        if column in group_membership.columns
+                    ]
+                    if len(membership_columns) != 3:
+                        raise RuntimeError(
+                            "group_segment_membership.csv is missing required columns: "
+                            "GroupID, GroupRowID, LogSegmentPath"
+                        )
+                    group = group.merge(
+                        group_membership[membership_columns].rename(
+                            columns={"LogSegmentPath": "InputSegmentPath"}
+                        ),
+                        on=["GroupID", "GroupRowID"],
+                        how="left",
+                        validate="one_to_one",
+                    )
+                    if group.InputSegmentPath.isna().any():
+                        raise RuntimeError(f"unmapped Step3 group rows: {group_file}")
                 group["MD"] = pd.to_numeric(group["MD"], errors="coerce")
-                # 逐段回接：行内自带 InputSegmentPath，只在该段内取坐标（不跨段、不平均）
+                # 逐段回接：从独立成员映射表恢复所属测井段，只在该段内取坐标。
                 merged_all, join_audit = attach_geometry_per_segment(
                     group,
                     preferred_column="InputSegmentPath",

@@ -212,23 +212,30 @@ def find_training_enrichment(config: dict[str, Any], well_name: str) -> Path:
 
 def select_pair_rows(base: pd.DataFrame, enrichment: pd.DataFrame, pair_type: str) -> pd.DataFrame:
     spec = PAIR_SPECS[pair_type]
-    required = ["DEPT", spec.gr_column, spec.deep_column, spec.reference_column]
+    gr_column = spec.gr_column if spec.gr_column in enrichment.columns else "GR"
+    required = ["DEPT", gr_column, spec.deep_column, spec.reference_column]
     missing = set(required) - set(enrichment.columns)
     if missing:
         raise RuntimeError(f"enrichment missing columns for {pair_type}: {sorted(missing)}")
     pair_columns = enrichment[required].rename(
         columns={
             spec.gr_column: "_PairGR",
+            gr_column: "_PairGR",
             spec.deep_column: "_PairDeep",
             spec.reference_column: "_PairReference",
         }
     )
+    petro_columns = [column for column in ("AC", "CNL", "DEN") if column in enrichment.columns]
+    for column in petro_columns:
+        pair_columns[f"_Petro{column}"] = enrichment[column]
     merged = base.merge(pair_columns, on="DEPT", how="left", validate="many_to_one")
     complete = merged[["_PairGR", "_PairDeep", "_PairReference"]].notna().all(axis=1)
     out = merged.loc[complete].copy()
     out["GR"] = numeric(out.pop("_PairGR"))
     out["RDeep"] = numeric(out.pop("_PairDeep"))
     out["RReference"] = numeric(out.pop("_PairReference"))
+    for column in petro_columns:
+        out[column] = numeric(out.pop(f"_Petro{column}"))
     out["PairType"] = spec.pair_type
     out["ReferenceType"] = spec.reference_type
     out["SourceGRCurve"] = spec.gr_column

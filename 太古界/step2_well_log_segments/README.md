@@ -1,5 +1,16 @@
 # Step 2 TaiGuJie Regular-Log Samples
 
+## 多曲线精简主表（2026-11-23）
+
+新增配置 `configs/taigu_step2_contracts_multilog_v1.json`，输出
+`output/taigu_step2_multilog_v1`。模型曲线为
+`GR/AC/CNL/DEN/RD/RS`，六项在同一次测井、同一行同时有效才保留。
+
+每个段数据文件只保存逐行深度、轨迹/层位元数据和六条曲线值。来源 LAS 路径、
+测井日期、实际曲线别名、完整行数、覆盖率和时深借用信息均放入
+`taigu_step2_segment_manifest.csv`；井级说明放入
+`taigu_step2_well_metadata.csv`。主表不重复保存来源字段。
+
 太古界实际入口是 `build_taigu_regular_samples.py`（**md1**，配置
 `configs/taigu_step2_contracts_md1.json`；上一轮 v5 配置与产物保留），原有的
 `build_real_well_t4_t7_samples.py` 和 `build_gr_resistivity_samples.py`
