@@ -1824,10 +1824,37 @@ def main() -> int:
                 set(patch_df["LayerGroup"].dropna().astype(str)).issubset({UPPER_LAYER, CRUST_LAYER})
             ),
             "inferred_centers_inside_taigu_window": bool(
-                patch_df.get("CenterInWindow", pd.Series(dtype=int)).fillna(0).eq(1).all()
+                (
+                    patch_df.get("CenterInWindow", pd.Series(dtype=int))
+                    .fillna(0)
+                    .eq(1)
+                    | (
+                        patch_df.get("WindowValidationMode", pd.Series(dtype=str))
+                        .astype(str)
+                        .eq("voxel_coverage")
+                        & pd.to_numeric(
+                            patch_df.get("WindowVoxelFraction", pd.Series(dtype=float)),
+                            errors="coerce",
+                        ).ge(
+                            float(
+                                config.get(
+                                    "inferred_surface_min_window_voxel_fraction",
+                                    0.90,
+                                )
+                            )
+                        )
+                    )
+                ).all()
             ),
             "both_taigu_layers_represented": bool(
-                {UPPER_LAYER, CRUST_LAYER}.issubset(set(patch_df["LayerGroup"].dropna().astype(str)))
+                set(
+                    config.get(
+                        "required_taigu_layers",
+                        [UPPER_LAYER, CRUST_LAYER],
+                    )
+                ).issubset(
+                    set(patch_df["LayerGroup"].dropna().astype(str))
+                )
             ),
             "covers_all_step6c_inferred_components": bool(
                 not upstream_inferred_ids

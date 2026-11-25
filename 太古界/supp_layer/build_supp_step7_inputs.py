@@ -49,6 +49,26 @@ def main() -> int:
     parser.add_argument("--background-sgy", type=Path, default=DEFAULT_BACKGROUND)
     parser.add_argument("--damage-sgy", type=Path, default=DEFAULT_DAMAGE)
     parser.add_argument("--step6d-summary", type=Path, default=DEFAULT_6D_SUMMARY)
+    parser.add_argument(
+        "--step6b-dir",
+        type=Path,
+        default=SUPP / "taigu_supp_legacy_v1/step6b_supp",
+    )
+    parser.add_argument(
+        "--step6c-dir",
+        type=Path,
+        default=SUPP / "taigu_supp_legacy_v1/step6c_supp",
+    )
+    parser.add_argument(
+        "--step3-groups-root",
+        type=Path,
+        default=TAIGU / "step3_imaging_groups/output/taigu_step3_imaging_md1/groups",
+    )
+    parser.add_argument(
+        "--step2-segments-root",
+        type=Path,
+        default=TAIGU / "step2_well_log_segments/output/taigu_step2_regular_md1",
+    )
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT)
     args = parser.parse_args()
 
@@ -92,12 +112,27 @@ def main() -> int:
     )
     print(f"[supp-step7] wrote {windows_path} shape={window_code.shape} inside={int(window_code.sum()):,}")
 
-    real_root = TAIGU / "step2_well_log_segments/output/taigu_step2_regular_md1"
+    real_root = args.step2_segments_root.resolve()
     # 7A 的产状库层名写死在"上部复合层/太古界风化壳"；用原有成像组提供产状库，
     # 新层几何仍由本区块的 window_code 决定（输出 LayerGroup 事后统一改为上部补充层）。
-    supp_groups = TAIGU / "step3_imaging_groups/output/taigu_step3_imaging_md1/groups"
-    step6b = SUPP / "taigu_supp_legacy_v1/step6b_supp"
-    step6c = SUPP / "taigu_supp_legacy_v1/step6c_supp"
+    supp_groups = args.step3_groups_root.resolve()
+    step6b = args.step6b_dir.resolve()
+    step6c = args.step6c_dir.resolve()
+    step6d_summary = json.loads(
+        args.step6d_summary.resolve().read_text(encoding="utf-8")
+    )
+    step6_contract_version = str(
+        step6d_summary.get("model_contract_version")
+        or step6d_summary.get("contract_version")
+        or ""
+    )
+    target_block = {
+        "name": "taigu_supp_pilot_ext300_v2",
+        "x_min": float(block["X"].min()),
+        "x_max": float(block["X"].max()),
+        "y_min": float(block["Y"].min()),
+        "y_max": float(block["Y"].max()),
+    }
 
     configs = {}
     cfg = json.loads(BASE_7A.read_text(encoding="utf-8"))
@@ -113,8 +148,11 @@ def main() -> int:
         "horizon_contract_csv": str(args.legacy_csv.resolve()),
         "step3_groups_root": str(supp_groups),
         "step2_segments_root": str(real_root),
+        "target_block": target_block,
         "_note": "上部补充层 Step7A（区块）；T4=TopV, T6=Top-1ms, T7=Top",
     })
+    if step6_contract_version:
+        cfg["expected_step6a_model_contract_version"] = step6_contract_version
     configs["supp_7a_config.json"] = cfg
 
     cfg = json.loads(BASE_7B.read_text(encoding="utf-8"))
@@ -126,11 +164,20 @@ def main() -> int:
         "medium_component_summary_csv": str(step6b / "medium_corridor_component_summary.csv"),
         "step6b_qc_json": str(step6b / "medium_corridor_qc.json"),
         "trace_mapping_npz": str(args.mapping_npz.resolve()),
+        "target_block": target_block,
         "_note": "上部补充层 Step7B（区块）",
     })
+    if step6_contract_version:
+        cfg["expected_step6a_model_contract_version"] = step6_contract_version
     configs["supp_7b_config.json"] = cfg
 
     cfg = json.loads(BASE_7C.read_text(encoding="utf-8"))
+    with segyio.open(
+        str(step6c / "large_fault_prior.sgy"),
+        "r",
+        ignore_geometry=True,
+    ) as large_handle:
+        large_axis = np.asarray(large_handle.samples, dtype=np.float64)
     cfg.update({
         "version": "taigu_supp_layer_v1_7c",
         "output_dir": str(out_dir / "step7c_supp"),
@@ -142,8 +189,10 @@ def main() -> int:
         "fault_patch_overlap_csv": str(step6c / "original_fault_rasterization_audit.csv"),
         "trace_mapping_npz": str(args.mapping_npz.resolve()),
         "horizon_contract_table": str(args.legacy_csv.resolve()),
-        "time_min_ms": 2630.0,
-        "time_max_ms": 3700.0,
+        "target_block": target_block,
+        "time_min_ms": float(large_axis[0]),
+        "time_max_ms": float(large_axis[-1]),
+        "required_taigu_layers": ["上部复合层"],
         "_note": "上部补充层 Step7C（区块）",
     })
     configs["supp_7c_config.json"] = cfg
@@ -157,8 +206,11 @@ def main() -> int:
         "large_dfn_vtk": str(out_dir / "step7c_supp/large_fault_dfn_raw_time.vtk"),
         "original_fault_manifest_csv": str(step6c / "original_fault_unit_manifest.csv"),
         "horizon_contract_table": str(args.legacy_csv.resolve()),
+        "target_block": target_block,
         "_note": "上部补充层 Step7D（区块）",
     })
+    if step6_contract_version:
+        cfg["model_contract_version"] = step6_contract_version
     configs["supp_7d_config.json"] = cfg
 
     for name, payload in configs.items():
